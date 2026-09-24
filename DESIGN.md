@@ -1632,6 +1632,20 @@ as `OpenAtelier-<version>-<platform>.zip|.tar.gz` — one folder: `OpenAtelier.e
 `openatelier`, `oa`, LICENSE, README, `plugins/` — writes `SHA256SUMS.txt`, and publishes
 a GitHub Release, a pre-release when the version has a pre-release part.
 
+**Windows installer and a self-contained package** (2026-09-24): the release also builds
+`OpenAtelier-<version>-windows-x64-setup.exe` with Inno Setup (`installer/openatelier.iss`)
+from the packaged folder: per-user into `%LOCALAPPDATA%\Programs\OpenAtelier` (no admin
+prompt, and writable, so the in-app updater still works; installing for everyone is
+offered), Start menu entry, optional desktop shortcut, license page, uninstaller (which
+also clears what the updater set aside), a fixed AppId so new versions upgrade in place.
+Windows packages carry **ffmpeg and ffprobe** next to the program — Windows (and Rust's
+`Command`) look in the program's folder before `PATH` — from a pinned gyan.dev build
+checked against its SHA-256 and for the encoders export needs, with its GPL license and a
+notice. The programs carry the **icon** and version details (`crates/app/build.rs`,
+`winresource`, `assets/logo.ico` written from the same drawing as the window icon by an
+ignored test). At start the app checks it can run ffmpeg and ffprobe (`app/deps.rs`) and
+says how to get them if not, instead of imports failing with a puzzling error.
+
 **Updates** (`app/update.rs`): the app reads the repository's releases (GitHub API via
 `curl`, once a day at start, or Settings → Updates → Check now) and compares by semantic
 versioning (`0.1.0-beta.2` > `beta.1`; a release above its pre-releases). The **Beta**

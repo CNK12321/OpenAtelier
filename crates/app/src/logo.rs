@@ -283,4 +283,59 @@ mod tests {
         assert!(contains(&s.points, [0.12, 0.95]));
         assert!(!contains(&s.points, [0.5, 0.9]));
     }
+
+    /// Writes `assets/logo.ico` — the program's icon in Windows (Explorer, the Start
+    /// menu, the installer), embedded by `build.rs` — from the same drawing as the window
+    /// icon. Run it after changing the logo:
+    /// `cargo test -p oa-app write_the_windows_icon -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_the_windows_icon() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/logo.ico");
+        std::fs::write(&path, windows_icon(&[16, 24, 32, 48, 64, 256])).unwrap();
+    }
+
+    /// An `.ico` holding the icon at each size (PNG-compressed, as Windows reads them).
+    fn windows_icon(sizes: &[u32]) -> Vec<u8> {
+        let images: Vec<Vec<u8>> = sizes
+            .iter()
+            .map(|&s| {
+                let icon = icon(s);
+                let mut png = Vec::new();
+                let mut enc = png::Encoder::new(&mut png, s, s);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                enc.write_header().unwrap().write_image_data(&icon.rgba).unwrap();
+                png
+            })
+            .collect();
+        let mut out = Vec::new();
+        out.extend(0u16.to_le_bytes()); // reserved
+        out.extend(1u16.to_le_bytes()); // an icon
+        out.extend((sizes.len() as u16).to_le_bytes());
+        let mut offset = 6 + 16 * sizes.len() as u32;
+        for (&s, image) in sizes.iter().zip(&images) {
+            let side = if s >= 256 { 0 } else { s as u8 }; // 0 means 256
+            out.extend([side, side, 0, 0]);
+            out.extend(1u16.to_le_bytes()); // planes
+            out.extend(32u16.to_le_bytes()); // bits per pixel
+            out.extend((image.len() as u32).to_le_bytes());
+            out.extend(offset.to_le_bytes());
+            offset += image.len() as u32;
+        }
+        for image in images {
+            out.extend(image);
+        }
+        out
+    }
+
+    #[test]
+    fn the_windows_icon_is_well_formed() {
+        let ico = windows_icon(&[16, 256]);
+        assert_eq!(&ico[..6], &[0, 0, 1, 0, 2, 0]);
+        // The second entry's image starts where it says, with a PNG signature.
+        let offset = u32::from_le_bytes(ico[6 + 16 + 12..6 + 16 + 16].try_into().unwrap()) as usize;
+        assert_eq!(&ico[offset..offset + 8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(ico[6 + 16], 0, "256 px is written as 0");
+    }
 }

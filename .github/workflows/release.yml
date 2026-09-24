@@ -62,6 +62,27 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p oa-app -p oa-cli
 
+      # Windows packages carry ffmpeg and ffprobe (next to the program, where it looks
+      # first), so the editor works without installing anything else. A pinned build,
+      # checked against its published SHA-256; bump both lines to update it.
+      - name: ffmpeg for Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          FFMPEG_URL: https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip
+          FFMPEG_SHA256: 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+        run: |
+          curl -sSL --fail --retry 3 -o ffmpeg.zip "$FFMPEG_URL"
+          echo "$FFMPEG_SHA256  ffmpeg.zip" | sha256sum -c -
+          mkdir -p ffmpeg && 7z x ffmpeg.zip -offmpeg > /dev/null
+          FF=$(dirname "$(find ffmpeg -name ffmpeg.exe | head -1)")
+          # The export needs these encoders; fail here rather than in a user's hands.
+          for enc in libx264 libx265 libvpx-vp9 prores_ks gif aac; do
+            "$FF/ffmpeg.exe" -hide_banner -encoders | grep -qw "$enc" || { echo "::error::the bundled ffmpeg has no $enc encoder"; exit 1; }
+          done
+          echo "FFMPEG_BIN=$FF" >> "$GITHUB_ENV"
+          echo "FFMPEG_ROOT=$(dirname "$FF")" >> "$GITHUB_ENV"
+
       - name: Package
         shell: bash
         run: |
@@ -69,6 +90,14 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp target/release/oa-app.exe "dist/$PACKAGE/OpenAtelier.exe"
             cp target/release/oa.exe "dist/$PACKAGE/oa.exe"
+            cp "$FFMPEG_BIN/ffmpeg.exe" "$FFMPEG_BIN/ffprobe.exe" "dist/$PACKAGE/"
+            cp "$FFMPEG_ROOT/LICENSE" "dist/$PACKAGE/ffmpeg-LICENSE.txt"
+            {
+              echo "ffmpeg.exe and ffprobe.exe are FFmpeg $(basename "$FFMPEG_ROOT"), built by gyan.dev,"
+              echo "licensed under the GNU GPL version 3 (see ffmpeg-LICENSE.txt). They're unmodified."
+              echo "FFmpeg's source: https://ffmpeg.org/download.html (and https://git.ffmpeg.org/ffmpeg.git)."
+              echo "The build's configuration and components: https://www.gyan.dev/ffmpeg/builds/"
+            } > "dist/$PACKAGE/ffmpeg-NOTICE.txt"
           else
             cp target/release/oa-app "dist/$PACKAGE/openatelier"
             cp target/release/oa "dist/$PACKAGE/oa"
@@ -84,12 +113,29 @@ jobs:
           fi
           ls -l
 
+      # The Windows installer, from the same folder (installer/openatelier.iss).
+      - name: Installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Preinstalled on GitHub's Windows images (Program Files); otherwise installed.
+          $find = { @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe", "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+          $iscc = & $find
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = & $find
+          }
+          & $iscc /Q "/DAppVersion=$env:VERSION" "/DSourceDir=$PWD\dist\$env:PACKAGE" "/DOutputDir=$PWD\dist" installer\openatelier.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist\*.exe
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PACKAGE }}
           path: |
             dist/*.zip
             dist/*.tar.gz
+            dist/*-setup.exe
           if-no-files-found: error
 
   release:

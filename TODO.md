@@ -5,7 +5,7 @@ Where things stand and what's next. Architecture and rationale live in
 
 ## State
 
-15 crates, ~45k lines of Rust, **319 tests passing, clippy clean** (as of this note):
+15 crates, ~45k lines of Rust, **321 tests passing, clippy clean** (as of this note):
 
 | Crate | What works |
 |---|---|

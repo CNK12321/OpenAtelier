@@ -72,9 +72,16 @@ Settings, autosaves and downloaded engines live in `~/.local/share/OpenAtelier`
 
 ## Download
 
-Ready-to-run builds are on the [Releases page](https://github.com/CNK12321/OpenAtelier/releases):
-`OpenAtelier-<version>-windows-x64.zip` and `-linux-x64.tar.gz`. Unpack anywhere and run
-`OpenAtelier.exe` (Windows) or `./openatelier` (Linux). The current builds are **betas**.
+Ready-to-run builds are on the [Releases page](https://github.com/CNK12321/OpenAtelier/releases)
+(the current builds are **betas**) — no Rust, no source code needed:
+
+- **Windows:** `OpenAtelier-<version>-windows-x64-setup.exe` installs it for you (no
+  administrator prompt; Start menu entry, optional desktop shortcut, uninstaller). Or take
+  the `…-windows-x64.zip`, unpack anywhere and run `OpenAtelier.exe`. Both include ffmpeg.
+  The programs aren't code-signed yet, so Windows SmartScreen may ask first: *More info →
+  Run anyway*.
+- **Linux:** `…-linux-x64.tar.gz`: unpack and run `./openatelier`. Install `ffmpeg` from
+  your package manager first (the app tells you if it can't find it).
 
 The app checks the releases once a day and offers newer versions in a bar at the top:
 **Update** downloads the package, checks it against the release's `SHA256SUMS.txt`,

@@ -23,6 +23,7 @@ mod sound_cards;
 mod connections;
 mod tracks;
 mod update;
+mod deps;
 mod winfocus;
 mod curves;
 mod command;
@@ -164,6 +165,7 @@ fn main() -> eframe::Result {
             app.apply_settings(&cc.egui_ctx);
             app.script = script;
             app.start_updates();
+            app.check_deps();
             if !files.is_empty() {
                 app.open_paths(&files);
                 app.screen = home::Screen::Editor;
@@ -397,6 +399,8 @@ struct App {
     tracker_setup: tracks::TrackerSetup,
     /// Newer versions on GitHub, and installing one.
     updater: update::Updater,
+    /// Whether ffmpeg and ffprobe can be run.
+    deps: deps::Deps,
     /// Sound levels for properties connected to the sound, and what they were built
     /// from (document, envelopes ready).
     follower: Option<Arc<oa_audio::envelope::Follower>>,
@@ -560,6 +564,7 @@ impl App {
             track_editor: None,
             tracker_setup: Default::default(),
             updater: Default::default(),
+            deps: Default::default(),
             follower: None,
             follower_key: (0, 0),
             follower_complete: false,
@@ -1838,6 +1843,7 @@ impl App {
         self.settings_window(ctx);
         if self.screen == home::Screen::Home {
             self.update_banner(root);
+            self.deps_banner(root);
             egui::CentralPanel::default().show(root, |ui| self.home(ui));
             return;
         }
@@ -1859,6 +1865,7 @@ impl App {
         }
         egui::Panel::top("menu").show(root, |ui| self.menu_bar(ui));
         self.update_banner(root);
+        self.deps_banner(root);
 
         if let Some(r) = self.recoveries.first().cloned() {
             egui::Panel::top("recovery").show(root, |ui| {
