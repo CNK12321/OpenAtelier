@@ -10,7 +10,6 @@ discussions, and anywhere you represent the project.
 
 ## Reporting
 
-If something happens that isn't OK, report it privately to the maintainers at
-**[CONTACT EMAIL]**. Reports are handled confidentially, and the maintainers will
+If something happens that isn't OK, report it privately to the maintainer. Reports are handled confidentially, and the maintainers will
 respond as the Contributor Covenant's enforcement guidelines describe, from a warning
 up to a ban from the project.
