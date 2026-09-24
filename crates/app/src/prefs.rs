@@ -150,6 +150,10 @@ impl App {
                 ui.label(egui::RichText::new("Restart OpenAtelier to use these.").small().color(crate::style::WARNING));
             }
 
+            ui.separator();
+            ui.heading("Updates");
+            self.update_settings(ui);
+
             // After the last use of `s`: it runs setup jobs of its own.
             ui.separator();
             ui.heading("AI tracker");

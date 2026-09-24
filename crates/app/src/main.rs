@@ -22,6 +22,7 @@ mod surface;
 mod sound_cards;
 mod connections;
 mod tracks;
+mod update;
 mod winfocus;
 mod curves;
 mod command;
@@ -162,6 +163,7 @@ fn main() -> eframe::Result {
             app.gpu_names = state.available_adapters.iter().map(|a| (a.get_info().name, oa_gpu::select::describe(&a.get_info()))).collect();
             app.apply_settings(&cc.egui_ctx);
             app.script = script;
+            app.start_updates();
             if !files.is_empty() {
                 app.open_paths(&files);
                 app.screen = home::Screen::Editor;
@@ -393,6 +395,8 @@ struct App {
     track_editor: Option<tracks::TrackEditor>,
     /// The AI tracker's setup, while it runs (it outlives the editor).
     tracker_setup: tracks::TrackerSetup,
+    /// Newer versions on GitHub, and installing one.
+    updater: update::Updater,
     /// Sound levels for properties connected to the sound, and what they were built
     /// from (document, envelopes ready).
     follower: Option<Arc<oa_audio::envelope::Follower>>,
@@ -555,6 +559,7 @@ impl App {
             connection_editor: None,
             track_editor: None,
             tracker_setup: Default::default(),
+            updater: Default::default(),
             follower: None,
             follower_key: (0, 0),
             follower_complete: false,
@@ -1758,6 +1763,8 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
+        // Restart now (after an update): the new version opens as this one closes.
+        self.relaunch_after_update();
         // Leave an up-to-date autosave behind only if there's unsaved work.
         if self.editor.dirty() {
             let _ = self.autosave.write_now(&self.editor.doc.snapshot(), self.editor.path.as_deref());
@@ -1827,8 +1834,10 @@ impl App {
         if let Some(Err(e)) = self.autosave.tick(&self.editor.doc.snapshot(), self.editor.dirty(), self.editor.path.as_deref()) {
             self.messages.push(format!("autosave failed: {e}"));
         }
+        self.poll_updates(ctx);
         self.settings_window(ctx);
         if self.screen == home::Screen::Home {
+            self.update_banner(root);
             egui::CentralPanel::default().show(root, |ui| self.home(ui));
             return;
         }
@@ -1849,6 +1858,7 @@ impl App {
             self.window_title = title;
         }
         egui::Panel::top("menu").show(root, |ui| self.menu_bar(ui));
+        self.update_banner(root);
 
         if let Some(r) = self.recoveries.first().cloned() {
             egui::Panel::top("recovery").show(root, |ui| {

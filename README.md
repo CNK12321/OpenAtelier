@@ -70,6 +70,32 @@ sudo dnf install gcc pkgconf-pkg-config alsa-lib-devel ffmpeg mesa-vulkan-driver
 Settings, autosaves and downloaded engines live in `~/.local/share/OpenAtelier`
 (`$XDG_DATA_HOME`). If the window won't open, try OpenGL: `OA_GPU_BACKEND=gl`.
 
+## Download
+
+Ready-to-run builds are on the [Releases page](https://github.com/CNK12321/OpenAtelier/releases):
+`OpenAtelier-<version>-windows-x64.zip` and `-linux-x64.tar.gz`. Unpack anywhere and run
+`OpenAtelier.exe` (Windows) or `./openatelier` (Linux). The current builds are **betas**.
+
+The app checks the releases once a day and offers newer versions in a bar at the top:
+**Update** downloads the package, checks it against the release's `SHA256SUMS.txt`,
+installs it in place and restarts. Settings → Updates picks the channel (Stable, or Beta
+for pre-releases too), turns the check off, or checks now.
+
+### Making a release
+
+The version lives in the workspace `Cargo.toml`. Tagging it publishes the release:
+
+```bash
+git tag v0.1.0-beta.1
+```
+
+```bash
+git push origin v0.1.0-beta.1
+```
+
+`.github/workflows/release.yml` builds Windows and Linux packages, writes the checksums
+and publishes a GitHub Release (a pre-release when the version has a `-beta`/`-rc` part).
+
 ## Getting started
 
 ```bash

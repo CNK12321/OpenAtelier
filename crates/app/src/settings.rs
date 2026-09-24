@@ -82,6 +82,15 @@ pub struct Settings {
     /// drivers whose decoder misbehaves).
     #[serde(default)]
     pub decode_with_ffmpeg: bool,
+    /// Updates: "stable" (full releases) or "beta" (pre-releases too).
+    #[serde(default = "default_channel")]
+    pub update_channel: String,
+    /// Look for a newer version at start (at most once a day).
+    #[serde(default = "yes")]
+    pub check_updates: bool,
+    /// When the last check was (Unix seconds).
+    #[serde(default)]
+    pub update_checked_at: u64,
     /// The caption generator's last choices.
     pub captions: CaptionPrefs,
     #[serde(skip)]
@@ -155,6 +164,11 @@ pub struct WindowState {
 
 /// Views kept for this many projects at most.
 pub const MAX_PROJECT_VIEWS: usize = 200;
+
+/// Beta builds follow the beta channel; releases the stable one.
+fn default_channel() -> String {
+    if crate::update::VERSION.contains('-') { "beta".into() } else { "stable".into() }
+}
 
 fn auto() -> String {
     "auto".into()
@@ -278,6 +292,9 @@ impl Default for Settings {
             gpu_backend: auto(),
             gpu_adapter: String::new(),
             decode_with_ffmpeg: false,
+            update_channel: default_channel(),
+            check_updates: true,
+            update_checked_at: 0,
             captions: CaptionPrefs::default(),
             path: None,
         }

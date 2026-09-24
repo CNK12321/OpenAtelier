@@ -1623,6 +1623,31 @@ atlas eviction beyond "start over when full".
   the GPU (rounded corners; the highlight following word times; the box behind only the
   spoken word).
 
+## 18. Releases and updates ✅ (2026-09-24; the first release not yet made)
+
+**Releases** (`.github/workflows/release.yml`): pushing a tag `v<version>` (it must match
+the workspace version; `0.1.0-beta.1` now) builds `oa-app` and `oa` in release mode
+(thin LTO, no debug info) on Windows and Ubuntu 22.04 (for older glibc), packages each
+as `OpenAtelier-<version>-<platform>.zip|.tar.gz` — one folder: `OpenAtelier.exe` /
+`openatelier`, `oa`, LICENSE, README, `plugins/` — writes `SHA256SUMS.txt`, and publishes
+a GitHub Release, a pre-release when the version has a pre-release part.
+
+**Updates** (`app/update.rs`): the app reads the repository's releases (GitHub API via
+`curl`, once a day at start, or Settings → Updates → Check now) and compares by semantic
+versioning (`0.1.0-beta.2` > `beta.1`; a release above its pre-releases). The **Beta**
+channel (the default for beta builds) also offers pre-releases; **Stable** only full
+releases; only releases with a package for this platform count. A bar at the top offers
+**Update**, **What's new** (the release page) and **Later**. Update downloads the package
+and the checksums (the engines' step runner, with progress), checks the SHA-256, unpacks
+with `tar` (zips too), and puts the files next to the running program — a file in the way
+is renamed aside (`*.old`; Windows lets a running program be renamed, not overwritten),
+cleared at the next start. **Restart now** closes the normal way (unsaved work is asked
+about) and `on_exit` starts the new version. Builds run from a `target` folder, or
+installs in a folder the app can't write, get the download page instead. `OA_UPDATE_REPO`
+points it at another repository. Tested: version ordering, channels, GitHub's answers
+(and its error messages), checksums, an end-to-end install from a real package (and a
+damaged one refused), files set aside and cleared.
+
 ## Roadmap
 
 1. ✅ **Core model** — time, params, document, variants, graph, planner, CLI.
