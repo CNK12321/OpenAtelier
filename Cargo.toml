@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+# Not published to crates.io (yet): the crate names are placeholders for now.
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+wgpu = "30.0.1"
+pollster = "1.0.1"
+bytemuck = "1.25.2"
+png = "0.18.1"
+cpal = "0.18.2"
+windows = { version = "0.62.2", default-features = false }
+
+oa-time = { path = "crates/time" }
+oa-params = { path = "crates/params" }
+oa-doc = { path = "crates/doc" }
+oa-graph = { path = "crates/graph" }
+oa-plan = { path = "crates/plan" }
+oa-gpu = { path = "crates/gpu" }
+oa-media = { path = "crates/media" }
+oa-audio = { path = "crates/audio" }
+oa-export = { path = "crates/export" }
+oa-edit = { path = "crates/edit" }
+oa-text = { path = "crates/text" }
+oa-captions = { path = "crates/captions" }
+oa-track = { path = "crates/track" }
+
+# `cargo run` builds are for working on the editor, but they still render and export
+# real video. Dependencies (wgpu, egui, the decoders, the text shaper) are built fully
+# optimized — they're compiled once and cached, and unoptimized they multiplied the CPU
+# cost of every GPU pass. Our own crates get light optimization, which keeps rebuilds
+# quick and debugging usable.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,13 @@
+[package]
+name = "oa-doc"
+description = "Project document: sequences, tracks, items, formats, edits and undo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+oa-time.workspace = true
+oa-params.workspace = true

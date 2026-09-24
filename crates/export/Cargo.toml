@@ -1,0 +1,30 @@
+[package]
+name = "oa-export"
+description = "Rendering a sequence to a video file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oa-time.workspace = true
+oa-params.workspace = true
+oa-doc.workspace = true
+oa-graph.workspace = true
+oa-plan.workspace = true
+oa-gpu.workspace = true
+oa-audio.workspace = true
+wgpu.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Media_MediaFoundation",
+]
+
+[dev-dependencies]
+oa-media.workspace = true

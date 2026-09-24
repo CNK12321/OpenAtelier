@@ -1,0 +1,26 @@
+[package]
+name = "oa-cli"
+description = "Command-line tools for inspecting OpenAtelier projects and render plans"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "oa"
+path = "src/main.rs"
+
+[dependencies]
+oa-time.workspace = true
+oa-params.workspace = true
+oa-doc.workspace = true
+oa-graph.workspace = true
+oa-plan.workspace = true
+oa-gpu.workspace = true
+oa-export.workspace = true
+oa-audio.workspace = true
+oa-media.workspace = true
+oa-edit.workspace = true
+png.workspace = true
+wgpu.workspace = true
+pollster.workspace = true

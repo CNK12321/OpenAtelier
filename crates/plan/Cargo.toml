@@ -1,0 +1,14 @@
+[package]
+name = "oa-plan"
+description = "Frame planner: document snapshot + time → render graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oa-time.workspace = true
+oa-params.workspace = true
+oa-doc.workspace = true
+oa-graph.workspace = true
+oa-text.workspace = true

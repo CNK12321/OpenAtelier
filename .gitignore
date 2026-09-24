@@ -1,0 +1,24 @@
+# Build output
+/target
+
+# Projects and what the app writes beside them
+*.oaproj.json
+*.thumb.png
+*.export-audio.wav
+
+# Your own media for trying the editor (not part of the repository)
+/samples/
+
+# Stray renders from `oa render`
+/frame.png
+
+# Machine- and session-specific notes
+*.local.md
+
+# Editors and tools
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
+Thumbs.db

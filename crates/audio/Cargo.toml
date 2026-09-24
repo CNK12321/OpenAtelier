@@ -1,0 +1,12 @@
+[package]
+name = "oa-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oa-time.workspace = true
+oa-params.workspace = true
+oa-doc.workspace = true
+cpal.workspace = true

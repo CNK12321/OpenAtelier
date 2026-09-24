@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Build, lint and test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # GPU tests use whatever DX12 adapter the runner has (often the WARP software
+      # adapter) and skip without one; decoder and export tests skip without ffmpeg.
+      - name: Test
+        run: cargo test --workspace -- --test-threads=4
+
+  linux:
+    name: Build, lint and test (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # ALSA headers for sound; ffmpeg for decoding and export; Mesa's software Vulkan
+      # (lavapipe) and OpenGL (llvmpipe) so the GPU tests run without a GPU.
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev ffmpeg mesa-vulkan-drivers libvulkan1 libgl1-mesa-dri libegl1 fontconfig fonts-dejavu-core
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace -- --test-threads=4
+
+      - name: Which GPU the tests used
+        run: cargo run -q -p oa-cli -- gpu

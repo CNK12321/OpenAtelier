@@ -1,0 +1,88 @@
+{
+  "id": "com.example.looks",
+  "name": "Example Looks",
+  "version": "1.0.0",
+  "author": "OpenAtelier",
+  "description": "A sample plugin, to copy when writing your own. Its two picture effects are deliberately simple versions of ones Atelier Core already has, so you can compare the manifest with the built-ins; its sound effect shows a sound shader.",
+  "api_version": 1,
+  "effects": [
+    {
+      "id": "com.example.vignette",
+      "name": "Vignette (example)",
+      "kind": "point",
+      "preserves_opacity": true,
+      "params": [
+        {
+          "id": "amount",
+          "type": "float",
+          "default": 0.6,
+          "min": 0,
+          "max": 1
+        },
+        {
+          "id": "size",
+          "type": "float",
+          "default": 0.7,
+          "min": 0.1,
+          "max": 1.5
+        }
+      ],
+      "shader": {
+        "entry": "example_vignette",
+        "file": "vignette.wgsl"
+      }
+    },
+    {
+      "id": "com.example.scanlines",
+      "name": "Scanlines (example)",
+      "kind": "point",
+      "preserves_opacity": true,
+      "params": [
+        {
+          "id": "amount",
+          "type": "float",
+          "default": 0.35,
+          "min": 0,
+          "max": 1
+        },
+        {
+          "id": "spacing",
+          "type": "float",
+          "default": 4,
+          "min": 2,
+          "max": 40,
+          "unit": "layer_pixels"
+        }
+      ],
+      "shader": {
+        "entry": "example_scanlines",
+        "file": "scanlines.wgsl"
+      }
+    },
+    {
+      "id": "com.example.telephone",
+      "name": "Telephone (example)",
+      "kind": "sound",
+      "params": [
+        {
+          "id": "amount",
+          "type": "float",
+          "default": 1,
+          "min": 0,
+          "max": 1
+        },
+        {
+          "id": "crunch",
+          "type": "float",
+          "default": 6,
+          "min": 0,
+          "max": 24,
+          "unit": "decibels"
+        }
+      ],
+      "shader": {
+        "file": "telephone.oasound"
+      }
+    }
+  ]
+}

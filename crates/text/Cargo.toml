@@ -1,0 +1,14 @@
+[package]
+name = "oa-text"
+description = "Fonts, shaping, layout and glyph distance fields for text layers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ab_glyph = "0.2.32"
+harfrust = "0.12"
+ttf-parser = "0.25"
+memmap2 = "0.9"
+epaint_default_fonts = "0.36"

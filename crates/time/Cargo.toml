@@ -1,0 +1,10 @@
+[package]
+name = "oa-time"
+description = "Exact timeline time (flicks), rationals and the frame-selection rule"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true

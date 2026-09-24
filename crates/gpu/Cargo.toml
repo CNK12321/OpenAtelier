@@ -1,0 +1,20 @@
+[package]
+name = "oa-gpu"
+description = "GPU executor for render graphs (wgpu)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oa-time.workspace = true
+oa-graph.workspace = true
+oa-text.workspace = true
+oa-params.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+oa-doc.workspace = true
+oa-plan.workspace = true

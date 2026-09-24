@@ -1,0 +1,37 @@
+[package]
+name = "oa-app"
+description = "Preview and editing UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "oa-app"
+path = "src/main.rs"
+
+[dependencies]
+oa-time.workspace = true
+oa-params.workspace = true
+oa-doc.workspace = true
+oa-graph.workspace = true
+oa-plan.workspace = true
+oa-text.workspace = true
+oa-gpu.workspace = true
+oa-media.workspace = true
+oa-audio.workspace = true
+oa-export.workspace = true
+oa-edit.workspace = true
+oa-captions.workspace = true
+oa-track.workspace = true
+wgpu.workspace = true
+eframe = "0.36.2"
+rfd = "0.17.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+png = "0.18"
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = ["Win32_Globalization", "Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"]

@@ -1,0 +1,14 @@
+// Telephone (example): only the middle of the voice gets through, a little crunchy.
+// A sound shader runs once per sample, per channel: read `in`, write `out`.
+
+// Two one-pole filters: one takes away the highs, the other finds the lows to take away.
+let k_low = 1 - exp(-TAU * 3400 / sample_rate);
+let k_high = 1 - exp(-TAU * 300 / sample_rate);
+state smooth = 0;
+state lows = 0;
+smooth += (in - smooth) * k_low;
+lows += (smooth - lows) * k_high;
+let band = smooth - lows;
+
+// Squeezed a little, like a cheap speaker, then mixed with the original.
+out = mix(in, tanh(band * db(crunch)) * 0.7, amount);
