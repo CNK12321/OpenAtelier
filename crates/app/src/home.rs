@@ -22,12 +22,16 @@ fn load_png(path: &Path) -> Option<([usize; 2], Vec<egui::Color32>)> {
     let info = reader.next_frame(&mut buf).ok()?;
     let pixels = match info.color_type {
         png::ColorType::Rgba => buf[..info.buffer_size()]
-            .chunks_exact(4)
-            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&[r, g, b, a]| egui::Color32::from_rgba_unmultiplied(r, g, b, a))
             .collect(),
         png::ColorType::Rgb => buf[..info.buffer_size()]
-            .chunks_exact(3)
-            .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&[r, g, b]| egui::Color32::from_rgb(r, g, b))
             .collect(),
         _ => return None,
     };

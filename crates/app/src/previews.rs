@@ -193,7 +193,7 @@ fn make_peaks(path: &Path) -> Option<Vec<(f32, f32)>> {
     let path = path.to_path_buf();
     let bytes = ffmpeg(&[], &path, &["-vn", "-ac", "1", "-ar", "4000", "-f", "f32le", "-"])?;
     let per = (RATE / PEAKS_PER_SECOND) as usize;
-    let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let samples: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     Some(
         samples
             .chunks(per)

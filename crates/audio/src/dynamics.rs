@@ -43,10 +43,10 @@ fn peak_db(buf: &[f32]) -> f32 {
 pub(crate) fn publish(effect: u64, before: &[f32], after: &[f32], channels: usize, reduction_db: f32) {
     let correlation = if channels == 2 {
         let (mut lr, mut ll, mut rr) = (0f32, 0f32, 0f32);
-        for f in after.chunks_exact(2) {
-            lr += f[0] * f[1];
-            ll += f[0] * f[0];
-            rr += f[1] * f[1];
+        for &[l, r] in after.as_chunks::<2>().0 {
+            lr += l * r;
+            ll += l * l;
+            rr += r * r;
         }
         if ll * rr > 1e-12 { lr / (ll * rr).sqrt() } else { 1.0 }
     } else {

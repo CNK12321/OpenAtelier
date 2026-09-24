@@ -8,7 +8,9 @@ use crate::{shaders, GpuContext, GpuImage, Pipelines, RenderError};
 pub fn read_linear(ctx: &GpuContext, img: &GpuImage) -> Result<Vec<[f32; 4]>, RenderError> {
     let bytes = read_texture(ctx, &img.tex.texture, img.size, 8)?;
     Ok(bytes
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|px| {
             let c = |i: usize| f16_to_f32(u16::from_le_bytes([px[i], px[i + 1]]));
             [c(0), c(2), c(4), c(6)]
