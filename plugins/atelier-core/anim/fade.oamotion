@@ -1,0 +1,2 @@
+// Fade: in as an intro, out as an outro.
+opacity = clamp(visibility, 0, 1);

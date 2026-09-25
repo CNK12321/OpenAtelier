@@ -98,21 +98,6 @@ fn framing(p: &oa_plan::scene::Placement, canvas: [f64; 2], aspect: f64) -> egui
     )
 }
 
-/// Settings that make an effect's preview show something (several effects are
-/// deliberately no-ops at their defaults: 0 stops of exposure, saturation 1).
-fn preview_values(type_id: &str) -> &'static [(&'static str, Value)] {
-    match type_id {
-        "oa.color.exposure" => &[("stops", Value::Float(1.2))],
-        "oa.color.saturation" => &[("amount", Value::Float(2.2))],
-        "oa.color.posterize" => &[("levels", Value::Float(4.0))],
-        "oa.blur.gaussian" => &[("radius", Value::Float(24.0))],
-        "oa.color.temperature" => &[("temperature", Value::Float(0.7))],
-        "oa.motion.shake" => &[("intensity", Value::Float(0.04)), ("rotation", Value::Float(4.0))],
-        "oa.motion.wiggle" => &[("amount", Value::Float(0.08)), ("rotation", Value::Float(8.0))],
-        _ => &[],
-    }
-}
-
 impl App {
     /// Called once per UI frame: forgets previews made for another moment or clip, and
     /// the hover animation once nothing is hovered. While playing, the previews stay on
@@ -290,9 +275,9 @@ impl App {
         let here = self.thumb_moment().max(it.range.start).min(it.range.end() - Time(1));
 
         let mut fx = EffectInstance::new(EffectId(u64::MAX - 7), type_id);
-        let preset = preview_values(type_id);
+        let preset = &d.preview;
         for (param, value) in preset {
-            fx.params.set(param, ParamSource::Static(value.clone()));
+            fx.params.set(param.as_str(), ParamSource::Static(value.clone()));
         }
         let secs = |s: f64| Time::from_seconds_f64(s.max(0.0));
         let t = match (kind, phase) {
@@ -307,7 +292,7 @@ impl App {
                 let k = 0.5 - 0.5 * (p * std::f64::consts::PI).cos();
                 for s in &d.params {
                     let (Value::Float(default), Some((lo, _))) = (&s.default, s.range) else { continue };
-                    let preset = preset.iter().find(|(id, _)| *id == s.id.as_str()).and_then(|(_, v)| v.as_float());
+                    let preset = preset.iter().find(|(id, _)| *id == s.id).and_then(|(_, v)| v.as_float());
                     let (from, to) = match preset {
                         Some(to) => (*default, to),
                         None => (lo.max(0.0).min(*default), *default),

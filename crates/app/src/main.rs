@@ -18,6 +18,7 @@ mod color;
 mod compound;
 mod crop;
 mod logo;
+mod points;
 mod surface;
 mod sound_cards;
 mod connections;
@@ -300,6 +301,8 @@ struct App {
     /// Every selected clip (includes `selection`, the one the inspector shows).
     selected: std::collections::BTreeSet<ItemId>,
     clipboard: clips::Clipboard,
+    /// Text for the system clipboard, put there next frame (see `copy_selection`).
+    clipboard_note: Option<String>,
     /// Timeline moves and trims snap to edges and the playhead.
     snapping: bool,
     /// A track being renamed in its header menu, with the name typed so far.
@@ -417,6 +420,8 @@ struct App {
     crop_drag: Option<crop::CropDrag>,
     /// A Surface point being dragged in the viewer.
     surface_drag: Option<surface::SurfaceDrag>,
+    /// An effect's point being dragged in the viewer.
+    point_drag: Option<points::PointDrag>,
     /// The Export window is open; files waiting to be exported after the running one;
     /// where the running one goes.
     export_dialog: bool,
@@ -521,6 +526,7 @@ impl App {
             selection: None,
             selected: Default::default(),
             clipboard: Vec::new(),
+            clipboard_note: None,
             snapping: true,
             renaming: None,
             bands: Default::default(),
@@ -573,6 +579,7 @@ impl App {
             crop_mode: None,
             crop_drag: None,
             surface_drag: None,
+            point_drag: None,
             export_dialog: false,
             export_queue: Default::default(),
             export_path: None,
@@ -1331,6 +1338,9 @@ impl App {
         // nearest frame on hand and fill in the exact one as soon as it's decoded.
         // Playing: exact frames, which the decode-ahead has ready anyway.
         self.sources.set_interactive(!self.playing || self.seek_settling);
+        if self.playing {
+            self.warm_upcoming();
+        }
         let image = match self.renderer.render(&graph, &self.registry, &mut self.sources) {
             Ok(img) => img,
             // A shader or glyphs are still being prepared in the background: keep the
@@ -1448,19 +1458,23 @@ impl App {
         let arrows = [(Key::ArrowLeft, [-1.0, 0.0]), (Key::ArrowRight, [1.0, 0.0]), (Key::ArrowUp, [0.0, -1.0]), (Key::ArrowDown, [0.0, 1.0])];
         for (key, d) in arrows {
             for (mods, step) in [(M::COMMAND | M::SHIFT, 10.0), (M::COMMAND, 1.0)] {
-                if pressed(mods, key)
-                    && let Some(item) = self.selection
-                {
-                    let ops = oa_edit::transform::nudge(
-                        self.editor.doc.project(),
-                        self.editor.seq,
-                        self.variant_id(),
-                        item,
-                        self.playhead,
-                        [d[0] * step, d[1] * step],
-                        self.transform_scope(),
-                    );
-                    if let Ok(ops) = ops
+                if pressed(mods, key) && self.selection.is_some() {
+                    // Every selected clip that has a picture (and is on screen now).
+                    let mut ops = Vec::new();
+                    for item in self.selected_clips() {
+                        if let Ok(more) = oa_edit::transform::nudge(
+                            self.editor.doc.project(),
+                            self.editor.seq,
+                            self.variant_id(),
+                            item,
+                            self.playhead,
+                            [d[0] * step, d[1] * step],
+                            self.transform_scope(),
+                        ) {
+                            ops.extend(more);
+                        }
+                    }
+                    if !ops.is_empty()
                         && let Err(e) = self.editor.apply_drag("Nudge layer", "nudge", ops)
                     {
                         self.error = Some(e.to_string());
@@ -1585,12 +1599,46 @@ impl App {
         }
     }
 
+    /// S: cuts every selected clip under the playhead (the back halves become the
+    /// selection); with none of them there, every clip under it.
+    /// While playing: opens the decoders of the clips starting in the next couple of
+    /// seconds, at their first frames, so a new file doesn't stall the frame it first
+    /// shows in.
+    fn warm_upcoming(&mut self) {
+        const AHEAD: Time = Time::from_seconds(2);
+        let now = self.playhead;
+        let s = self.editor.sequence();
+        let upcoming: Vec<(u64, Time)> = s
+            .tracks
+            .iter()
+            .filter(|t| t.enabled && t.kind == oa_doc::TrackKind::Video)
+            .flat_map(|t| t.items.iter())
+            .filter(|i| i.enabled && i.range.start > now && i.range.start <= now + AHEAD)
+            .filter_map(|i| match i.kind {
+                oa_doc::ItemKind::Media { media } => Some((media.0, i.time_map.source_time(Time::ZERO))),
+                _ => None,
+            })
+            .collect();
+        for (media, at) in upcoming {
+            self.sources.warm(media, at);
+        }
+    }
+
     pub(crate) fn split_at_playhead(&mut self) {
         let t = self.playhead;
-        let target = self.selection.filter(|id| self.editor.item(*id).is_some_and(|i| i.range.contains(t)));
-        match self.editor.split(target, t) {
-            Ok(Some(back)) => self.selection = Some(back),
-            Ok(None) => {}
+        let under: Vec<ItemId> = self.selected_clips().into_iter().filter(|id| self.editor.item(*id).is_some_and(|i| i.range.contains(t))).collect();
+        if under.is_empty() {
+            if let Err(e) = self.editor.split(None, t) {
+                self.error = Some(format!("can't split here: {e}"));
+            }
+            return;
+        }
+        match self.editor.split_many(&under, t) {
+            Ok(backs) => {
+                // The front halves that weren't cut stay selected alongside the back halves.
+                self.selected.extend(backs.iter().copied());
+                self.selection = backs.last().copied().or(self.selection);
+            }
             Err(e) => self.error = Some(format!("can't split here: {e}")),
         }
     }
@@ -1600,6 +1648,19 @@ impl App {
     /// selected clip is nearer.
     fn add_transition_at_playhead(&mut self) {
         let t = self.playhead;
+        // Several clips: a dissolve (or fade in) at the start of each.
+        if self.selected.len() > 1 {
+            let mut ops = Vec::new();
+            for item in self.selected_clips() {
+                if let Ok(more) = oa_edit::timeline::set_transition(self.editor.doc.project(), self.editor.seq, item, oa_doc::ClipEnd::Head, "oa.transition.crossfade", Time::from_seconds(1)) {
+                    ops.extend(more);
+                }
+            }
+            if let Err(e) = self.editor.apply("Add transitions", ops) {
+                self.error = Some(e.to_string());
+            }
+            return;
+        }
         let s = self.editor.sequence();
         let tolerance = Time::from_seconds_f64(0.5);
         let selected_track = self.selection.and_then(|id| s.find_item(id)).map(|(ti, _)| s.tracks[ti].id);
@@ -1824,6 +1885,11 @@ impl App {
             self.effect_drag = None;
         }
         self.shortcuts(ctx);
+        // Something was copied inside the app: say so on the system clipboard too, so
+        // Ctrl+V reaches the app (egui only reports it when there's text to paste).
+        if let Some(note) = self.clipboard_note.take() {
+            ctx.copy_text(note);
+        }
         self.audition_tick();
         self.compound_still_there();
         self.sync_selection();

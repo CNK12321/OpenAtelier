@@ -18,8 +18,30 @@ impl App {
         Some((m.color.clone(), t, g, auto))
     }
 
+    /// Sets `media`'s source color — and makes the same change (only the settings that
+    /// changed) to the other selected clips' files.
     fn set_media_color(&mut self, media: MediaId, color: InputColor, drag: bool) {
-        let op = vec![Op::SetMediaColor { media, color }];
+        let before = self.editor.doc.project().media(media).map(|m| m.color.clone()).unwrap_or_default();
+        let mut op = vec![Op::SetMediaColor { media, color: color.clone() }];
+        for other in self.selected_picture_media().into_iter().filter(|m| *m != media) {
+            let Some(mut c) = self.editor.doc.project().media(other).map(|m| m.color.clone()) else { continue };
+            if color.transfer != before.transfer {
+                c.transfer = color.transfer;
+            }
+            if color.gamut != before.gamut {
+                c.gamut = color.gamut;
+            }
+            if color.matrix != before.matrix {
+                c.matrix = color.matrix;
+            }
+            if color.range != before.range {
+                c.range = color.range;
+            }
+            if color.exposure != before.exposure {
+                c.exposure = color.exposure;
+            }
+            op.push(Op::SetMediaColor { media: other, color: c });
+        }
         let result = if drag { self.editor.apply_drag("Source color", "source-color", op) } else { self.editor.apply("Source color", op) };
         if let Err(e) = result {
             self.error = Some(e.to_string());

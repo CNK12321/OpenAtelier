@@ -500,7 +500,7 @@ impl Renderer {
         ready(crate::text::warm(&self.text, &[], wait))?;
         for d in registry.effects() {
             if let (Some(shader), Some(stage)) = (&d.shader, crate::text::stage(&d.kind)) {
-                ready(crate::text::warm(&self.text, &[(shader, stage, d.uniform_len())], wait))?;
+                ready(crate::text::warm(&self.text, &[(shader, stage, d.uniform_len(), false)], wait))?;
             }
         }
         Ok(())
@@ -865,6 +865,11 @@ impl Exec<'_> {
                 };
                 self.gpu.text_pass(self.text, self.registry, &draw)
             }
+            NodeOp::TextMask { spec, scale, bounds } => {
+                let b = node.bounds;
+                let size = [(b.x1 - b.x0).round().max(1.0) as u32, (b.y1 - b.y0).round().max(1.0) as u32];
+                self.gpu.text_mask_pass(self.text, spec, *scale, *bounds, [b.x0, b.y0], size)
+            }
             NodeOp::Transition { type_id, uniforms, progress, .. } => {
                 let from = self.node(node.inputs[0])?;
                 let to = self.node(node.inputs[1])?;
@@ -910,11 +915,11 @@ impl Exec<'_> {
                 let origin = [input.origin[0] - left, input.origin[1] - top];
                 let size = [input.size[0] + (left + right) as u32, input.size[1] + (top + bottom) as u32];
                 let mut current = input;
-                let passes = d.pass_count.map_or(shader.passes, |count| count(uniforms)).clamp(1, 32);
+                let passes = d.pass_count.as_ref().map_or(shader.passes, |count| count.count(uniforms)).clamp(1, 32);
                 for pass in 0..passes {
                     // A pass may run on a coarser grid (its target divided); the layer area it
                     // covers is the same, the shader works out its cells.
-                    let div = d.pass_divisor.map_or(1, |f| f(uniforms, pass)).clamp(1, 64);
+                    let div = d.pass_divisor.as_ref().map_or(1, |f| f.divisor(uniforms, pass, passes)).clamp(1, 64);
                     let pass_size = [size[0].div_ceil(div).max(1), size[1].div_ceil(div).max(1)];
                     let target = self.gpu.target(pass_size)?;
                     let u = Uniforms::default().output(origin, pass_size).input(&current).pass_index(pass).params(0, uniforms)?;

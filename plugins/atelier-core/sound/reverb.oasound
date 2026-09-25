@@ -1,0 +1,93 @@
+// Reverb: Freeverb. Eight damped combs in parallel, then four allpasses in series, per
+// channel; the right channel's are a little longer, for width.
+
+// A named space sets the room; "custom" uses the sliders.
+let size = clamp(choose(space, room, 0.3, 0.5, 0.82, 0.96, 0.72, 0.92), 0, 1);
+let damp = 0.4 * clamp(choose(space, damping, 0.6, 0.5, 0.35, 0.25, 0.1, 0.55), 0, 1);
+let wait = clamp(max(predelay, choose(space, 0, 0.005, 0.01, 0.025, 0.04, 0, 0.06)), 0, 0.25);
+let feedback = 0.7 + 0.28 * size;
+let wet = clamp(mix, 0, 1);
+
+// Lengths, in samples at 44.1 kHz, scaled to this rate.
+let k = sample_rate / 44100;
+let spread = 23 * channel;
+let t1 = floor((1116 + spread) * k) / sample_rate;
+let t2 = floor((1188 + spread) * k) / sample_rate;
+let t3 = floor((1277 + spread) * k) / sample_rate;
+let t4 = floor((1356 + spread) * k) / sample_rate;
+let t5 = floor((1422 + spread) * k) / sample_rate;
+let t6 = floor((1491 + spread) * k) / sample_rate;
+let t7 = floor((1557 + spread) * k) / sample_rate;
+let t8 = floor((1617 + spread) * k) / sample_rate;
+let u1 = floor((556 + spread) * k) / sample_rate;
+let u2 = floor((441 + spread) * k) / sample_rate;
+let u3 = floor((341 + spread) * k) / sample_rate;
+let u4 = floor((225 + spread) * k) / sample_rate;
+
+// Both channels feed the room, quietly, through the pre-delay.
+line gap = 0.26;
+write(gap, (left + right) * 0.5 * 0.015);
+let input = read(gap, floor(wait * sample_rate) / sample_rate);
+
+// The combs: each reads what it wrote its length ago, softened by `damp`.
+line c1 = 0.05;
+line c2 = 0.05;
+line c3 = 0.05;
+line c4 = 0.05;
+line c5 = 0.05;
+line c6 = 0.05;
+line c7 = 0.05;
+line c8 = 0.05;
+state s1 = 0;
+state s2 = 0;
+state s3 = 0;
+state s4 = 0;
+state s5 = 0;
+state s6 = 0;
+state s7 = 0;
+state s8 = 0;
+let y1 = read(c1, t1);
+let y2 = read(c2, t2);
+let y3 = read(c3, t3);
+let y4 = read(c4, t4);
+let y5 = read(c5, t5);
+let y6 = read(c6, t6);
+let y7 = read(c7, t7);
+let y8 = read(c8, t8);
+s1 = y1 * (1 - damp) + s1 * damp;
+s2 = y2 * (1 - damp) + s2 * damp;
+s3 = y3 * (1 - damp) + s3 * damp;
+s4 = y4 * (1 - damp) + s4 * damp;
+s5 = y5 * (1 - damp) + s5 * damp;
+s6 = y6 * (1 - damp) + s6 * damp;
+s7 = y7 * (1 - damp) + s7 * damp;
+s8 = y8 * (1 - damp) + s8 * damp;
+write(c1, input + s1 * feedback);
+write(c2, input + s2 * feedback);
+write(c3, input + s3 * feedback);
+write(c4, input + s4 * feedback);
+write(c5, input + s5 * feedback);
+write(c6, input + s6 * feedback);
+write(c7, input + s7 * feedback);
+write(c8, input + s8 * feedback);
+let combs = y1 + y2 + y3 + y4 + y5 + y6 + y7 + y8;
+
+// The allpasses smear it into a wash.
+line a1 = 0.02;
+line a2 = 0.02;
+line a3 = 0.02;
+line a4 = 0.02;
+let b1 = read(a1, u1);
+write(a1, combs + b1 * 0.5);
+let o1 = b1 - combs;
+let b2 = read(a2, u2);
+write(a2, o1 + b2 * 0.5);
+let o2 = b2 - o1;
+let b3 = read(a3, u3);
+write(a3, o2 + b3 * 0.5);
+let o3 = b3 - o2;
+let b4 = read(a4, u4);
+write(a4, o3 + b4 * 0.5);
+let o4 = b4 - o3;
+
+out = in * (1 - wet * 0.5) + o4 * wet * 3;

@@ -14,11 +14,12 @@ const RANGE_DB: f32 = 18.0;
 /// The rate the curve is drawn at (the response barely changes with it below 20 kHz).
 const DRAW_RATE: f32 = 48_000.0;
 
-/// Effects whose card shows a live meter, and what the meter's third row shows.
+/// Whether an effect's card shows a live meter (its manifest's `meter`), and what the
+/// meter's third row shows.
 fn meter_kind(type_id: &str) -> Option<MeterKind> {
-    match type_id {
-        "oa.audio.compressor" | "oa.audio.limiter" | "oa.audio.deess" => Some(MeterKind::Reduction),
-        "oa.audio.width" => Some(MeterKind::Correlation),
+    match oa_audio::fx::info(type_id)?.meter.as_deref()? {
+        oa_graph::registry::METER_REDUCTION => Some(MeterKind::Reduction),
+        oa_graph::registry::METER_CORRELATION => Some(MeterKind::Correlation),
         _ => None,
     }
 }

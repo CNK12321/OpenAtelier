@@ -1,0 +1,20 @@
+// De-esser: listens for sibilance above `frequency` (a high-pass on both channels, so
+// they agree), and turns a high shelf down when there's too much.
+let f = clamp(frequency, 2000, 12000);
+let heard = max(abs(highpass(left, f, 0.707)), abs(highpass(right, f, 0.707)));
+let attack_k = 1 - exp(-1 / (0.001 * sample_rate));
+let release_k = 1 - exp(-1 / (0.06 * sample_rate));
+state env = 0;
+env += (heard - env) * select(heard > env, attack_k, release_k);
+let level = select(env > 0.000001, to_db(env), -120);
+
+// Ratio 4 above the threshold, with a 4 dB knee, never more than `amount`.
+let over = level - threshold;
+let target = min(select(abs(over) <= 2, 0.75 * (over + 2) ^ 2 / 8, select(over > 0, 0.75 * over, 0)), max(amount, 0));
+
+// The shelf sits a little below the detector, so the whole hiss is under it (moved in
+// quarter-dB steps).
+state gr = 0;
+out = highshelf(in, f * 0.8, -round(gr * 4) / 4);
+gr += (target - gr) * select(target > gr, attack_k, release_k);
+reduction = gr;

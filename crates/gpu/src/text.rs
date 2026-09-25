@@ -223,6 +223,29 @@ fn oa_hsv(h: f32, s: f32, v: f32) -> vec3f {
     let p = abs(fract(vec3f(h) + vec3f(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
     return v * mix(vec3f(1.0), clamp(p - 1.0, vec3f(0.0), vec3f(1.0)), s);
 }
+// How much a bounded effect applies to letter `i` (which spans i..i+1): its range at
+// slot `b` — percent? (1: of the letter count), start, end, blend — covers the letters
+// whose middles are inside it, fading in and out over the blend.
+fn oa_bounded(i: f32, b: u32) -> f32 {
+    let k = select(1.0, text_count() / 100.0, u(b) > 0.5);
+    let start = u(b + 1u) * k;
+    let end = u(b + 2u) * k;
+    let blend = max(u(b + 3u) * k, 0.0);
+    let x = i + 0.5;
+    if (blend < 1e-4) {
+        return step(start, x) * step(x, end);
+    }
+    return clamp((x - start) / blend + 0.5, 0.0, 1.0) * clamp((end - x) / blend + 0.5, 0.0, 1.0);
+}
+// A per-letter effect's result `b`, blended with the letter as it was, `a`.
+fn oa_bounded_glyph(a: Glyph, b: Glyph, w: f32) -> Glyph {
+    var g = b;
+    g.offset = mix(a.offset, b.offset, w);
+    g.scale = mix(a.scale, b.scale, w);
+    g.rotation = mix(a.rotation, b.rotation, w);
+    g.color = mix(a.color, b.color, w);
+    return g;
+}
 // This letter's own 0 → 1 progress through the effect's `visibility()`: letters start
 // one after another, `stagger` (0..1) of the window apart from first to last.
 fn letter_progress(g: Glyph, stagger: f32) -> f32 {
@@ -263,14 +286,22 @@ fn prelude() -> String {
     s
 }
 
-/// Where each effect's params (and their spoken copy) sit: `base` for each.
-fn bases(chain: &[(&EffectShader, Stage, usize)]) -> Vec<usize> {
+/// One effect of a text pass: its shader, stage, uniform floats, and whether it's
+/// bounded to some of the letters.
+pub type Link<'a> = (&'a EffectShader, Stage, usize, bool);
+
+/// Floats of a bounded effect's range: percent?, start, end, blend.
+const BOUNDS: usize = 4;
+
+/// Where each effect's params sit: `base` for each, then their spoken copy, then (when
+/// bounded) its range.
+fn bases(chain: &[Link<'_>]) -> Vec<usize> {
     let mut base = CHAIN_BASE;
     chain
         .iter()
-        .map(|(_, _, len)| {
+        .map(|(_, _, len, bounded)| {
             let b = base;
-            base += 2 * len;
+            base += 2 * len + if *bounded { BOUNDS } else { 0 };
             b
         })
         .collect()
@@ -278,11 +309,11 @@ fn bases(chain: &[(&EffectShader, Stage, usize)]) -> Vec<usize> {
 
 /// WGSL for a text pass with this chain of (shader, stage, uniform floats). Box effects
 /// take their slots but are drawn by their own pipelines (`box_shader`).
-pub fn text_shader(chain: &[(&EffectShader, Stage, usize)]) -> String {
+pub fn text_shader(chain: &[Link<'_>]) -> String {
     let mut s = prelude();
     s.push_str(GLYPH_LIB);
     let mut seen = Vec::new();
-    for (shader, stage, _) in chain {
+    for (shader, stage, _, _) in chain {
         if *stage != Stage::Box && !seen.contains(&shader.entry.as_str()) {
             seen.push(&shader.entry);
             s.push_str(&shader.source);
@@ -290,17 +321,30 @@ pub fn text_shader(chain: &[(&EffectShader, Stage, usize)]) -> String {
         }
     }
     let (mut vertex, mut pixel) = (String::new(), String::new());
-    for ((shader, stage, len), base) in chain.iter().zip(bases(chain)) {
+    for ((shader, stage, len, bounded), base) in chain.iter().zip(bases(chain)) {
         let clock = base + len.saturating_sub(CLOCK_SLOTS);
         let alt = base + len;
-        match stage {
-            Stage::Letter => {
+        // A bounded effect is blended with the letter as it was, by how far the letter is
+        // inside its range.
+        let range = base + 2 * len;
+        match (stage, bounded) {
+            (Stage::Letter, false) => {
                 let _ = writeln!(vertex, "    oa_set_clock({clock}u);\n    g = {}(g, select({base}u, {alt}u, g.word == spoken_word()));", shader.entry);
             }
-            Stage::Pixel => {
+            (Stage::Letter, true) => {
+                let _ = writeln!(
+                    vertex,
+                    "    oa_set_clock({clock}u);\n    {{ let before = g;\n      g = oa_bounded_glyph(before, {}(g, select({base}u, {alt}u, g.word == spoken_word())), oa_bounded(gi.index, {range}u)); }}",
+                    shader.entry
+                );
+            }
+            (Stage::Pixel, false) => {
                 let _ = writeln!(pixel, "    oa_set_clock({clock}u);\n    c = {}(c, px, select({base}u, {alt}u, spoken));", shader.entry);
             }
-            Stage::Box => {}
+            (Stage::Pixel, true) => {
+                let _ = writeln!(pixel, "    oa_set_clock({clock}u);\n    c = mix(c, {}(c, px, select({base}u, {alt}u, spoken)), oa_bounded(v.info.x, {range}u));", shader.entry);
+            }
+            (Stage::Box, _) => {}
         }
     }
     let _ = write!(
@@ -407,15 +451,15 @@ fn fs_box(v: BoxOut) -> @location(0) vec4f {{
     s
 }
 
-fn text_key(chain: &[(&EffectShader, Stage, usize)]) -> String {
+fn text_key(chain: &[Link<'_>]) -> String {
     let mut k = String::from("text2");
-    for (s, stage, len) in chain {
+    for (s, stage, len, bounded) in chain {
         let tag = match stage {
             Stage::Letter => "g",
             Stage::Pixel => "p",
             Stage::Box => "b",
         };
-        let _ = write!(k, "|{tag}{}:{len}", s.entry);
+        let _ = write!(k, "|{tag}{}:{len}{}", s.entry, if *bounded { "~" } else { "" });
     }
     k
 }
@@ -424,7 +468,7 @@ fn box_key(shader: &EffectShader, base: usize, len: usize) -> String {
     format!("textbox|{}:{base}:{len}", shader.entry)
 }
 
-fn text_spec(key: &str, chain: &[(&EffectShader, Stage, usize)]) -> PipelineSpec {
+fn text_spec(key: &str, chain: &[Link<'_>]) -> PipelineSpec {
     PipelineSpec {
         label: key.to_string(),
         source: text_shader(chain),
@@ -477,20 +521,25 @@ impl crate::renderer::GpuServices<'_> {
             let Some(d) = registry.effect(&fx.type_id) else { continue };
             let (Some(shader), Some(stage)) = (d.shader.clone(), stage(&d.kind)) else { continue };
             let len = fx.uniforms.len();
-            if base + 2 * len > SLOTS {
-                return Err(RenderError::Unsupported(format!("text effects need {} params; {} fit", base + 2 * len - CHAIN_BASE, SLOTS - CHAIN_BASE)));
+            let bounds = fx.bounds.filter(|_| stage != Stage::Box);
+            let size = 2 * len + if bounds.is_some() { BOUNDS } else { 0 };
+            if base + size > SLOTS {
+                return Err(RenderError::Unsupported(format!("text effects need {} params; {} fit", base + size - CHAIN_BASE, SLOTS - CHAIN_BASE)));
             }
             uniforms[base..base + len].copy_from_slice(&fx.uniforms);
             let spoken = if fx.spoken.len() == len { &fx.spoken } else { &fx.uniforms };
             uniforms[base + len..base + 2 * len].copy_from_slice(spoken);
-            base += 2 * len;
-            shaders.push((shader, stage, len));
+            if let Some(b) = bounds {
+                uniforms[base + 2 * len..base + size].copy_from_slice(&b);
+            }
+            base += size;
+            shaders.push((shader, stage, len, bounds.is_some()));
         }
-        let chain: Vec<(&EffectShader, Stage, usize)> = shaders.iter().map(|(s, st, l)| (s, *st, *l)).collect();
+        let chain: Vec<Link<'_>> = shaders.iter().map(|(s, st, l, b)| (s, *st, *l, *b)).collect();
         let key = text_key(&chain);
         let pipeline = state.pipelines.get(&key, self.wait, || text_spec(&key, &chain))?;
         let mut box_pipelines = Vec::new();
-        for ((shader, stage, len), base) in chain.iter().zip(bases(&chain)) {
+        for ((shader, stage, len, _), base) in chain.iter().zip(bases(&chain)) {
             if *stage == Stage::Box {
                 let key = box_key(shader, base, *len);
                 box_pipelines.push(state.pipelines.get(&key, self.wait, || box_spec(&key, shader, base, *len))?);
@@ -628,10 +677,152 @@ impl crate::renderer::GpuServices<'_> {
     }
 }
 
+const MASK_LIB: &str = r#"
+struct Cell { rect: vec4f, w: vec4f }
+@group(0) @binding(3) var<storage, read> cells: array<Cell>;
+
+struct MaskOut {
+    @builtin(position) pos: vec4f,
+    @location(0) w: f32,
+}
+
+@vertex
+fn vs_mask(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> MaskOut {
+    var corners = array<vec2f, 6>(
+        vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0),
+        vec2f(1.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0),
+    );
+    let c = cells[ii];
+    let k = corners[vi];
+    let p = mix(c.rect.xy, c.rect.zw, k);
+    let o = (p - out_origin()) / out_size();
+    var out: MaskOut;
+    out.pos = vec4f(o.x * 2.0 - 1.0, 1.0 - o.y * 2.0, 0.0, 1.0);
+    // Across a letter's cell, from how much its left edge gets to its right edge's.
+    out.w = mix(c.w.x, c.w.y, k.x);
+    return out;
+}
+
+@fragment
+fn fs_mask(v: MaskOut) -> @location(0) vec4f {
+    return vec4f(clamp(v.w, 0.0, 1.0));
+}
+"#;
+
+/// How much a bounded effect gets at `x` letters from the text's start (`n` letters),
+/// its range `b` as in `oa_graph::TextEffect::bounds`. Without a blend, whole letters:
+/// the ones whose middles are inside.
+fn bound_weight(x: f64, b: [f32; 4], n: f64, whole_letter: f64) -> f64 {
+    let k = if b[0] > 0.5 { n / 100.0 } else { 1.0 };
+    let (start, end, blend) = (b[1] as f64 * k, b[2] as f64 * k, (b[3] as f64 * k).max(0.0));
+    if blend < 1e-4 {
+        let m = whole_letter + 0.5;
+        return if m >= start && m <= end { 1.0 } else { 0.0 };
+    }
+    ((x - start) / blend + 0.5).clamp(0.0, 1.0) * ((end - x) / blend + 0.5).clamp(0.0, 1.0)
+}
+
+/// A cell per letter for a bounded effect's mask (8 floats: x0, y0, x1, y1 in output px,
+/// the weight at its left and right edges, 2 unused), within `area`. Cells reach halfway
+/// to the neighbors on their line, and lines halfway to the next: every pixel belongs
+/// to the letter it's nearest in reading order, so an effect that spreads (a blur, a
+/// glow) spreads within its letters' share.
+fn mask_cells(glyphs: &[oa_text::PlacedGlyph], size: f64, scale: f64, b: [f32; 4], area: [f64; 4]) -> Vec<f32> {
+    const FAR: f64 = 1e7;
+    let n = glyphs.len() as f64;
+    let (up, down) = (0.82 * size, 0.24 * size);
+    let mut lines: Vec<u32> = glyphs.iter().map(|g| g.line).collect();
+    lines.dedup();
+    let baseline = |line: u32| glyphs.iter().find(|g| g.line == line).map_or(0.0, |g| g.origin[1]);
+    let mut out = Vec::with_capacity(glyphs.len() * 8);
+    for (i, g) in glyphs.iter().enumerate() {
+        let li = lines.iter().position(|l| *l == g.line).unwrap_or(0);
+        let top = if li == 0 { -FAR } else { ((baseline(lines[li - 1]) + down) + (g.origin[1] - up)) / 2.0 };
+        let bottom = if li + 1 == lines.len() { FAR } else { ((g.origin[1] + down) + (baseline(lines[li + 1]) - up)) / 2.0 };
+        let center = |g: &oa_text::PlacedGlyph| (g.ink[0] + g.ink[2]) / 2.0;
+        let prev = i.checked_sub(1).map(|j| &glyphs[j]).filter(|p| p.line == g.line);
+        let next = glyphs.get(i + 1).filter(|p| p.line == g.line);
+        let left = prev.map_or(-FAR, |p| (center(p) + center(g)) / 2.0);
+        let right = next.map_or(FAR, |p| (center(p) + center(g)) / 2.0);
+        let x0 = (left * scale).max(area[0]);
+        let x1 = (right * scale).min(area[2]);
+        let y0 = (top * scale).max(area[1]);
+        let y1 = (bottom * scale).min(area[3]);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        // The weight along the letter axis at the clipped edges.
+        let at = |x: f64| {
+            let span = ((right - left) * scale).max(1e-6);
+            i as f64 + ((x - left * scale) / span).clamp(0.0, 1.0)
+        };
+        let (wl, wr) = (bound_weight(at(x0), b, n, i as f64), bound_weight(at(x1), b, n, i as f64));
+        out.extend([x0 as f32, y0 as f32, x1 as f32, y1 as f32, wl as f32, wr as f32, 0.0, 0.0]);
+    }
+    out
+}
+
+impl crate::renderer::GpuServices<'_> {
+    /// A bounded effect's mask over `origin`/`size` (see `NodeOp::TextMask`).
+    pub(crate) fn text_mask_pass(&mut self, state: &mut TextState, spec: &TextSpec, scale: f64, bounds: [f32; 4], origin: [f64; 2], size: [u32; 2]) -> Result<GpuImage, RenderError> {
+        let device = &self.ctx.device;
+        let atlas = state.atlas.get_or_insert_with(|| Atlas::new(device));
+        let layout = oa_text::layout(spec);
+        let area = [origin[0], origin[1], origin[0] + size[0] as f64, origin[1] + size[1] as f64];
+        let mut cells = mask_cells(&layout.glyphs, spec.size, scale, bounds, area);
+        let count = cells.len() / 8;
+        if cells.is_empty() {
+            cells.resize(8, 0.0);
+        }
+        let key = "textmask";
+        let pipeline = state.pipelines.get(key, self.wait, || {
+            let mut source = prelude();
+            source.push_str(MASK_LIB);
+            PipelineSpec { label: key.to_string(), source, vertex_entry: "vs_mask", fragment_entry: "fs_mask", format: WORKING_FORMAT, blend: None }
+        })?;
+        let mut uniforms = vec![0f32; SLOTS];
+        uniforms[0..4].copy_from_slice(&[origin[0] as f32, origin[1] as f32, size[0] as f32, size[1] as f32]);
+        let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("oa-textmask-uniforms"), contents: bytemuck::cast_slice(&uniforms), usage: wgpu::BufferUsages::UNIFORM });
+        let cbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("oa-textmask-cells"), contents: bytemuck::cast_slice(&cells), usage: wgpu::BufferUsages::STORAGE });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("oa-textmask"),
+            layout: &state.pipelines.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&atlas.view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&state.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: cbuf.as_entire_binding() },
+            ],
+        });
+        let target = self.target(size)?;
+        let mut pass = self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("oa-textmask"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        if count > 0 {
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..6, 0..count as u32);
+        }
+        drop(pass);
+        self.stats.passes += 1;
+        Ok(GpuImage { tex: target, origin, size })
+    }
+}
+
 /// Compiles the text pipeline for `chain` ahead of use (warm-up), and the box pipelines
 /// of its box effects.
-pub fn warm(state: &TextState, chain: &[(&EffectShader, Stage, usize)], wait: bool) -> Result<Arc<wgpu::RenderPipeline>, RenderError> {
-    for ((shader, stage, len), base) in chain.iter().zip(bases(chain)) {
+pub fn warm(state: &TextState, chain: &[Link<'_>], wait: bool) -> Result<Arc<wgpu::RenderPipeline>, RenderError> {
+    for ((shader, stage, len, _), base) in chain.iter().zip(bases(chain)) {
         if *stage == Stage::Box {
             let key = box_key(shader, base, *len);
             state.pipelines.get(&key, wait, || box_spec(&key, shader, base, *len))?;

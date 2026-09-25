@@ -101,7 +101,10 @@ jobs:
           else
             cp target/release/oa-app "dist/$PACKAGE/openatelier"
             cp target/release/oa "dist/$PACKAGE/oa"
-            chmod +x "dist/$PACKAGE/openatelier" "dist/$PACKAGE/oa"
+            # To install it for the user (menu entry, icon): ./install.sh
+            cp installer/linux/install.sh installer/linux/openatelier.desktop "dist/$PACKAGE/"
+            cp assets/logo-256.png "dist/$PACKAGE/openatelier.png"
+            chmod +x "dist/$PACKAGE/openatelier" "dist/$PACKAGE/oa" "dist/$PACKAGE/install.sh"
           fi
           cp LICENSE README.md "dist/$PACKAGE/"
           cp -r plugins "dist/$PACKAGE/plugins"
@@ -129,6 +132,45 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem dist\*.exe
 
+      # The Linux installer: a .deb for Debian, Ubuntu and their relatives. The program in
+      # /opt/openatelier, `openatelier` on the PATH, a menu entry and its icon; apt brings
+      # ffmpeg, the sound library and a Vulkan loader with it. Built on the oldest
+      # supported Ubuntu, so it installs on anything from Ubuntu 22.04 / Debian 12 on.
+      - name: Linux installer
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Debian versions sort a pre-release before the release with "~".
+          DEB_VERSION=${VERSION/-/\~}
+          root=dist/deb
+          mkdir -p "$root/DEBIAN" "$root/opt" "$root/usr/bin" "$root/usr/share/applications" "$root/usr/share/icons/hicolor/256x256/apps"
+          cp -R "dist/$PACKAGE" "$root/opt/openatelier"
+          rm -f "$root/opt/openatelier/install.sh"
+          ln -s /opt/openatelier/openatelier "$root/usr/bin/openatelier"
+          ln -s /opt/openatelier/oa "$root/usr/bin/oa"
+          cp installer/linux/openatelier.desktop "$root/usr/share/applications/"
+          cp assets/logo-256.png "$root/usr/share/icons/hicolor/256x256/apps/openatelier.png"
+          size=$(du -sk "$root" | cut -f1)
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: openatelier
+          Version: $DEB_VERSION
+          Section: video
+          Priority: optional
+          Architecture: amd64
+          Installed-Size: $size
+          Depends: ffmpeg, libasound2 | libasound2t64, libvulkan1, libc6 (>= 2.35)
+          Recommends: mesa-vulkan-drivers, fontconfig
+          Maintainer: OpenAtelier contributors <61389990+CNK12321@users.noreply.github.com>
+          Homepage: https://github.com/CNK12321/OpenAtelier
+          Description: GPU-first video editor
+           One timeline for every format (16:9, 9:16, 1:1), effects, titles, captions,
+           motion tracking and sound, rendered on the GPU. Free software (AGPL-3.0-or-later).
+          EOF
+          dpkg-deb --build --root-owner-group "$root" "dist/$PACKAGE.deb"
+          dpkg-deb --info "dist/$PACKAGE.deb"
+          rm -rf "$root"
+          ls -l dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PACKAGE }}
@@ -136,6 +178,7 @@ jobs:
             dist/*.zip
             dist/*.tar.gz
             dist/*-setup.exe
+            dist/*.deb
           if-no-files-found: error
 
   release:
@@ -162,4 +205,10 @@ jobs:
           # "v0.1.0-beta.1" and the like are pre-releases (the Beta update channel).
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+          body: |
+            ### Which file?
+            - **Windows:** `…-windows-x64-setup.exe` installs it (no administrator needed). Or unpack `…-windows-x64.zip` anywhere and run `OpenAtelier.exe`. Both include ffmpeg. Windows may warn that the program isn't signed: *More info → Run anyway*.
+            - **Ubuntu, Debian, Mint, Pop!_OS…:** `…-linux-x64.deb` — open it with your software installer, or `sudo apt install ./OpenAtelier-…-linux-x64.deb`. It brings ffmpeg with it.
+            - **Other Linux:** unpack `…-linux-x64.tar.gz` and run `./install.sh` inside it (installs for you, with a menu entry; `./install.sh --uninstall` removes it). Install `ffmpeg` from your package manager too.
+            - `SHA256SUMS.txt` has each file's checksum.
           files: dist/*

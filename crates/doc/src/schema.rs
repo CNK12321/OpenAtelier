@@ -121,6 +121,53 @@ pub fn spoken(param: &str) -> String {
     format!("{param}{SPOKEN_SUFFIX}")
 }
 
+/// **Bounded**: a per-letter or per-pixel text effect limited to some of the letters.
+/// Stored with the effect instance's own parameters, so they keyframe like them. On or
+/// off; the unit (`percent` of the text, or `letters`: letter numbers from 1); where it
+/// starts and ends (letters: the first and last letter it covers); and a blend, in the
+/// same unit, over which it fades in and out at both ends.
+pub const BOUNDED: &str = "bounded.on";
+pub const BOUND_UNIT: &str = "bounded.unit";
+pub const BOUND_START: &str = "bounded.start";
+pub const BOUND_END: &str = "bounded.end";
+pub const BOUND_BLEND: &str = "bounded.blend";
+pub const BOUND_UNITS: [&str; 2] = ["percent", "letters"];
+
+pub fn bounds() -> &'static [ParamSchema] {
+    static S: OnceLock<Vec<ParamSchema>> = OnceLock::new();
+    S.get_or_init(|| {
+        vec![
+            ParamSchema::new(BOUNDED, Value::Bool(false), Unit::None).static_only(),
+            ParamSchema::new(BOUND_UNIT, Value::Enum(BOUND_UNITS[0].into()), Unit::None).options(&BOUND_UNITS).static_only(),
+            ParamSchema::new(BOUND_START, Value::Float(0.0), Unit::None).range(0.0, 100.0),
+            ParamSchema::new(BOUND_END, Value::Float(50.0), Unit::None).range(0.0, 100.0),
+            ParamSchema::new(BOUND_BLEND, Value::Float(0.0), Unit::None).range(0.0, 50.0),
+        ]
+    })
+}
+
+/// A bounded effect's range, in letters from the text's start (letter `i` spans `i`
+/// to `i + 1`): start, end and blend — or, for percent, those as fractions ×100 of the
+/// letter count, which only the renderer knows (`percent` says which).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bounds {
+    pub percent: bool,
+    pub start: f64,
+    pub end: f64,
+    pub blend: f64,
+}
+
+/// The bounds of an effect with these (evaluated) parameters, if it's bounded.
+pub fn bounds_of(v: &oa_params::Evaluated) -> Option<Bounds> {
+    if !matches!(v.get(BOUNDED), Some(Value::Bool(true))) {
+        return None;
+    }
+    let percent = v.get(BOUND_UNIT).and_then(Value::as_enum).is_none_or(|u| u == BOUND_UNITS[0]);
+    let (start, end, blend) = (v.float(BOUND_START), v.float(BOUND_END), v.float(BOUND_BLEND).max(0.0));
+    // Letters are counted from 1 and both ends are included: letters 2 to 3 cover 1..3.
+    Some(if percent { Bounds { percent, start, end, blend } } else { Bounds { percent, start: start - 1.0, end, blend } })
+}
+
 /// A title's own parameters that can be highlighted when spoken.
 pub const SPOKEN_TEXT_PARAMS: [&str; 3] = [TEXT_COLOR, TEXT_OUTLINE, TEXT_OUTLINE_COLOR];
 
@@ -177,4 +224,26 @@ pub fn audio() -> &'static [ParamSchema] {
             ParamSchema::new(AUDIO_ENABLED, Value::Bool(true), Unit::None).static_only(),
         ]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oa_params::{EvalContext, ParamSet, ParamSource};
+    use oa_time::Time;
+
+    /// Bounds are off until switched on; letters count from 1 and include both ends.
+    #[test]
+    fn bounds_in_letters_and_percent() {
+        let at = EvalContext::at(Time::ZERO, Time::ZERO);
+        let mut p = ParamSet::default();
+        assert_eq!(bounds_of(&p.eval(bounds(), None, &at)), None);
+        p.set(BOUNDED, ParamSource::Static(Value::Bool(true)));
+        assert_eq!(bounds_of(&p.eval(bounds(), None, &at)), Some(Bounds { percent: true, start: 0.0, end: 50.0, blend: 0.0 }));
+        p.set(BOUND_UNIT, ParamSource::Static(Value::Enum("letters".into())));
+        p.set(BOUND_START, ParamSource::Static(Value::Float(2.0)));
+        p.set(BOUND_END, ParamSource::Static(Value::Float(3.0)));
+        p.set(BOUND_BLEND, ParamSource::Static(Value::Float(-1.0)));
+        assert_eq!(bounds_of(&p.eval(bounds(), None, &at)), Some(Bounds { percent: false, start: 1.0, end: 3.0, blend: 0.0 }));
+    }
 }

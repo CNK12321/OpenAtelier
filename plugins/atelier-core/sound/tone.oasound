@@ -1,0 +1,31 @@
+// Tone: an oscillator added on top of the sound.
+// * `pitch` in Hz (keyframe it for a glide), wobbled by `vibrato` (Hz) ± `vibrato_depth`
+//   semitones; `pulse` is the square wave's duty cycle.
+// * Envelope: rises over `attack`, then (with `decay` > 0) dies away exponentially;
+//   `repeat` > 0 restarts it every that many seconds (beeps, a metronome).
+// * `follow` makes it sound only while the clip does (an envelope follower), `original`
+//   is how much of the clip's own sound stays; as an intro/outro it fades with the clip.
+
+// Where this note is: restarted every `repeat` seconds when that's on.
+let t = select(repeat > 0, time % max(repeat, 0.001), time);
+
+// The oscillator.
+let hz = pitch * pow(2, vibrato_depth / 12 * sin(TAU * vibrato * time));
+state phase = 0;
+phase = fract(phase + hz / sample_rate);
+let sine = sin(TAU * phase);
+let square = select(phase < pulse, 1, -1);
+let triangle = 1 - 4 * abs(phase - 0.5);
+let saw = 2 * phase - 1;
+let osc = choose(wave, sine, square, triangle, saw, noise());
+
+// Its envelope.
+let rise = select(attack > 0, clamp(t / max(attack, 0.0001), 0, 1), 1);
+let fall = select(decay > 0, exp(-max(t - attack, 0) / max(decay, 0.0001)), 1);
+
+// How loud the clip itself is right now (for `follow`).
+state level = 0;
+level = max(abs(in), level * exp(-1 / (0.08 * sample_rate)));
+let duck = mix(1, clamp(level * 4, 0, 1), follow);
+
+out = in * original + osc * db(gain) * rise * fall * duck * visibility;

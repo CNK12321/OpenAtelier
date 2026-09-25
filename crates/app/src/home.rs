@@ -201,12 +201,12 @@ impl App {
                 painter.rect_filled(thumb, crate::style::ROUNDING, visuals.extreme_bg_color);
                 match self.project_thumb(ui.ctx(), &r) {
                     Some(texture) => {
-                        painter.image(
-                            texture.id(),
-                            thumb,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
+                        // Fitted inside the card at its own shape (a vertical project is
+                        // a tall picture in the middle, not a squashed one).
+                        let size = texture.size_vec2();
+                        let k = (thumb.width() / size.x.max(1.0)).min(thumb.height() / size.y.max(1.0));
+                        let fitted = egui::Rect::from_center_size(thumb.center(), size * k);
+                        painter.image(texture.id(), fitted, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
                     }
                     None => {
                         let icon = if exists { crate::icons::VIDEO_TRACK } else { crate::icons::WARNING };

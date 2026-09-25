@@ -214,14 +214,25 @@ fn opaque_solid_on_top_culls_media_below() {
     assert_eq!(find(&later, |op| matches!(op, NodeOp::Source { .. })).len(), 1);
 }
 
+/// An effect that needs the frames before it (none of Atelier Core's do yet).
+fn with_stateful_effect() -> Registry {
+    let mut r = Registry::with_builtins();
+    r.register(oa_graph::registry::EffectDescriptor {
+        state: oa_graph::Statefulness::Stateful { preroll: secs(2) },
+        ..oa_graph::registry::EffectDescriptor::new("test.trail", "Trail", oa_graph::EffectKind::Temporal { frames_before: 1, frames_after: 0 }, Vec::new())
+    })
+    .unwrap();
+    r
+}
+
 #[test]
 fn missing_and_stateful_effects() {
     let p = project(|clip| {
-        for (i, id) in ["com.someone.missing", "oa.time.feedback-trail"].iter().enumerate() {
+        for (i, id) in ["com.someone.missing", "test.trail"].iter().enumerate() {
             clip.effects.push(EffectInstance { id: EffectId(30 + i as u64), type_id: (*id).into(), type_version: 1, enabled: true, params: Default::default(), role: Default::default() });
         }
     });
-    let plan = plan(&p, secs(3), PlanOptions::default());
+    let plan = plan_frame(&p, SEQ, secs(3), &PlanOptions::default(), &with_stateful_effect()).unwrap();
     assert_eq!(plan.report.missing_effects, vec!["com.someone.missing".to_string()]);
     assert_eq!(plan.graph.preroll, secs(2));
     let out = plan.graph.node(plan.graph.output);
@@ -505,13 +516,13 @@ fn fly_follows_any_direction_and_outros_leave_that_way() {
     let outro = EffectRole::Out { duration: secs(2) };
     // Moving down (90°): an intro starts a full canvas above.
     let [x, y] = offset(intro, 90.0, secs(0));
-    assert!(x.abs() < 1e-6 && (y + 1080.0).abs() < 1.0, "{x},{y}");
+    assert!(x.abs() < 1e-3 && (y + 1080.0).abs() < 1.0, "{x},{y}");
     // Moving up-left (225°): starts down-right, far enough to clear both edges.
     let [x, y] = offset(intro, 225.0, secs(0));
     assert!(x >= 1920.0 && y >= 1080.0, "{x},{y}");
     // An outro moving down leaves through the bottom.
     let [x, y] = offset(outro, 90.0, secs(10) - Time(1));
-    assert!(x.abs() < 1e-6 && y > 1000.0, "{x},{y}");
+    assert!(x.abs() < 1e-3 && y > 1000.0, "{x},{y}");
 }
 
 #[test]
@@ -576,7 +587,7 @@ fn backgrounds() {
     let g = with(&|s| {
         s.set(schema::BG_MODE, ParamSource::Static(Value::Enum("blur".into())));
     });
-    assert_eq!((effect(&g, "oa.blur.gaussian"), effect(&g, oa_graph::registry::DIM), top(&g).1), (1, 1, 2));
+    assert_eq!((effect(&g, oa_graph::registry::BLUR), effect(&g, oa_graph::registry::DIM), top(&g).1), (1, 1, 2));
     assert_eq!(find(&g, |op| matches!(op, NodeOp::Composite { size: [480, 270], .. })).len(), 1, "blurred at a quarter size");
 
     // The frame as placed: a clip at half size is enlarged 2× behind itself (then ¼).

@@ -1,0 +1,10 @@
+// Drop In: falls from above and bounces to rest (as an outro, it hops up and away).
+// `height` is how far above it starts, in canvas heights; `bounces` how many times it
+// bounces before settling.
+
+// 0 while arriving, 1 once it's in place.
+let t = clamp(visibility, 0, 1);
+// A bounce that dies away: |cos| swings, shrinking as t goes on.
+let swing = abs(cos(PI * (bounces + 0.5) * t)) * (1 - t) ^ 2;
+move_y = -swing * height * canvas_h;
+opacity = min(t * 4, 1);

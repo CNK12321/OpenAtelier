@@ -1,0 +1,7 @@
+// A one-pole low-pass. Over an intro or outro it opens up as the clip arrives.
+let open = select(visibility < 1, visibility ^ 2, 0);
+let hz = mix(cutoff, 18000, open);
+let k = 1 - exp(-TAU * hz / sample_rate);
+state low = 0;
+low += (in - low) * k;
+out = mix(in, low, amount);

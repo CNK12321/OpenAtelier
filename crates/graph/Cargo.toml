@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 oa-time.workspace = true
 oa-params.workspace = true
+oa-script.workspace = true
 xxhash-rust.workspace = true
 oa-text.workspace = true
 serde = { workspace = true }

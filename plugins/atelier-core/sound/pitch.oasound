@@ -1,0 +1,30 @@
+// Pitch Shift: two taps sweep through a delay line, read faster or slower than it's
+// written; each fades out as it jumps back a window.
+line recent = 0.2;
+write(recent, in);
+let w = round(sample_rate * 0.06);
+let ratio = 2 ^ (semitones / 12);
+state d = 0;
+d = (d + 1 - ratio) % w;
+let d2 = (d + w / 2) % w;
+let g1 = sin(PI * d / w) ^ 2;
+let g2 = sin(PI * d2 / w) ^ 2;
+let wet = read(recent, d / sample_rate) * g1 + read(recent, d2 / sample_rate) * g2;
+out = mix(in, wet, clamp(mix, 0, 1));
+
+// Then the formants — the voice's character — moved on their own (or held where they
+// were, with "keep voice"): each window's magnitudes divided by their smoothed envelope
+// and multiplied by the envelope read further up or down. It always runs, so the delay
+// it adds never changes mid-clip.
+spectrum 1024;
+let shift = formant - select(keep_voice, semitones, 0);
+let stretch = 2 ^ (shift / 12);
+let level = log(mag + 1e-9);
+pass;
+// The envelope: log magnitude averaged over ~±250 Hz.
+let envelope = exp(mean(level, bin - 5, bin + 5));
+pass;
+let from = bin / stretch;
+let target = select(from < bins - 1, at(envelope, from), at(envelope, bins - 1) * 0.1);
+let moved = clamp(target / max(envelope, 1e-9), 0, 16);
+mag *= select(bin == 0 || abs(stretch - 1) <= 0.001, 1, moved);

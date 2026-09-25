@@ -118,6 +118,11 @@ impl Rect {
     pub fn expand(&self, by: f64) -> Rect {
         Rect::new(self.x0 - by, self.y0 - by, self.x1 + by, self.y1 + by)
     }
+
+    /// The smallest rectangle holding both.
+    pub fn union(&self, o: &Rect) -> Rect {
+        Rect::new(self.x0.min(o.x0), self.y0.min(o.y0), self.x1.max(o.x1), self.y1.max(o.y1))
+    }
 }
 
 #[cfg(test)]

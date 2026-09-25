@@ -1,0 +1,3 @@
+// Repeats fading by `feedback` each pass, until 60 dB down.
+let passes = select(feedback > 0.01, log(0.001) / log(min(clamp(feedback, 0, 0.95), 0.97)), 1);
+out = max(delay, 0.02) * passes;

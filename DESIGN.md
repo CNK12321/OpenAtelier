@@ -35,6 +35,7 @@ Status legend: ✅ implemented · 🟡 partly implemented · ⏳ planned
 |---|---|---|
 | `oa-time` | Flicks, rationals, **the** frame-selection rule | ✅ |
 | `oa-params` | Param schemas, values, keyframe curves, anchors, overrides | ✅ |
+| `oa-script` | OA script: the small language sound shaders, motion, bounds and pass counts are written in | ✅ |
 | `oa-doc` | Project model, format variants & aspect presets, ops, undo, file format | ✅ |
 | `oa-graph` | Render graph IR, cache keys, plugin-facing registry (with WGSL), optimizer | ✅ |
 | `oa-plan` | Document snapshot + time → render graph; `scene`: where layers land (hit testing) | ✅ |
@@ -44,7 +45,7 @@ Status legend: ✅ implemented · 🟡 partly implemented · ⏳ planned
 | `oa-media` | Probe, frame index, fingerprint, import/conform, stills, **hardware decode into GPU textures** (Windows) | ✅ / ⏳ |
 | `oa-text` | System fonts, shaping (HarfBuzz rules via harfrust), line layout, glyph distance fields | ✅ |
 | `oa-audio` | Ring buffer, decoding, output device, **the playback clock**, the timeline mixer | ✅ |
-| `oa-graph::plugin` | Plugin manifests (JSON + WGSL), Atelier Core, enable/disable | ✅ |
+| `oa-graph::plugin` | Plugin manifests (JSON + WGSL + scripts), Atelier Core (built in from `plugins/atelier-core`), enable/disable | ✅ |
 | `oa-plugin-host` | wasmtime host and native bridge (CPU-side plugin code) | ⏳ |
 | `oa-export` | Sequence → file: GPU color conversion, encoder sink, audio mux | ✅ |
 | `oa-engine` | Scheduler, proxies (decode lookahead lives in `oa-media`) | ⏳ |
@@ -245,26 +246,68 @@ gain, attack, exponential decay, repeat every N seconds (beeps), vibrato rate an
 Ranges are the *comfortable* range, not a limit — sliders clamp what you drag, never what
 you type, so an effect can be pushed as far as it will go.
 
-**Everything is a plugin** ✅ (`oa_graph::plugin`): the built-ins ship inside the binary
-as **Atelier Core** (`com.openatelier.core`) — every picture, text and sound effect —
-and are enabled by default. `Registry::from_plugins` builds the registry the whole app
-renders with from the enabled ones, so turning a plugin off takes its effects out of the
-menus *and* out of rendering; clips that used them keep their settings and are reported
-as missing, naming the plugin that has them.
+**Everything is a plugin** ✅ (`oa_graph::plugin`; 2026-09-24: truly): the built-ins are
+**Atelier Core** (`com.openatelier.core`), an ordinary plugin folder,
+`plugins/atelier-core` — `plugin.json`, one `.wgsl` per picture effect, `.oasound` sound
+shaders, motion/bounds/pass scripts. `crates/graph/build.rs` builds the folder's files
+into the program and `plugin::core` loads them through the same manifest loader as any
+plugin; the only thing Atelier Core has that a plugin doesn't is its `oa.*` ids. Nothing
+in the host knows an effect by its id to make it work: what used to be Rust (motion
+functions, Glow's pass counts, Surface/Depth/Drop Shadow bounds, the native sound
+processors, the picker's categories and thumbnail settings, the equalizer card and the
+meters) is now declared in the manifest, in shaders and in **OA script** (`oa-script`),
+so a plugin can do anything a built-in does. The host keeps only its own plumbing —
+`oa.internal.*` (crop, backgrounds, the color transforms, a blur for blurred
+backgrounds), registered under `registry::HOST_ID` by `Registry::from_plugins` whether or
+not Atelier Core is on. `Registry::from_plugins` builds the registry the whole app
+renders with from the enabled plugins, so turning a plugin off takes its effects out of
+the menus *and* out of rendering; clips that used them keep their settings and are
+reported as missing, naming the plugin that has them.
+
+**OA script** ✅ (`oa-script`, 2026-09-24): the small language for everything that isn't
+a GPU shader — sound shaders, motion, bounds, pass counts, sound tails. Statements (`let`,
+`state`, assignment, `line` where the host has delay lines, host-function calls), math,
+`select`/`choose`, parameters by id (a point's parts as `id_x`…), parsed to an AST and
+compiled to a stack machine over one register file. No loops or branches, so every
+script finishes; `let`s that only read steady inputs (parameters, the sample rate) are
+hoisted to a per-block section. Each host (`oa_script::Env`) names what a script reads,
+writes and may call — `oa_audio::shader` (samples, spectra), `oa_graph::script`
+(`MotionScript`, `BoundsScript`, `PassScript`).
+
+**Compiled to machine code** ✅ (`oa_script::jit`, 2026-09-24): sound shaders run per
+sample, so they're compiled with Cranelift when they load (interpreted, the built-in
+effects cost 20–40× what their native Rust versions did). Each op list becomes one
+function `(registers, memory, first)`: registers a run reads before writing are loaded
+into SSA values once and written ones stored once (`Keep::HostAnd`: a `let` used only
+within a run is never stored); `OnFirst` is a branch; math with an instruction is inline
+and the rest calls Rust functions with the interpreter's exact behavior. The memory
+operations are **intrinsics** (`Intrinsic`), inline on `jit::Memory` laid out as
+`oa_script::dsp` describes: delay-line reads (interpolated, wrapping) and writes, filters
+(coefficients cached per call site, remade only when their settings change). Other host
+functions call back through a `&mut dyn Host`. The interpreter stays the reference and
+the fallback where Cranelift can't target the CPU; `shader::tests::
+compiled_and_interpreted_agree` checks every Atelier Core sound effect is compiled and
+sounds the same both ways.
 
 Other plugins are folders under `<config>/plugins` (and `./plugins` beside the app),
 each with a `plugin.json` listing effects: kind, usage, working space, parameters (a
 friendly form — `{"id": "amount", "type": "float", "default": 0.5, "min": 0, "max": 1}`
 — lowered to `ParamSchema`, so plugin parameters are keyframable and modulatable like
 any other) and WGSL, inline or in a file beside the manifest. Nothing executes but
-shaders, through the same path built-ins use. `oa.*` ids are reserved for Atelier Core;
-bad effects are skipped and reported per plugin rather than failing the load, and a
-manifest written for another `api_version` is refused. `plugins/example-looks` in the
-repo is a working example (vignette, scanlines).
+shaders and scripts, through the same path built-ins use. `oa.*` ids are reserved for
+Atelier Core; bad effects are skipped and reported per plugin rather than failing the
+load, and a manifest written for another `api_version` is refused. `plugins/README.md`
+is the guide; `plugins/example-looks` in the repo is a working example (vignette,
+scanlines, a sound shader, a motion intro).
 
-Descriptor fields: kind (`PointOp`, `UvWarp`, `Spatial{expand}`, `Temporal`, `Cpu`),
-**`Statefulness`** (`Pure` | `Stateful{preroll}`), **`WorkingSpace`** (`Linear` |
-`Display`), `fusible`, `preserves_opacity`, param schemas.
+Descriptor fields: kind (`PointOp`, `UvWarp`, `Spatial{expand}`, `Transition`,
+`Motion`, `Glyph`, `GlyphPixel`, `TextBox`, `Sound`; `Temporal` and `Cpu` exist but no
+plugin can declare them yet), **`Statefulness`** (`Pure` | `Stateful{preroll}`),
+**`WorkingSpace`** (`Linear` | `Display`), `fusible`, `preserves_opacity`, param
+schemas, and what the manifest adds: `category`, `description`, `preview` (thumbnail
+settings), `editor` (`surface`, `equalizer`: host editors a plugin opts into by naming
+its parameters as they expect), `second_input` (`media` | `original`), and scripts —
+`motion`, `bounds`, `pass_count`/`pass_divisor`, and for sound `tail`, `latency`, `meter`.
 
 * Stateful effects (feedback, simulations, audio reverb tails) are never cached; the
   planner reports the required **preroll** so rendering starts early enough to warm
@@ -287,11 +330,12 @@ renders every offered effect and checks it changes the picture.
 
 **Motion effects** ✅ (`EffectKind::Motion`): anything that moves the whole layer — fly,
 zoom, fade, shake, wiggle — can't be a pixel shader (a shader only sees the pixels inside
-the layer). A motion effect is a deterministic function of its params and clock
-(`MotionFn`) returning an offset (canvas px), scale, rotation and opacity, folded into the
-layer's transform around its anchor by the planner; the GPU still draws the moved layer.
-Camera Shake adds a touch of zoom so the moving edges stay hidden. ⏳ Plugins can only
-provide shader effects for now (motion functions are built-in Rust).
+the layer). A motion effect is a deterministic script of its params and clock
+(`oa_graph::script::MotionScript`: reads the clock, the canvas size and `leaving`; writes
+`move_x`/`move_y` in canvas px, `zoom`, `turn`, `opacity`; `noise`/`jitter` give each
+instance its own smooth randomness), folded into the layer's transform around its anchor
+by the planner; the GPU still draws the moved layer. Camera Shake adds a touch of zoom so
+the moving edges stay hidden. Plugins write them the same way (`example-looks`' Drop In).
 
 **Effect roles**: under the hood every effect instance has one of three roles:
 * **Passive** — applies for the whole clip (all effects today).
@@ -822,11 +866,11 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
   radius (steps 2ⁿ⁻¹ … 1, 8 taps each) keeps, per pixel, the way to the nearest seed
   any neighbor knows, and a last pass draws. Its cost grows with log₂ of the radius —
   8 passes at 30 px — and pixels inside the clip skip the drawing. The pass count comes
-  from the radius on the host (`EffectDescriptor::pass_count`, `glow_jumps`; the shader
-  counts the same way). The planner hands the effect the clip's picture as its second
+  from the radius on the host (the manifest's `pass_count` script, `light/glow.passes`; the shader
+  counts the same way). The planner hands the effect the clip's picture as its second (`second_input: original`)
   input (a mask's matte's path), which the last pass reads for the edge colors and lays
   over the halo. `mode`: *behind*, or *over* (added on top too).
-  **Wide glows run on a coarse grid** (`glow_divisor`): from 24 px of radius the flood
+  **Wide glows run on a coarse grid** (`pass_divisor`, `light/glow.divisor`): from 24 px of radius the flood
   works on cells of 2 × 2 pixels, from 48 px 4 × 4, from 96 px 8 × 8 — a quarter of the
   pixels per halving, and fewer jumps — while the drawing pass stays full size, so the
   picture and its falloff stay smooth. Each seed is an opaque point found inside its
@@ -1085,20 +1129,33 @@ an ordinary effect — an `EffectDescriptor` of `EffectKind::Sound` in the same 
 from the same plugins (Atelier Core included), stored in the clip's one effect list with
 the same **roles**: over the whole clip, or as its intro or outro, where it gets the same
 clock picture effects get (`visibility`, `progress`, `seconds` — `EffectRole::clock`,
-shared through `oa-doc`; the mixer glides it across each block). Like picture effects,
-each is **native** (a processor in `oa_audio::fx`) or a **shader**: a *sound shader*
-(`oa_audio::shader`) is a small per-sample program — `let`/`state` variables, math,
-`delay`/`delay_out` memory up to 4 s, `left`/`right` for stereo — compiled to a stack
-machine and run per sample per channel, sandboxed like WGSL (no loops, files or calls
-out; output kept finite and within ±4, a channel that blows up starts over). Plugins
-declare `"kind": "sound"` with a shader file (`plugins/README.md`;
+shared through `oa-doc`; the mixer glides it across each block). Every one is a **sound
+shader** (`oa_audio::shader`, 2026-09-24: Atelier Core's included — there are no native
+processors left but the mixer's own pitch shifter for sped-up clips): OA script run per
+sample per channel — `let`/`state`, math, `delay`/`delay_out`, named delay **lines**
+(`line name = seconds;`, `write`, `read`, `line_max`/`line_min`) up to 4 s, **filters**
+with per-call state (`lowpass`, `highpass`, `bandpass`, `peak`, `lowshelf`, `highshelf`:
+RBJ biquads, coefficients cached per call site), `left`/`right` for stereo and linked
+dynamics, and a `reduction` output for the card's meter. After `spectrum N;` the rest runs
+per frequency bin of an STFT (sqrt-Hann, 75% overlap, `N` frames of latency) on `mag` and
+`phase`, with `state` per bin and `pass;`-separated passes that read earlier passes'
+bins (`at`, `mean`) — Denoise and Pitch Shift's formants are written that way. Sandboxed
+like WGSL (no loops, files or calls out; output kept finite and within ±4, a channel that
+blows up starts over). The manifest adds what isn't per-sample: `latency` (a lookahead,
+in seconds), `tail` (a script: how long it rings on), `meter`, `editor: equalizer`.
+Plugins declare `"kind": "sound"` with a shader file (`plugins/README.md`;
 `example-looks/telephone.oasound`); `Plugins::load` compiles them (errors listed on the
 Plugins page with the line), `Plugins::registry` installs the enabled ones in the mixer
-(`fx::install`). Atelier Core's Fade, Muffle, Tremolo, Drive and Stereo Width are sound
-shaders themselves. The Sound tab uses the picture effect cards (drag to reorder or copy,
-Apply to All Selected) plus a Whole clip / Intro / Outro switch with a duration.
+(`fx::install`); Atelier Core's come from `plugin::core()`. They run as machine code
+(`oa_script::jit`, below). Cost, release build, stereo 48 kHz, share of one core: most
+0.06–0.3%, Reverb 0.4%, Limiter 0.7%, Denoise 1.8%, Pitch Shift 2.4% — within 2–3× of
+the native Rust they replaced, and Tone, Fade, Tremolo, Drive and Width, interpreted
+before, several times faster (`fx::tests::cost_of_each_core_effect`, ignored). The Sound tab uses the picture effect
+cards (drag to reorder or copy, Apply to All Selected) plus a Whole clip / Intro / Outro
+switch with a duration.
 
-**Sound effects** ✅ (`oa_audio::fx`, 2026-09-18): **Bass Boost** (RBJ low shelf),
+**Sound effects** ✅ (`plugins/atelier-core/sound`, 2026-09-18; sound shaders since
+2026-09-24): **Bass Boost** (RBJ low shelf),
 **Pitch Shift** (two crossfaded taps sweeping a delay line; ±12 semitones, same speed),
 **Echo** (feedback delay), **Reverb** (Freeverb: 8 damped combs + 4 allpasses per
 channel), **Threshold** (a noise gate: envelope follower, 2 ms attack, set release),
@@ -1112,7 +1169,7 @@ or removing one rebuilds the chain and re-seeks. Look-ahead effects report a lat
 (Denoise: exactly 1024 frames, whatever the block size) and the mixer **primes** them
 after every seek, so sound stays sample-aligned with the picture (tested against the dry
 mix before and after a seek). ✅ **Tails** (2026-09-24): a clip keeps feeding
- its effect chain silence for as long as its effects ring (`fx::tail_seconds`: echo
+ its effect chain silence for as long as its effects ring (each effect's `tail` script, `fx::tail_seconds`: echo
  delay × repeats, reverb pre-delay plus decay, pitch and dynamics briefly), so echoes and
  reverbs sound on past the clip's end at the gain it ended with.
 
@@ -1601,6 +1658,24 @@ atlas eviction beyond "start over when full".
 
 ---
 
+* **Bounded text effects** ✅ (2026-09-24): right-click a per-letter or per-pixel text
+  effect's name → **Bounded**: it applies only to a range of the letters — a start and
+  an end in percent of the text or in letter numbers (from 1, both ends included; spaces
+  aren't letters), with a blend over which it fades in and out at both ends. Stored with
+  the effect's own params (`schema::bounds()`, `bounded.*`), so they keyframe: a
+  highlight can sweep across a title. The planner hands the text node the range
+  (`TextEffect::bounds`: percent?, start, end, blend, in letter edges); the text pass puts
+  it after the effect's params and their spoken copy and blends the effect's result with
+  the letter as it was by `oa_bounded(index, slot)` — per letter, the glyph's offset,
+  scale, rotation and color (`oa_bounded_glyph`); per pixel, the color. Switching units in
+  the card keeps the range where it was. **Any other picture effect** on a title (color,
+  blur, glow, warp… — not motion, text backgrounds or transitions) bounds the same way,
+  after the text pass: the planner adds a `NodeOp::TextMask` over the effect's area —
+  each letter's cell (halfway to its neighbors on its line, lines halfway to each other,
+  the ends reaching out) filled with its weight, blending across the cell when there's a
+  blend — and puts the result together in three host passes with a second input:
+  effect × mask (`MASK_KEEP`), picture before it × (1 − mask) (`MASK_DROP`), the two
+  added (`ADD`). A blur or glow so spreads within its letters' share.
 * **Highlight when spoken** ✅ (2026-09-21): right-click a title's color, outline width
   or outline color, or any text effect's parameter → "Highlight when spoken": a second
   value, stored beside the parameter as `<id>#spoken` (`schema::spoken`) and shown just

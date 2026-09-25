@@ -1,0 +1,5 @@
+// The combs ring on until 60 dB down, after the pre-delay.
+let size = clamp(choose(space, room, 0.3, 0.5, 0.82, 0.96, 0.72, 0.92), 0, 1);
+let wait = max(max(predelay, 0), choose(space, 0, 0.005, 0.01, 0.025, 0.04, 0, 0.06));
+let feedback = 0.7 + 0.28 * size;
+out = wait + 0.034 * log(0.001) / log(min(feedback, 0.97));

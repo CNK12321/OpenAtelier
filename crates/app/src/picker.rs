@@ -24,34 +24,13 @@ struct Entry {
     used: bool,
 }
 
-/// The categories built-in effects fall into, from the middle of their id.
-fn builtin_category(type_id: &str) -> Option<&'static str> {
-    let part = type_id.strip_prefix("oa.")?.split('.').next()?;
-    Some(match part {
-        "color" => "Color",
-        "blur" => "Blur",
-        "light" => "Light",
-        "key" => "Keying",
-        "mask" => "Masking",
-        "warp" => "Warp",
-        "stylize" => "Stylize",
-        "depth" => "Depth",
-        "motion" => "Motion",
-        "anim" => "Animation",
-        "text" => "Text",
-        "transition" => "Transition",
-        "audio" => "Sound",
-        _ => "Other",
-    })
-}
-
 impl App {
-    /// Where an effect came from, as the picker groups them.
+    /// What an effect is for, as the picker groups them: its manifest's `category`
+    /// ("Color", "Blur"…), or the plugin it came from.
     pub(crate) fn effect_category(&self, type_id: &str) -> String {
-        if let Some(c) = builtin_category(type_id) {
-            return c.to_string();
+        if let Some(c) = self.registry.effect(type_id).and_then(|d| d.category.clone()) {
+            return c;
         }
-        // A plugin's effects are grouped under the plugin.
         self.registry
             .plugin_of(type_id)
             .and_then(|id| self.plugins.list.iter().find(|p| p.id == **id))
@@ -144,13 +123,16 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    /// Atelier Core's effects say what they're for; a plugin's without one group under
+    /// the plugin's name.
     #[test]
     fn builtins_are_grouped_by_what_they_do() {
-        assert_eq!(builtin_category("oa.color.tint"), Some("Color"));
-        assert_eq!(builtin_category("oa.depth.slab"), Some("Depth"));
-        assert_eq!(builtin_category("oa.text.wave"), Some("Text"));
-        assert_eq!(builtin_category("com.example.vignette"), None, "plugins group under their own name");
+        let r = oa_graph::registry::Registry::with_builtins();
+        let category = |id: &str| r.effect(id).and_then(|d| d.category.clone());
+        assert_eq!(category("oa.color.tint").as_deref(), Some("Color"));
+        assert_eq!(category("oa.depth.slab").as_deref(), Some("Depth"));
+        assert_eq!(category("oa.text.wave").as_deref(), Some("Text"));
+        let example = oa_graph::plugin::load(&std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/example-looks/plugin.json")).expect("loads");
+        assert!(example.effects.iter().all(|d| d.category.is_none()));
     }
 }

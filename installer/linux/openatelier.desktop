@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=OpenAtelier
+GenericName=Video Editor
+Comment=Edit video on your GPU: one timeline, every format
+Exec=openatelier %F
+Icon=openatelier
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+MimeType=video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;image/png;image/jpeg;
+StartupWMClass=openatelier
+Keywords=video;editor;edit;cut;timeline;captions;

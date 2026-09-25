@@ -186,7 +186,7 @@ impl App {
             ParamTarget::Effect(id) => {
                 let fx = it.effects.iter().find(|e| e.id == *id)?;
                 // A Surface's points are offsets, dragged in the viewer.
-                if fx.type_id == oa_graph::registry::SURFACE {
+                if self.registry.effect(&fx.type_id).is_some_and(|d| d.editor.as_deref() == Some(oa_graph::registry::EDITOR_SURFACE)) {
                     return None;
                 }
                 self.registry.effect(&fx.type_id)?.params.iter().find(|s| s.id.as_str() == param)?.clone()

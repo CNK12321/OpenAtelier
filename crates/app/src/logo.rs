@@ -295,6 +295,21 @@ mod tests {
         std::fs::write(&path, windows_icon(&[16, 24, 32, 48, 64, 256])).unwrap();
     }
 
+    /// Writes `assets/logo-256.png`, the icon Linux desktops show (the `.deb` and the
+    /// `install.sh` in the Linux package put it beside the desktop entry):
+    /// `cargo test -p oa-app write_the_linux_icon -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_the_linux_icon() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/logo-256.png");
+        let icon = icon(256);
+        let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        let mut enc = png::Encoder::new(file, 256, 256);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&icon.rgba).unwrap();
+    }
+
     /// An `.ico` holding the icon at each size (PNG-compressed, as Windows reads them).
     fn windows_icon(sizes: &[u32]) -> Vec<u8> {
         let images: Vec<Vec<u8>> = sizes

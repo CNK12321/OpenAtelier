@@ -128,6 +128,8 @@ pub enum Guide {
 pub struct Update {
     pub ops: Vec<Op>,
     pub guides: Vec<Guide>,
+    /// The values the ops set (the transform params, as seen in the viewed format).
+    pub values: Vec<(&'static str, Value)>,
 }
 
 /// One drag of one handle, from pointer-down to pointer-up.
@@ -260,9 +262,10 @@ impl Gesture {
                 values.push((schema::POSITION, Value::Vec2(pos)));
             }
         }
-        for (param, value) in values {
-            out.ops.push(write_param(p, self.seq, self.item, self.variant, self.scope, self.t, param, value)?);
+        for (param, value) in &values {
+            out.ops.push(write_param(p, self.seq, self.item, self.variant, self.scope, self.t, param, value.clone())?);
         }
+        out.values = values;
         Ok(out)
     }
 

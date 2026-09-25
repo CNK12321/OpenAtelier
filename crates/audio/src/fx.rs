@@ -1,22 +1,23 @@
-//! Sound effects on clips: bass boost, pitch shift, echo, reverb, threshold (a noise
-//! gate), denoise — and any a plugin adds, written as sound shaders.
+//! Sound effects on clips: bass boost, pitch shift, echo, reverb, the mixing desk's
+//! dynamics, denoise — Atelier Core's, and any a plugin adds. Every one is a sound
+//! shader ([`crate::shader`]) declared in a plugin manifest: Atelier Core's come from its
+//! folder (`plugins/atelier-core`), built into the program, through the same path a
+//! plugin's take ([`install`]).
 //!
 //! They're stored on a clip exactly like picture effects (`EffectInstance`s, in the
 //! same list, with the same roles and keyframable params evaluated on the clip's
 //! clocks), and run by the mixer on each clip's decoded samples before its gain — so
-//! playback and export sound the same. Like picture effects, each one is either native
-//! (a processor built into the host) or a shader ([`crate::shader`]): Atelier Core ships
-//! some of each, and plugins add shaders through the same [`install`] path.
-//!
-//! Every processor is streaming and stateful (filters, delay lines, an FFT frame); the
-//! mixer resets it on a seek and, for effects that look ahead (denoise), primes it by
-//! its [`Processor::latency`] so the output stays in sync with the picture.
+//! playback and export sound the same. Every processor is streaming and stateful; the
+//! mixer resets it on a seek and, for effects that look ahead (a spectrum, a limiter),
+//! primes it by its [`Processor::latency`] so the output stays in sync with the picture.
 
-pub use crate::dynamics::{eq_bands, eq_response_db, meter, tail_seconds, Band, BandShape, Meter, SPACES};
+pub use crate::dynamics::{eq_bands, eq_response_db, meter, Band, BandShape, Meter};
 pub use crate::shader::ClockSpan;
 use crate::shader::{Program, ShaderProcessor};
 use oa_doc::EffectRole;
-use oa_params::{Evaluated, ParamSchema, ParamSet, Unit, Value};
+use oa_graph::registry::{EffectDescriptor, EffectKind, EffectUsage};
+use oa_params::{Evaluated, ParamSchema, ParamSet, Value};
+use oa_script::{Env, Frame, NoHost, Section};
 use std::f32::consts::PI;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -28,234 +29,97 @@ pub enum FxUsage {
     InOut,
 }
 
+/// How long an effect rings on after its clip: a script reading the params.
+#[derive(Debug)]
+struct Tail {
+    section: Section,
+    frame: Frame,
+}
+
 /// A sound effect's type: what the UI shows and what runs it.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct FxInfo {
     pub type_id: String,
     pub name: String,
     pub description: String,
     pub params: Vec<ParamSchema>,
     pub usage: FxUsage,
-    /// The sound shader that runs it; `None` for native effects.
-    pub shader: Option<Arc<Program>>,
+    /// The sound shader that runs it.
+    pub shader: Arc<Program>,
+    /// The live meter its card shows (`oa_graph::registry::METER_*`).
+    pub meter: Option<String>,
+    tail: Option<Tail>,
+}
+
+impl PartialEq for FxInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_id == other.type_id && self.shader == other.shader
+    }
 }
 
 impl FxInfo {
-    /// A sound effect written as a sound shader (a plugin's, or a built-in one).
+    /// A sound effect written as a sound shader.
     pub fn shader(type_id: &str, name: &str, description: &str, params: Vec<ParamSchema>, usage: FxUsage, source: &str) -> Result<FxInfo, String> {
         let program = Program::compile(source, &params)?;
-        Ok(FxInfo { type_id: type_id.into(), name: name.into(), description: description.into(), params, usage, shader: Some(Arc::new(program)) })
+        Ok(FxInfo { type_id: type_id.into(), name: name.into(), description: description.into(), params, usage, shader: Arc::new(program), meter: None, tail: None })
     }
 
-    fn native(type_id: &str, name: &str, description: &str, params: Vec<ParamSchema>) -> FxInfo {
-        FxInfo { type_id: type_id.into(), name: name.into(), description: description.into(), params, usage: FxUsage::Passive, shader: None }
+    /// A plugin's sound effect, as its manifest declares it.
+    pub fn from_descriptor(d: &EffectDescriptor) -> Result<FxInfo, String> {
+        if d.kind != EffectKind::Sound {
+            return Err("not a sound effect".into());
+        }
+        let source = d.shader.as_ref().map(|s| s.source.clone()).ok_or("no sound shader")?;
+        let mut program = Program::compile(&source, &d.params)?;
+        program.latency = d.latency;
+        let tail = match &d.tail {
+            Some(src) => {
+                let env = Env { writes: &["out"], params: &d.params, ..Env::default() };
+                let (section, frame) = oa_script::compile(src, env).map_err(|e| format!("tail: {e}"))?;
+                Some(Tail { section, frame })
+            }
+            None => None,
+        };
+        let usage = if d.usage == EffectUsage::InOut { FxUsage::InOut } else { FxUsage::Passive };
+        Ok(FxInfo {
+            type_id: d.type_id.to_string(),
+            name: d.name.clone(),
+            description: d.description.clone(),
+            params: d.params.clone(),
+            usage,
+            shader: Arc::new(program),
+            meter: d.meter.clone(),
+            tail,
+        })
+    }
+
+    /// How long it keeps sounding after its input stops, in seconds (at most 12).
+    pub fn tail_seconds(&self, v: &Evaluated) -> f64 {
+        let Some(t) = &self.tail else { return 0.0 };
+        let mut regs = vec![0.0; t.frame.registers];
+        t.frame.load_params(&mut regs, &self.params, v);
+        let mut stack = Vec::new();
+        oa_script::run(&t.section.block, &mut regs, &mut stack, &mut NoHost, true);
+        oa_script::run(&t.section.main, &mut regs, &mut stack, &mut NoHost, true);
+        let seconds = regs[0] as f64;
+        if seconds.is_finite() { seconds.clamp(0.0, 12.0) } else { 0.0 }
     }
 }
 
-/// Tone: an oscillator added on top of the sound.
-/// * `pitch` in Hz (keyframe it for a glide), wobbled by `vibrato` (Hz) ± `vibrato_depth`
-///   semitones; `pulse` is the square wave's duty cycle.
-/// * Envelope: rises over `attack`, then (with `decay` > 0) dies away exponentially;
-///   `repeat` > 0 restarts it every that many seconds (beeps, a metronome).
-/// * `follow` makes it sound only while the clip does (an envelope follower), `original`
-///   is how much of the clip's own sound stays; as an intro/outro it fades with the clip.
-const TONE: &str = "\
-// Where this note is: restarted every `repeat` seconds when that's on.
-let t = select(repeat > 0, time % max(repeat, 0.001), time);
+/// How long an effect keeps sounding after its input stops (an echo's repeats, a room's
+/// reverberation), so the mixer runs it on past the end of its clip.
+pub fn tail_seconds(type_id: &str, v: &Evaluated) -> f64 {
+    info(type_id).map_or(0.0, |i| i.tail_seconds(v))
+}
 
-// The oscillator.
-let hz = pitch * pow(2, vibrato_depth / 12 * sin(TAU * vibrato * time));
-state phase = 0;
-phase = fract(phase + hz / sample_rate);
-let sine = sin(TAU * phase);
-let square = select(phase < pulse, 1, -1);
-let triangle = 1 - 4 * abs(phase - 0.5);
-let saw = 2 * phase - 1;
-let osc = select(wave < 0.5, sine, select(wave < 1.5, square, select(wave < 2.5, triangle, select(wave < 3.5, saw, noise()))));
-
-// Its envelope.
-let rise = select(attack > 0, clamp(t / max(attack, 0.0001), 0, 1), 1);
-let fall = select(decay > 0, exp(-max(t - attack, 0) / max(decay, 0.0001)), 1);
-
-// How loud the clip itself is right now (for `follow`).
-state level = 0;
-level = max(abs(in), level * exp(-1 / (0.08 * sample_rate)));
-let duck = mix(1, clamp(level * 4, 0, 1), follow);
-
-out = in * original + osc * db(gain) * rise * fall * duck * visibility;
-";
-
-/// Atelier Core's sound effects, in menu order.
+/// Atelier Core's sound effects, in its manifest's order.
 fn builtins() -> &'static [Arc<FxInfo>] {
     static C: OnceLock<Vec<Arc<FxInfo>>> = OnceLock::new();
     C.get_or_init(|| {
-        let p = |id: &str, v: f64, unit: Unit, lo: f64, hi: f64| ParamSchema::new(id, Value::Float(v), unit).range(lo, hi);
-        let shader = |id: &str, name: &str, description: &str, params: Vec<ParamSchema>, usage: FxUsage, source: &str| {
-            FxInfo::shader(id, name, description, params, usage, source).unwrap_or_else(|e| panic!("built-in sound shader {id}: {e}"))
-        };
-        let list = vec![
-            FxInfo::native("oa.audio.bass", "Bass Boost", "Lifts the low end.", vec![p("boost", 8.0, Unit::Decibels, 0.0, 18.0), p("frequency", 110.0, Unit::None, 40.0, 300.0)]),
-            FxInfo::native(
-                "oa.audio.pitch",
-                "Pitch Shift",
-                "Higher or lower, same speed. Formant moves the voice's character (child to giant) on its own; \"keep voice\" holds it where it was while the pitch moves.",
-                vec![
-                    p("semitones", 5.0, Unit::None, -12.0, 12.0),
-                    p("mix", 1.0, Unit::None, 0.0, 1.0),
-                    p("formant", 0.0, Unit::None, -12.0, 12.0),
-                    ParamSchema::new("keep_voice", Value::Bool(false), Unit::None),
-                ],
-            ),
-            FxInfo::native(
-                "oa.audio.echo",
-                "Echo",
-                "Repeats that fade away.",
-                vec![p("delay", 0.35, Unit::Seconds, 0.02, 1.5), p("feedback", 0.4, Unit::None, 0.0, 0.9), p("mix", 0.35, Unit::None, 0.0, 1.0)],
-            ),
-            FxInfo::native(
-                "oa.audio.reverb",
-                "Reverb",
-                "The sound of a room: pick a space, or set your own. It keeps ringing after the clip ends.",
-                vec![
-                    ParamSchema::new("space", Value::Enum("custom".into()), Unit::None).options(&crate::dynamics::SPACES),
-                    p("room", 0.6, Unit::None, 0.0, 1.0),
-                    p("damping", 0.4, Unit::None, 0.0, 1.0),
-                    p("predelay", 0.0, Unit::Seconds, 0.0, 0.2),
-                    p("mix", 0.3, Unit::None, 0.0, 1.0),
-                ],
-            ),
-            FxInfo::native(
-                "oa.audio.eq",
-                "Equalizer",
-                "Shape the tone: a low shelf, three bands and a high shelf. Drag the points on its curve.",
-                vec![
-                    p("low_freq", 100.0, Unit::None, 20.0, 600.0),
-                    p("low_gain", 0.0, Unit::Decibels, -18.0, 18.0),
-                    p("p1_freq", 300.0, Unit::None, 40.0, 18000.0),
-                    p("p1_gain", 0.0, Unit::Decibels, -18.0, 18.0),
-                    p("p1_q", 1.0, Unit::None, 0.2, 10.0),
-                    p("p2_freq", 1500.0, Unit::None, 40.0, 18000.0),
-                    p("p2_gain", 0.0, Unit::Decibels, -18.0, 18.0),
-                    p("p2_q", 1.0, Unit::None, 0.2, 10.0),
-                    p("p3_freq", 5000.0, Unit::None, 40.0, 18000.0),
-                    p("p3_gain", 0.0, Unit::Decibels, -18.0, 18.0),
-                    p("p3_q", 1.0, Unit::None, 0.2, 10.0),
-                    p("high_freq", 8000.0, Unit::None, 1500.0, 18000.0),
-                    p("high_gain", 0.0, Unit::Decibels, -18.0, 18.0),
-                ],
-            ),
-            FxInfo::native(
-                "oa.audio.compressor",
-                "Compressor",
-                "Evens out the level: whatever goes over the threshold is turned down by the ratio.",
-                vec![
-                    p("threshold", -18.0, Unit::Decibels, -60.0, 0.0),
-                    p("ratio", 4.0, Unit::None, 1.0, 20.0),
-                    p("attack", 0.01, Unit::Seconds, 0.0001, 0.2),
-                    p("release", 0.15, Unit::Seconds, 0.01, 1.5),
-                    p("knee", 6.0, Unit::Decibels, 0.0, 18.0),
-                    p("makeup", 0.0, Unit::Decibels, 0.0, 24.0),
-                ],
-            ),
-            FxInfo::native(
-                "oa.audio.limiter",
-                "Limiter",
-                "Nothing gets past the ceiling — put it last, on the whole mix.",
-                vec![p("ceiling", -1.0, Unit::Decibels, -24.0, 0.0), p("release", 0.08, Unit::Seconds, 0.005, 1.0)],
-            ),
-            FxInfo::native(
-                "oa.audio.deess",
-                "De-esser",
-                "Tames harsh s and sh sounds in a voice, leaving the rest alone.",
-                vec![p("frequency", 6500.0, Unit::None, 2000.0, 12000.0), p("threshold", -30.0, Unit::Decibels, -60.0, 0.0), p("amount", 10.0, Unit::Decibels, 0.0, 24.0)],
-            ),
-            FxInfo::native(
-                "oa.audio.gate",
-                "Threshold",
-                "Mutes everything quieter than the threshold (a noise gate).",
-                vec![p("threshold", -40.0, Unit::Decibels, -80.0, 0.0), p("release", 0.15, Unit::Seconds, 0.01, 1.0)],
-            ),
-            FxInfo::native(
-                "oa.audio.crush",
-                "Bit Crush",
-                "Coarse and grainy: fewer bits, a lower sample rate, like old hardware.",
-                vec![p("bits", 6.0, Unit::None, 1.0, 16.0), p("rate", 8000.0, Unit::None, 200.0, 48000.0), p("mix", 1.0, Unit::None, 0.0, 1.0)],
-            ),
-            FxInfo::native(
-                "oa.audio.denoise",
-                "Denoise",
-                "Removes steady background noise (hiss, hum, fans).",
-                vec![p("reduction", 18.0, Unit::Decibels, 0.0, 40.0), p("sensitivity", 2.0, Unit::None, 0.5, 4.0)],
-            ),
-            // Written as sound shaders, the way a plugin writes them.
-            shader(
-                "oa.audio.fade",
-                "Fade",
-                "Fades the sound in as an intro, out as an outro.",
-                vec![p("curve", 1.0, Unit::None, 0.25, 4.0)],
-                FxUsage::InOut,
-                "out = in * pow(visibility, curve);",
-            ),
-            shader(
-                "oa.audio.muffle",
-                "Muffle",
-                "Dull and far away, as if through a wall. As an intro it opens up; as an outro it closes in.",
-                vec![p("cutoff", 600.0, Unit::None, 80.0, 8000.0), p("amount", 1.0, Unit::None, 0.0, 1.0)],
-                FxUsage::Passive,
-                "// A one-pole low-pass. Over an intro or outro it opens up as the clip arrives.\n\
-                 let open = select(visibility < 1, visibility ^ 2, 0);\n\
-                 let hz = mix(cutoff, 18000, open);\n\
-                 let k = 1 - exp(-TAU * hz / sample_rate);\n\
-                 state low = 0;\n\
-                 low += (in - low) * k;\n\
-                 out = mix(in, low, amount);",
-            ),
-            shader(
-                "oa.audio.tone",
-                "Tone",
-                "Adds a tone on top of the sound: a sine, square, triangle or saw wave (or noise) at a pitch, with its own attack, decay and repeats.",
-                vec![
-                    ParamSchema::new("wave", Value::Enum("sine".into()), Unit::None).options(&["sine", "square", "triangle", "saw", "noise"]),
-                    p("pitch", 440.0, Unit::None, 20.0, 8000.0),
-                    p("gain", -12.0, Unit::Decibels, -60.0, 0.0),
-                    p("attack", 0.01, Unit::Seconds, 0.0, 2.0),
-                    p("decay", 0.0, Unit::Seconds, 0.0, 10.0),
-                    p("repeat", 0.0, Unit::Seconds, 0.0, 10.0),
-                    p("vibrato", 0.0, Unit::None, 0.0, 12.0),
-                    p("vibrato_depth", 0.5, Unit::None, 0.0, 2.0),
-                    p("pulse", 0.5, Unit::None, 0.05, 0.95),
-                    p("follow", 0.0, Unit::None, 0.0, 1.0),
-                    p("original", 1.0, Unit::None, 0.0, 1.0),
-                ],
-                FxUsage::Passive,
-                TONE,
-            ),
-            shader(
-                "oa.audio.tremolo",
-                "Tremolo",
-                "The level swings up and down.",
-                vec![p("speed", 5.0, Unit::None, 0.1, 20.0), p("depth", 0.5, Unit::None, 0.0, 1.0)],
-                FxUsage::Passive,
-                "let swing = 0.5 + 0.5 * sin(TAU * speed * time);\nout = in * (1 - depth * swing);",
-            ),
-            shader(
-                "oa.audio.drive",
-                "Drive",
-                "Warm saturation, up to a fuzzy distortion.",
-                vec![p("drive", 12.0, Unit::Decibels, 0.0, 36.0), p("mix", 1.0, Unit::None, 0.0, 1.0)],
-                FxUsage::Passive,
-                "let d = db(drive);\nout = mix(in, tanh(in * d) / tanh(d), mix);",
-            ),
-            shader(
-                "oa.audio.width",
-                "Stereo Width",
-                "Narrower (0 is mono) or wider than it was recorded.",
-                vec![p("width", 1.5, Unit::None, 0.0, 3.0)],
-                FxUsage::Passive,
-                "let mid = (left + right) * 0.5;\nlet side = (left - right) * 0.5 * width;\nout = select(channels < 2, in, select(channel == 0, mid + side, mid - side));",
-            ),
-        ];
-        list.into_iter().map(Arc::new).collect()
+        oa_graph::plugin::core()
+            .sounds()
+            .map(|d| Arc::new(FxInfo::from_descriptor(d).unwrap_or_else(|e| panic!("Atelier Core's sound effect {}: {e}", d.type_id))))
+            .collect()
     })
 }
 
@@ -352,133 +216,17 @@ pub(crate) trait Processor: Send {
     }
 }
 
-/// A processor for `type_id`: its sound shader, or the native one.
+/// A processor for `type_id`: its sound shader, running.
 pub(crate) fn processor(type_id: &str, channels: usize, rate: f32) -> Option<Box<dyn Processor>> {
-    if let Some(program) = info(type_id).and_then(|i| i.shader.clone()) {
-        return Some(Box::new(ShaderProcessor::new(program, channels, rate)));
-    }
-    native(type_id, channels, rate)
+    let program = info(type_id)?.shader.clone();
+    Some(Box::new(ShaderProcessor::new(program, channels, rate)))
 }
 
-pub(crate) fn native(type_id: &str, channels: usize, rate: f32) -> Option<Box<dyn Processor>> {
-    let ch = channels.max(1);
-    Some(match type_id {
-        "oa.audio.bass" => Box::new(BassBoost { ch, rate, state: vec![[0.0; 4]; ch], coeffs: None }),
-        "oa.audio.pitch" => Box::new(PitchFormant { pitch: PitchShift::new(ch, rate), formant: crate::dynamics::Formant::new(ch) }),
-        "oa.audio.echo" => Box::new(Echo { ch, rate, line: vec![0.0; (rate * 1.6) as usize * ch], pos: 0 }),
-        "oa.audio.reverb" => Box::new(Reverb::new(ch, rate)),
-        "oa.audio.gate" => Box::new(Gate { ch, rate, env: 0.0, gain: 0.0 }),
-        "oa.audio.crush" => Box::new(BitCrush { ch, rate, held: vec![0.0; ch], phase: 0.0 }),
-        "oa.audio.denoise" => Box::new(Denoise::new(ch)),
-        "oa.audio.eq" => Box::new(crate::dynamics::Equalizer::new(ch, rate)),
-        "oa.audio.compressor" => Box::new(crate::dynamics::Compressor::new(ch, rate)),
-        "oa.audio.limiter" => Box::new(crate::dynamics::Limiter::new(ch, rate)),
-        "oa.audio.deess" => Box::new(crate::dynamics::DeEsser::new(ch, rate)),
-        _ => return None,
-    })
-}
+// ---- keeping a sped-up clip's pitch ----
 
-// ---- bit crush: fewer bits, and a coarser sample clock ----
-
-/// Two kinds of coarseness at once, which is what makes it sound like old hardware:
-/// **bits** quantizes the level, **rate** holds each sample for a while (a sample-and-
-/// hold at a lower rate). `mix` blends back towards the clean signal.
-struct BitCrush {
-    ch: usize,
-    rate: f32,
-    /// The sample being held, per channel.
-    held: Vec<f32>,
-    /// How far through the current hold we are, in output samples.
-    phase: f32,
-}
-
-impl Processor for BitCrush {
-    fn process(&mut self, buf: &mut [f32], v: &Evaluated, _clock: &ClockSpan) {
-        let bits = v.float("bits").clamp(1.0, 16.0) as f32;
-        let target = v.float("rate").clamp(50.0, self.rate as f64 * 2.0) as f32;
-        let mix = v.float("mix").clamp(0.0, 1.0) as f32;
-        // How many output samples each held value lasts.
-        let hold = (self.rate / target.max(1.0)).max(1.0);
-        // 2^bits levels between -1 and 1.
-        let levels = (2.0f32).powf(bits) * 0.5;
-        for frame in buf.chunks_mut(self.ch) {
-            self.phase += 1.0;
-            let fresh = self.phase >= hold;
-            if fresh {
-                self.phase -= hold;
-            }
-            for (c, sample) in frame.iter_mut().enumerate() {
-                if fresh {
-                    // Quantize on the way in, so held samples stay on the grid.
-                    self.held[c] = (*sample * levels).round() / levels;
-                }
-                *sample = *sample * (1.0 - mix) + self.held[c] * mix;
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.held.iter_mut().for_each(|h| *h = 0.0);
-        self.phase = 0.0;
-    }
-}
-
-// ---- bass boost: an RBJ low-shelf biquad ----
-
-struct BassBoost {
-    ch: usize,
-    rate: f32,
-    /// Per channel: x1, x2, y1, y2.
-    state: Vec<[f32; 4]>,
-    /// ((boost, frequency), [b0, b1, b2, a1, a2]) for the params they were made for.
-    coeffs: Option<((f32, f32), [f32; 5])>,
-}
-
-fn low_shelf(rate: f32, freq: f32, gain_db: f32) -> [f32; 5] {
-    let a = 10f32.powf(gain_db / 40.0);
-    let w = 2.0 * PI * freq / rate;
-    let (sin, cos) = w.sin_cos();
-    let alpha = sin / 2.0 * (2f32).sqrt(); // shelf slope 1
-    let sq = 2.0 * a.sqrt() * alpha;
-    let b0 = a * ((a + 1.0) - (a - 1.0) * cos + sq);
-    let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos);
-    let b2 = a * ((a + 1.0) - (a - 1.0) * cos - sq);
-    let a0 = (a + 1.0) + (a - 1.0) * cos + sq;
-    let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos);
-    let a2 = (a + 1.0) + (a - 1.0) * cos - sq;
-    [b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0]
-}
-
-impl Processor for BassBoost {
-    fn process(&mut self, buf: &mut [f32], v: &Evaluated, _clock: &ClockSpan) {
-        let key = (v.float("boost") as f32, v.float("frequency").clamp(20.0, 1000.0) as f32);
-        let c = match self.coeffs {
-            Some((k, c)) if k == key => c,
-            _ => {
-                let c = low_shelf(self.rate, key.1, key.0);
-                self.coeffs = Some((key, c));
-                c
-            }
-        };
-        for frame in buf.chunks_exact_mut(self.ch) {
-            for (x, s) in frame.iter_mut().zip(&mut self.state) {
-                let y = c[0] * *x + c[1] * s[0] + c[2] * s[1] - c[3] * s[2] - c[4] * s[3];
-                s[1] = s[0];
-                s[0] = *x;
-                s[3] = s[2];
-                s[2] = y;
-                *x = y;
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.state.iter_mut().for_each(|s| *s = [0.0; 4]);
-    }
-}
-
-// ---- pitch shift: two crossfaded taps sweeping through a delay line ----
-
+/// Two crossfaded taps sweeping through a delay line: reading slower or faster than
+/// it's written changes the pitch. (Pitch Shift does the same in its sound shader; this
+/// one is the mixer's own, for a clip whose speed changed but whose pitch shouldn't.)
 struct PitchShift {
     ch: usize,
     line: Vec<f32>,
@@ -516,8 +264,7 @@ impl Processor for PitchShift {
                 self.line[self.write * self.ch + c] = *x;
             }
             self.write = (self.write + 1) % self.len;
-            // Reading slower or faster than writing changes the pitch; the taps jump
-            // back a window when they run out, each faded out as it does.
+            // The taps jump back a window when they run out, each faded out as it does.
             self.delay = (self.delay + 1.0 - ratio).rem_euclid(w);
             let d2 = (self.delay + w / 2.0).rem_euclid(w);
             let g1 = (PI * self.delay / w).sin().powi(2);
@@ -535,360 +282,10 @@ impl Processor for PitchShift {
     }
 }
 
-
-/// Pitch Shift as the catalog offers it: the pitch moved, then the formants — the voice's
-/// character — moved on their own (or held where they were, with "keep voice"). The
-/// formant stage always runs, so the delay it adds never changes mid-clip.
-struct PitchFormant {
-    pitch: PitchShift,
-    formant: crate::dynamics::Formant,
-}
-
-impl Processor for PitchFormant {
-    fn process(&mut self, buf: &mut [f32], v: &Evaluated, clock: &ClockSpan) {
-        self.pitch.process(buf, v, clock);
-        let keep = matches!(v.get("keep_voice"), Some(Value::Bool(true)));
-        let shift = v.float("formant") as f32 - if keep { v.float("semitones") as f32 } else { 0.0 };
-        self.formant.run(buf, shift);
-    }
-
-    fn reset(&mut self) {
-        self.pitch.reset();
-        self.formant.reset();
-    }
-
-    fn latency(&self) -> usize {
-        crate::dynamics::Formant::LATENCY
-    }
-}
-
-/// The plain pitch shifter, without the formant stage (and its delay): for keeping a
-/// sped-up clip's pitch, which runs outside any effect chain.
+/// The plain pitch shifter: for keeping a sped-up clip's pitch, which runs outside any
+/// effect chain.
 pub(crate) fn plain_pitch(ch: usize, rate: f32) -> Box<dyn Processor> {
     Box::new(PitchShift::new(ch.max(1), rate))
-}
-// ---- echo: a feedback delay line ----
-
-struct Echo {
-    ch: usize,
-    rate: f32,
-    line: Vec<f32>,
-    pos: usize,
-}
-
-impl Processor for Echo {
-    fn process(&mut self, buf: &mut [f32], v: &Evaluated, _clock: &ClockSpan) {
-        let frames = self.line.len() / self.ch;
-        let delay = ((v.float("delay") as f32 * self.rate) as usize).clamp(1, frames - 1);
-        let feedback = v.float("feedback").clamp(0.0, 0.95) as f32;
-        let mix = v.float("mix").clamp(0.0, 1.0) as f32;
-        for frame in buf.chunks_exact_mut(self.ch) {
-            let read = (self.pos + frames - delay) % frames;
-            for (c, x) in frame.iter_mut().enumerate() {
-                let echoed = self.line[read * self.ch + c];
-                self.line[self.pos * self.ch + c] = *x + echoed * feedback;
-                *x += echoed * mix;
-            }
-            self.pos = (self.pos + 1) % frames;
-        }
-    }
-
-    fn reset(&mut self) {
-        self.line.fill(0.0);
-    }
-}
-
-// ---- reverb: Freeverb (8 damped combs, 4 allpasses per channel) ----
-
-struct Comb {
-    buf: Vec<f32>,
-    pos: usize,
-    store: f32,
-}
-
-struct Allpass {
-    buf: Vec<f32>,
-    pos: usize,
-}
-
-struct Reverb {
-    ch: usize,
-    rate: f32,
-    combs: Vec<Vec<Comb>>,
-    allpasses: Vec<Vec<Allpass>>,
-    /// Pre-delay: the gap before the room answers (mono, up to 0.25 s).
-    pre: Vec<f32>,
-    pre_pos: usize,
-}
-
-impl Reverb {
-    fn new(ch: usize, rate: f32) -> Self {
-        const COMBS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
-        const ALLPASSES: [usize; 4] = [556, 441, 341, 225];
-        let k = rate / 44_100.0;
-        // Channels are detuned slightly, for width.
-        let size = |n: usize, c: usize| ((n + 23 * c) as f32 * k) as usize;
-        Reverb {
-            ch,
-            combs: (0..ch).map(|c| COMBS.iter().map(|n| Comb { buf: vec![0.0; size(*n, c)], pos: 0, store: 0.0 }).collect()).collect(),
-            allpasses: (0..ch).map(|c| ALLPASSES.iter().map(|n| Allpass { buf: vec![0.0; size(*n, c)], pos: 0 }).collect()).collect(),
-            rate,
-            pre: vec![0.0; (rate * 0.25) as usize + 1],
-            pre_pos: 0,
-        }
-    }
-}
-
-impl Processor for Reverb {
-    fn process(&mut self, buf: &mut [f32], v: &Evaluated, _clock: &ClockSpan) {
-        // A named space sets the room; "custom" uses the sliders.
-        let (room, damping, space_predelay) = crate::dynamics::reverb_space(v);
-        let feedback = 0.7 + 0.28 * room as f32;
-        let damp = 0.4 * damping as f32;
-        let mix = v.float("mix").clamp(0.0, 1.0) as f32;
-        let pre = ((v.float("predelay").max(space_predelay).clamp(0.0, 0.25) as f32 * self.rate) as usize).min(self.pre.len() - 1);
-        for frame in buf.chunks_exact_mut(self.ch) {
-            let dry = frame.iter().sum::<f32>() / self.ch as f32 * 0.015;
-            // Through the pre-delay first.
-            let n = self.pre.len();
-            self.pre[self.pre_pos] = dry;
-            let input = self.pre[(self.pre_pos + n - pre) % n];
-            self.pre_pos = (self.pre_pos + 1) % n;
-            for (c, x) in frame.iter_mut().enumerate() {
-                let mut out = 0.0;
-                for comb in &mut self.combs[c] {
-                    let y = comb.buf[comb.pos];
-                    comb.store = y * (1.0 - damp) + comb.store * damp;
-                    comb.buf[comb.pos] = input + comb.store * feedback;
-                    comb.pos = (comb.pos + 1) % comb.buf.len();
-                    out += y;
-                }
-                for ap in &mut self.allpasses[c] {
-                    let b = ap.buf[ap.pos];
-                    ap.buf[ap.pos] = out + b * 0.5;
-                    ap.pos = (ap.pos + 1) % ap.buf.len();
-                    out = b - out;
-                }
-                *x = *x * (1.0 - mix * 0.5) + out * mix * 3.0;
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        for c in self.combs.iter_mut().flatten() {
-            c.buf.fill(0.0);
-            c.store = 0.0;
-        }
-        for a in self.allpasses.iter_mut().flatten() {
-            a.buf.fill(0.0);
-        }
-        self.pre.fill(0.0);
-    }
-}
-
-// ---- threshold: a noise gate ----
-
-struct Gate {
-    ch: usize,
-    rate: f32,
-    env: f32,
-    gain: f32,
-}
-
-impl Processor for Gate {
-    fn process(&mut self, buf: &mut [f32], v: &Evaluated, _clock: &ClockSpan) {
-        let threshold = 10f32.powf(v.float("threshold") as f32 / 20.0);
-        let attack = 1.0 - (-1.0 / (0.002 * self.rate)).exp();
-        let release = 1.0 - (-1.0 / (v.float("release").max(0.005) as f32 * self.rate)).exp();
-        let follow = 1.0 - (-1.0 / (0.01 * self.rate)).exp();
-        for frame in buf.chunks_exact_mut(self.ch) {
-            let peak = frame.iter().fold(0f32, |m, x| m.max(x.abs()));
-            // Envelope: jumps up with peaks, eases down.
-            self.env = if peak > self.env { peak } else { self.env + (peak - self.env) * follow };
-            let target = if self.env >= threshold { 1.0 } else { 0.0 };
-            self.gain += (target - self.gain) * if target > self.gain { attack } else { release };
-            for x in frame.iter_mut() {
-                *x *= self.gain;
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.env = 0.0;
-        self.gain = 0.0;
-    }
-}
-
-// ---- denoise: spectral gating against a tracked noise floor ----
-
-const FFT: usize = 1024;
-const HOP: usize = FFT / 4;
-
-struct DenoiseChannel {
-    input: Vec<f32>,
-    output: Vec<f32>,
-    smooth: Vec<f32>,
-    fast: Vec<f32>,
-    noise: Vec<f32>,
-    gains: Vec<f32>,
-    frames: u32,
-}
-
-struct Denoise {
-    ch: usize,
-    chans: Vec<DenoiseChannel>,
-    window: Vec<f32>,
-    /// Input frames since the last hop.
-    fill: usize,
-    /// Processed samples ready to hand out, per channel (interleaved later).
-    ready: Vec<Vec<f32>>,
-}
-
-impl Denoise {
-    fn new(ch: usize) -> Self {
-        // sqrt-Hann for analysis and synthesis: their product, a Hann window at 75%
-        // overlap, sums to a constant 2.
-        let window = (0..FFT).map(|i| (0.5 - 0.5 * (2.0 * PI * i as f32 / FFT as f32).cos()).sqrt()).collect();
-        let chan = || DenoiseChannel { input: vec![0.0; FFT], output: vec![0.0; FFT], smooth: vec![0.0; FFT / 2 + 1], fast: vec![0.0; FFT / 2 + 1], noise: vec![0.0; FFT / 2 + 1], gains: vec![1.0; FFT / 2 + 1], frames: 0 };
-        // The output queue starts a hop of silence ahead, so the delay is always exactly
-        // FFT samples whatever the block sizes (see `latency`).
-        Denoise { ch, chans: (0..ch).map(|_| chan()).collect(), window, fill: 0, ready: vec![vec![0.0; HOP]; ch] }
-    }
-
-    fn frame(&mut self, c: usize, reduction: f32, sensitivity: f32) {
-        let floor = 10f32.powf(-reduction / 20.0);
-        let ch = &mut self.chans[c];
-        let mut re: Vec<f32> = ch.input.iter().zip(&self.window).map(|(x, w)| x * w).collect();
-        let mut im = vec![0.0f32; FFT];
-        fft(&mut re, &mut im, false);
-        // The first frames (the buffer still filling) set the floor outright.
-        let first = ch.frames < 8;
-        ch.frames += 1;
-        let mut raw = [0f32; FFT / 2 + 1];
-        for (k, raw) in raw.iter_mut().enumerate() {
-            let power = re[k] * re[k] + im[k] * im[k];
-            // Each bin's smoothed power; the noise floor follows it down at once and
-            // creeps up slowly, so steady noise is tracked while speech and music (which
-            // come and go) aren't.
-            let s = &mut ch.smooth[k];
-            *s = if first { power } else { *s * 0.85 + power * 0.15 };
-            let n = &mut ch.noise[k];
-            *n = if first || *s < *n { *s } else { *n * 1.004 + 1e-12 };
-            // A minimum sits below the average: ~2.2× brings it back to the noise level.
-            let noise = *n * 2.2;
-            // Decide on lightly smoothed power (raw noise power swings too much), and
-            // subtract the noise, over-subtracting by `sensitivity`, never below the floor.
-            let f = &mut ch.fast[k];
-            *f = if first { power } else { *f * 0.5 + power * 0.5 };
-            *raw = (1.0 - sensitivity * noise / f.max(1e-12)).max(0.0).sqrt();
-        }
-        for k in 0..=FFT / 2 {
-            // Smooth across neighboring bins and over time: lone bins poking through
-            // the noise are what sounds like "musical noise".
-            let near = (raw[k.saturating_sub(1)] + 2.0 * raw[k] + raw[(k + 1).min(FFT / 2)]) / 4.0;
-            ch.gains[k] = ch.gains[k] * 0.5 + near.max(floor) * 0.5;
-            let g = ch.gains[k];
-            re[k] *= g;
-            im[k] *= g;
-            if k > 0 && k < FFT / 2 {
-                re[FFT - k] = re[k];
-                im[FFT - k] = -im[k];
-            }
-        }
-        fft(&mut re, &mut im, true);
-        // Overlap-add; the first HOP samples are complete.
-        for ((out, x), w) in ch.output.iter_mut().zip(&re).zip(&self.window) {
-            *out += x * w * 0.5;
-        }
-        self.ready[c].extend_from_slice(&ch.output[..HOP]);
-        ch.output.copy_within(HOP.., 0);
-        ch.output[FFT - HOP..].fill(0.0);
-    }
-}
-
-impl Processor for Denoise {
-    fn process(&mut self, buf: &mut [f32], v: &Evaluated, _clock: &ClockSpan) {
-        let reduction = v.float("reduction").clamp(0.0, 60.0) as f32;
-        let sensitivity = v.float("sensitivity").clamp(0.1, 10.0) as f32;
-        let frames = buf.len() / self.ch;
-        for f in 0..frames {
-            for c in 0..self.ch {
-                let ch = &mut self.chans[c];
-                ch.input.copy_within(1.., 0);
-                ch.input[FFT - 1] = buf[f * self.ch + c];
-            }
-            self.fill += 1;
-            if self.fill == HOP {
-                self.fill = 0;
-                for c in 0..self.ch {
-                    self.frame(c, reduction, sensitivity);
-                }
-            }
-        }
-        // Hand out what's processed, oldest first (the queue always holds enough).
-        let have = self.ready[0].len().min(frames);
-        for f in 0..frames {
-            for c in 0..self.ch {
-                buf[f * self.ch + c] = if f < have { self.ready[c][f] } else { 0.0 };
-            }
-        }
-        for r in &mut self.ready {
-            r.drain(..have);
-        }
-    }
-
-    fn reset(&mut self) {
-        let ch = self.ch;
-        *self = Denoise::new(ch);
-    }
-
-    fn latency(&self) -> usize {
-        FFT
-    }
-}
-
-/// In-place radix-2 complex FFT (`inverse` scales by 1/n).
-pub(crate) fn fft(re: &mut [f32], im: &mut [f32], inverse: bool) {
-    let n = re.len();
-    let mut j = 0;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j |= bit;
-        if i < j {
-            re.swap(i, j);
-            im.swap(i, j);
-        }
-    }
-    let mut len = 2;
-    while len <= n {
-        let ang = 2.0 * PI / len as f32 * if inverse { 1.0 } else { -1.0 };
-        let (wr, wi) = (ang.cos(), ang.sin());
-        for start in (0..n).step_by(len) {
-            let (mut cr, mut ci) = (1.0f32, 0.0f32);
-            for k in 0..len / 2 {
-                let (a, b) = (start + k, start + k + len / 2);
-                let tr = re[b] * cr - im[b] * ci;
-                let ti = re[b] * ci + im[b] * cr;
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
-                let nr = cr * wr - ci * wi;
-                ci = cr * wi + ci * wr;
-                cr = nr;
-            }
-        }
-        len <<= 1;
-    }
-    if inverse {
-        let k = 1.0 / n as f32;
-        re.iter_mut().for_each(|x| *x *= k);
-        im.iter_mut().for_each(|x| *x *= k);
-    }
 }
 
 #[cfg(test)]
@@ -927,8 +324,28 @@ mod tests {
         20.0 * (a / b).log10()
     }
 
+    /// How fast each of Atelier Core's sound effects runs, as a share of real time
+    /// (stereo, 48 kHz): `cargo test --release -p oa-audio -- --ignored --nocapture cost`.
     #[test]
-    fn voice_cleanup_runs_natively_and_cuts_hum() {
+    #[ignore]
+    fn cost_of_each_core_effect() {
+        let seconds = 10.0;
+        let input: Vec<f32> = sine(220.0, seconds, 0.3).into_iter().flat_map(|x| [x, x * 0.8]).collect();
+        for fx in core_catalog() {
+            let v = ParamSet::default().eval(&fx.params, None, &EvalContext::at(Time::ZERO, Time::ZERO));
+            let mut p = processor(&fx.type_id, 2, RATE).unwrap();
+            let mut buf = input.clone();
+            let start = std::time::Instant::now();
+            for block in buf.chunks_mut(2 * 512) {
+                p.process(block, &v, &ClockSpan::default());
+            }
+            let share = start.elapsed().as_secs_f32() / seconds;
+            println!("{:<22} {:>6.2}% of real time", fx.type_id, share * 100.0);
+        }
+    }
+
+    #[test]
+    fn voice_cleanup_runs_and_cuts_hum() {
         let chain = voice_cleanup();
         let mut procs: Vec<_> = chain.iter().map(|e| (processor(&e.type_id, 1, RATE).expect("a native processor"), e.params.eval(&info(&e.type_id).unwrap().params, None, &EvalContext::at(Time::ZERO, Time::ZERO)))).collect();
         let hum = sine(50.0, 3.0, 0.2);
@@ -1018,7 +435,7 @@ mod tests {
         let tone = sine(440.0, 2.0, 0.3);
         let x: Vec<f32> = (0..192_000).map(|i| noise() * 0.02 + if i >= 96_000 { tone[i - 96_000] } else { 0.0 }).collect();
         let y = run("oa.audio.denoise", &[("reduction", 30.0)], &x, 1);
-        let lat = FFT;
+        let lat = 1024;
         let hiss_before = rms(&x[48_000..90_000]);
         let hiss_after = rms(&y[48_000 + lat..90_000 + lat]);
         assert!(db(hiss_after, hiss_before) < -12.0, "hiss down {} dB", db(hiss_after, hiss_before));

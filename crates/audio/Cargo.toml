@@ -9,4 +9,6 @@ publish.workspace = true
 oa-time.workspace = true
 oa-params.workspace = true
 oa-doc.workspace = true
+oa-graph.workspace = true
+oa-script.workspace = true
 cpal.workspace = true

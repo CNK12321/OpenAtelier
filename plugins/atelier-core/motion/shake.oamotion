@@ -1,0 +1,8 @@
+// Camera Shake: quick, jittery handheld-camera movement.
+let x = seconds * frequency;
+let amp = intensity * min(canvas_w, canvas_h);
+move_x = jitter(x, 0) * amp;
+move_y = jitter(x, 1) * amp;
+turn = jitter(x, 2) * rotation;
+// A touch of zoom hides the edges the shake would otherwise expose.
+zoom = 1 + 2 * intensity;

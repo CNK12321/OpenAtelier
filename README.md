@@ -33,8 +33,11 @@ export all running through the same render engine the preview uses.
 - **Color**: a scene-linear working space, per-file input transforms (log and HDR
   curves, gamuts) and tone mapping to SDR.
 - **Plugins**: effects are plugins, even the built-in ones. A plugin is a folder with a
-  `plugin.json` and WGSL shaders — and, for sound, small *sound shaders*. See
-  [`plugins/README.md`](plugins/README.md) and the example in `plugins/example-looks`.
+  `plugin.json`, WGSL shaders, *sound shaders* for sound and small scripts for motion.
+  Every built-in effect, picture and sound, lives in
+  [`plugins/atelier-core`](plugins/atelier-core), written exactly the way a plugin is,
+  so anything they do a plugin can do. See [`plugins/README.md`](plugins/README.md) and
+  the example in `plugins/example-looks`.
 - **Export**: H.264/HEVC (hardware encoders through Media Foundation on Windows),
   ProRes, ProRes 4444 and WebM with transparency, and GIF; a time range; a live
   preview while it runs.
@@ -80,12 +83,19 @@ Ready-to-run builds are on the [Releases page](https://github.com/CNK12321/OpenA
   the `…-windows-x64.zip`, unpack anywhere and run `OpenAtelier.exe`. Both include ffmpeg.
   The programs aren't code-signed yet, so Windows SmartScreen may ask first: *More info →
   Run anyway*.
-- **Linux:** `…-linux-x64.tar.gz`: unpack and run `./openatelier`. Install `ffmpeg` from
-  your package manager first (the app tells you if it can't find it).
+- **Ubuntu, Debian, Mint, Pop!_OS…:** `…-linux-x64.deb` installs it for everyone
+  (`sudo apt install ./OpenAtelier-…-linux-x64.deb`, or open it with your software
+  installer), with a menu entry, and brings ffmpeg with it. Ubuntu 22.04 / Debian 12 or
+  newer.
+- **Other Linux:** unpack `…-linux-x64.tar.gz` and run `./install.sh` in it: it installs
+  for you into `~/.local` with a menu entry (and can update itself there);
+  `./install.sh --uninstall` removes it. Or just run `./openatelier` from the folder.
+  Install `ffmpeg` from your package manager too (the app tells you if it can't find it).
 
 The app checks the releases once a day and offers newer versions in a bar at the top:
 **Update** downloads the package, checks it against the release's `SHA256SUMS.txt`,
-installs it in place and restarts. Settings → Updates picks the channel (Stable, or Beta
+installs it in place and restarts (installed from the `.deb`, it points to the download
+instead: apt owns `/opt/openatelier`). Settings → Updates picks the channel (Stable, or Beta
 for pre-releases too), turns the check off, or checks now.
 
 ### Making a release
@@ -141,6 +151,7 @@ with wgpu; preview and export share that path, so what you see is what you get.
 |---|---|
 | `oa-time` | Exact time (flicks) and frame rates |
 | `oa-params` | Parameters, keyframes, easing, waves |
+| `oa-script` | OA script, the small language for sound shaders, motion and the like |
 | `oa-doc` | The project document, edits (ops) and undo |
 | `oa-graph` | The render graph, cache keys, the effect registry and plugins |
 | `oa-plan` | Document snapshot + time → render graph |

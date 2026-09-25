@@ -1,0 +1,61 @@
+// Depth draws the box the sheet is cut from, turned and seen through the same pinhole
+// camera as its shader: the outline of its eight corners on the film.
+let w = x1 - x0;
+let h = y1 - y0;
+let cx = (x0 + x1) / 2;
+let cy = (y0 + y1) / 2;
+let hw = w / 2;
+let hh = h / 2;
+let hz = max(depth * 0.01 * w, 0.001) / 2;
+let yw = yaw * PI / 180;
+let pt = pitch * PI / 180;
+let dist = w * (1.2 + 40 * (1 - clamp(pov, 0, 1)));
+
+// Each corner: pitch, then yaw (the shader turns its rays the other way); behind the
+// camera, as far as the layer may grow.
+// Corners at z = -hz.
+let a_y = cos(pt) * -hh - sin(pt) * -hz;
+let a_z = sin(pt) * -hh + cos(pt) * -hz;
+let b_y = cos(pt) * hh - sin(pt) * -hz;
+let b_z = sin(pt) * hh + cos(pt) * -hz;
+// Corners at z = +hz.
+let c_y = cos(pt) * -hh - sin(pt) * hz;
+let c_z = sin(pt) * -hh + cos(pt) * hz;
+let d_y = cos(pt) * hh - sin(pt) * hz;
+let d_z = sin(pt) * hh + cos(pt) * hz;
+
+let x1a = cos(yw) * -hw + sin(yw) * a_z;
+let z1a = -sin(yw) * -hw + cos(yw) * a_z;
+let k1a = select(z1a + dist > 1, dist / (z1a + dist), 1000000);
+grow(cx + x1a * k1a, cy + a_y * k1a);
+let x2a = cos(yw) * hw + sin(yw) * a_z;
+let z2a = -sin(yw) * hw + cos(yw) * a_z;
+let k2a = select(z2a + dist > 1, dist / (z2a + dist), 1000000);
+grow(cx + x2a * k2a, cy + a_y * k2a);
+
+let x1b = cos(yw) * -hw + sin(yw) * b_z;
+let z1b = -sin(yw) * -hw + cos(yw) * b_z;
+let k1b = select(z1b + dist > 1, dist / (z1b + dist), 1000000);
+grow(cx + x1b * k1b, cy + b_y * k1b);
+let x2b = cos(yw) * hw + sin(yw) * b_z;
+let z2b = -sin(yw) * hw + cos(yw) * b_z;
+let k2b = select(z2b + dist > 1, dist / (z2b + dist), 1000000);
+grow(cx + x2b * k2b, cy + b_y * k2b);
+
+let x1c = cos(yw) * -hw + sin(yw) * c_z;
+let z1c = -sin(yw) * -hw + cos(yw) * c_z;
+let k1c = select(z1c + dist > 1, dist / (z1c + dist), 1000000);
+grow(cx + x1c * k1c, cy + c_y * k1c);
+let x2c = cos(yw) * hw + sin(yw) * c_z;
+let z2c = -sin(yw) * hw + cos(yw) * c_z;
+let k2c = select(z2c + dist > 1, dist / (z2c + dist), 1000000);
+grow(cx + x2c * k2c, cy + c_y * k2c);
+
+let x1d = cos(yw) * -hw + sin(yw) * d_z;
+let z1d = -sin(yw) * -hw + cos(yw) * d_z;
+let k1d = select(z1d + dist > 1, dist / (z1d + dist), 1000000);
+grow(cx + x1d * k1d, cy + d_y * k1d);
+let x2d = cos(yw) * hw + sin(yw) * d_z;
+let z2d = -sin(yw) * hw + cos(yw) * d_z;
+let k2d = select(z2d + dist > 1, dist / (z2d + dist), 1000000);
+grow(cx + x2d * k2d, cy + d_y * k2d);

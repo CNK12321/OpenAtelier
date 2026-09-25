@@ -1,0 +1,7 @@
+// Wiggle: slow, smooth wandering (one octave of noise), playful drift for titles and
+// stickers.
+let x = seconds * speed;
+let amp = amount * min(canvas_w, canvas_h);
+move_x = noise(x, 0) * amp;
+move_y = noise(x, 1) * amp;
+turn = noise(x, 2) * rotation;

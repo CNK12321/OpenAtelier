@@ -7,7 +7,7 @@
 use crate::App;
 use eframe::egui;
 use oa_doc::{EffectId, EffectRole, ItemId, ParamTarget};
-use oa_graph::registry::{surface_point_id, surface_points, SURFACE};
+use oa_graph::registry::{surface_point_id, surface_points, EDITOR_SURFACE};
 use oa_params::Value;
 use oa_plan::scene::Placement;
 use oa_time::Time;
@@ -55,8 +55,9 @@ impl App {
     /// on their own), at `t`.
     pub(crate) fn surface_of(&self, item: ItemId, t: Time) -> Option<Surface> {
         let it = self.editor.item(item)?;
-        let fx = it.effects.iter().find(|e| e.enabled && e.type_id == SURFACE && e.role == EffectRole::Passive)?;
-        let d = self.registry.effect(SURFACE)?;
+        let is_surface = |type_id: &str| self.registry.effect(type_id).is_some_and(|d| d.editor.as_deref() == Some(EDITOR_SURFACE));
+        let fx = it.effects.iter().find(|e| e.enabled && e.role == EffectRole::Passive && is_surface(&e.type_id))?;
+        let d = self.registry.effect(&fx.type_id)?;
         let values = fx.params.eval(&d.params, None, &it.eval_context(t));
         let (n, points) = surface_points(&values);
         Some(Surface { effect: fx.id, n, points })

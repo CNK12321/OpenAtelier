@@ -1,0 +1,12 @@
+// Threshold: a noise gate. The level follows peaks at once and eases down; below the
+// threshold the sound is shut off, over `release`.
+let open_k = 1 - exp(-1 / (0.002 * sample_rate));
+let release_k = 1 - exp(-1 / (max(release, 0.005) * sample_rate));
+let follow = 1 - exp(-1 / (0.01 * sample_rate));
+let loudest = max(abs(left), abs(right));
+state env = 0;
+env = select(loudest > env, loudest, env + (loudest - env) * follow);
+let target = env >= db(threshold);
+state gain = 0;
+gain += (target - gain) * select(target > gain, open_k, release_k);
+out = in * gain;

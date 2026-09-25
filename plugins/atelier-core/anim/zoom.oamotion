@@ -1,0 +1,5 @@
+// Zoom: grows from (or shrinks to) `scale` times the layer's size.
+let eased = 1 - (1 - clamp(visibility, 0, 1)) ^ 3;
+let from = max(scale, 0);
+zoom = max(from + (1 - from) * eased, 0.0001);
+opacity = select(fade, eased, 1);

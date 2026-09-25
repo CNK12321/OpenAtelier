@@ -311,12 +311,19 @@ fn variants_render_at_their_own_aspect_ratio() {
 #[test]
 fn stateful_effects_are_reported_not_silently_dropped() {
     let Some(ctx) = gpu() else { return };
-    let registry = Registry::with_builtins();
-    let (p, seq) = pattern_project(|clip| add_effect(clip, 30, "oa.time.feedback-trail", "decay", ParamSource::Static(Value::Float(0.5))));
+    // An effect that needs the frames before it (none of Atelier Core's do yet).
+    let mut registry = Registry::with_builtins();
+    registry
+        .register(oa_graph::registry::EffectDescriptor {
+            state: oa_graph::Statefulness::Stateful { preroll: Time::from_seconds(2) },
+            ..oa_graph::registry::EffectDescriptor::new("test.trail", "Trail", EffectKind::Temporal { frames_before: 1, frames_after: 0 }, vec![oa_params::ParamSchema::new("decay", Value::Float(0.85), oa_params::Unit::None)])
+        })
+        .unwrap();
+    let (p, seq) = pattern_project(|clip| add_effect(clip, 30, "test.trail", "decay", ParamSource::Static(Value::Float(0.5))));
     let g = plan_frame(&p, seq, Time::from_seconds(3), &PlanOptions::default(), &registry).unwrap().graph;
     let mut r = renderer(&ctx, FusionMode::Blocking);
     r.render(&g, &registry, &mut TestPatternSource::default()).unwrap();
-    assert!(r.stats.unsupported.iter().any(|u| u.contains("feedback-trail")), "{:?}", r.stats.unsupported);
+    assert!(r.stats.unsupported.iter().any(|u| u.contains("test.trail")), "{:?}", r.stats.unsupported);
 }
 
 /// Transitions mix their two inputs: a dissolve averages, a wipe splits the canvas, a
@@ -604,6 +611,97 @@ fn text_layers_draw_their_glyphs_centered() {
     assert!((big_total / total - 4.0).abs() < 0.6, "{}", big_total / total);
 }
 
+/// A bounded per-letter effect only changes the letters in its range: rainbow on the
+/// first half of "HELLO" tints the left letters and leaves the right ones white.
+#[test]
+fn bounded_text_effects_only_touch_their_letters() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let (p, _) = text_project(|c| {
+        let mut fx = EffectInstance::new(EffectId(40), "oa.text.rainbow");
+        fx.params.set(schema::BOUNDED, ParamSource::Static(Value::Bool(true)));
+        fx.params.set(schema::BOUND_START, ParamSource::Static(Value::Float(0.0)));
+        fx.params.set(schema::BOUND_END, ParamSource::Static(Value::Float(50.0)));
+        c.effects.push(fx);
+    });
+    let px = render_project(&mut r, &p, Time::from_seconds(1));
+    // How far from grey the ink is, on each side.
+    let tint = |x0: usize, x1: usize| {
+        let (mut spread, mut ink) = (0.0, 0.0);
+        for (i, c) in px.iter().enumerate() {
+            let x = i % 640;
+            if x >= x0 && x < x1 && c[3] > 0.5 {
+                let (hi, lo) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+                spread += hi - lo;
+                ink += hi;
+            }
+        }
+        spread / ink.max(1e-6)
+    };
+    let (left, right) = (tint(0, 250), tint(420, 640));
+    assert!(left > 0.3, "the first letters are tinted: {left}");
+    assert!(right < 0.05, "the last ones stay white: {right}");
+}
+
+/// Any effect on a title can be bounded: Color To turns the first half of "HELLO" red
+/// and leaves the rest white; a bounded blur softens only its letters.
+#[test]
+fn bounded_picture_effects_on_titles() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let bound = |fx: &mut EffectInstance| {
+        fx.params.set(schema::BOUNDED, ParamSource::Static(Value::Bool(true)));
+        fx.params.set(schema::BOUND_START, ParamSource::Static(Value::Float(0.0)));
+        fx.params.set(schema::BOUND_END, ParamSource::Static(Value::Float(50.0)));
+    };
+    let (p, _) = text_project(|c| {
+        let mut fx = EffectInstance::new(EffectId(41), "oa.color.color-to");
+        fx.params.set("from", ParamSource::Static(Value::Color([1.0, 1.0, 1.0, 1.0])));
+        fx.params.set("to", ParamSource::Static(Value::Color([1.0, 0.0, 0.0, 1.0])));
+        fx.params.set("offset_from_original", ParamSource::Static(Value::Bool(false)));
+        bound(&mut fx);
+        c.effects.push(fx);
+    });
+    let px = render_project(&mut r, &p, Time::from_seconds(1));
+    let color = |x0: usize, x1: usize| {
+        let mut sum = [0.0f32; 3];
+        for (i, c) in px.iter().enumerate() {
+            if (x0..x1).contains(&(i % 640)) && c[3] > 0.9 && c[0] > 0.5 {
+                for k in 0..3 {
+                    sum[k] += c[k];
+                }
+            }
+        }
+        sum
+    };
+    let (left, right) = (color(0, 250), color(420, 640));
+    assert!(left[0] > 10.0 && left[1] < 0.1 * left[0], "the first letters turn red: {left:?}");
+    assert!(right[0] > 10.0 && (right[1] - right[0]).abs() < 0.05 * right[0], "the last stay white: {right:?}");
+
+    // A blur bounded to the first half: soft edges there, crisp ones on the right.
+    let (p, _) = text_project(|c| {
+        let mut fx = EffectInstance::new(EffectId(42), "oa.blur.gaussian");
+        fx.params.set("radius", ParamSource::Static(Value::Float(12.0)));
+        bound(&mut fx);
+        c.effects.push(fx);
+    });
+    let px = render_project(&mut r, &p, Time::from_seconds(1));
+    let soft = |x0: usize, x1: usize| {
+        let (mut partial, mut ink) = (0.0, 0.0);
+        for (i, c) in px.iter().enumerate() {
+            if (x0..x1).contains(&(i % 640)) {
+                ink += c[0];
+                if c[0] > 0.05 && c[0] < 0.95 {
+                    partial += 1.0;
+                }
+            }
+        }
+        partial / ink.max(1.0)
+    };
+    let (left, right) = (soft(0, 250), soft(420, 640));
+    assert!(left > 3.0 * right, "blurred on the left only: {left} vs {right}");
+}
+
 #[test]
 fn text_color_gradient_and_outline() {
     let Some(ctx) = gpu() else { return };
@@ -882,7 +980,7 @@ fn plugin_effects_render() {
     let manifest = std::path::Path::new("../../plugins/example-looks/plugin.json");
     let plugin = oa_graph::plugin::load(manifest).expect("example plugin loads");
     assert!(plugin.issues.is_empty(), "{:?}", plugin.issues);
-    let core = oa_graph::plugin::core(Vec::new());
+    let core = oa_graph::plugin::core();
     let (registry, issues) = Registry::from_plugins([&core, &plugin]);
     assert!(issues.is_empty(), "{issues:?}");
 
@@ -899,6 +997,32 @@ fn plugin_effects_render() {
 }
 
 
+/// Color To turns red blue and leaves green alone; with "offset from original", a darker
+/// red becomes a darker blue.
+#[test]
+fn color_to_replaces_a_color_and_keeps_its_shading() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let mut through = |color: [f32; 4], offset: f32| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let s = solid(&mut b, color, 8.0);
+        // from, tolerance, softness, to, offset from original
+        let e = effect(&mut b, &registry, s, "oa.color.color-to", vec![1.0, 0.0, 0.0, 1.0, 0.3, 0.05, 0.0, 0.0, 1.0, 1.0, offset], 0.0);
+        let out = composite(&mut b, 8, [0.0; 4], &[(e, BlendMode::Normal)]);
+        render_with(&mut r, &b.finish(out), &registry)[36]
+    };
+    let red = through([1.0, 0.0, 0.0, 1.0], 0.0);
+    assert!(red[2] > 0.95 && red[0] < 0.05, "red became blue: {red:?}");
+    let green = through([0.0, 1.0, 0.0, 1.0], 0.0);
+    assert!(green[1] > 0.95 && green[2] < 0.05, "green stays: {green:?}");
+    // A red a little darker (in display terms): replaced, and as much darker.
+    let dark = through([0.6, 0.0, 0.0, 1.0], 1.0);
+    let flat = through([0.6, 0.0, 0.0, 1.0], 0.0);
+    assert!(dark[2] > 0.3 && dark[2] < 0.8 && dark[0] < 0.05, "a darker blue: {dark:?}");
+    assert!(flat[2] > 0.95, "without the offset, just blue: {flat:?}");
+}
+
 /// Effects on pixel art read whole picture pixels: a shader that samples half a pixel
 /// off keeps the hard edge instead of blending the two colors.
 #[test]
@@ -907,26 +1031,12 @@ fn effects_on_pixel_art_do_not_blend_pixels() {
     let mut registry = Registry::with_builtins();
     registry
         .register(oa_graph::registry::EffectDescriptor {
-            type_id: "test.halfpixel".into(),
-            version: 1,
-            api_version: oa_graph::registry::PLUGIN_API_VERSION,
-            name: "Half pixel".into(),
-            kind: EffectKind::Spatial { expand: None },
-            state: oa_graph::Statefulness::Pure,
-            space: WorkingSpace::Linear,
-            fusible: false,
-            preserves_opacity: false,
-            time_varying: false,
-            usage: oa_graph::registry::EffectUsage::Passive,
-            motion: None,
-            pass_count: None,
-            pass_divisor: None,
-            params: Vec::new(),
             shader: Some(oa_graph::EffectShader {
                 entry: "test_halfpixel".into(),
                 source: "fn test_halfpixel(pos: vec2f, base: u32) -> vec4f { return sample_input(pos + vec2f(0.5, 0.0)); }".into(),
                 passes: 1,
             }),
+            ..oa_graph::registry::EffectDescriptor::new("test.halfpixel", "Half pixel", EffectKind::Spatial { expand: None }, Vec::new())
         })
         .expect("test effect");
 
@@ -1132,7 +1242,7 @@ fn a_wide_glow_on_a_coarse_grid_still_follows_the_edges() {
     let registry = Registry::with_builtins();
     let mut r = renderer(&ctx, FusionMode::Blocking);
     let d = registry.effect(oa_graph::registry::GLOW).unwrap();
-    assert_eq!(oa_graph::registry::glow_divisor(64.0), 4);
+    assert_eq!(d.pass_divisor.as_ref().unwrap().divisor(&[64.0], 0, 99), 4);
     let mut b = GraphBuilder::new(KeyContext::default());
     let red = solid(&mut b, [1.0, 0.0, 0.0, 1.0], 32.0);
     let blue = solid(&mut b, [0.0, 0.0, 1.0, 1.0], 16.0);

@@ -19,7 +19,9 @@
 //! file, a reserved id — are collected in [`Plugin::issues`] and shown to the user
 //! rather than failing the load.
 
-use crate::registry::{builtins, EffectDescriptor, EffectKind, EffectShader, EffectUsage, WorkingSpace, PLUGIN_API_VERSION};
+use crate::registry::{EffectDescriptor, EffectKind, EffectShader, EffectUsage, SecondInput, WorkingSpace, PLUGIN_API_VERSION};
+use crate::script::{BoundsScript, MotionScript, PassScript};
+use std::sync::Arc;
 use oa_params::{Gradient, ParamId, ParamSchema, Unit, Value};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -71,23 +73,24 @@ impl Plugin {
     }
 }
 
-/// Atelier Core: every built-in effect. `sounds` are the host's sound effects (the host
-/// passes them in, since the processing lives in `oa-audio`), as [`EffectKind::Sound`]
-/// descriptors.
-pub fn core(sounds: Vec<EffectDescriptor>) -> Plugin {
-    let mut effects = builtins();
-    effects.extend(sounds);
-    Plugin {
-        id: CORE_ID.into(),
-        name: "Atelier Core".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        description: "The effects OpenAtelier ships with: color, blur, keying, motion, transitions, text animation and sound.".into(),
-        author: "OpenAtelier".into(),
-        builtin: true,
-        path: None,
-        effects,
-        issues: Vec::new(),
-    }
+/// Atelier Core's files (`plugins/atelier-core`), built into the program.
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/core_files.rs"));
+}
+
+/// Atelier Core: every built-in effect, picture and sound. It's an ordinary plugin
+/// folder (`plugins/atelier-core`) whose files are built into the program, read by the
+/// same loader as any other; only its `oa.*` ids are its own.
+pub fn core() -> Plugin {
+    static CORE: std::sync::OnceLock<Plugin> = std::sync::OnceLock::new();
+    CORE.get_or_init(|| {
+        let read = |name: &str| embedded::CORE_FILES.iter().find(|(n, _)| *n == name).map(|(_, text)| text.to_string()).ok_or_else(|| format!("{name}: not found"));
+        let manifest = read(MANIFEST).expect("Atelier Core's manifest is built in");
+        let mut core = from_manifest(&manifest, &read, true).unwrap_or_else(|e| panic!("Atelier Core: {e}"));
+        core.version = env!("CARGO_PKG_VERSION").into();
+        core
+    })
+    .clone()
 }
 
 // ---- manifests -------------------------------------------------------------
@@ -121,7 +124,8 @@ fn default_api() -> u32 {
 struct EffectDef {
     id: String,
     name: String,
-    /// point · uv_warp · spatial · transition · glyph · glyph_pixel · sound
+    /// point · uv_warp · spatial · transition · motion · glyph · glyph_pixel · text_box ·
+    /// sound
     kind: String,
     /// passive (default) · in_out · cut
     #[serde(default)]
@@ -138,11 +142,68 @@ struct EffectDef {
     /// Opaque input stays opaque. Default: true for `point`, false otherwise.
     #[serde(default)]
     preserves_opacity: Option<bool>,
+    /// May be fused into one pass with its neighbors. Default: true for `point` and
+    /// `uv_warp`.
+    #[serde(default)]
+    fusible: Option<bool>,
     #[serde(default = "one")]
     version: u32,
     #[serde(default)]
+    description: String,
+    /// The picker's group ("Color", "Blur"…); the plugin's name when missing.
+    #[serde(default)]
+    category: Option<String>,
+    /// Settings for its preview in the picker, by parameter id.
+    #[serde(default)]
+    preview: serde_json::Map<String, serde_json::Value>,
+    /// A host editor: "surface" or "equalizer".
+    #[serde(default)]
+    editor: Option<String>,
+    /// Sound: "reduction" or "correlation".
+    #[serde(default)]
+    meter: Option<String>,
+    /// Sound: seconds of lookahead.
+    #[serde(default)]
+    latency: f64,
+    /// Sound: a script giving how long it rings on (`out`, in seconds).
+    #[serde(default)]
+    tail: Option<Source>,
+    /// `motion`: a script moving the layer.
+    #[serde(default)]
+    motion: Option<Source>,
+    /// A script giving where it may draw.
+    #[serde(default)]
+    bounds: Option<Source>,
+    /// Scripts giving its pass count and each pass's resolution divisor.
+    #[serde(default)]
+    pass_count: Option<Source>,
+    #[serde(default)]
+    pass_divisor: Option<Source>,
+    /// media (default) · original: what `sample_media` reads.
+    #[serde(default)]
+    second_input: Option<String>,
+    #[serde(default)]
     params: Vec<ParamDef>,
-    shader: ShaderDef,
+    /// Every kind but `motion` has one.
+    #[serde(default)]
+    shader: Option<ShaderDef>,
+}
+
+/// A script, written in place or in a file beside the manifest.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum Source {
+    Inline(String),
+    File { file: String },
+}
+
+impl Source {
+    fn text(&self, read: &dyn Fn(&str) -> Result<String, String>) -> Result<String, String> {
+        match self {
+            Source::Inline(s) => Ok(s.clone()),
+            Source::File { file } => read(file),
+        }
+    }
 }
 
 fn one() -> u32 {
@@ -226,7 +287,11 @@ impl ParamDef {
             "vec2" => Value::Vec2(numbers(d, [0.0, 0.0])),
             "vec3" => Value::Vec3(numbers(d, [0.0, 0.0, 0.0])),
             "color" => Value::Color(numbers(d, [1.0, 1.0, 1.0, 1.0])),
-            "gradient" => Value::Gradient(Gradient::solid(numbers(d, [1.0, 1.0, 1.0, 1.0]))),
+            // A color (solid), or a whole gradient as the editor saves one.
+            "gradient" => match d.map(|v| serde_json::from_value::<Gradient>(v.clone())) {
+                Some(Ok(g)) => Value::Gradient(g),
+                _ => Value::Gradient(Gradient::solid(numbers(d, [1.0, 1.0, 1.0, 1.0]))),
+            },
             "media" => Value::Media(None),
             "text" => Value::Text(d.and_then(|v| v.as_str()).unwrap_or_default().into()),
             "enum" => {
@@ -246,10 +311,16 @@ impl ParamDef {
 }
 
 impl EffectDef {
-    fn into_descriptor(self, dir: Option<&Path>) -> Result<EffectDescriptor, String> {
+    /// `read` fetches a file named in the manifest; `builtin` is Atelier Core, whose ids
+    /// are `oa.*`.
+    fn into_descriptor(self, read: &dyn Fn(&str) -> Result<String, String>, builtin: bool) -> Result<EffectDescriptor, String> {
         let where_ = format!("effect \"{}\"", self.id);
-        if self.id.starts_with("oa.") {
-            return Err(format!("{where_}: ids starting with \"oa.\" are reserved for Atelier Core"));
+        if self.id.starts_with("oa.") != builtin {
+            return Err(if builtin {
+                format!("{where_}: Atelier Core's ids start with \"oa.\"")
+            } else {
+                format!("{where_}: ids starting with \"oa.\" are reserved for Atelier Core")
+            });
         }
         let expand = self.expand.as_deref().map(ParamId::new);
         let kind = match self.kind.as_str() {
@@ -257,8 +328,10 @@ impl EffectDef {
             "uv_warp" => EffectKind::UvWarp,
             "spatial" => EffectKind::Spatial { expand },
             "transition" => EffectKind::Transition,
+            "motion" => EffectKind::Motion,
             "glyph" => EffectKind::Glyph { expand },
             "glyph_pixel" => EffectKind::GlyphPixel,
+            "text_box" => EffectKind::TextBox,
             "sound" => EffectKind::Sound,
             other => return Err(format!("{where_}: unknown kind \"{other}\"")),
         };
@@ -280,18 +353,24 @@ impl EffectDef {
             Some("display") => WorkingSpace::Display,
             Some(other) => return Err(format!("{where_}: unknown space \"{other}\"")),
         };
-        let source = match (&self.shader.source, &self.shader.file) {
-            (Some(s), _) => s.clone(),
-            (None, Some(f)) => {
-                let path = dir.ok_or_else(|| format!("{where_}: \"file\" needs a plugin folder"))?.join(f);
-                std::fs::read_to_string(&path).map_err(|e| format!("{where_}: {}: {e}", path.display()))?
+        let motion_kind = kind == EffectKind::Motion;
+        let shader = match &self.shader {
+            None if motion_kind => None,
+            None => return Err(format!("{where_}: no \"shader\"")),
+            Some(_) if motion_kind => return Err(format!("{where_}: a motion effect has a \"motion\" script, not a shader")),
+            Some(s) => {
+                let source = match (&s.source, &s.file) {
+                    (Some(src), _) => src.clone(),
+                    (None, Some(f)) => read(f).map_err(|e| format!("{where_}: {e}"))?,
+                    (None, None) => return Err(format!("{where_}: no shader \"source\" or \"file\"")),
+                };
+                if kind != EffectKind::Sound && (s.entry.is_empty() || !source.contains(&s.entry)) {
+                    return Err(format!("{where_}: the shader has no function called \"{}\"", s.entry));
+                }
+                Some(EffectShader { entry: s.entry.clone(), source: source.into(), passes: s.passes.max(1) })
             }
-            (None, None) => return Err(format!("{where_}: no shader \"source\" or \"file\"")),
         };
         let sound = kind == EffectKind::Sound;
-        if !sound && (self.shader.entry.is_empty() || !source.contains(&self.shader.entry)) {
-            return Err(format!("{where_}: the shader has no function called \"{}\"", self.shader.entry));
-        }
         let mut params = Vec::new();
         for p in self.params {
             params.push(p.into_schema().map_err(|e| format!("{where_}: {e}"))?);
@@ -299,62 +378,128 @@ impl EffectDef {
         if sound && usage == EffectUsage::Cut {
             return Err(format!("{where_}: a sound effect's usage is passive or in_out"));
         }
+        let mut preview = Vec::new();
+        for (id, v) in self.preview {
+            let Some(p) = params.iter().find(|p| p.id.as_str() == id) else { return Err(format!("{where_}: \"preview\" sets \"{id}\", which isn't one of its parameters")) };
+            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, unit: None, options: p.options.clone(), static_only: false };
+            preview.push((ParamId::new(&id), def.into_schema().map_err(|e| format!("{where_}: preview: {e}"))?.default));
+        }
+        if let Some(e) = &self.editor
+            && ![crate::registry::EDITOR_SURFACE, crate::registry::EDITOR_EQUALIZER].contains(&e.as_str())
+        {
+            return Err(format!("{where_}: unknown editor \"{e}\""));
+        }
+        if let Some(m) = &self.meter
+            && ![crate::registry::METER_REDUCTION, crate::registry::METER_CORRELATION].contains(&m.as_str())
+        {
+            return Err(format!("{where_}: unknown meter \"{m}\""));
+        }
+        let tail = match &self.tail {
+            Some(t) => Some(t.text(read).map_err(|e| format!("{where_}: tail: {e}"))?.into()),
+            None => None,
+        };
+        // Scripts: read and compiled now, so a mistake is reported with the plugin.
+        let script = |what: &str, src: &Option<Source>| -> Result<Option<String>, String> {
+            match src {
+                Some(s) => s.text(read).map(Some).map_err(|e| format!("{where_}: {what}: {e}")),
+                None => Ok(None),
+            }
+        };
+        let motion = match script("motion", &self.motion)? {
+            Some(src) => Some(Arc::new(MotionScript::compile(&src, &params).map_err(|e| format!("{where_}: motion: {e}"))?)),
+            None if motion_kind => return Err(format!("{where_}: a motion effect needs a \"motion\" script")),
+            None => None,
+        };
+        let bounds = match script("bounds", &self.bounds)? {
+            Some(src) => Some(Arc::new(BoundsScript::compile(&src, &params).map_err(|e| format!("{where_}: bounds: {e}"))?)),
+            None => None,
+        };
+        let pass_count = match script("pass_count", &self.pass_count)? {
+            Some(src) => Some(Arc::new(PassScript::compile(&src, &params).map_err(|e| format!("{where_}: pass_count: {e}"))?)),
+            None => None,
+        };
+        let pass_divisor = match script("pass_divisor", &self.pass_divisor)? {
+            Some(src) => Some(Arc::new(PassScript::compile(&src, &params).map_err(|e| format!("{where_}: pass_divisor: {e}"))?)),
+            None => None,
+        };
+        let second_input = match self.second_input.as_deref() {
+            None | Some("media") => SecondInput::Media,
+            Some("original") => SecondInput::Original,
+            Some(other) => return Err(format!("{where_}: unknown second_input \"{other}\"")),
+        };
         let pointish = matches!(kind, EffectKind::PointOp | EffectKind::UvWarp);
-        Ok(EffectDescriptor {
-            type_id: self.id.into(),
-            version: self.version,
-            api_version: PLUGIN_API_VERSION,
-            name: self.name,
-            preserves_opacity: self.preserves_opacity.unwrap_or(kind == EffectKind::PointOp),
-            time_varying: self.time_varying,
-            usage,
-            motion: None,
-            pass_count: None,
-            pass_divisor: None,
-            fusible: pointish,
-            kind,
-            state: crate::registry::Statefulness::Pure,
-            space,
-            params,
-            shader: Some(EffectShader { entry: self.shader.entry, source: source.into(), passes: self.shader.passes.max(1) }),
-        })
+        let mut d = crate::registry::descriptor(&self.id, &self.name, kind.clone(), params);
+        d.version = self.version;
+        d.preserves_opacity = self.preserves_opacity.unwrap_or(kind == EffectKind::PointOp);
+        d.fusible = self.fusible.unwrap_or(pointish);
+        d.time_varying = self.time_varying;
+        d.usage = usage;
+        d.space = space;
+        d.description = self.description;
+        d.category = self.category;
+        d.preview = preview;
+        d.editor = self.editor;
+        d.meter = self.meter;
+        d.latency = self.latency.max(0.0);
+        d.tail = tail;
+        d.motion = motion;
+        d.bounds = bounds;
+        d.pass_count = pass_count;
+        d.pass_divisor = pass_divisor;
+        d.second_input = second_input;
+        d.shader = shader;
+        Ok(d)
     }
+}
+
+/// A parameter type's name in manifests.
+fn type_name(ty: oa_params::ParamType) -> &'static str {
+    use oa_params::ParamType as T;
+    match ty {
+        T::Float => "float",
+        T::Int => "int",
+        T::Bool => "bool",
+        T::Vec2 => "vec2",
+        T::Vec3 => "vec3",
+        T::Color => "color",
+        T::Enum => "enum",
+        T::Text => "text",
+        T::Media => "media",
+        T::Gradient => "gradient",
+    }
+}
+
+/// A plugin from its manifest's text; `read` fetches the files it names.
+fn from_manifest(text: &str, read: &dyn Fn(&str) -> Result<String, String>, builtin: bool) -> Result<Plugin, String> {
+    let manifest: Manifest = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if manifest.api_version != PLUGIN_API_VERSION {
+        return Err(format!("plugin API version {} — this host speaks {PLUGIN_API_VERSION}", manifest.api_version));
+    }
+    if (manifest.id == CORE_ID) != builtin {
+        return Err(format!("\"{CORE_ID}\" is the built-in plugin's id"));
+    }
+    let (mut effects, mut issues) = (Vec::new(), Vec::new());
+    for e in manifest.effects {
+        match e.into_descriptor(read, builtin) {
+            Ok(d) => effects.push(d),
+            Err(e) => issues.push(e),
+        }
+    }
+    Ok(Plugin { id: manifest.id, name: manifest.name, version: manifest.version, description: manifest.description, author: manifest.author, builtin, path: None, effects, issues })
 }
 
 /// Reads one plugin folder (or a lone `plugin.json`). Bad effects are skipped and
 /// reported in `issues`; only a broken manifest fails outright.
 pub fn load(manifest_path: &Path) -> Result<Plugin, String> {
     let text = std::fs::read_to_string(manifest_path).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
-    let manifest: Manifest = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
-    if manifest.api_version != PLUGIN_API_VERSION {
-        return Err(format!(
-            "{}: plugin API version {} — this host speaks {PLUGIN_API_VERSION}",
-            manifest_path.display(),
-            manifest.api_version
-        ));
-    }
-    if manifest.id == CORE_ID {
-        return Err(format!("{}: \"{CORE_ID}\" is the built-in plugin's id", manifest_path.display()));
-    }
-    let dir = manifest_path.parent();
-    let (mut effects, mut issues) = (Vec::new(), Vec::new());
-    for e in manifest.effects {
-        match e.into_descriptor(dir) {
-            Ok(d) => effects.push(d),
-            Err(e) => issues.push(e),
-        }
-    }
-    Ok(Plugin {
-        id: manifest.id,
-        name: manifest.name,
-        version: manifest.version,
-        description: manifest.description,
-        author: manifest.author,
-        builtin: false,
-        path: Some(manifest_path.to_path_buf()),
-        effects,
-        issues,
-    })
+    let dir = manifest_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let read = |name: &str| {
+        let path = dir.join(name);
+        std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let mut plugin = from_manifest(&text, &read, false).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    plugin.path = Some(manifest_path.to_path_buf());
+    Ok(plugin)
 }
 
 /// Every plugin under `dir`: each subfolder's `plugin.json`, plus any `*.plugin.json`
@@ -376,6 +521,10 @@ pub fn load_dir(dir: &Path) -> (Vec<Plugin>, Vec<String>) {
     }
     found.sort();
     for path in found {
+        // Atelier Core's own folder (a checkout's `plugins/atelier-core`) is built in.
+        if std::fs::read_to_string(&path).is_ok_and(|t| serde_json::from_str::<Manifest>(&t).is_ok_and(|m| m.id == CORE_ID)) {
+            continue;
+        }
         match load(&path) {
             Ok(p) if plugins.iter().any(|e: &Plugin| e.id == p.id) => errors.push(format!("{}: another plugin already uses the id \"{}\"", path.display(), p.id)),
             Ok(p) => plugins.push(p),
@@ -406,11 +555,12 @@ mod tests {
 
     #[test]
     fn core_holds_the_builtins() {
-        let core = core(vec![crate::registry::sound("oa.audio.echo", "Echo", EffectUsage::Passive, vec![], None)]);
+        let core = core();
         assert!(core.builtin && core.id == CORE_ID);
+        assert!(core.issues.is_empty(), "{:?}", core.issues);
         assert!(core.effects.iter().any(|d| &*d.type_id == "oa.blur.gaussian"));
         assert!(core.offered_effects() < core.effects.len(), "internal effects aren't offered");
-        assert!(core.summary().contains("1 sound effect"));
+        assert!(core.summary().contains("17 sound effects"), "{}", core.summary());
     }
 
     /// A folder with a manifest and a shader file becomes effects the registry can use.

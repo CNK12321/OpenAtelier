@@ -1,0 +1,23 @@
+// Surface draws wherever its points are: each point rests at its place on the grid
+// (0..1 across the layer) and is moved by its offset. Points past the grid's size are
+// left at a corner, inside the box already.
+let n = grid + 2;
+let side = n - 1;
+let w = x1 - x0;
+let h = y1 - y0;
+grow(select(n > 0, x0 + (0 / side + p00_x) * w, x0), select(n > 0, y0 + (0 / side + p00_y) * h, y0));
+grow(select(n > 1, x0 + (1 / side + p01_x) * w, x0), select(n > 1, y0 + (0 / side + p01_y) * h, y0));
+grow(select(n > 2, x0 + (2 / side + p02_x) * w, x0), select(n > 2, y0 + (0 / side + p02_y) * h, y0));
+grow(select(n > 3, x0 + (3 / side + p03_x) * w, x0), select(n > 3, y0 + (0 / side + p03_y) * h, y0));
+grow(select(n > 1, x0 + (0 / side + p10_x) * w, x0), select(n > 1, y0 + (1 / side + p10_y) * h, y0));
+grow(select(n > 1, x0 + (1 / side + p11_x) * w, x0), select(n > 1, y0 + (1 / side + p11_y) * h, y0));
+grow(select(n > 2, x0 + (2 / side + p12_x) * w, x0), select(n > 2, y0 + (1 / side + p12_y) * h, y0));
+grow(select(n > 3, x0 + (3 / side + p13_x) * w, x0), select(n > 3, y0 + (1 / side + p13_y) * h, y0));
+grow(select(n > 2, x0 + (0 / side + p20_x) * w, x0), select(n > 2, y0 + (2 / side + p20_y) * h, y0));
+grow(select(n > 2, x0 + (1 / side + p21_x) * w, x0), select(n > 2, y0 + (2 / side + p21_y) * h, y0));
+grow(select(n > 2, x0 + (2 / side + p22_x) * w, x0), select(n > 2, y0 + (2 / side + p22_y) * h, y0));
+grow(select(n > 3, x0 + (3 / side + p23_x) * w, x0), select(n > 3, y0 + (2 / side + p23_y) * h, y0));
+grow(select(n > 3, x0 + (0 / side + p30_x) * w, x0), select(n > 3, y0 + (3 / side + p30_y) * h, y0));
+grow(select(n > 3, x0 + (1 / side + p31_x) * w, x0), select(n > 3, y0 + (3 / side + p31_y) * h, y0));
+grow(select(n > 3, x0 + (2 / side + p32_x) * w, x0), select(n > 3, y0 + (3 / side + p32_y) * h, y0));
+grow(select(n > 3, x0 + (3 / side + p33_x) * w, x0), select(n > 3, y0 + (3 / side + p33_y) * h, y0));

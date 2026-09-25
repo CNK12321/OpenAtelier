@@ -15,7 +15,7 @@
 
 use crate::{MediaError, VideoTrack};
 use oa_gpu::{FrameSource, GpuImage, GpuServices, Nv12Frame, RenderError, SourceRequest, VideoColor};
-use oa_time::{Rational, Time};
+use oa_time::Time;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -535,6 +535,27 @@ impl<D: VideoDecoder + 'static> MediaFrameSource<D> {
         false
     }
 
+    /// Gets a decoder ready for `media` at `source_time` before it's needed: playback
+    /// calls this for clips about to start, so a new file doesn't hold up the frame it
+    /// first shows in — its decoder is open, sought and decoding ahead by then. Does
+    /// nothing if a decoder is already there (or on its way), or the file has as many as
+    /// it may.
+    pub fn warm(&mut self, media: u64, source_time: Time) {
+        let frame = self.frame;
+        let Some(entry) = self.media.get_mut(&media) else { return };
+        let Some(target) = entry.video.index.frame_at(source_time.max(Time::ZERO)) else { return };
+        let near = |s: &Slot| s.wanted == Some(target) || s.last.is_some_and(|l| l <= target && target - l <= FORWARD_DECODE_LIMIT);
+        if entry.workers.iter().any(|(_, s)| near(s)) || entry.workers.len() >= DECODERS_PER_FILE {
+            return;
+        }
+        let worker = spawn::<D>(entry.path.clone(), entry.video.clone(), self.open.clone());
+        self.wants += 1;
+        worker.shared.wanted.store(self.wants, Ordering::Release);
+        let _ = worker.tx.send(Cmd::Want { target, generation: self.wants });
+        // Not "used" this frame, so the clip playing now keeps its own decoder.
+        entry.workers.push((worker, Slot { last: Some(target), used: frame.saturating_sub(1), wanted: Some(target) }));
+    }
+
     fn fetch(&mut self, media: u64, target: usize) -> Result<(usize, Surface), MediaError> {
         let index = self.route(media, target);
         let worker = &self.media.get(&media).expect("checked by caller").workers[index].0;
@@ -703,14 +724,4 @@ impl<D: VideoDecoder> Drop for MediaFrameSource<D> {
         // Surfaces still waiting on a submission that never happened: release them now.
         self.in_flight.clear();
     }
-}
-
-/// Converts a decoder timestamp in 100 ns units to exact timeline time.
-pub fn time_from_hns(hns: i64) -> Time {
-    Time::from_rational_floor(Rational::new(hns, 10_000_000))
-}
-
-/// Converts time to 100 ns units, rounding down.
-pub fn hns_from_time(t: Time) -> i64 {
-    (t.0 as i128 * 10_000_000 / oa_time::FLICKS_PER_SECOND as i128) as i64
 }

@@ -7,7 +7,7 @@
 //! clips that still use them keep their settings and are reported as missing.
 
 use oa_graph::plugin::{self, Plugin};
-use oa_graph::registry::{EffectKind, EffectUsage, Registry};
+use oa_graph::registry::{EffectKind, Registry};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -27,14 +27,6 @@ pub struct Plugins {
 impl Plugins {
     /// Atelier Core plus everything under `dir`.
     pub fn load(dir: PathBuf, disabled: &[String]) -> Self {
-        // Atelier Core's sound effects, as effect descriptors like every other effect.
-        let sounds = oa_audio::fx::core_catalog()
-            .iter()
-            .map(|f| {
-                let usage = if f.usage == oa_audio::fx::FxUsage::InOut { EffectUsage::InOut } else { EffectUsage::Passive };
-                oa_graph::registry::sound(&f.type_id, &f.name, usage, f.params.clone(), f.shader.as_ref().map(|p| p.source().into()))
-            })
-            .collect();
         let (mut found, mut errors) = plugin::load_dir(&dir);
         let mut extra_dirs = Vec::new();
         let local = PathBuf::from("plugins");
@@ -56,8 +48,10 @@ impl Plugins {
         for p in &mut found {
             let mut issues = Vec::new();
             p.effects.retain(|d| {
-                let (EffectKind::Sound, Some(shader)) = (&d.kind, &d.shader) else { return true };
-                match oa_audio::shader::Program::compile(&shader.source, &d.params) {
+                if d.kind != EffectKind::Sound {
+                    return true;
+                }
+                match oa_audio::fx::FxInfo::from_descriptor(d) {
                     Ok(_) => true,
                     Err(e) => {
                         issues.push(format!("sound effect \"{}\": {e}", d.type_id));
@@ -67,7 +61,7 @@ impl Plugins {
             });
             p.issues.extend(issues);
         }
-        let mut list = vec![plugin::core(sounds)];
+        let mut list = vec![plugin::core()];
         list.extend(found);
         Plugins { dir, extra_dirs, list, disabled: disabled.iter().cloned().collect(), errors }
     }
@@ -88,9 +82,7 @@ impl Plugins {
         let mut shaders = Vec::new();
         for p in self.enabled().filter(|p| !p.builtin) {
             for d in p.sounds() {
-                let Some(source) = d.shader.as_ref().map(|s| s.source.clone()) else { continue };
-                let usage = if d.usage == EffectUsage::InOut { oa_audio::fx::FxUsage::InOut } else { oa_audio::fx::FxUsage::Passive };
-                match oa_audio::fx::FxInfo::shader(&d.type_id, &d.name, "", d.params.clone(), usage, &source) {
+                match oa_audio::fx::FxInfo::from_descriptor(d) {
                     Ok(fx) => shaders.push(fx),
                     Err(e) => issues.push(format!("{}: {}: {e}", p.name, d.type_id)),
                 }
@@ -125,6 +117,7 @@ impl Plugins {
 mod tests {
     use super::*;
     use oa_graph::plugin::CORE_ID;
+    use oa_graph::registry::EffectUsage;
 
     /// Building a registry installs sound shaders in the mixer, which is process-wide.
     static MIXER: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -153,7 +146,8 @@ mod tests {
 
         let off = Plugins::load(dir.clone(), &[CORE_ID.to_string()]);
         let (none, _) = off.registry();
-        assert_eq!(none.effects().count(), 0, "nothing renders with core off");
+        assert!(none.effects().all(|d| oa_graph::registry::is_internal_effect(&d.type_id)), "only the host's own effects are left with core off");
+        assert!(none.offered(EffectUsage::Passive).is_empty() && none.transitions().next().is_none(), "and nothing is offered");
         assert!(off.sounds(&none).is_empty(), "and nothing is heard");
         assert_eq!(off.list.len(), 1, "it's still listed, so it can be turned back on");
         let _ = std::fs::remove_dir_all(&dir);
@@ -171,6 +165,15 @@ mod tests {
         assert!(issues.is_empty(), "{issues:?}");
         assert!(registry.effect("com.example.vignette").is_some());
         assert!(plugins.sounds(&registry).iter().any(|d| &*d.type_id == "com.example.telephone"));
+        // Its motion intro drops in from above and comes to rest.
+        let drop = registry.effect("com.example.drop").expect("a motion effect");
+        let values = oa_params::ParamSet::default().eval(&drop.params, None, &oa_params::EvalContext::at(oa_time::Time::ZERO, oa_time::Time::ZERO));
+        let at = |visibility: f64| {
+            let input = oa_graph::registry::MotionInput { visibility, progress: visibility, seconds: 0.0, canvas: [1920.0, 1080.0], seed: 1, leaving: false };
+            drop.motion.as_ref().expect("its script").eval(&values, &input)
+        };
+        assert!((at(0.0).offset[1] + 540.0).abs() < 1.0, "starts half a canvas up: {:?}", at(0.0));
+        assert_eq!((at(1.0).offset, at(1.0).opacity), ([0.0, 0.0], 1.0), "and lands");
         let _ = Plugins::load(empty_dir("reset"), &[]).registry();
     }
 

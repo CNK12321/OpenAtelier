@@ -1,0 +1,2 @@
+// Bass Boost: a low shelf lifting everything below `frequency` by `boost` dB.
+out = lowshelf(in, clamp(frequency, 20, 1000), boost);

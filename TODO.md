@@ -5,12 +5,13 @@ Where things stand and what's next. Architecture and rationale live in
 
 ## State
 
-15 crates, ~45k lines of Rust, **321 tests passing, clippy clean** (as of this note):
+16 crates, ~46k lines of Rust, **340 tests passing, clippy clean** (as of this note):
 
 | Crate | What works |
 |---|---|
 | `oa-time` | Flicks, exact rationals, the one frame-selection rule |
 | `oa-params` | Schemas, keyframes w/ easing, clip/source anchoring, wiggle (w/ clock offset), `set_at` (keyframe-aware writes), `shift_clip_clock` |
+| `oa-script` | **New.** OA script: lexer, AST, compiler (steady `let`s hoisted per block), stack machine; hosts give it inputs, outputs and functions |
 | `oa-doc` | Project model, format variants + presets, reframe, ops w/ undo (capped at 1000)/coalescing, JSON file; **`repair()` on load** (overlaps → new track, dup ids, order, empty curves, missing formats…); `MediaInfo.still`; `schema::audio()`; `Item::transition_in/out`, `Op::SetTransition`, track/clip on-off ops |
 | `oa-graph` | Render graph IR, cache keys, registry with WGSL, optimizer; `Affine2::invert`; `NodeOp::Transition` + built-in transitions (dissolve, dip, wipe, push) |
 | `oa-plan` | Snapshot + time → graph; **`scene`**: placements, `layers_at`, `hit_test` (same math as rendering); **`transitions`**: timing windows (`window`, `active`) |

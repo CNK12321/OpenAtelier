@@ -1,0 +1,9 @@
+// Glow's passes: find the nearest edges (a jump flood, one pass per halving of the
+// radius, on a grid coarser for wider halos), then draw. The shader counts its jumps
+// the same way, by doubling.
+let r = max(radius, 0);
+// Cells of 1 to 8 pixels a side: a wide halo doesn't need pixel-exact distances.
+let cell = select(r >= 24, clamp(2 ^ floor(log2(r / 12)), 1, 8), 1);
+let reach = r / cell;
+let jumps = select(reach > 1, min(1 + ceil(log2(reach)), 12), 1);
+out = jumps + 2;

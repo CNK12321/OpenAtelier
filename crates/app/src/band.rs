@@ -122,6 +122,78 @@ impl App {
 
     /// Ctrl+click on the line: a key at `t` with the value there (keyframing the property
     /// if it wasn't). On a key (`key`): removes it.
+    /// Right-click on a key of a clip's line: its exact value and time (drag, or
+    /// double-click to type), going to it, removing it.
+    pub(crate) fn key_menu(&mut self, ui: &mut egui::Ui, item: ItemId, index: usize) {
+        let (Some(band), Some(it)) = (self.clip_band(item), self.editor.item(item).cloned()) else {
+            ui.close();
+            return;
+        };
+        let Some(mut src) = self.editor.param_source(item, &band.target, &band.param) else {
+            ui.close();
+            return;
+        };
+        let Some(curve) = src.curve_mut().filter(|c| index < c.keys.len()) else {
+            ui.close();
+            return;
+        };
+        if curve.anchor != KeyframeAnchor::ClipStart {
+            ui.label("This key follows the source's clock: drag it on the line.");
+            return;
+        }
+        // Shown as the inspector shows it: opacity in percent, gain in dB.
+        let (k, suffix) = if band.param == schema::OPACITY { (100.0, " %") } else if band.param == schema::AUDIO_GAIN { (1.0, " dB") } else { (1.0, "") };
+        let name = band.param.rsplit('.').next().unwrap_or(&band.param).replace('_', " ");
+        let key = curve.keys[index].clone();
+        let mut changed = false;
+        let mut finished = false;
+        let mut moved_to = None;
+        egui::Grid::new(("key-menu", item.0, index)).num_columns(2).show(ui, |ui| {
+            if let Some(v) = key.value.as_float() {
+                ui.label(name);
+                let mut shown = v * k;
+                let r = ui.add(egui::DragValue::new(&mut shown).speed(((band.hi - band.lo) * k / 200.0).max(1e-4)).max_decimals(4).suffix(suffix));
+                if r.changed() {
+                    curve.keys[index].value = Value::Float(shown / k);
+                    changed = true;
+                }
+                finished |= r.drag_stopped() || r.lost_focus();
+                ui.end_row();
+            }
+            ui.label("at");
+            let mut secs = key.t.as_seconds_f64();
+            let r = ui.add(egui::DragValue::new(&mut secs).speed(0.01).range(0.0..=it.range.duration.as_seconds_f64()).max_decimals(3).suffix(" s into the clip"));
+            let moved = Time::from_seconds_f64(secs);
+            if r.changed() && !curve.keys.iter().any(|k| k.t == moved) {
+                curve.keys[index].t = moved;
+                curve.keys.sort_by_key(|k| k.t);
+                moved_to = curve.keys.iter().position(|k| k.t == moved);
+                changed = true;
+            }
+            finished |= r.drag_stopped() || r.lost_focus();
+            ui.end_row();
+        });
+        if changed {
+            self.editor.set_param(item, band.target.clone(), &band.param, src, "keyframe-menu");
+            // Moved past another key: the menu follows it to its new place in the order.
+            if let Some(i) = moved_to {
+                self.timeline_view.menu = Some(crate::timeline::Menu::Key(item, i));
+            }
+        }
+        if finished {
+            self.editor.doc.seal();
+        }
+        ui.separator();
+        if ui.button("Go to this key").clicked() {
+            self.set_playhead(it.range.start + key.t);
+            ui.close();
+        }
+        if ui.button("Delete key").clicked() {
+            self.toggle_band_key(item, &band, Some(index), it.range.start + key.t);
+            ui.close();
+        }
+    }
+
     pub(crate) fn toggle_band_key(&mut self, item: ItemId, band: &Band, key: Option<usize>, t: Time) {
         let Some(it) = self.editor.item(item).cloned() else { return };
         let ctx = it.eval_context(t);

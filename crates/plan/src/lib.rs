@@ -228,7 +228,7 @@ impl Planner<'_> {
                     canvas_rect,
                     top && background[3] >= 1.0,
                 );
-                let (node, _) = self.effect_chain(item, &ctx, below, canvas_rect, scale, [canvas_rect.x1, canvas_rect.y1], false, depth);
+                let (node, _) = self.effect_chain(item, &ctx, below, canvas_rect, scale, [canvas_rect.x1, canvas_rect.y1], false, depth, None);
                 let blend = blend_of(&vis);
                 if mix < 1.0 || blend != BlendMode::Normal {
                     // The untouched picture, with the result laid over it.
@@ -292,7 +292,7 @@ impl Planner<'_> {
         };
         let bounds = self.b.node(node).bounds;
         let size = [bounds.x1 - bounds.x0, bounds.y1 - bounds.y0];
-        self.effect_chain(item, &ctx, node, bounds, scale, size, false, depth).0
+        self.effect_chain(item, &ctx, node, bounds, scale, size, false, depth, None).0
     }
 
     /// Where a composite's layers actually put pixels, within `canvas` (`None`: nowhere).
@@ -329,7 +329,7 @@ impl Planner<'_> {
         let placed = self.b.add(NodeOp::Transform { matrix }, vec![front], matrix.map_rect(Rect::from_size(w, h)), false);
         let layers = vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false }];
         let shrunk = self.b.add(NodeOp::Composite { size: small, background: [0.0; 4], layers }, vec![placed], small_rect, false);
-        let blurred = self.internal("oa.blur.gaussian", vec![(blur * scale * k) as f32, 1.0], shrunk, small_rect)?;
+        let blurred = self.internal(oa_graph::registry::BLUR, vec![(blur * scale * k) as f32, 1.0], shrunk, small_rect)?;
         let dimmed = self.internal(oa_graph::registry::DIM, vec![dim as f32], blurred, small_rect)?;
         let up = Affine2::scale(w / small[0] as f64, h / small[1] as f64);
         Some(self.b.add(NodeOp::Transform { matrix: up }, vec![dimmed], up.map_rect(small_rect), false))
@@ -457,11 +457,11 @@ impl Planner<'_> {
         let mut total = Motion::NONE;
         for fx in item.active_effects().iter().filter(|e| e.enabled) {
             let Some(d) = self.registry.effect(&fx.type_id) else { continue };
-            let Some(f) = d.motion.filter(|_| d.kind == oa_graph::EffectKind::Motion) else { continue };
+            let Some(script) = d.motion.as_ref().filter(|_| d.kind == oa_graph::EffectKind::Motion) else { continue };
             let Some(clock) = fx.role.clock(ctx.clip_time, item.range.duration) else { continue };
             let values = fx.params.eval(&d.params, None, ctx);
             let input = MotionInput { visibility: clock.visibility, progress: clock.progress, seconds: clock.seconds, canvas, seed: fx.id.0, leaving: matches!(fx.role, oa_doc::EffectRole::Out { .. }) };
-            total = total.then(f(&values, &input));
+            total = total.then(script.eval(&values, &input));
         }
         total
     }
@@ -480,8 +480,11 @@ impl Planner<'_> {
         raster_size: [f64; 2],
         pixelated: bool,
         depth: usize,
+        text: Option<(std::sync::Arc<oa_text::TextSpec>, f64)>,
     ) -> (NodeId, Rect) {
         for fx in item.active_effects().iter().filter(|e| e.enabled) {
+            // On a title, an effect can be bounded to some of its letters.
+            let (before, before_bounds) = (node, bounds);
             if self.registry.is_sound(&fx.type_id) {
                 continue; // sound: the audio mixer runs it
             }
@@ -502,8 +505,8 @@ impl Planner<'_> {
             let values = fx.params.eval(&d.params, None, ctx);
             // A media parameter's picture becomes the effect's second input, stretched
             // over the layer at the layer's raster size.
-            // Glow's second input is the clip itself, unblurred, to lay over its halo.
-            let media_input = if d.type_id.as_ref() == oa_graph::registry::GLOW {
+            // Or the picture as it came in (Glow lays it over its halo).
+            let media_input = if d.second_input == oa_graph::registry::SecondInput::Original {
                 Some(node)
             } else {
                 d.media_param()
@@ -546,6 +549,27 @@ impl Planner<'_> {
             node = self.b.add(op, inputs, bounds, opaque);
             if display {
                 node = self.internal_keeping(oa_graph::registry::TO_LINEAR, vec![], node, bounds, opaque).unwrap_or(node);
+            }
+            // Bounded: the effect's result where the letters' mask says, the picture as
+            // it was elsewhere.
+            if let Some((spec, scale)) = &text
+                && let Some(b) = schema::bounds_of(&fx.params.eval(schema::bounds(), None, ctx))
+            {
+                let area = bounds.union(&before_bounds);
+                let range = [b.percent as u8 as f32, b.start as f32, b.end as f32, b.blend as f32];
+                let mask = self.b.add(NodeOp::TextMask { spec: spec.clone(), scale: *scale, bounds: range }, vec![], area, false);
+                let two = |p: &mut Self, id: &str, a: NodeId, b: NodeId| -> Option<NodeId> {
+                    let op = p.internal_op(id, vec![])?;
+                    Some(p.b.add(op, vec![a, b], area, false))
+                };
+                let keep = two(self, oa_graph::registry::MASK_KEEP, node, mask);
+                let drop = two(self, oa_graph::registry::MASK_DROP, before, mask);
+                if let (Some(keep), Some(drop)) = (keep, drop)
+                    && let Some(mixed) = two(self, oa_graph::registry::ADD, keep, drop)
+                {
+                    node = mixed;
+                    bounds = area;
+                }
             }
         }
         (node, bounds)
@@ -641,7 +665,7 @@ impl Planner<'_> {
         ctx: &oa_params::EvalContext,
         raster: f64,
         bounds: Rect,
-    ) -> (NodeId, Rect) {
+    ) -> (NodeId, Rect, std::sync::Arc<oa_text::TextSpec>) {
         let values = item.params.eval(schema::text(), variant.overrides.get(&item.id), ctx);
         let spec = scene::text_spec(&values);
         // "Highlight when spoken": the values the spoken word takes instead.
@@ -705,7 +729,13 @@ impl Planner<'_> {
                 u
             };
             any_spoken |= alt.is_some();
-            chain.push(oa_graph::TextEffect { type_id: d.type_id.clone(), version: d.version, uniforms: pack(&values), spoken: alt.as_ref().map(pack).unwrap_or_default() });
+            // Bounded to some of the letters (per-letter and per-pixel effects).
+            let bounds = if matches!(d.kind, oa_graph::EffectKind::Glyph { .. } | oa_graph::EffectKind::GlyphPixel) {
+                schema::bounds_of(&fx.params.eval(schema::bounds(), None, ctx)).map(|b| [b.percent as u8 as f32, b.start as f32, b.end as f32, b.blend as f32])
+            } else {
+                None
+            };
+            chain.push(oa_graph::TextEffect { type_id: d.type_id.clone(), version: d.version, uniforms: pack(&values), spoken: alt.as_ref().map(pack).unwrap_or_default(), bounds });
         }
         // Which word is being spoken — only worked out when something changes for it,
         // so other titles' frames (and cache keys) don't depend on it.
@@ -716,8 +746,9 @@ impl Planner<'_> {
         };
         let margin = (outline + reach_em * spec.size) * raster + 2.0;
         let bounds = bounds.expand(margin);
-        let op = NodeOp::Text { spec: std::sync::Arc::new(spec), scale: raster, style, spoken_style, spoken_word, chain };
-        (self.b.add(op, vec![], bounds, false), bounds)
+        let spec = std::sync::Arc::new(spec);
+        let op = NodeOp::Text { spec: spec.clone(), scale: raster, style, spoken_style, spoken_word, chain };
+        (self.b.add(op, vec![], bounds, false), bounds, spec)
     }
 
     fn layer(
@@ -785,6 +816,8 @@ impl Planner<'_> {
         };
         let raster_size = [native[0] * raster, native[1] * raster];
         let mut bounds = Rect::from_size(raster_size[0], raster_size[1]);
+        // A title's layout, for effects bounded to some of its letters.
+        let mut text_layout = None;
 
         let mut node = match &item.kind {
             ItemKind::Media { media } => {
@@ -824,7 +857,8 @@ impl Planner<'_> {
             }
             ItemKind::Nested { sequence } => self.sequence(*sequence, None, ctx.source_time, raster, depth + 1),
             ItemKind::Text => {
-                let (node, grown) = self.text(item, variant, &ctx, raster, bounds);
+                let (node, grown, spec) = self.text(item, variant, &ctx, raster, bounds);
+                text_layout = Some((spec, raster));
                 bounds = grown;
                 node
             }
@@ -843,7 +877,7 @@ impl Planner<'_> {
             node = self.b.add(op, vec![node], bounds, false);
         }
 
-        let (node, bounds) = self.effect_chain(item, &ctx, node, bounds, raster, raster_size, pixelated, depth);
+        let (node, bounds) = self.effect_chain(item, &ctx, node, bounds, raster, raster_size, pixelated, depth, text_layout);
 
         let matrix = Affine2::scale(1.0 / raster, 1.0 / raster).then(&full);
         let opaque = self.b.node(node).opaque && matrix.is_axis_aligned();

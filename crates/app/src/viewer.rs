@@ -39,6 +39,16 @@ impl Default for ViewerView {
 pub struct ViewerDrag {
     pub gesture: Gesture,
     pub guides: Vec<Guide>,
+    /// The other selected clips, which follow: moved by the same amount (their own
+    /// gestures on the body), or scaled and turned as much as the grabbed clip is (their
+    /// scale and rotation at the start).
+    pub followers: Vec<Follower>,
+}
+
+pub struct Follower {
+    pub gesture: Gesture,
+    pub scale: [f64; 2],
+    pub rotation: f64,
 }
 
 fn cursor_for(handle: Handle, rotation: f64) -> egui::CursorIcon {
@@ -238,15 +248,26 @@ impl App {
             h.pick(p, pointer, GRAB_PX / zoom)
         };
         let surface_point = |pointer: egui::Pos2| -> Option<usize> { surface.as_ref()?.point_near(selected.as_ref()?, &to_screen, pointer) };
+        // Its effects' points (a Swirl's center…), grabbed before anything else.
+        let effect_points = selected.as_ref().map(|p| self.effect_points(p.item, t)).unwrap_or_default();
+        let effect_point = |pointer: egui::Pos2| -> Option<usize> { crate::points::point_near(&effect_points, selected.as_ref()?, &to_screen, pointer) };
         let hit = |pointer: [f64; 2]| variant.as_ref().and_then(|v| scene::hit_test(&project, seq, v, t, pointer));
 
         // Pointer feedback.
         let mut hovered_layer = None;
         let mut hovered_point = None;
-        if let Some(pos) = response.hover_pos().filter(|_| self.viewer_drag.is_none() && self.surface_drag.is_none()) {
+        let mut hovered_effect_point = None;
+        if let Some(pos) = response.hover_pos().filter(|_| self.viewer_drag.is_none() && self.surface_drag.is_none() && self.point_drag.is_none()) {
             let c = to_canvas(pos);
+            hovered_effect_point = effect_point(pos);
             hovered_point = surface_point(pos);
             match pick(c) {
+                _ if hovered_effect_point.is_some() => {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    if let Some(e) = hovered_effect_point.and_then(|i| effect_points.get(i)) {
+                        response.clone().on_hover_text(format!("{}: {} (drag it; right-click its values in the inspector to track it)", e.name, e.param.replace('_', " ")));
+                    }
+                }
                 _ if hovered_point.is_some() => ui.ctx().set_cursor_icon(egui::CursorIcon::Grab),
                 Some(h) => {
                     let rotation = selected.as_ref().map_or(0.0, |p| p.values.float(oa_doc::schema::ROTATION));
@@ -310,7 +331,11 @@ impl App {
         // (not while cropping: the pointer belongs to the crop then).
         if response.drag_started_by(egui::PointerButton::Primary) && self.crop_mode.is_none() {
             let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
-            if let (Some(origin), Some(p), Some(s)) = (origin, selected.as_ref(), surface.as_ref())
+            if let (Some(origin), Some(p)) = (origin, selected.as_ref())
+                && let Some(i) = effect_point(origin)
+            {
+                self.begin_point_drag(p, &effect_points[i], to_canvas(origin));
+            } else if let (Some(origin), Some(p), Some(s)) = (origin, selected.as_ref(), surface.as_ref())
                 && let Some(i) = s.point_near(p, &to_screen, origin)
             {
                 self.begin_surface_drag(p, s, i, to_canvas(origin));
@@ -321,11 +346,24 @@ impl App {
                     None => hit(c).map(|id| (id, Handle::Body)),
                 };
                 if let Some((item, handle)) = grabbed {
+                    // Grabbing one of several selected clips drags them all.
+                    let others: Vec<oa_doc::ItemId> = if self.selected.contains(&item) && handle != Handle::Anchor { self.selected_clips().into_iter().filter(|o| *o != item).collect() } else { Vec::new() };
                     self.selection = Some(item);
                     self.set_playing(false);
                     let scope = self.transform_scope();
                     match Gesture::begin(&project, seq, variant_id, item, t, handle, c, scope) {
-                        Ok(gesture) => self.viewer_drag = Some(ViewerDrag { gesture, guides: Vec::new() }),
+                        Ok(gesture) => {
+                            let followers = others
+                                .into_iter()
+                                .filter_map(|o| {
+                                    let gesture = Gesture::begin(&project, seq, variant_id, o, t, Handle::Body, c, scope).ok()?;
+                                    let v = &gesture.start().values;
+                                    let (scale, rotation) = (v.vec2(oa_doc::schema::SCALE), v.float(oa_doc::schema::ROTATION));
+                                    Some(Follower { gesture, scale, rotation })
+                                })
+                                .collect();
+                            self.viewer_drag = Some(ViewerDrag { gesture, guides: Vec::new(), followers });
+                        }
                         Err(e) => self.error = Some(e.to_string()),
                     }
                 }
@@ -336,8 +374,45 @@ impl App {
         {
             let snap = if mods.step { 0.0 } else { SNAP_PX / zoom };
             match drag.gesture.update(self.editor.doc.project(), to_canvas(pos), mods, snap) {
-                Ok(update) => {
+                Ok(mut update) => {
                     drag.guides = update.guides;
+                    let project = self.editor.doc.project();
+                    match drag.gesture.handle {
+                        // The others move with the pointer too (snapping is the grabbed
+                        // clip's).
+                        Handle::Body => {
+                            for f in &drag.followers {
+                                if let Ok(u) = f.gesture.update(project, to_canvas(pos), mods, 0.0) {
+                                    update.ops.extend(u.ops);
+                                }
+                            }
+                        }
+                        // The others scale and turn by as much as the grabbed clip does.
+                        _ if !drag.followers.is_empty() => {
+                            let v0 = &drag.gesture.start().values;
+                            let (s0, r0) = (v0.vec2(oa_doc::schema::SCALE), v0.float(oa_doc::schema::ROTATION));
+                            let (mut s1, mut r1) = (s0, r0);
+                            for (param, value) in &update.values {
+                                match (*param, value) {
+                                    (oa_doc::schema::SCALE, oa_params::Value::Vec2(s)) => s1 = *s,
+                                    (oa_doc::schema::ROTATION, oa_params::Value::Float(r)) => r1 = *r,
+                                    _ => {}
+                                }
+                            }
+                            let ratio = [s1[0] / s0[0].max(1e-9), s1[1] / s0[1].max(1e-9)];
+                            for f in &drag.followers {
+                                let g = &f.gesture;
+                                let write = |param: &str, value: oa_params::Value| oa_edit::transform::write_param(project, g.seq, g.item, g.variant, g.scope, g.t, param, value);
+                                if (ratio[0] - 1.0).abs() > 1e-9 || (ratio[1] - 1.0).abs() > 1e-9 {
+                                    update.ops.extend(write(oa_doc::schema::SCALE, oa_params::Value::Vec2([f.scale[0] * ratio[0], f.scale[1] * ratio[1]])).ok());
+                                }
+                                if (r1 - r0).abs() > 1e-9 {
+                                    update.ops.extend(write(oa_doc::schema::ROTATION, oa_params::Value::Float(f.rotation + r1 - r0)).ok());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                     let label = match drag.gesture.handle {
                         Handle::Body => "Move layer",
                         Handle::Corner(_) | Handle::Edge(_) => "Scale layer",
@@ -368,14 +443,24 @@ impl App {
         if response.drag_stopped_by(egui::PointerButton::Primary) && self.viewer_drag.take().is_some() {
             self.editor.doc.seal();
         }
+        if let (Some(drag), Some(p), Some(pos)) = (self.point_drag.clone(), selected.as_ref(), response.interact_pointer_pos())
+            && response.dragged_by(egui::PointerButton::Primary)
+            && drag.item == p.item
+        {
+            self.drag_point(&drag, p, to_canvas(pos));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
         if !ui.input(|i| i.pointer.primary_down()) && self.surface_drag.take().is_some() {
+            self.editor.doc.seal();
+        }
+        if !ui.input(|i| i.pointer.primary_down()) && self.point_drag.take().is_some() {
             self.editor.doc.seal();
         }
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
             let c = to_canvas(pos);
-            if pick(c).is_none() && surface_point(pos).is_none() {
+            if pick(c).is_none() && surface_point(pos).is_none() && effect_point(pos).is_none() {
                 self.selection = hit(c);
             }
         }
@@ -439,6 +524,11 @@ impl App {
             for d in [egui::vec2(9.0, 0.0), egui::vec2(0.0, 9.0)] {
                 painter.line_segment([pivot - d, pivot + d], egui::Stroke::new(1.0, accent));
             }
+        }
+        // The selected clip's effect points, where they are after this frame's edits.
+        if let Some(p) = current.as_ref().filter(|p| self.crop_mode != Some(p.item)) {
+            let points = self.effect_points(p.item, t);
+            self.paint_points(&painter, p, &points, &to_screen, hovered_effect_point);
         }
         if let Some((id, _)) = self.canvas_text {
             match visible(id) {

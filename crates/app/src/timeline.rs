@@ -66,6 +66,8 @@ pub(crate) enum Menu {
     Empty(Time, Option<TrackId>),
     /// A divider (and the section it starts).
     Divider(u64),
+    /// Key `index` of a clip's keyframe line.
+    Key(ItemId, usize),
 }
 
 pub enum TimelineDrag {
@@ -687,6 +689,8 @@ impl App {
         {
             self.timeline_view.menu = if let Some(m) = flag_at(pos).or_else(|| line_at(pos)) {
                 Some(Menu::Divider(m.divider.id))
+            } else if let Some((item, _, Some(key), _)) = band_hit(self, pos) {
+                Some(Menu::Key(item, key))
             } else if pos.x < lane.left() {
                 row_at(pos.y).map(|r| Menu::Track(rows[r].0))
             } else if let Some(b) = clip_at(pos) {
@@ -705,6 +709,7 @@ impl App {
             Some(Menu::Track(track)) => self.track_menu(ui, track),
             Some(Menu::Empty(at, track)) => self.empty_menu(ui, at, track),
             Some(Menu::Divider(divider)) => self.divider_menu(ui, divider),
+            Some(Menu::Key(item, key)) => self.key_menu(ui, item, key),
             None => {
                 ui.close();
             }

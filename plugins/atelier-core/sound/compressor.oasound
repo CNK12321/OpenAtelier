@@ -1,0 +1,19 @@
+// Compressor. Linked: the louder channel decides, so the stereo image doesn't wander.
+let loudest = max(abs(left), abs(right));
+let level = select(loudest > 0.000001, to_db(loudest), -120);
+
+// How far to turn it down: 1/ratio of what's over the threshold, eased in over the knee.
+let over = level - threshold;
+let slope = 1 - 1 / max(ratio, 1);
+let k = max(knee, 0);
+let in_knee = k > 0 && abs(over) <= k / 2;
+let target = select(in_knee, slope * (over + k / 2) ^ 2 / (2 * max(k, 0.0001)), select(over > 0, slope * over, 0));
+
+// Getting there fast (attack), letting go slowly (release).
+let attack_k = 1 - exp(-1 / (max(attack, 0.0001) * sample_rate));
+let release_k = 1 - exp(-1 / (max(release, 0.0001) * sample_rate));
+state gr = 0;
+gr += (target - gr) * select(target > gr, attack_k, release_k);
+
+reduction = gr;
+out = in * db(makeup - gr);

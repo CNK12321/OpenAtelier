@@ -12,6 +12,7 @@ mod geom;
 mod optimize;
 pub mod plugin;
 pub mod registry;
+pub mod script;
 
 pub use geom::{Affine2, Rect};
 pub use optimize::{optimize, OptLevel};
@@ -125,6 +126,11 @@ pub enum NodeOp {
     /// (`spoken_word`, −1 for none) is drawn with `spoken_style` and each effect's
     /// `spoken` uniforms — "highlight when spoken".
     Text { spec: Arc<oa_text::TextSpec>, scale: f64, style: Vec<f32>, spoken_style: Vec<f32>, spoken_word: f32, chain: Vec<TextEffect> },
+    /// Where a bounded effect applies on a text layer: each letter's share of the layer
+    /// (a cell from halfway to its neighbors, on its line) filled with how much of the
+    /// effect it gets — `bounds` as in [`TextEffect::bounds`] — in every channel,
+    /// straight across the node's bounds (the text laid out as in `Text`).
+    TextMask { spec: Arc<oa_text::TextSpec>, scale: f64, bounds: [f32; 4] },
 }
 
 /// One text effect in a text pass: its packed params (and clock), and the ones it uses on
@@ -135,6 +141,9 @@ pub struct TextEffect {
     pub version: u32,
     pub uniforms: Vec<f32>,
     pub spoken: Vec<f32>,
+    /// Only some of the letters (a "bounded" effect): whether the rest are percent of the
+    /// letter count, then where it starts and ends and its blend, in letters (or percent).
+    pub bounds: Option<[f32; 4]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -223,6 +232,7 @@ impl Graph {
                 let names: Vec<_> = chain.iter().map(|c| &*c.type_id).collect();
                 format!("Text {:?} {}px×{scale} [{}]", spec.content, spec.size, names.join(" → "))
             }
+            NodeOp::TextMask { spec, bounds, .. } => format!("TextMask {:?} {bounds:?}", spec.content),
         };
         let b = n.bounds;
         let key = n.key.map_or("uncached".to_string(), |k| format!("{k:?}"));
@@ -369,7 +379,22 @@ impl GraphBuilder {
                     f32s(&mut h, &fx.uniforms);
                     h.update(&(fx.spoken.len() as u64).to_le_bytes());
                     f32s(&mut h, &fx.spoken);
+                    match &fx.bounds {
+                        Some(b) => {
+                            h.update(&[1]);
+                            f32s(&mut h, b);
+                        }
+                        None => h.update(&[0]),
+                    }
                 }
+            }
+            NodeOp::TextMask { spec, scale, bounds } => {
+                h.update(&[8]);
+                text(&mut h, &spec.content);
+                text(&mut h, &spec.family);
+                h.update(&[spec.bold as u8, spec.italic as u8, spec.align as u8]);
+                f64s(&mut h, &[spec.size, spec.tracking, spec.line_height, *scale]);
+                f32s(&mut h, bounds);
             }
         }
         for i in inputs {

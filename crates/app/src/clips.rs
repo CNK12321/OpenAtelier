@@ -3,7 +3,8 @@
 //! track rename/reorder/delete. Each is one undo step.
 
 use crate::App;
-use oa_doc::{ItemId, Op, TrackId, TrackKind};
+use oa_doc::{schema, ItemId, ItemKind, Op, ParamTarget, TrackId, TrackKind};
+use oa_params::ParamSource;
 use oa_time::Time;
 use std::collections::BTreeSet;
 
@@ -105,7 +106,9 @@ impl App {
             .filter_map(|id| s.find_item(id).map(|(t, i)| (s.tracks[t].id, s.tracks[t].items[i].clone())))
             .collect();
         if !clips.is_empty() {
+            let n = clips.len();
             self.clipboard = clips;
+            self.clipboard_note = Some(format!("OpenAtelier: {n} clip{}", if n == 1 { "" } else { "s" }));
         }
     }
 
@@ -330,13 +333,33 @@ impl App {
                 (MediaScaling::Auto, auto, "Pixel for pictures up to 32×32, smooth otherwise"),
             ] {
                 if ui.radio(current == mode, label).on_hover_text(hint).clicked() {
-                    if let Err(e) = self.editor.apply("Scale mode", vec![Op::SetMediaScaling { media, scaling: mode }]) {
+                    // Every selected picture clip's file, not just this one's.
+                    let mut files = self.selected_picture_media();
+                    if !files.contains(&media) {
+                        files.push(media);
+                    }
+                    let ops = files.into_iter().map(|media| Op::SetMediaScaling { media, scaling: mode }).collect();
+                    if let Err(e) = self.editor.apply("Scale mode", ops) {
                         self.error = Some(e.to_string());
                     }
                     ui.close();
                 }
             }
         });
+    }
+
+    /// The files behind the selected picture clips, each once.
+    pub(crate) fn selected_picture_media(&self) -> Vec<oa_doc::MediaId> {
+        let mut out = Vec::new();
+        for id in self.selected_clips() {
+            if let Some(oa_doc::ItemKind::Media { media }) = self.editor.item(id).map(|i| &i.kind)
+                && self.editor.pool_item(*media).is_some_and(|p| p.probe.video.is_some())
+                && !out.contains(media)
+            {
+                out.push(*media);
+            }
+        }
+        out
     }
 
     pub(crate) fn selection_grouped(&self) -> bool {
@@ -459,10 +482,17 @@ impl App {
             {
                 ops.push(Op::SetReverseIntro { seq, item, on });
             }
-            for (k, fx) in self.effect_clipboard.clone().into_iter().enumerate() {
+            // Only the ones that belong on this clip (sound on sound, text effects on
+            // titles…): one that doesn't mustn't stop the rest.
+            let fitting: Vec<oa_doc::EffectInstance> = self.effect_clipboard.clone().into_iter().filter(|fx| self.effect_fits(item, &fx.type_id)).collect();
+            for (k, fx) in fitting.into_iter().enumerate() {
                 let effect = oa_doc::EffectInstance { id: oa_doc::EffectId(self.editor.doc.alloc_id()), ..fx };
                 ops.push(Op::InsertEffect { seq, item, index: n + k, effect });
             }
+        }
+        if ops.is_empty() {
+            self.report_error("none of the copied effects fit the selected clips");
+            return;
         }
         if let Err(e) = self.editor.apply("Paste effects", ops) {
             self.error = Some(e.to_string());
@@ -471,13 +501,17 @@ impl App {
 
     /// Replaces `effect`'s settings with the copied effect's (same type only).
     pub(crate) fn paste_effect_settings(&mut self, item: ItemId, effect: oa_doc::EffectId) {
-        let Some(it) = self.editor.item(item) else { return };
-        let Some(index) = it.effects.iter().position(|e| e.id == effect) else { return };
-        let target = &it.effects[index];
-        let Some(source) = self.effect_clipboard.iter().find(|e| e.type_id == target.type_id) else { return };
-        let updated = oa_doc::EffectInstance { params: source.params.clone(), ..target.clone() };
         let seq = self.editor.seq;
-        let ops = vec![Op::RemoveEffect { seq, item, effect }, Op::InsertEffect { seq, item, index, effect: updated }];
+        let mut ops = Vec::new();
+        // This effect, and the same effect on the other selected clips.
+        for (item, effect) in std::iter::once((item, effect)).chain(self.editor.effect_peers(item, effect)) {
+            let Some(it) = self.editor.item(item) else { continue };
+            let Some(index) = it.effects.iter().position(|e| e.id == effect) else { continue };
+            let target = &it.effects[index];
+            let Some(source) = self.effect_clipboard.iter().find(|e| e.type_id == target.type_id) else { continue };
+            let updated = oa_doc::EffectInstance { params: source.params.clone(), ..target.clone() };
+            ops.extend([Op::RemoveEffect { seq, item, effect }, Op::InsertEffect { seq, item, index, effect: updated }]);
+        }
         if let Err(e) = self.editor.apply("Paste effect settings", ops) {
             self.error = Some(e.to_string());
         }
@@ -633,6 +667,14 @@ impl App {
     }
 
     /// Right-click menu entries for one effect card.
+    /// Whether `type_id` on `item` can be bounded to some letters: any picture effect on
+    /// a title but one that moves the whole layer, or a text background.
+    pub(crate) fn can_bound(&self, item: ItemId, type_id: &str) -> bool {
+        use oa_graph::EffectKind as K;
+        self.editor.item(item).is_some_and(|it| it.kind == ItemKind::Text)
+            && self.registry.effect(type_id).is_some_and(|d| !matches!(d.kind, K::Motion | K::Sound | K::TextBox | K::Transition))
+    }
+
     pub(crate) fn effect_menu(&mut self, ui: &mut eframe::egui::Ui, item: ItemId, effect: &oa_doc::EffectInstance) {
         if ui.button("Copy effect").clicked() {
             self.copy_effects(item, Some(effect.id));
@@ -642,6 +684,16 @@ impl App {
         if ui.add_enabled(same_type, eframe::egui::Button::new("Paste settings")).on_hover_text("From the copied effect of the same kind").clicked() {
             self.paste_effect_settings(item, effect.id);
             ui.close();
+        }
+        // A per-letter or per-pixel effect on a title can be limited to some of its letters.
+        if self.can_bound(item, &effect.type_id) {
+            ui.separator();
+            let mut on = matches!(effect.params.get(schema::BOUNDED).map(|s| s.eval(&oa_params::EvalContext::at(Time::ZERO, Time::ZERO))), Some(oa_params::Value::Bool(true)));
+            let tip = "Only some of the letters: from a start to an end, in letters or percent of the text, with a blend at the edges";
+            if ui.checkbox(&mut on, "Bounded").on_hover_text(tip).clicked() {
+                self.editor.set_param(item, ParamTarget::Effect(effect.id), schema::BOUNDED, ParamSource::Static(oa_params::Value::Bool(on)), "bounded");
+                ui.close();
+            }
         }
         ui.separator();
         if ui.button("Copy all effects").clicked() {
@@ -784,11 +836,11 @@ impl App {
 /// moments of its window with its default settings.
 fn fades_only(d: &oa_graph::registry::EffectDescriptor) -> bool {
     use oa_graph::registry::MotionInput;
-    let Some(f) = d.motion else { return false };
+    let Some(script) = &d.motion else { return false };
     let values = oa_params::ParamSet::default().eval(&d.params, None, &oa_params::EvalContext::at(Time::ZERO, Time::ZERO));
     [0.0, 0.3, 0.7].into_iter().all(|v| {
         let input = MotionInput { visibility: v, progress: v, seconds: v, canvas: [1920.0, 1080.0], seed: 1, leaving: false };
-        let m = f(&values, &input);
+        let m = script.eval(&values, &input);
         m.offset == [0.0, 0.0] && m.scale == 1.0 && m.rotation == 0.0
     })
 }

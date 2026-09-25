@@ -1,0 +1,20 @@
+// Limiter: nothing past the ceiling. It looks 3 ms ahead (the sound is delayed that
+// much), so the gain is already down when a peak arrives.
+let ceiling_gain = db(min(ceiling, 0));
+let ahead = floor(sample_rate * 0.003) / sample_rate;
+let release_k = 1 - exp(-1 / (max(release, 0.0001) * sample_rate));
+
+// What each moment needs (stored as how far it must come down, so an empty line asks
+// for nothing), and the most any moment in the window needs.
+let loudest = max(abs(left), abs(right));
+line needs = 0.01;
+write(needs, 1 - select(loudest > ceiling_gain, ceiling_gain / loudest, 1));
+let target = 1 - line_max(needs, ahead);
+
+state gain = 1;
+gain = select(target < gain, target, gain + (target - gain) * release_k);
+
+line held = 0.01;
+write(held, in);
+reduction = -to_db(gain);
+out = read(held, ahead) * gain;

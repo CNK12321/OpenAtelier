@@ -33,6 +33,7 @@ oa-edit = { path = "crates/edit" }
 oa-text = { path = "crates/text" }
 oa-captions = { path = "crates/captions" }
 oa-track = { path = "crates/track" }
+oa-script = { path = "crates/script" }
 
 # `cargo run` builds are for working on the editor, but they still render and export
 # real video. Dependencies (wgpu, egui, the decoders, the text shaper) are built fully

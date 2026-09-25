@@ -1,0 +1,765 @@
+{
+  "id": "com.openatelier.core",
+  "name": "Atelier Core",
+  "version": "1.0.0",
+  "author": "OpenAtelier",
+  "description": "The effects OpenAtelier ships with: color, blur, keying, motion, transitions, text animation and sound.",
+  "api_version": 1,
+  "effects": [
+    {
+      "id": "oa.color.exposure", "name": "Exposure", "kind": "point", "category": "Color",
+      "preview": {"stops": 1.2},
+      "params": [
+        {"id": "stops", "type": "float", "default": 0, "min": -10, "max": 10}
+      ],
+      "shader": {"entry": "oa_color_exposure", "file": "color/exposure.wgsl"}
+    },
+    {
+      "id": "oa.color.saturation", "name": "Saturation", "kind": "point", "category": "Color",
+      "preview": {"amount": 2.2},
+      "params": [
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 4}
+      ],
+      "shader": {"entry": "oa_color_saturation", "file": "color/saturation.wgsl"}
+    },
+    {
+      "id": "oa.color.posterize", "name": "Posterize", "kind": "point", "category": "Color", "space": "display",
+      "preview": {"levels": 4},
+      "params": [
+        {"id": "levels", "type": "float", "default": 8, "min": 2, "max": 256}
+      ],
+      "shader": {"entry": "oa_color_posterize", "file": "color/posterize.wgsl"}
+    },
+    {
+      "id": "oa.blur.gaussian", "name": "Blur", "kind": "spatial", "category": "Blur",
+      "preview": {"radius": 24},
+      "params": [
+        {"id": "radius", "type": "float", "default": 8, "min": 0, "max": 2000, "unit": "layer_pixels"},
+        {"id": "edges", "type": "enum", "default": "clamp", "options": ["transparent", "clamp"], "static_only": true}
+      ],
+      "shader": {"entry": "oa_blur_gaussian", "file": "blur/gaussian.wgsl", "passes": 2}
+    },
+    {
+      "id": "oa.blur.smear", "name": "Smear Blur", "kind": "spatial", "category": "Blur",
+      "params": [
+        {"id": "length", "type": "float", "default": 40, "min": 0, "max": 2000, "unit": "layer_pixels"},
+        {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "trail", "type": "bool", "default": false}
+      ],
+      "shader": {"entry": "oa_blur_smear", "file": "blur/smear.wgsl"}
+    },
+    {
+      "id": "oa.warp.wobble", "name": "Wobble", "kind": "spatial", "category": "Warp", "time_varying": true,
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.15, "min": 0, "max": 4},
+        {"id": "speed", "type": "float", "default": 2, "min": 0, "max": 40},
+        {"id": "edges", "type": "enum", "options": ["transparent", "clamp"], "static_only": true}
+      ],
+      "shader": {"entry": "oa_warp_wobble", "file": "warp/wobble.wgsl"}
+    },
+    {
+      "id": "oa.stylize.pixelate", "name": "Pixelate", "kind": "spatial", "category": "Stylize",
+      "params": [
+        {"id": "size", "type": "float", "default": 16, "min": 1, "max": 512, "unit": "layer_pixels"},
+        {"id": "blend", "type": "float", "default": 0, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_stylize_pixelate", "file": "stylize/pixelate.wgsl"}
+    },
+    {
+      "id": "oa.stylize.scanlines", "name": "Scanlines", "kind": "point", "category": "Stylize", "time_varying": true, "preserves_opacity": false,
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.35, "min": 0, "max": 2},
+        {"id": "spacing", "type": "float", "default": 4, "min": 2, "max": 200, "unit": "layer_pixels"},
+        {"id": "sharpness", "type": "float", "default": 1, "min": 0.2, "max": 8},
+        {"id": "roll", "type": "float", "default": 0, "min": -20, "max": 20}
+      ],
+      "shader": {"entry": "oa_stylize_scanlines", "file": "stylize/scanlines.wgsl"}
+    },
+    {
+      "id": "oa.stylize.vignette", "name": "Vignette", "kind": "point", "category": "Stylize", "preserves_opacity": false,
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.6, "min": 0, "max": 2},
+        {"id": "size", "type": "float", "default": 0.75, "min": 0.05, "max": 2},
+        {"id": "softness", "type": "float", "default": 0.45, "min": 0, "max": 2},
+        {"id": "roundness", "type": "float", "default": 1, "min": 0, "max": 1},
+        {"id": "color", "type": "color", "default": [0, 0, 0, 1]},
+        {"id": "center", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"}
+      ],
+      "shader": {"entry": "oa_stylize_vignette", "file": "stylize/vignette.wgsl"}
+    },
+    {
+      "id": "oa.stylize.grain", "name": "Film Grain", "kind": "point", "category": "Stylize", "time_varying": true,
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.12, "min": 0, "max": 1.5},
+        {"id": "size", "type": "float", "default": 2, "min": 1, "max": 64, "unit": "layer_pixels"},
+        {"id": "speed", "type": "float", "default": 24, "min": 0, "max": 60}
+      ],
+      "shader": {"entry": "oa_stylize_grain", "file": "stylize/grain.wgsl"}
+    },
+    {
+      "id": "oa.stylize.halftone", "name": "Halftone", "kind": "spatial", "category": "Stylize",
+      "params": [
+        {"id": "size", "type": "float", "default": 8, "min": 2, "max": 128, "unit": "layer_pixels"},
+        {"id": "angle", "type": "float", "default": 15, "min": -90, "max": 90, "unit": "degrees"},
+        {"id": "paper", "type": "color", "default": [1, 1, 1, 1]},
+        {"id": "ink", "type": "color", "default": [0, 0, 0, 1]}
+      ],
+      "shader": {"entry": "oa_stylize_halftone", "file": "stylize/halftone.wgsl"}
+    },
+    {
+      "id": "oa.stylize.sharpen", "name": "Sharpen", "kind": "spatial", "category": "Stylize",
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.6, "min": 0, "max": 5},
+        {"id": "radius", "type": "float", "default": 1.5, "min": 0.5, "max": 32, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_stylize_sharpen", "file": "stylize/sharpen.wgsl"}
+    },
+    {
+      "id": "oa.stylize.edges", "name": "Edges", "kind": "spatial", "category": "Stylize",
+      "params": [
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 8},
+        {"id": "radius", "type": "float", "default": 1, "min": 0.5, "max": 16, "unit": "layer_pixels"},
+        {"id": "blend", "type": "float", "default": 1, "min": 0, "max": 1},
+        {"id": "color", "type": "color", "default": [1, 1, 1, 1]}
+      ],
+      "shader": {"entry": "oa_stylize_edges", "file": "stylize/edges.wgsl"}
+    },
+    {
+      "id": "oa.warp.fisheye", "name": "Fisheye", "kind": "spatial", "category": "Warp",
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.6, "min": -3, "max": 3},
+        {"id": "zoom", "type": "float", "default": 1, "min": 0.2, "max": 4},
+        {"id": "center", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"}
+      ],
+      "shader": {"entry": "oa_warp_fisheye", "file": "warp/fisheye.wgsl"}
+    },
+    {
+      "id": "oa.warp.swirl", "name": "Swirl", "kind": "spatial", "category": "Warp",
+      "params": [
+        {"id": "angle", "type": "float", "default": 90, "min": -1080, "max": 1080, "unit": "degrees"},
+        {"id": "radius", "type": "float", "default": 0.8, "min": 0.05, "max": 3},
+        {"id": "center", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"}
+      ],
+      "shader": {"entry": "oa_warp_swirl", "file": "warp/swirl.wgsl"}
+    },
+    {
+      "id": "oa.warp.mirror", "name": "Mirror", "kind": "spatial", "category": "Warp",
+      "params": [
+        {"id": "axis", "type": "enum", "options": ["vertical", "horizontal"], "static_only": true},
+        {"id": "position", "type": "float", "default": 0.5, "min": 0, "max": 1},
+        {"id": "flip", "type": "bool", "default": false, "static_only": true}
+      ],
+      "shader": {"entry": "oa_warp_mirror", "file": "warp/mirror.wgsl"}
+    },
+    {
+      "id": "oa.light.glow", "name": "Glow", "kind": "spatial", "category": "Light", "expand": "radius",
+      "second_input": "original",
+      "pass_count": {"file": "light/glow.passes"},
+      "pass_divisor": {"file": "light/glow.divisor"},
+      "params": [
+        {"id": "radius", "type": "float", "default": 30, "min": 0, "max": 400, "unit": "layer_pixels"},
+        {"id": "strength", "type": "float", "default": 0.8, "min": 0, "max": 4},
+        {"id": "color", "type": "color", "default": [1, 1, 1, 1]},
+        {"id": "mode", "type": "enum", "options": ["behind", "over"], "static_only": true}
+      ],
+      "shader": {"entry": "oa_light_glow", "file": "light/glow.wgsl"}
+    },
+    {
+      "id": "oa.light.shadow", "name": "Drop Shadow", "kind": "spatial", "category": "Light",
+      "bounds": "let reach = (abs(distance) + abs(softness)) * raster_scale;\nleft = x0 - reach;\ntop = y0 - reach;\nright = x1 + reach;\nbottom = y1 + reach;",
+      "params": [
+        {"id": "color", "type": "color", "default": [0, 0, 0, 1]},
+        {"id": "opacity", "type": "float", "default": 0.6, "min": 0, "max": 1},
+        {"id": "direction", "type": "float", "default": 45, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "distance", "type": "float", "default": 14, "min": 0, "max": 400, "unit": "layer_pixels"},
+        {"id": "softness", "type": "float", "default": 12, "min": 0, "max": 200, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_light_shadow", "file": "light/shadow.wgsl"}
+    },
+    {
+      "id": "oa.stylize.stroke", "name": "Stroke", "kind": "spatial", "category": "Stylize", "expand": "width",
+      "params": [
+        {"id": "width", "type": "float", "default": 6, "min": 0, "max": 100, "unit": "layer_pixels"},
+        {"id": "color", "type": "color", "default": [1, 1, 1, 1]}
+      ],
+      "shader": {"entry": "oa_stylize_stroke", "file": "stylize/stroke.wgsl"}
+    },
+    {
+      "id": "oa.stylize.glitch", "name": "Glitch", "kind": "spatial", "category": "Stylize", "time_varying": true,
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.5, "min": 0, "max": 1},
+        {"id": "speed", "type": "float", "default": 8, "min": 0, "max": 30},
+        {"id": "split", "type": "float", "default": 6, "min": 0, "max": 100, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_stylize_glitch", "file": "stylize/glitch.wgsl"}
+    },
+    {
+      "id": "oa.warp.kaleidoscope", "name": "Kaleidoscope", "kind": "spatial", "category": "Warp",
+      "params": [
+        {"id": "segments", "type": "float", "default": 6, "min": 2, "max": 24},
+        {"id": "rotation", "type": "float", "default": 0, "min": -180, "max": 180, "unit": "degrees"},
+        {"id": "center", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"}
+      ],
+      "shader": {"entry": "oa_warp_kaleidoscope", "file": "warp/kaleidoscope.wgsl"}
+    },
+    {
+      "id": "oa.warp.ripple", "name": "Ripple", "kind": "spatial", "category": "Warp", "time_varying": true,
+      "params": [
+        {"id": "amplitude", "type": "float", "default": 8, "min": 0, "max": 100, "unit": "layer_pixels"},
+        {"id": "wavelength", "type": "float", "default": 60, "min": 4, "max": 1000, "unit": "layer_pixels"},
+        {"id": "speed", "type": "float", "default": 1, "min": -10, "max": 10},
+        {"id": "center", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"}
+      ],
+      "shader": {"entry": "oa_warp_ripple", "file": "warp/ripple.wgsl"}
+    },
+    {
+      "id": "oa.color.temperature", "name": "Temperature", "kind": "point", "category": "Color",
+      "preview": {"temperature": 0.7},
+      "params": [
+        {"id": "temperature", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "tint", "type": "float", "default": 0, "min": -1, "max": 1}
+      ],
+      "shader": {"entry": "oa_color_temperature", "file": "color/temperature.wgsl"}
+    },
+    {
+      "id": "oa.warp.tile", "name": "Tile", "kind": "spatial", "category": "Warp",
+      "params": [
+        {"id": "columns", "type": "float", "default": 3, "min": 1, "max": 20},
+        {"id": "rows", "type": "float", "default": 3, "min": 1, "max": 20},
+        {"id": "gap", "type": "float", "default": 0, "min": 0, "max": 0.5},
+        {"id": "mirror", "type": "bool", "default": false}
+      ],
+      "shader": {"entry": "oa_warp_tile", "file": "warp/tile.wgsl"}
+    },
+    {
+      "id": "oa.warp.scroll", "name": "Scroll", "kind": "spatial", "category": "Warp", "time_varying": true,
+      "params": [
+        {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "speed", "type": "float", "default": 120, "min": -2000, "max": 2000, "unit": "layer_pixels"},
+        {"id": "edges", "type": "enum", "options": ["wrap", "leave"], "static_only": true}
+      ],
+      "shader": {"entry": "oa_warp_scroll", "file": "warp/scroll.wgsl"}
+    },
+    {
+      "id": "oa.blur.zoom", "name": "Zoom Blur", "kind": "spatial", "category": "Blur",
+      "params": [
+        {"id": "zoom", "type": "float", "default": 0.4, "min": -2, "max": 2},
+        {"id": "spin", "type": "float", "default": 0, "min": -180, "max": 180, "unit": "degrees"},
+        {"id": "center", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"}
+      ],
+      "shader": {"entry": "oa_blur_zoom", "file": "blur/zoom.wgsl"}
+    },
+    {
+      "id": "oa.color.chromatic", "name": "Chromatic Aberration", "kind": "spatial", "category": "Color",
+      "params": [
+        {"id": "amount", "type": "float", "default": 3, "min": 0, "max": 200, "unit": "layer_pixels"},
+        {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "edges", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_color_chromatic", "file": "color/chromatic.wgsl"}
+    },
+    {
+      "id": "oa.color.hue", "name": "Hue Shift", "kind": "point", "category": "Color",
+      "params": [
+        {"id": "angle", "type": "float", "default": 30, "min": -360, "max": 360, "unit": "degrees"},
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_color_hue", "file": "color/hue.wgsl"}
+    },
+    {
+      "id": "oa.color.color-to", "name": "Color To", "kind": "point", "category": "Color",
+      "description": "Replaces one color with another: pixels within the tolerance of \"from\" become \"to\" (its opacity is how much). With \"offset from original\", each keeps its difference in hue, saturation and brightness from \"from\", so shading survives.",
+      "preview": {"tolerance": 0.45},
+      "params": [
+        {"id": "from", "type": "color", "default": [1, 0, 0, 1]},
+        {"id": "tolerance", "type": "float", "default": 0.15, "min": 0, "max": 1},
+        {"id": "softness", "type": "float", "default": 0.05, "min": 0, "max": 0.5},
+        {"id": "to", "type": "color", "default": [0, 0.2, 1, 1]},
+        {"id": "offset_from_original", "type": "bool", "default": true}
+      ],
+      "shader": {"entry": "oa_color_to", "file": "color/color-to.wgsl"}
+    },
+    {
+      "id": "oa.color.contrast", "name": "Contrast", "kind": "point", "category": "Color",
+      "params": [
+        {"id": "contrast", "type": "float", "default": 1.2, "min": 0, "max": 8},
+        {"id": "brightness", "type": "float", "default": 0, "min": -2, "max": 2},
+        {"id": "pivot", "type": "float", "default": 0.18, "min": 0, "max": 1},
+        {"id": "gamma", "type": "float", "default": 1, "min": 0.1, "max": 4}
+      ],
+      "shader": {"entry": "oa_color_contrast", "file": "color/contrast.wgsl"}
+    },
+    {
+      "id": "oa.color.invert", "name": "Invert", "kind": "point", "category": "Color", "space": "display",
+      "params": [
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_color_invert", "file": "color/invert.wgsl"}
+    },
+    {
+      "id": "oa.color.duotone", "name": "Duotone", "kind": "point", "category": "Color", "space": "display",
+      "params": [
+        {"id": "shadows", "type": "color", "default": [0.1, 0.1, 0.4, 1]},
+        {"id": "highlights", "type": "color", "default": [1, 0.85, 0.4, 1]},
+        {"id": "balance", "type": "float", "default": 1, "min": 0.1, "max": 4},
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_color_duotone", "file": "color/duotone.wgsl"}
+    },
+    {
+      "id": "oa.key.chroma", "name": "Chroma Key", "kind": "point", "category": "Keying", "space": "display", "preserves_opacity": false,
+      "params": [
+        {"id": "key", "type": "color", "default": [0, 1, 0, 1]},
+        {"id": "tolerance", "type": "float", "default": 0.12, "min": 0, "max": 1},
+        {"id": "softness", "type": "float", "default": 0.08, "min": 0, "max": 1},
+        {"id": "spill", "type": "float", "default": 0.7, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_key_chroma", "file": "key/chroma.wgsl"}
+    },
+    {
+      "id": "oa.motion.shake", "name": "Camera Shake", "kind": "motion", "category": "Motion", "time_varying": true,
+      "preview": {"intensity": 0.04, "rotation": 4},
+      "params": [
+        {"id": "intensity", "type": "float", "default": 0.012, "min": 0, "max": 0.5},
+        {"id": "frequency", "type": "float", "default": 12, "min": 0.1, "max": 120},
+        {"id": "rotation", "type": "float", "default": 0.6, "min": 0, "max": 90, "unit": "degrees"}
+      ],
+      "motion": {"file": "motion/shake.oamotion"}
+    },
+    {
+      "id": "oa.motion.wiggle", "name": "Wiggle", "kind": "motion", "category": "Motion", "time_varying": true,
+      "preview": {"amount": 0.08, "rotation": 8},
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.02, "min": 0, "max": 1},
+        {"id": "speed", "type": "float", "default": 1.5, "min": 0.1, "max": 10},
+        {"id": "rotation", "type": "float", "default": 3, "min": 0, "max": 180, "unit": "degrees"}
+      ],
+      "motion": {"file": "motion/wiggle.oamotion"}
+    },
+    {
+      "id": "oa.anim.fade", "name": "Fade", "kind": "motion", "category": "Animation", "usage": "in_out",
+      "motion": {"file": "anim/fade.oamotion"}
+    },
+    {
+      "id": "oa.anim.fly", "name": "Fly", "kind": "motion", "category": "Animation", "usage": "in_out",
+      "params": [
+        {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "distance", "type": "float", "default": 1, "min": 0.05, "max": 1.5},
+        {"id": "fade", "type": "bool", "default": false}
+      ],
+      "motion": {"file": "anim/fly.oamotion"}
+    },
+    {
+      "id": "oa.anim.zoom", "name": "Zoom", "kind": "motion", "category": "Animation", "usage": "in_out",
+      "params": [
+        {"id": "scale", "type": "float", "default": 0.6, "min": 0, "max": 4},
+        {"id": "fade", "type": "bool", "default": true}
+      ],
+      "motion": {"file": "anim/zoom.oamotion"}
+    },
+    {
+      "id": "oa.anim.blur", "name": "Defocus", "kind": "spatial", "category": "Animation", "usage": "in_out",
+      "params": [
+        {"id": "radius", "type": "float", "default": 40, "min": 0, "max": 500, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_anim_blur", "file": "anim/blur.wgsl", "passes": 2}
+    },
+    {
+      "id": "oa.anim.reveal", "name": "Wipe", "kind": "spatial", "category": "Animation", "usage": "in_out",
+      "params": [
+        {"id": "angle", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "softness", "type": "float", "default": 30, "min": 0, "max": 500, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_anim_reveal", "file": "anim/reveal.wgsl"}
+    },
+    {
+      "id": "oa.text.wiggle", "name": "Letter Wiggle", "kind": "glyph", "category": "Text", "expand": "amount", "time_varying": true,
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.06, "min": 0, "max": 1},
+        {"id": "speed", "type": "float", "default": 2, "min": 0, "max": 40},
+        {"id": "rotation", "type": "float", "default": 8, "min": 0, "max": 90, "unit": "degrees"}
+      ],
+      "shader": {"entry": "oa_text_wiggle", "file": "text/wiggle.wgsl"}
+    },
+    {
+      "id": "oa.text.wave", "name": "Wave", "kind": "glyph", "category": "Text", "expand": "height", "time_varying": true,
+      "params": [
+        {"id": "height", "type": "float", "default": 0.2, "min": 0, "max": 1},
+        {"id": "speed", "type": "float", "default": 1, "min": 0, "max": 5},
+        {"id": "length", "type": "float", "default": 8, "min": 1, "max": 40}
+      ],
+      "shader": {"entry": "oa_text_wave", "file": "text/wave.wgsl"}
+    },
+    {
+      "id": "oa.text.rainbow", "name": "Rainbow Letters", "kind": "glyph", "category": "Text", "time_varying": true,
+      "params": [
+        {"id": "speed", "type": "float", "default": 0.3, "min": 0, "max": 4},
+        {"id": "spread", "type": "float", "default": 0.08, "min": 0, "max": 0.5},
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_text_rainbow", "file": "text/rainbow.wgsl"}
+    },
+    {
+      "id": "oa.text.typewriter", "name": "Typewriter", "kind": "glyph", "category": "Text", "usage": "in_out",
+      "shader": {"entry": "oa_text_typewriter", "file": "text/typewriter.wgsl"}
+    },
+    {
+      "id": "oa.text.rise", "name": "Letters Rise", "kind": "glyph", "category": "Text", "expand": "distance", "usage": "in_out",
+      "params": [
+        {"id": "distance", "type": "float", "default": 0.6, "min": -3, "max": 3},
+        {"id": "stagger", "type": "float", "default": 0.6, "min": 0, "max": 0.95},
+        {"id": "fade", "type": "bool", "default": true}
+      ],
+      "shader": {"entry": "oa_text_rise", "file": "text/rise.wgsl"}
+    },
+    {
+      "id": "oa.text.pop", "name": "Letters Pop", "kind": "glyph", "category": "Text", "usage": "in_out",
+      "params": [
+        {"id": "stagger", "type": "float", "default": 0.6, "min": 0, "max": 0.95},
+        {"id": "overshoot", "type": "float", "default": 1.7, "min": 0, "max": 4}
+      ],
+      "shader": {"entry": "oa_text_pop", "file": "text/pop.wgsl"}
+    },
+    {
+      "id": "oa.text.scatter", "name": "Letters Scatter", "kind": "glyph", "category": "Text", "expand": "distance", "usage": "in_out",
+      "params": [
+        {"id": "distance", "type": "float", "default": 2, "min": 0, "max": 6},
+        {"id": "spin", "type": "float", "default": 180, "min": 0, "max": 720, "unit": "degrees"},
+        {"id": "stagger", "type": "float", "default": 0.3, "min": 0, "max": 0.95}
+      ],
+      "shader": {"entry": "oa_text_scatter", "file": "text/scatter.wgsl"}
+    },
+    {
+      "id": "oa.text.fade", "name": "Letter Fade", "kind": "glyph", "category": "Text", "usage": "in_out",
+      "params": [
+        {"id": "stagger", "type": "float", "default": 0.7, "min": 0, "max": 0.95}
+      ],
+      "shader": {"entry": "oa_text_fade", "file": "text/fade.wgsl"}
+    },
+    {
+      "id": "oa.text.glow", "name": "Glow", "kind": "glyph_pixel", "category": "Text",
+      "params": [
+        {"id": "color", "type": "gradient", "default": {"angle":90.0,"stops":[{"pos":0.0,"color":[1.0,0.8,0.3,1.0]}]}},
+        {"id": "size", "type": "float", "default": 0.1, "min": 0, "max": 0.2},
+        {"id": "strength", "type": "float", "default": 1, "min": 0, "max": 2}
+      ],
+      "shader": {"entry": "oa_text_glow", "file": "text/glow.wgsl"}
+    },
+    {
+      "id": "oa.text.background", "name": "Background", "kind": "text_box", "category": "Text",
+      "params": [
+        {"id": "shape", "type": "enum", "default": "lines", "options": ["text", "lines", "words"]},
+        {"id": "color", "type": "color", "default": [0, 0, 0, 0.75]},
+        {"id": "padding", "type": "float", "default": 0.3, "min": 0, "max": 1.5},
+        {"id": "roundness", "type": "float", "default": 0.25, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_text_background", "file": "text/background.wgsl"}
+    },
+    {
+      "id": "oa.color.tint", "name": "Tint", "kind": "point", "category": "Color",
+      "params": [
+        {"id": "color", "type": "gradient", "default": {"angle":90.0,"stops":[{"pos":0.0,"color":[1.0,0.6,0.2,1.0]}]}},
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_color_tint", "file": "color/tint.wgsl"}
+    },
+    {
+      "id": "oa.light.shimmer", "name": "Shimmer", "kind": "point", "category": "Light", "time_varying": true,
+      "params": [
+        {"id": "speed", "type": "float", "default": 0.6, "min": 0, "max": 4},
+        {"id": "width", "type": "float", "default": 0.12, "min": 0.01, "max": 1},
+        {"id": "direction", "type": "float", "default": 20, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "color", "type": "color", "default": [1, 1, 1, 1]},
+        {"id": "strength", "type": "float", "default": 0.8, "min": 0, "max": 8}
+      ],
+      "shader": {"entry": "oa_light_shimmer", "file": "light/shimmer.wgsl"}
+    },
+    {
+      "id": "oa.depth.slab", "name": "Depth", "kind": "spatial", "category": "Depth",
+      "bounds": {"file": "depth/slab.bounds"},
+      "params": [
+        {"id": "depth", "type": "float", "default": 8, "min": 0, "max": 200},
+        {"id": "yaw", "type": "float", "default": 25, "min": -180, "max": 180, "unit": "degrees"},
+        {"id": "pitch", "type": "float", "default": 0, "min": -180, "max": 180, "unit": "degrees"},
+        {"id": "pov", "type": "float", "default": 0.35, "min": 0, "max": 1},
+        {"id": "map", "type": "media", "static_only": true},
+        {"id": "back", "type": "float", "default": 0.45, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_depth_slab", "file": "depth/slab.wgsl"}
+    },
+    {
+      "id": "oa.warp.surface", "name": "Surface", "kind": "spatial", "category": "Warp",
+      "editor": "surface",
+      "bounds": {"file": "warp/surface.bounds"},
+      "params": [
+        {"id": "grid", "type": "enum", "options": ["Corners", "3 × 3", "4 × 4"], "static_only": true},
+        {"id": "p00", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p01", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p02", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p03", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p10", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p11", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p12", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p13", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p20", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p21", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p22", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p23", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p30", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p31", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p32", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "p33", "type": "vec2", "default": [0, 0], "unit": "source_fraction"}
+      ],
+      "shader": {"entry": "oa_warp_surface", "file": "warp/surface.wgsl"}
+    },
+    {
+      "id": "oa.mask.media", "name": "Mask", "kind": "spatial", "category": "Masking",
+      "params": [
+        {"id": "matte", "type": "media", "static_only": true},
+        {"id": "use", "type": "enum", "options": ["luma", "alpha"], "static_only": true},
+        {"id": "invert", "type": "bool", "default": false, "static_only": true}
+      ],
+      "shader": {"entry": "oa_mask_media", "file": "mask/media.wgsl"}
+    },
+    {
+      "id": "oa.transition.crossfade", "name": "Cross Dissolve", "kind": "transition", "category": "Transition", "preserves_opacity": true,
+      "shader": {"entry": "oa_transition_crossfade", "file": "transition/crossfade.wgsl"}
+    },
+    {
+      "id": "oa.transition.dip", "name": "Dip to Color", "kind": "transition", "category": "Transition", "preserves_opacity": true,
+      "params": [
+        {"id": "color", "type": "color", "default": [0, 0, 0, 1]}
+      ],
+      "shader": {"entry": "oa_transition_dip", "file": "transition/dip.wgsl"}
+    },
+    {
+      "id": "oa.transition.wipe", "name": "Wipe", "kind": "transition", "category": "Transition", "preserves_opacity": true,
+      "params": [
+        {"id": "angle", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "softness", "type": "float", "default": 40, "min": 0, "max": 500, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_transition_wipe", "file": "transition/wipe.wgsl"}
+    },
+    {
+      "id": "oa.transition.push", "name": "Push", "kind": "transition", "category": "Transition", "preserves_opacity": true,
+      "params": [
+        {"id": "direction", "type": "float", "default": 180, "min": 0, "max": 360, "unit": "direction"}
+      ],
+      "shader": {"entry": "oa_transition_push", "file": "transition/push.wgsl"}
+    },
+    {
+      "id": "oa.transition.iris", "name": "Iris", "kind": "transition", "category": "Transition", "preserves_opacity": true,
+      "params": [
+        {"id": "softness", "type": "float", "default": 24, "min": 0, "max": 400, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_transition_iris", "file": "transition/iris.wgsl"}
+    },
+    {
+      "id": "oa.transition.zoom", "name": "Zoom", "kind": "transition", "category": "Transition", "preserves_opacity": true,
+      "params": [
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 4}
+      ],
+      "shader": {"entry": "oa_transition_zoom", "file": "transition/zoom.wgsl"}
+    },
+    {
+      "id": "oa.transition.slide", "name": "Slide", "kind": "transition", "category": "Transition", "preserves_opacity": true,
+      "params": [
+        {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"}
+      ],
+      "shader": {"entry": "oa_transition_slide", "file": "transition/slide.wgsl"}
+    },
+    {
+      "id": "oa.transition.blur", "name": "Blur Dissolve", "kind": "transition", "category": "Transition", "preserves_opacity": true,
+      "params": [
+        {"id": "radius", "type": "float", "default": 40, "min": 0, "max": 400, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_transition_blur", "file": "transition/blur.wgsl"}
+    },
+    {
+      "id": "oa.audio.bass", "name": "Bass Boost", "kind": "sound", "category": "Sound",
+      "description": "Lifts the low end.",
+      "params": [
+        {"id": "boost", "type": "float", "default": 8, "min": 0, "max": 18, "unit": "decibels"},
+        {"id": "frequency", "type": "float", "default": 110, "min": 40, "max": 300}
+      ],
+      "shader": {"file": "sound/bass.oasound"}
+    },
+    {
+      "id": "oa.audio.pitch", "name": "Pitch Shift", "kind": "sound", "category": "Sound",
+      "description": "Higher or lower, same speed. Formant moves the voice's character (child to giant) on its own; \"keep voice\" holds it where it was while the pitch moves.",
+      "params": [
+        {"id": "semitones", "type": "float", "default": 5, "min": -12, "max": 12},
+        {"id": "mix", "type": "float", "default": 1, "min": 0, "max": 1},
+        {"id": "formant", "type": "float", "default": 0, "min": -12, "max": 12},
+        {"id": "keep_voice", "type": "bool", "default": false}
+      ],
+      "tail": "out = 0.15;",
+      "shader": {"file": "sound/pitch.oasound"}
+    },
+    {
+      "id": "oa.audio.echo", "name": "Echo", "kind": "sound", "category": "Sound",
+      "description": "Repeats that fade away.",
+      "params": [
+        {"id": "delay", "type": "float", "default": 0.35, "min": 0.02, "max": 1.5, "unit": "seconds"},
+        {"id": "feedback", "type": "float", "default": 0.4, "min": 0, "max": 0.9},
+        {"id": "mix", "type": "float", "default": 0.35, "min": 0, "max": 1}
+      ],
+      "tail": {"file": "sound/echo.tail"},
+      "shader": {"file": "sound/echo.oasound"}
+    },
+    {
+      "id": "oa.audio.reverb", "name": "Reverb", "kind": "sound", "category": "Sound",
+      "description": "The sound of a room: pick a space, or set your own. It keeps ringing after the clip ends.",
+      "params": [
+        {"id": "space", "type": "enum", "options": ["custom", "small room", "studio", "hall", "cathedral", "plate", "cave"]},
+        {"id": "room", "type": "float", "default": 0.6, "min": 0, "max": 1},
+        {"id": "damping", "type": "float", "default": 0.4, "min": 0, "max": 1},
+        {"id": "predelay", "type": "float", "default": 0, "min": 0, "max": 0.2, "unit": "seconds"},
+        {"id": "mix", "type": "float", "default": 0.3, "min": 0, "max": 1}
+      ],
+      "tail": {"file": "sound/reverb.tail"},
+      "shader": {"file": "sound/reverb.oasound"}
+    },
+    {
+      "id": "oa.audio.eq", "name": "Equalizer", "kind": "sound", "category": "Sound", "editor": "equalizer",
+      "description": "Shape the tone: a low shelf, three bands and a high shelf. Drag the points on its curve.",
+      "params": [
+        {"id": "low_freq", "type": "float", "default": 100, "min": 20, "max": 600},
+        {"id": "low_gain", "type": "float", "default": 0, "min": -18, "max": 18, "unit": "decibels"},
+        {"id": "p1_freq", "type": "float", "default": 300, "min": 40, "max": 18000},
+        {"id": "p1_gain", "type": "float", "default": 0, "min": -18, "max": 18, "unit": "decibels"},
+        {"id": "p1_q", "type": "float", "default": 1, "min": 0.2, "max": 10},
+        {"id": "p2_freq", "type": "float", "default": 1500, "min": 40, "max": 18000},
+        {"id": "p2_gain", "type": "float", "default": 0, "min": -18, "max": 18, "unit": "decibels"},
+        {"id": "p2_q", "type": "float", "default": 1, "min": 0.2, "max": 10},
+        {"id": "p3_freq", "type": "float", "default": 5000, "min": 40, "max": 18000},
+        {"id": "p3_gain", "type": "float", "default": 0, "min": -18, "max": 18, "unit": "decibels"},
+        {"id": "p3_q", "type": "float", "default": 1, "min": 0.2, "max": 10},
+        {"id": "high_freq", "type": "float", "default": 8000, "min": 1500, "max": 18000},
+        {"id": "high_gain", "type": "float", "default": 0, "min": -18, "max": 18, "unit": "decibels"}
+      ],
+      "shader": {"file": "sound/eq.oasound"}
+    },
+    {
+      "id": "oa.audio.compressor", "name": "Compressor", "kind": "sound", "category": "Sound", "meter": "reduction",
+      "description": "Evens out the level: whatever goes over the threshold is turned down by the ratio.",
+      "params": [
+        {"id": "threshold", "type": "float", "default": -18, "min": -60, "max": 0, "unit": "decibels"},
+        {"id": "ratio", "type": "float", "default": 4, "min": 1, "max": 20},
+        {"id": "attack", "type": "float", "default": 0.01, "min": 0.0001, "max": 0.2, "unit": "seconds"},
+        {"id": "release", "type": "float", "default": 0.15, "min": 0.01, "max": 1.5, "unit": "seconds"},
+        {"id": "knee", "type": "float", "default": 6, "min": 0, "max": 18, "unit": "decibels"},
+        {"id": "makeup", "type": "float", "default": 0, "min": 0, "max": 24, "unit": "decibels"}
+      ],
+      "tail": "out = 0.05;",
+      "shader": {"file": "sound/compressor.oasound"}
+    },
+    {
+      "id": "oa.audio.limiter", "name": "Limiter", "kind": "sound", "category": "Sound", "meter": "reduction",
+      "description": "Nothing gets past the ceiling — put it last, on the whole mix.",
+      "params": [
+        {"id": "ceiling", "type": "float", "default": -1, "min": -24, "max": 0, "unit": "decibels"},
+        {"id": "release", "type": "float", "default": 0.08, "min": 0.005, "max": 1, "unit": "seconds"}
+      ],
+      "latency": 0.003,
+      "tail": "out = 0.05;",
+      "shader": {"file": "sound/limiter.oasound"}
+    },
+    {
+      "id": "oa.audio.deess", "name": "De-esser", "kind": "sound", "category": "Sound", "meter": "reduction",
+      "description": "Tames harsh s and sh sounds in a voice, leaving the rest alone.",
+      "params": [
+        {"id": "frequency", "type": "float", "default": 6500, "min": 2000, "max": 12000},
+        {"id": "threshold", "type": "float", "default": -30, "min": -60, "max": 0, "unit": "decibels"},
+        {"id": "amount", "type": "float", "default": 10, "min": 0, "max": 24, "unit": "decibels"}
+      ],
+      "tail": "out = 0.05;",
+      "shader": {"file": "sound/deess.oasound"}
+    },
+    {
+      "id": "oa.audio.gate", "name": "Threshold", "kind": "sound", "category": "Sound",
+      "description": "Mutes everything quieter than the threshold (a noise gate).",
+      "params": [
+        {"id": "threshold", "type": "float", "default": -40, "min": -80, "max": 0, "unit": "decibels"},
+        {"id": "release", "type": "float", "default": 0.15, "min": 0.01, "max": 1, "unit": "seconds"}
+      ],
+      "shader": {"file": "sound/gate.oasound"}
+    },
+    {
+      "id": "oa.audio.crush", "name": "Bit Crush", "kind": "sound", "category": "Sound",
+      "description": "Coarse and grainy: fewer bits, a lower sample rate, like old hardware.",
+      "params": [
+        {"id": "bits", "type": "float", "default": 6, "min": 1, "max": 16},
+        {"id": "rate", "type": "float", "default": 8000, "min": 200, "max": 48000},
+        {"id": "mix", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"file": "sound/crush.oasound"}
+    },
+    {
+      "id": "oa.audio.denoise", "name": "Denoise", "kind": "sound", "category": "Sound",
+      "description": "Removes steady background noise (hiss, hum, fans).",
+      "params": [
+        {"id": "reduction", "type": "float", "default": 18, "min": 0, "max": 40, "unit": "decibels"},
+        {"id": "sensitivity", "type": "float", "default": 2, "min": 0.5, "max": 4}
+      ],
+      "shader": {"file": "sound/denoise.oasound"}
+    },
+    {
+      "id": "oa.audio.fade", "name": "Fade", "kind": "sound", "category": "Sound", "usage": "in_out",
+      "description": "Fades the sound in as an intro, out as an outro.",
+      "params": [{"id": "curve", "type": "float", "default": 1, "min": 0.25, "max": 4}],
+      "shader": {"source": "out = in * pow(visibility, curve);"}
+    },
+    {
+      "id": "oa.audio.muffle", "name": "Muffle", "kind": "sound", "category": "Sound",
+      "description": "Dull and far away, as if through a wall. As an intro it opens up; as an outro it closes in.",
+      "params": [
+        {"id": "cutoff", "type": "float", "default": 600, "min": 80, "max": 8000},
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"file": "sound/muffle.oasound"}
+    },
+    {
+      "id": "oa.audio.tone", "name": "Tone", "kind": "sound", "category": "Sound",
+      "description": "Adds a tone on top of the sound: a sine, square, triangle or saw wave (or noise) at a pitch, with its own attack, decay and repeats.",
+      "params": [
+        {"id": "wave", "type": "enum", "options": ["sine", "square", "triangle", "saw", "noise"]},
+        {"id": "pitch", "type": "float", "default": 440, "min": 20, "max": 8000},
+        {"id": "gain", "type": "float", "default": -12, "min": -60, "max": 0, "unit": "decibels"},
+        {"id": "attack", "type": "float", "default": 0.01, "min": 0, "max": 2, "unit": "seconds"},
+        {"id": "decay", "type": "float", "default": 0, "min": 0, "max": 10, "unit": "seconds"},
+        {"id": "repeat", "type": "float", "default": 0, "min": 0, "max": 10, "unit": "seconds"},
+        {"id": "vibrato", "type": "float", "default": 0, "min": 0, "max": 12},
+        {"id": "vibrato_depth", "type": "float", "default": 0.5, "min": 0, "max": 2},
+        {"id": "pulse", "type": "float", "default": 0.5, "min": 0.05, "max": 0.95},
+        {"id": "follow", "type": "float", "default": 0, "min": 0, "max": 1},
+        {"id": "original", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"file": "sound/tone.oasound"}
+    },
+    {
+      "id": "oa.audio.tremolo", "name": "Tremolo", "kind": "sound", "category": "Sound",
+      "description": "The level swings up and down.",
+      "params": [
+        {"id": "speed", "type": "float", "default": 5, "min": 0.1, "max": 20},
+        {"id": "depth", "type": "float", "default": 0.5, "min": 0, "max": 1}
+      ],
+      "shader": {"source": "let swing = 0.5 + 0.5 * sin(TAU * speed * time);\nout = in * (1 - depth * swing);"}
+    },
+    {
+      "id": "oa.audio.drive", "name": "Drive", "kind": "sound", "category": "Sound",
+      "description": "Warm saturation, up to a fuzzy distortion.",
+      "params": [
+        {"id": "drive", "type": "float", "default": 12, "min": 0, "max": 36, "unit": "decibels"},
+        {"id": "mix", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"source": "let d = db(drive);\nout = mix(in, tanh(in * d) / tanh(d), mix);"}
+    },
+    {
+      "id": "oa.audio.width", "name": "Stereo Width", "kind": "sound", "category": "Sound", "meter": "correlation",
+      "description": "Narrower (0 is mono) or wider than it was recorded.",
+      "params": [{"id": "width", "type": "float", "default": 1.5, "min": 0, "max": 3}],
+      "shader": {"source": "let mid = (left + right) * 0.5;\nlet side = (left - right) * 0.5 * width;\nout = select(channels < 2, in, select(channel == 0, mid + side, mid - side));"}
+    }
+  ]
+}

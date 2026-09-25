@@ -1,0 +1,15 @@
+[package]
+name = "oa-script"
+description = "The small scripting language plugins write sound shaders, motion and bounds in"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cranelift-codegen = "0.136.1"
+cranelift-frontend = "0.136.1"
+cranelift-jit = "0.136.1"
+cranelift-module = "0.136.1"
+cranelift-native = "0.136.1"
+oa-params.workspace = true

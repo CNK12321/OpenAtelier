@@ -1,0 +1,6 @@
+// Equalizer: a low shelf, three peaks and a high shelf, in a row.
+let x = lowshelf(in, low_freq, low_gain);
+let a = peak(x, p1_freq, max(p1_q, 0.1), p1_gain);
+let b = peak(a, p2_freq, max(p2_q, 0.1), p2_gain);
+let c = peak(b, p3_freq, max(p3_q, 0.1), p3_gain);
+out = highshelf(c, high_freq, high_gain);

@@ -356,6 +356,8 @@ impl App {
                         for r in &responses {
                             self.seal_on_release(r);
                             crate::widgets::context_menu(r, |ui| {
+                                self.property_menu_items(ui, item, &ParamTarget::Item, schema::SCALE, &Value::Vec2([1.0, 1.0]), None, t);
+                                ui.separator();
                                 if !advanced && ui.button("Advanced: separate X and Y").clicked() {
                                     advanced = true;
                                     ui.close();
@@ -787,7 +789,9 @@ impl App {
             self.seal_on_release(&a);
             self.seal_on_release(&b);
             let lr = ui.add(egui::Label::new(label).sense(egui::Sense::click()));
-            self.property_menu(&lr, item, target, id, &schema.default, None, t);
+            for r in [&a, &b, &lr] {
+                self.property_menu(r, item, target, id, &schema.default, None, t);
+            }
         });
     }
 
@@ -837,6 +841,61 @@ impl App {
     }
 
     /// The clip's (or the background's) passive picture effects.
+    /// A bounded text effect's range (right-click its name to bound it): the unit, and
+    /// where it starts and ends and its blend — keyframable, so a highlight can sweep
+    /// across a title. Switching units keeps the range where it was.
+    fn bounds_settings(&mut self, ui: &mut egui::Ui, item: ItemId, fx: &oa_doc::EffectInstance, t: Time) {
+        let Some(it) = self.editor.item(item) else { return };
+        let v = fx.params.eval(schema::bounds(), None, &it.eval_context(t));
+        if schema::bounds_of(&v).is_none() {
+            return;
+        }
+        // Letters as the title draws them (spaces aren't letters).
+        let text = it.params.get(schema::TEXT_CONTENT).map(|s| s.eval(&it.eval_context(t)));
+        let count = match &text {
+            Some(Value::Text(s)) => s.chars().filter(|c| !c.is_whitespace()).count().max(1),
+            _ => 1,
+        } as f64;
+        let letters = v.get(schema::BOUND_UNIT).and_then(Value::as_enum) == Some(schema::BOUND_UNITS[1]);
+        let target = ParamTarget::Effect(fx.id);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Bounded").strong()).on_hover_text("Only these letters; right-click the effect's name to turn it off");
+            for (unit, label) in [(false, "Percent"), (true, "Letters")] {
+                if ui.selectable_label(letters == unit, label).clicked() && letters != unit {
+                    // The same range in the other unit.
+                    let (start, end, blend) = (v.float(schema::BOUND_START), v.float(schema::BOUND_END), v.float(schema::BOUND_BLEND));
+                    let (start, end, blend) = if unit {
+                        ((start / 100.0 * count).floor() + 1.0, (end / 100.0 * count).ceil(), (blend / 100.0 * count).round())
+                    } else {
+                        ((start - 1.0) / count * 100.0, end / count * 100.0, blend / count * 100.0)
+                    };
+                    let unit_name = schema::BOUND_UNITS[unit as usize];
+                    let ops = [
+                        (schema::BOUND_UNIT, Value::Enum(unit_name.into())),
+                        (schema::BOUND_START, Value::Float(start.max(if unit { 1.0 } else { 0.0 }))),
+                        (schema::BOUND_END, Value::Float(end)),
+                        (schema::BOUND_BLEND, Value::Float(blend.max(0.0))),
+                    ];
+                    for (id, value) in ops {
+                        self.editor.set_param(item, target.clone(), id, oa_params::ParamSource::Static(value), "bounded-unit");
+                    }
+                }
+            }
+            if letters {
+                ui.label(egui::RichText::new(format!("of {count}")).weak());
+            }
+        });
+        // In letters, the sliders run over the title's letters.
+        for id in [schema::BOUND_START, schema::BOUND_END, schema::BOUND_BLEND] {
+            let Some(mut s) = schema::bounds().iter().find(|s| s.id.as_str() == id).cloned() else { continue };
+            if letters {
+                s.range = Some(if id == schema::BOUND_BLEND { (0.0, count / 2.0) } else { (1.0, count) });
+            }
+            self.param_widget(ui, item, &target, &s, t, &fx.id.0.to_string());
+        }
+    }
+
     fn effects_section(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
         self.effect_list(ui, item, List::Effects, t);
     }
@@ -857,22 +916,33 @@ impl App {
         let in_out = matches!(list, List::Intro | List::Outro);
         let reversing = list == List::Outro && it.outro_reverses_intro;
         let registry = &self.registry;
-        let effects: Vec<(usize, oa_doc::EffectInstance)> = it
-            .effects
-            .iter()
-            .cloned()
-            .enumerate()
-            .filter(|(_, e)| {
-                let heard = registry.is_sound(&e.type_id);
-                match list {
-                    List::Effects => e.role == EffectRole::Passive && !heard,
-                    List::Sound => heard,
-                    List::Intro => matches!(e.role, EffectRole::In { .. }) && !heard,
-                    List::Outro => matches!(e.role, EffectRole::Out { .. }) && !heard,
+        let in_list = |e: &oa_doc::EffectInstance| {
+            let heard = registry.is_sound(&e.type_id);
+            match list {
+                List::Effects => e.role == EffectRole::Passive && !heard,
+                List::Sound => heard,
+                List::Intro => matches!(e.role, EffectRole::In { .. }) && !heard,
+                List::Outro => matches!(e.role, EffectRole::Out { .. }) && !heard,
+            }
+        };
+        let effects: Vec<(usize, oa_doc::EffectInstance)> = it.effects.iter().cloned().enumerate().filter(|(_, e)| in_list(e)).filter(|_| !reversing).collect();
+        // With several clips selected, the cards are every effect any of them has — this
+        // clip's first, then the others' it doesn't — each saying how many have it, and
+        // anything done to one is done to all of them (`Editor::fanned`).
+        let peers: Vec<ItemId> = self.editor.linked.iter().copied().filter(|l| *l != item).collect();
+        let mut cards: Vec<(ItemId, oa_doc::EffectInstance)> = effects.iter().map(|(_, e)| (item, e.clone())).collect();
+        if !reversing {
+            for &other in &peers {
+                let Some(o) = self.editor.item(other) else { continue };
+                for fx in o.effects.iter().filter(|e| in_list(e)) {
+                    let key = self.editor.effect_key(other, fx.id);
+                    if !cards.iter().any(|(owner, e)| self.editor.effect_key(*owner, e.id) == key) {
+                        cards.push((other, fx.clone()));
+                    }
                 }
-            })
-            .filter(|_| !reversing)
-            .collect();
+            }
+        }
+        let total = peers.len() + 1;
         let seq = self.editor.seq;
         // The other selected clips (the background is never part of a selection).
         let others: Vec<ItemId> = if item == oa_doc::BACKGROUND { Vec::new() } else { self.selected_clips().into_iter().filter(|i| *i != item).collect() };
@@ -890,7 +960,7 @@ impl App {
                 }
             });
         }
-        if effects.is_empty() && !reversing {
+        if cards.is_empty() && !reversing {
             let none = match list {
                 List::Effects => "No effects yet.",
                 List::Sound => "No sound effects yet.",
@@ -898,16 +968,20 @@ impl App {
                 List::Outro => "No outro yet.",
             };
             ui.label(egui::RichText::new(none).weak());
-        } else if !effects.is_empty() {
+        } else if !cards.is_empty() {
             let order = if in_out { "They play together. Drag ⋮⋮ to reorder, or onto another clip to copy." } else { "Applied top to bottom. Drag ⋮⋮ to reorder, or onto another clip to copy." };
-            let hint = if effects.len() > 1 { order } else { "Drag ⋮⋮ onto another clip to copy it there." };
+            let hint = if cards.len() > 1 { order } else { "Drag ⋮⋮ onto another clip to copy it there." };
             ui.label(egui::RichText::new(hint).small().weak());
         }
         // Dragging: the effect being dragged, and where each card sits.
         let drag_key = egui::Id::new(("effect-drag", item.0, list));
         let dragging: Option<u64> = ui.data(|d| d.get_temp(drag_key));
         let mut rects: Vec<egui::Rect> = Vec::new();
-        for (_, fx) in effects.iter() {
+        let primary = item;
+        for (owner, fx) in cards.iter() {
+            // A card is its owner's effect (this clip's, or another selected clip's).
+            let item = *owner;
+            let have = 1 + self.editor.effect_peers(item, fx.id).len();
             let d = self.registry.effect(&fx.type_id).cloned();
             let sound_info = if sound { oa_audio::fx::info(&fx.type_id) } else { None };
             let fits: Vec<ItemId> = others.iter().copied().filter(|o| self.effect_fits(*o, &fx.type_id)).collect();
@@ -934,8 +1008,13 @@ impl App {
                         let name = d.as_ref().map_or(fx.type_id.as_str(), |d| d.name.as_str());
                         let color = if fx.enabled { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
                         let r = ui.add(egui::Label::new(egui::RichText::new(name).strong().color(color)).sense(egui::Sense::click()));
-                        let tip = sound_info.as_ref().map_or(String::new(), |i| format!("{}\n", i.description));
-                        let r = r.on_hover_text(format!("{tip}Right-click to copy or paste"));
+                        if have < total {
+                            ui.label(egui::RichText::new(format!("on {have} of {total}")).small().weak()).on_hover_text("Only some of the selected clips have it; changes go to those");
+                        }
+                        let about = sound_info.as_ref().map(|i| i.description.clone()).or_else(|| d.as_ref().map(|d| d.description.clone())).unwrap_or_default();
+                        let tip = if about.is_empty() { String::new() } else { format!("{about}\n") };
+                        let more = if is_text && self.can_bound(item, &fx.type_id) { ", or to bound it to some of the letters" } else { "" };
+                        let r = r.on_hover_text(format!("{tip}Right-click to copy or paste{more}"));
                         crate::widgets::context_menu(&r, |ui| self.effect_menu(ui, item, fx));
                         if in_out {
                             // How long it plays, over the clip's start or end.
@@ -948,7 +1027,7 @@ impl App {
                             if r.changed() {
                                 let duration = Time::from_seconds_f64(seconds);
                                 let role = if list == List::Intro { EffectRole::In { duration } } else { EffectRole::Out { duration } };
-                                if let Err(e) = self.editor.apply_drag("Effect duration", "in-out-duration", vec![Op::SetEffectRole { seq, item, effect: fx.id, role }]) {
+                                if let Err(e) = self.editor.apply_drag("Effect duration", "in-out-duration", self.editor.fanned(vec![Op::SetEffectRole { seq, item, effect: fx.id, role }])) {
                                     self.error = Some(e.to_string());
                                 }
                             }
@@ -988,7 +1067,7 @@ impl App {
                                 if r.changed() {
                                     let duration = Time::from_seconds_f64(seconds);
                                     let role = if kind == 1 { EffectRole::In { duration } } else { EffectRole::Out { duration } };
-                                    if let Err(e) = self.editor.apply_drag("Effect duration", "sound-fx-duration", vec![Op::SetEffectRole { seq, item, effect: fx.id, role }]) {
+                                    if let Err(e) = self.editor.apply_drag("Effect duration", "sound-fx-duration", self.editor.fanned(vec![Op::SetEffectRole { seq, item, effect: fx.id, role }])) {
                                         self.error = Some(e.to_string());
                                     }
                                 }
@@ -1012,8 +1091,8 @@ impl App {
                         Some(d) if !sound && !d.renders() => {
                             ui.label(egui::RichText::new("Can't be rendered by this version yet; it's skipped.").small().weak());
                         }
-                        Some(d) if d.type_id.as_ref() == oa_graph::registry::SURFACE => self.surface_settings(ui, item, fx, d, t),
-                        Some(d) if d.type_id.as_ref() == "oa.audio.eq" => {
+                        Some(d) if d.editor.as_deref() == Some(oa_graph::registry::EDITOR_SURFACE) => self.surface_settings(ui, item, fx, d, t),
+                        Some(d) if d.editor.as_deref() == Some(oa_graph::registry::EDITOR_EQUALIZER) => {
                             self.eq_settings(ui, item, fx, d, t);
                         }
                         Some(d) => {
@@ -1024,6 +1103,9 @@ impl App {
                             if sound {
                                 self.sound_meter(ui, fx);
                             }
+                            if is_text && self.can_bound(item, &fx.type_id) {
+                                self.bounds_settings(ui, item, fx, t);
+                            }
                         }
                         None => {
                             ui.label(egui::RichText::new("This effect's plugin is off or isn't installed; its settings are kept.").small().weak());
@@ -1031,7 +1113,10 @@ impl App {
                     }
                 });
             });
-            rects.push(resp.response.rect);
+            // Only this clip's own cards are reordered here.
+            if item == primary {
+                rects.push(resp.response.rect);
+            }
             // The card being dragged is dimmed where it was.
             if dragging == Some(fx.id.0) {
                 ui.painter().rect_filled(resp.response.rect, 4.0, ui.visuals().panel_fill.gamma_multiply(0.6));
@@ -1193,7 +1278,7 @@ impl App {
             self.notify(if n == 0 { format!("The selected clips already have {name} like this.") } else { format!("Applied {name} to {n} more clip{}.", if n == 1 { "" } else { "s" }) });
         }
         if let Some((label, ops)) = ops
-            && let Err(e) = self.editor.apply(label, ops)
+            && let Err(e) = self.editor.apply(label, self.editor.fanned(ops))
         {
             self.error = Some(e.to_string());
         }
@@ -1204,7 +1289,6 @@ impl App {
     fn speed_row(&mut self, ui: &mut egui::Ui, item: ItemId) {
         let Some(it) = self.editor.item(item) else { return };
         let old = it.time_map.speed.num() as f64 / it.time_map.speed.den() as f64;
-        let (range, source_in) = (it.range, it.time_map.source_in);
         let keep = !matches!(it.params.get(schema::AUDIO_KEEP_PITCH).map(|s| s.eval(&it.eval_context(it.range.start))), Some(Value::Bool(false)));
         let mut speed = old;
         ui.horizontal(|ui| {
@@ -1230,12 +1314,20 @@ impl App {
         if (speed - old).abs() < 1e-9 || speed <= 0.0 || old <= 0.0 {
             return;
         }
-        // Same part of the file, played at the new speed.
-        let span = range.duration.as_seconds_f64() * old;
-        let duration = Time::from_seconds_f64(span / speed).max(Time(1));
-        let time_map = oa_doc::TimeMap { source_in, speed: oa_time::Rational::new((speed * 1000.0).round() as i64, 1000) };
-        let op = oa_doc::Op::SetItemTiming { seq: self.editor.seq, item, range: oa_time::TimeRange::new(range.start, duration), time_map };
-        if let Err(e) = self.editor.apply_drag("Clip speed", "clip-speed", vec![op]) {
+        // Each selected clip: the same part of its file, played at the new speed.
+        let mut ops = Vec::new();
+        for id in std::iter::once(item).chain(self.editor.linked.iter().copied().filter(|l| *l != item)) {
+            let Some(it) = self.editor.item(id) else { continue };
+            let was = it.time_map.speed.num() as f64 / it.time_map.speed.den().max(1) as f64;
+            if was <= 0.0 {
+                continue;
+            }
+            let span = it.range.duration.as_seconds_f64() * was;
+            let duration = Time::from_seconds_f64(span / speed).max(Time(1));
+            let time_map = oa_doc::TimeMap { source_in: it.time_map.source_in, speed: oa_time::Rational::new((speed * 1000.0).round() as i64, 1000) };
+            ops.push(oa_doc::Op::SetItemTiming { seq: self.editor.seq, item: id, range: oa_time::TimeRange::new(it.range.start, duration), time_map });
+        }
+        if let Err(e) = self.editor.apply_drag("Clip speed", "clip-speed", ops) {
             self.error = Some(format!("can't change the speed: {e} (make room after the clip first)"));
         }
     }
@@ -1548,7 +1640,13 @@ impl App {
     /// make it the one the clip's keyframe line shows on the timeline.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn property_menu(&mut self, r: &egui::Response, item: ItemId, target: &ParamTarget, param: &str, default: &Value, band: Option<(f64, f64)>, t: Time) {
-        crate::widgets::context_menu(r, |ui| {
+        crate::widgets::context_menu(r, |ui| self.property_menu_items(ui, item, target, param, default, band, t));
+    }
+
+    /// The entries of [`App::property_menu`], for menus that add their own.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn property_menu_items(&mut self, ui: &mut egui::Ui, item: ItemId, target: &ParamTarget, param: &str, default: &Value, band: Option<(f64, f64)>, t: Time) {
+        {
             let current = self.editor.param_value(item, target, param, t).unwrap_or_else(|| default.clone());
             if ui.button("Copy value").clicked() {
                 self.value_clipboard = Some(current.clone());
@@ -1617,7 +1715,7 @@ impl App {
                 });
             }
             self.spoken_entry(ui, item, target, param, default, t);
-        });
+        }
     }
 
     /// Whether `param` can take its own value on the word being spoken: a title's color

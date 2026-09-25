@@ -1,0 +1,5 @@
+// Echo: a feedback delay line. What comes back is fed in again, `feedback` quieter.
+line echoes = 1.6;
+let echoed = read(echoes, clamp(delay, 1 / sample_rate, 1.55));
+write(echoes, in + echoed * clamp(feedback, 0, 0.95));
+out = in + echoed * clamp(mix, 0, 1);

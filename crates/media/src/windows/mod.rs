@@ -10,10 +10,10 @@
 //! 3. D3D12 opens the shared handle once per slot; wgpu wraps it as an NV12 texture.
 //! 4. `GpuServices::convert_nv12` converts it to linear RGB in the render graph.
 
-use crate::source::{hns_from_time, time_from_hns, Lease, Surface, VideoDecoder};
+use crate::source::{Lease, Surface, VideoDecoder};
 use crate::{MediaError, VideoTrack};
 use oa_gpu::{GpuContext, VideoColor};
-use oa_time::Time;
+use oa_time::{Rational, Time};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
@@ -30,6 +30,16 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 fn win(context: &'static str) -> impl Fn(windows::core::Error) -> MediaError {
     move |e| MediaError::Decode(format!("{context}: {e}"))
+}
+
+/// Converts a decoder timestamp in 100 ns units to exact timeline time.
+fn time_from_hns(hns: i64) -> Time {
+    Time::from_rational_floor(Rational::new(hns, 10_000_000))
+}
+
+/// Converts time to 100 ns units, rounding down.
+fn hns_from_time(t: Time) -> i64 {
+    (t.0 as i128 * 10_000_000 / oa_time::FLICKS_PER_SECOND as i128) as i64
 }
 
 fn startup() {

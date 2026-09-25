@@ -427,6 +427,30 @@ impl Editor {
         }
     }
 
+    /// Cuts each of `items` at `t` (skipping any too close to an edge there), in one
+    /// undo step. Returns the new back halves.
+    pub fn split_many(&mut self, items: &[ItemId], t: Time) -> Result<Vec<ItemId>, EditError> {
+        let snapshot = self.doc.snapshot();
+        let doc = &mut self.doc;
+        let mut alloc = || doc.alloc_id();
+        let (mut ops, mut backs) = (Vec::new(), Vec::new());
+        let mut last_err = None;
+        for &item in items {
+            match oa_edit::timeline::split(&snapshot, self.seq, item, t, &mut alloc) {
+                Ok((more, back)) => {
+                    ops.extend(more);
+                    backs.push(back);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if ops.is_empty() {
+            return Err(last_err.unwrap_or(EditError::InvalidRange));
+        }
+        self.doc.edit(if items.len() == 1 { "Split clip" } else { "Split clips" }, ops)?;
+        Ok(backs)
+    }
+
     /// Where a clip or effect parameter's keyframes are, in clip-local seconds.
     pub fn keyframe_times(&self, item: ItemId, target: &ParamTarget, param: &str) -> Vec<Time> {
         let Some(it) = self.item(item) else { return Vec::new() };
@@ -524,6 +548,60 @@ impl Editor {
                 _ => None,
             };
             out.extend(there.map(|t| (other_id, t)));
+        }
+        out
+    }
+
+    /// Which of its kind an effect is on its clip: its type, and how many of that type
+    /// come before it. Effects match across clips by this.
+    pub fn effect_key(&self, item: ItemId, effect: oa_doc::EffectId) -> Option<(String, usize)> {
+        let it = self.item(item)?;
+        let fx = it.effects.iter().find(|e| e.id == effect)?;
+        let nth = it.effects.iter().take_while(|e| e.id != effect).filter(|e| e.type_id == fx.type_id).count();
+        Some((fx.type_id.clone(), nth))
+    }
+
+    /// The same effect on the linked clips (the rest of a multiple selection).
+    pub fn effect_peers(&self, item: ItemId, effect: oa_doc::EffectId) -> Vec<(ItemId, oa_doc::EffectId)> {
+        let Some((type_id, nth)) = self.effect_key(item, effect) else { return Vec::new() };
+        self.linked
+            .iter()
+            .filter(|l| **l != item)
+            .filter_map(|&other| self.item(other)?.effects.iter().filter(|e| e.type_id == type_id).nth(nth).map(|e| (other, e.id)))
+            .collect()
+    }
+
+    /// `ops` made for one clip, done to the linked clips too: an effect switched on or
+    /// off, removed or retimed happens to the same effect on each; an intro reversed as
+    /// the outro, on each clip. (Moves within one clip's list stay its own.)
+    pub fn fanned(&self, ops: Vec<Op>) -> Vec<Op> {
+        let moved: Vec<oa_doc::EffectId> = ops.iter().filter_map(|op| if let Op::InsertEffect { effect, .. } = op { Some(effect.id) } else { None }).collect();
+        let mut out = ops.clone();
+        for op in &ops {
+            match op {
+                Op::SetEffectEnabled { seq, item, effect, enabled } => {
+                    out.extend(self.effect_peers(*item, *effect).into_iter().map(|(item, effect)| Op::SetEffectEnabled { seq: *seq, item, effect, enabled: *enabled }));
+                }
+                Op::RemoveEffect { seq, item, effect } if !moved.contains(effect) => {
+                    out.extend(self.effect_peers(*item, *effect).into_iter().map(|(item, effect)| Op::RemoveEffect { seq: *seq, item, effect }));
+                }
+                Op::SetEffectRole { seq, item, effect, role } => {
+                    for (other, effect) in self.effect_peers(*item, *effect) {
+                        // An intro or outro no longer than the clip.
+                        let length = self.item(other).map_or(Time::MAX, |i| i.range.duration);
+                        let role = match *role {
+                            oa_doc::EffectRole::In { duration } => oa_doc::EffectRole::In { duration: duration.min(length) },
+                            oa_doc::EffectRole::Out { duration } => oa_doc::EffectRole::Out { duration: duration.min(length) },
+                            r => r,
+                        };
+                        out.push(Op::SetEffectRole { seq: *seq, item: other, effect, role });
+                    }
+                }
+                Op::SetReverseIntro { seq, item, on } => {
+                    out.extend(self.linked.iter().filter(|l| **l != *item).map(|&other| Op::SetReverseIntro { seq: *seq, item: other, on: *on }));
+                }
+                _ => {}
+            }
         }
         out
     }
@@ -765,6 +843,42 @@ mod tests {
         assert_eq!(e.item(b).map(|i| i.id), Some(b), "back after undo");
         e.doc.redo().unwrap();
         assert!(e.item(b).is_none(), "and gone again after redo");
+    }
+
+    /// With several clips selected, what's done to one clip's effect happens to the same
+    /// effect on the others (matched by type and order), and "Reverse" reaches each; a
+    /// split cuts every selected clip under the playhead.
+    #[test]
+    fn selections_act_as_one() {
+        let mut e = Editor::new();
+        let a = e.add_text(Time::ZERO, "A", Time::from_seconds(4)).unwrap();
+        let b = e.add_text(Time::from_seconds(5), "B", Time::from_seconds(4)).unwrap();
+        let seq = e.seq;
+        let fx = |id: u64| EffectInstance::new(EffectId(id), "oa.color.tint");
+        e.doc
+            .edit("fx", vec![Op::InsertEffect { seq, item: a, index: 0, effect: fx(100) }, Op::InsertEffect { seq, item: b, index: 0, effect: fx(200) }])
+            .unwrap();
+        e.linked = vec![a, b];
+        assert_eq!(e.effect_peers(a, EffectId(100)), vec![(b, EffectId(200))]);
+        let ops = e.fanned(vec![Op::SetEffectEnabled { seq, item: a, effect: EffectId(100), enabled: false }, Op::SetReverseIntro { seq, item: a, on: true }]);
+        e.doc.edit("toggle", ops).unwrap();
+        for id in [a, b] {
+            let it = e.item(id).unwrap();
+            assert!(!it.effects[0].enabled && it.outro_reverses_intro, "{id:?}");
+        }
+        let ops = e.fanned(vec![Op::RemoveEffect { seq, item: a, effect: EffectId(100) }]);
+        e.doc.edit("remove", ops).unwrap();
+        assert!(e.item(a).unwrap().effects.is_empty() && e.item(b).unwrap().effects.is_empty());
+        e.linked.clear();
+
+        // Split: both clips, where the playhead crosses them; a clip it doesn't cross
+        // is skipped, not an error.
+        let c = e.add_text(Time::from_seconds(20), "C", Time::from_seconds(2)).unwrap();
+        let backs = e.split_many(&[a, c], Time::from_seconds(2)).unwrap();
+        assert_eq!(backs.len(), 1);
+        let backs = e.split_many(&[b, c], Time::from_seconds(7)).unwrap();
+        assert_eq!(backs.len(), 1);
+        assert_eq!(e.item(b).unwrap().range.duration, Time::from_seconds(2));
     }
 
     #[test]

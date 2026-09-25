@@ -1,0 +1,12 @@
+// Bit Crush: two kinds of coarseness at once, which is what makes it sound like old
+// hardware. `bits` quantizes the level; `rate` holds each sample for a while (a
+// sample-and-hold at a lower rate). `mix` blends back towards the clean sound.
+let levels = 2 ^ clamp(bits, 1, 16) * 0.5;
+let hold = max(sample_rate / clamp(rate, 50, sample_rate * 2), 1);
+state phase = 0;
+phase += 1;
+let fresh = phase >= hold;
+phase -= fresh * hold;
+state held = 0;
+held = select(fresh, round(in * levels) / levels, held);
+out = mix(in, held, clamp(mix, 0, 1));

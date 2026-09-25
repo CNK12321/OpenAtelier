@@ -188,6 +188,33 @@ impl App {
                 changed = true;
                 finished = true;
             }
+            // The selected key, exactly: where it is and its value (drag, or double-click
+            // to type).
+            if let Some(i) = ed.selected.filter(|i| *i < curve.keys.len()) {
+                ui.separator();
+                let (t, v) = (curve.keys[i].t, curve.keys[i].value.as_float());
+                if let Some(mut v) = v {
+                    ui.label(egui::RichText::new("value").small().weak());
+                    let r = ui.add(egui::DragValue::new(&mut v).speed(((band.hi - band.lo) / 200.0).max(1e-4)).max_decimals(4));
+                    if r.changed() {
+                        curve.keys[i].value = Value::Float(v);
+                        changed = true;
+                    }
+                    finished |= r.drag_stopped() || r.lost_focus();
+                }
+                let mut secs = t.as_seconds_f64();
+                ui.label(egui::RichText::new("at").small().weak());
+                let r = ui.add(egui::DragValue::new(&mut secs).speed(0.01).range(0.0..=it.range.duration.as_seconds_f64()).max_decimals(3).suffix(" s"));
+                let moved = Time::from_seconds_f64(secs);
+                // Not onto another key.
+                if r.changed() && !curve.keys.iter().any(|k| k.t == moved) {
+                    curve.keys[i].t = moved;
+                    curve.keys.sort_by_key(|k| k.t);
+                    ed.selected = curve.keys.iter().position(|k| k.t == moved);
+                    changed = true;
+                }
+                finished |= r.drag_stopped() || r.lost_focus();
+            }
         });
 
         // The graph.

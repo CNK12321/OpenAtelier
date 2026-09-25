@@ -39,6 +39,13 @@ impl Sources {
         }
     }
 
+    /// Opens a decoder for `media` at `source_time` ahead of time (a clip about to play).
+    pub fn warm(&mut self, media: u64, source_time: oa_time::Time) {
+        if let Some(video) = self.video.as_mut() {
+            video.warm(media, source_time);
+        }
+    }
+
     pub fn stills_mut(&mut self) -> &mut StillSource {
         &mut self.stills
     }

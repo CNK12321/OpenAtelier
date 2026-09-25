@@ -1,0 +1,4 @@
+// The flood runs on the coarse grid; only the last pass, which draws, is full size.
+let r = max(radius, 0);
+let cell = select(r >= 24, clamp(2 ^ floor(log2(r / 12)), 1, 8), 1);
+out = select(pass + 1 == passes, 1, cell);
