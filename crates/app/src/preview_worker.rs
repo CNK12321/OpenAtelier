@@ -408,16 +408,18 @@ mod tests {
         }
     }
 
-    /// Everything `slot` hands back within a moment (then nothing more for a while).
+    /// Everything `slot` hands back: waits (up to 20 s — a first render on a software GPU
+    /// compiling its shaders is slow) for the first, then until nothing more comes for a
+    /// moment.
     fn collect(worker: &mut PreviewWorker, slot: u64) -> Vec<Rendered> {
         let mut got = Vec::new();
-        let mut quiet_since = Instant::now();
+        let mut quiet_since = None;
         let started = Instant::now();
-        while quiet_since.elapsed() < Duration::from_millis(400) && started.elapsed() < Duration::from_secs(20) {
+        while quiet_since.is_none_or(|q: Instant| q.elapsed() < Duration::from_millis(400)) && started.elapsed() < Duration::from_secs(20) {
             match worker.take(slot) {
                 Some(r) => {
                     got.push(r);
-                    quiet_since = Instant::now();
+                    quiet_since = Some(Instant::now());
                 }
                 None => std::thread::sleep(Duration::from_millis(5)),
             }
@@ -449,8 +451,10 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(2));
         worker.request(request(12, 1, Some((generation.clone(), 1)), None));
         worker.request(request(13, 2, Some((generation, 2)), None));
-        assert!(collect(&mut worker, 12).is_empty(), "rendered for a moment that had passed");
+        // The thread takes them in order: once 13 is back, 12 was either rendered or
+        // (rightly) skipped.
         assert_eq!(collect(&mut worker, 13).len(), 1);
+        assert!(worker.take(12).is_none(), "rendered for a moment that had passed");
 
         // A compound's filmstrip: its frames, rendered and laid out ten to a row.
         let (reply, strip) = channel();
