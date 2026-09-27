@@ -102,13 +102,23 @@ impl App {
     }
 }
 
+/// A project's panel sizes (as last seen) fitted to the window they're opening in:
+/// (right-hand column, media bin, timeline). Sizes remembered in a bigger window — or
+/// kept from a 4K monitor and opened on a laptop — would otherwise crowd the viewer out;
+/// the viewer keeps at least ~40% of the width and height.
+pub(crate) fn fit_panels(view: &crate::settings::ProjectView, vertical: bool, room: [f32; 2]) -> (f32, f32, f32) {
+    let [w, h] = room;
+    let right = if vertical { view.viewer.min(w * 0.45) } else { view.inspector.min(w * 0.3) };
+    let media = view.media.min((w * 0.6 - right).max(w * 0.15));
+    let timeline = view.timeline.min(h * 0.45);
+    (right.max(1.0), media.max(1.0), timeline.max(1.0))
+}
+
 impl App {
-    /// The first frames: puts the window the way it should open. Asking for "maximized"
-    /// when the window is created doesn't always take (it came back at the small size it
-    /// had before being maximized), so it's asked again once the window exists; and a
-    /// window much smaller than the screen (a size remembered from a small window, a
-    /// first run on a big screen) or bigger than it is fitted to 85% of the screen,
-    /// centered.
+    /// The first frames: puts the window the way it should open. Maximized on the first
+    /// run, when it was maximized last time (asked again once the window exists: asking
+    /// when it's created doesn't always take), or when the remembered size doesn't fit
+    /// this screen; a window much smaller than the screen grows to 80% of it where it is.
     pub(crate) fn fit_window(&mut self, ctx: &egui::Context) {
         let Some(frames) = self.window_fitting else { return };
         if self.script.is_some() {
@@ -126,21 +136,32 @@ impl App {
             _ => egui::vec2(1600.0, 1000.0),
         };
         self.window_fitting = None;
-        if self.settings.window.as_ref().is_some_and(|w| w.maximized) {
-            if maximized != Some(true) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-            }
-            return;
-        }
         if maximized == Some(true) {
             return;
         }
+        // Maximized last time, the first run (an editor wants the whole screen), or a
+        // remembered size the screen can't hold (another monitor, a lower resolution):
+        // maximized — the system fits it to the screen it's on, taskbar and all.
+        let big = inner.width() > monitor.x * 0.98 || inner.height() > monitor.y * 0.95;
+        if self.settings.window.as_ref().is_none_or(|w| w.maximized) || big {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            return;
+        }
+        // Much smaller than the screen: 80% of it, around where the window already is (on
+        // its own monitor — the monitor's corner isn't known, so it isn't centered on
+        // the first one).
         let small = inner.width() < monitor.x * 0.6 || inner.height() < monitor.y * 0.6;
-        let big = inner.width() > monitor.x || inner.height() > monitor.y;
-        if small || big {
-            let size = egui::vec2((monitor.x * 0.85).max(800.0), (monitor.y * 0.85).max(500.0));
+        if small {
+            let size = egui::vec2((monitor.x * 0.8).max(800.0), (monitor.y * 0.8).max(500.0));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(((monitor - size) * 0.5).to_pos2()));
+            if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+                let mut at = (outer.center() - size * 0.5).max(egui::pos2(0.0, 0.0));
+                // On the first monitor (it starts at 0,0): not past its far edges either.
+                if outer.min.x < monitor.x && outer.min.y < monitor.y {
+                    at = at.min((monitor - size).max(egui::Vec2::ZERO).to_pos2());
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(at));
+            }
         }
     }
 
@@ -186,4 +207,24 @@ impl App {
 
 fn key(path: &std::path::Path) -> String {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_panels;
+    use crate::settings::ProjectView;
+
+    /// Sizes kept from a big screen shrink to fit a small window (the viewer keeping the
+    /// middle), and are left as they were where they fit.
+    #[test]
+    fn panel_sizes_fit_the_window() {
+        let wide = ProjectView { inspector: 540.0, media: 500.0, timeline: 700.0, viewer: 1400.0, ..Default::default() };
+        let (right, media, timeline) = fit_panels(&wide, false, [1280.0, 720.0]);
+        assert!(right <= 384.0 && timeline <= 324.0, "{right} {timeline}");
+        assert!(1280.0 - right - media >= 1280.0 * 0.4, "the viewer keeps {} px", 1280.0 - right - media);
+        let (right, _, _) = fit_panels(&wide, true, [1280.0, 720.0]);
+        assert!(right <= 576.0);
+        let usual = ProjectView::default();
+        assert_eq!(fit_panels(&usual, false, [2560.0, 1440.0]), (usual.inspector, usual.media, usual.timeline));
+    }
 }

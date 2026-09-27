@@ -43,7 +43,7 @@ fn kind_of(path: &Path) -> Option<MediaKind> {
     }
     Some(match ext.as_str() {
         "mp3" | "m4a" | "wav" | "flac" | "aac" | "ogg" => MediaKind::Audio,
-        "png" | "jpg" | "jpeg" | "bmp" | "webp" => MediaKind::Still,
+        "png" | "jpg" | "jpeg" | "bmp" | "webp" | "svg" => MediaKind::Still,
         _ => MediaKind::Video,
     })
 }

@@ -104,7 +104,7 @@ impl App {
         };
         let mut open = true;
         let title = format!("Curve — {} · {}", it.name, band.param.rsplit('.').next().unwrap_or(&band.param));
-        let shown = egui::Window::new(title)
+        let shown = crate::widgets::on_screen(egui::Window::new(title), ctx)
             .id(egui::Id::new("curve-editor"))
             .open(&mut open)
             .default_size([560.0, 300.0])

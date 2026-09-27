@@ -14,6 +14,8 @@ wgpu.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 xxhash-rust.workspace = true
+# SVG: parsed and rasterized in Rust (ffmpeg only reads it when built with librsvg).
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true

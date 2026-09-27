@@ -52,6 +52,98 @@ pub struct AudioClip {
     /// Its track's place in the stack: an effect track's [`AudioBus`] runs over every clip
     /// on a lower layer.
     pub layer: u32,
+    /// Played backwards: the place in the file the clip starts at, from which it plays
+    /// down. `source_in` and `speed` then count forwards from there in reversed time
+    /// (the file read through [`Reversed`]), so everything else — speed, keep pitch,
+    /// effects, transition handles — works on it as on any clip.
+    pub reverse: Option<Time>,
+}
+
+/// A file played backwards from `pivot`: reversed time `r` is the file at `pivot − r`.
+/// Decoded forward a block at a time just below where it's playing, each block turned
+/// round — so reading on goes back through the file.
+pub struct Reversed {
+    inner: Box<dyn AudioSource>,
+    format: AudioFormat,
+    pivot: i64,
+    /// File frame the next block ends at (it plays down from just below here).
+    at: i64,
+    /// The current block, reversed: read from the front.
+    block: Vec<f32>,
+    used: usize,
+}
+
+/// Frames decoded at a time when playing backwards (a seek each).
+const REVERSE_BLOCK_SECONDS: f64 = 1.0;
+
+impl Reversed {
+    pub fn new(inner: Box<dyn AudioSource>, pivot: Time) -> Self {
+        let format = inner.format();
+        let pivot = (pivot.as_seconds_f64() * format.sample_rate as f64).round() as i64;
+        Reversed { inner, format, pivot, at: pivot, block: Vec::new(), used: 0 }
+    }
+
+    /// The next block below `at`, decoded and turned round. False at the file's start.
+    fn fill(&mut self) -> bool {
+        let ch = self.format.channels as usize;
+        if self.at <= 0 {
+            return false;
+        }
+        let from = (self.at - (REVERSE_BLOCK_SECONDS * self.format.sample_rate as f64) as i64).max(0);
+        let frames = (self.at - from) as usize;
+        if self.inner.seek(Time::from_seconds_f64(from as f64 / self.format.sample_rate as f64)).is_err() {
+            return false;
+        }
+        let mut buf = vec![0.0f32; frames * ch];
+        let mut got = 0;
+        while got < buf.len() {
+            let r = self.inner.read(&mut buf[got..]);
+            if r == 0 {
+                break;
+            }
+            got += r;
+        }
+        // Past the file's end (a handle beyond it): silence there.
+        buf[got..].fill(0.0);
+        self.block.clear();
+        for frame in buf.chunks(ch).rev() {
+            self.block.extend_from_slice(frame);
+        }
+        self.used = 0;
+        self.at = from;
+        true
+    }
+}
+
+impl AudioSource for Reversed {
+    fn format(&self) -> AudioFormat {
+        self.format
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> usize {
+        let mut written = 0;
+        while written < out.len() {
+            if self.used == self.block.len() && !self.fill() {
+                break;
+            }
+            let n = (self.block.len() - self.used).min(out.len() - written);
+            out[written..written + n].copy_from_slice(&self.block[self.used..self.used + n]);
+            self.used += n;
+            written += n;
+        }
+        written
+    }
+
+    fn seek(&mut self, t: Time) -> Result<(), AudioError> {
+        self.at = self.pivot - (t.as_seconds_f64() * self.format.sample_rate as f64).round() as i64;
+        self.block.clear();
+        self.used = 0;
+        Ok(())
+    }
+
+    fn finished(&self) -> bool {
+        self.at <= 0 && self.used == self.block.len()
+    }
 }
 
 impl AudioClip {
@@ -70,6 +162,7 @@ impl AudioClip {
             speed: 1.0,
             keep_pitch: false,
             layer: 0,
+            reverse: None,
             range,
         }
     }
@@ -169,9 +262,11 @@ impl AudioClip {
     }
 }
 
-/// An effect track's container on the sound side: its effects run over everything on the
-/// layers below it (every clip whose `layer` is lower), mixed, while it lasts — and ring
-/// on for their tails after.
+/// Effects over a mix of clips, while they last — and ringing on for their tails after.
+/// Either an effect track's container (`members: None`: everything on the layers below
+/// it, every clip whose `layer` is lower) or a compound clip's own sound effects
+/// (`members`: just its clips, mixed apart, run through its effects, then added in at
+/// its layer).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioBus {
     /// The container's id: its effects' state follows it across edits.
@@ -179,6 +274,8 @@ pub struct AudioBus {
     pub range: TimeRange,
     pub effects: Vec<AudioEffect>,
     pub layer: u32,
+    /// The clips (by id) it runs over, when it's a compound clip's.
+    pub members: Option<Vec<u64>>,
 }
 
 impl AudioBus {
@@ -281,13 +378,13 @@ struct Decoder {
     phase: f64,
     /// Exact source position (frames) of the next output sample.
     pos: f64,
-    /// Undoes the pitch change of a speed change ("keep pitch").
-    pitch: Option<Box<dyn Processor>>,
+    /// Plays at another speed at the source's own pitch ("keep pitch").
+    stretch: Option<crate::stretch::Stretch>,
 }
 
 impl Decoder {
     fn new(source: Option<Box<dyn AudioSource>>, path: PathBuf) -> Self {
-        Decoder { source, next: None, path, chain: Chain { fx: Vec::new() }, hold: Vec::new(), phase: 0.0, pos: 0.0, pitch: None }
+        Decoder { source, next: None, path, chain: Chain { fx: Vec::new() }, hold: Vec::new(), phase: 0.0, pos: 0.0, stretch: None }
     }
 
     /// Positioned at source frame `at`: forget everything carried over.
@@ -296,15 +393,15 @@ impl Decoder {
         self.pos = at as f64;
         self.hold.clear();
         self.phase = 0.0;
-        if let Some(p) = &mut self.pitch {
-            p.reset();
+        if let Some(s) = &mut self.stretch {
+            s.reset();
         }
         self.chain.reset();
     }
 
     /// Fills `out` with the clip's next samples at its speed: straight from the file at
-    /// speed 1, otherwise resampled (linear), pitch following speed like tape unless the
-    /// clip keeps its pitch.
+    /// speed 1; time-stretched at its own pitch when the clip keeps it (`stretch`);
+    /// otherwise resampled (linear), the pitch following the speed like tape.
     fn pull(&mut self, out: &mut [f32], format: AudioFormat, clip: &AudioClip) {
         let ch = format.channels as usize;
         let Some(source) = self.source.as_mut() else {
@@ -324,6 +421,10 @@ impl Decoder {
             }
             out[got..].fill(0.0); // the file ran out early: silence
             self.pos += (got / ch) as f64;
+        } else if clip.keep_pitch {
+            let stretch = self.stretch.get_or_insert_with(|| crate::stretch::Stretch::new(ch, format.sample_rate));
+            stretch.pull(out, speed, &mut |buf| source.read(buf));
+            self.pos += frames as f64 * speed;
         } else {
             let mut chunk = vec![0.0f32; 256 * ch];
             for f in 0..frames {
@@ -348,17 +449,17 @@ impl Decoder {
             self.hold.drain(..(used * ch).min(self.hold.len()));
             self.phase -= used as f64;
             self.pos += frames as f64 * speed;
-            if clip.keep_pitch {
-                let p = self.pitch.get_or_insert_with(|| fx::plain_pitch(ch, format.sample_rate as f32));
-                let values = oa_params::Evaluated(vec![
-                    (oa_params::ParamId::new("semitones"), Value::Float(-12.0 * speed.log2())),
-                    (oa_params::ParamId::new("mix"), Value::Float(1.0)),
-                ]);
-                p.process(out, &values, &fx::ClockSpan::default());
-            }
         }
         self.next = Some(self.pos.round() as i64);
     }
+}
+
+/// One thing the mixer adds in: a clip, or a compound clip's group (a bus with members:
+/// its clips, then its effects over them).
+#[derive(Clone, Debug)]
+enum Unit {
+    Clip(usize),
+    Group(usize, Vec<usize>),
 }
 
 pub struct TimelineAudio {
@@ -373,9 +474,12 @@ pub struct TimelineAudio {
     scratch: Vec<f32>,
     /// Frames each clip (by id) keeps sounding past its end: its effects' tails.
     tails: HashMap<u64, i64>,
-    /// Clips, and buses, in layer order (indices into the state's lists).
-    order: Vec<usize>,
+    /// What mixes, in layer order: clips on their own and compound clips' groups — and
+    /// the effect tracks' buses between them (indices into the state's lists).
+    order: Vec<Unit>,
     bus_order: Vec<usize>,
+    /// A compound clip's group, mixed apart before its effects run over it.
+    group: Vec<f32>,
     /// Each bus's running effects, and the frame it last stopped at.
     buses: HashMap<u64, (Chain, Option<i64>)>,
 }
@@ -401,6 +505,7 @@ impl TimelineAudio {
             tails: HashMap::new(),
             order: Vec::new(),
             bus_order: Vec::new(),
+            group: Vec::new(),
             buses: HashMap::new(),
         };
         mixer.refresh();
@@ -456,10 +561,21 @@ impl TimelineAudio {
                 .map(|c| (c.id, (tail_of(&c.effects, &c.context(c.range.end())).as_seconds_f64() * rate).round() as i64))
                 .filter(|(_, t)| *t > 0)
                 .collect();
-            let mut order: Vec<usize> = (0..state.clips.len()).collect();
-            order.sort_by_key(|i| state.clips[*i].layer);
-            self.order = order;
-            let mut buses: Vec<usize> = (0..state.buses.len()).collect();
+            // Clips in a compound clip's group mix with it, not on their own.
+            let index: HashMap<u64, usize> = state.clips.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+            let mut grouped = std::collections::HashSet::new();
+            let mut order: Vec<(u32, Unit)> = Vec::new();
+            for (b, bus) in state.buses.iter().enumerate() {
+                if let Some(members) = &bus.members {
+                    let clips: Vec<usize> = members.iter().filter_map(|id| index.get(id).copied()).collect();
+                    grouped.extend(clips.iter().copied());
+                    order.push((bus.layer, Unit::Group(b, clips)));
+                }
+            }
+            order.extend((0..state.clips.len()).filter(|i| !grouped.contains(i)).map(|i| (state.clips[i].layer, Unit::Clip(i))));
+            order.sort_by_key(|(layer, _)| *layer);
+            self.order = order.into_iter().map(|(_, u)| u).collect();
+            let mut buses: Vec<usize> = (0..state.buses.len()).filter(|b| state.buses[*b].members.is_none()).collect();
             buses.sort_by_key(|i| state.buses[*i].layer);
             self.bus_order = buses;
             self.state = state;
@@ -472,7 +588,14 @@ impl TimelineAudio {
         let format = self.format;
         let want_time = self.time_of(want);
         let open = &mut self.open;
-        let d = self.decoders.entry(clip.id).or_insert_with(|| Decoder::new(open(clip, format).ok(), clip.path.clone()));
+        let d = self.decoders.entry(clip.id).or_insert_with(|| {
+            // A reversed clip reads its file backwards from where it starts.
+            let source = open(clip, format).ok().map(|s| match clip.reverse {
+                Some(pivot) => Box::new(Reversed::new(s, pivot)) as Box<dyn AudioSource>,
+                None => s,
+            });
+            Decoder::new(source, clip.path.clone())
+        });
         // Effects added or removed: rebuild the chain and start it cleanly from here
         // (its latency may have changed).
         if !d.chain.matches(&clip.effects) {
@@ -562,6 +685,27 @@ impl TimelineAudio {
         }
     }
 
+    /// Adds one unit to `out`: a clip, or a compound clip's group — its clips mixed apart,
+    /// its own effects run over them, then added in.
+    fn mix_unit(&mut self, state: &MixState, unit: &Unit, out: &mut [f32], start: i64, stop: i64) {
+        match unit {
+            Unit::Clip(i) => self.mix_clip(&state.clips[*i], out, start, stop),
+            Unit::Group(b, members) => {
+                let mut group = std::mem::take(&mut self.group);
+                group.clear();
+                group.resize(out.len(), 0.0);
+                for &i in members {
+                    self.mix_clip(&state.clips[i], &mut group, start, stop);
+                }
+                self.run_bus(&state.buses[*b], &mut group, start, stop);
+                for (o, g) in out.iter_mut().zip(&group) {
+                    *o += g;
+                }
+                self.group = group;
+            }
+        }
+    }
+
     /// Runs an effect track's container over what's mixed so far (the layers below it)
     /// while it lasts; after its end, what its effects still ring with is added on top.
     fn run_bus(&mut self, bus: &AudioBus, out: &mut [f32], start: i64, stop: i64) {
@@ -620,17 +764,21 @@ impl AudioSource for TimelineAudio {
         // Layer by layer, bottom up: every effect track's bus runs over what's been
         // mixed below it, then the layers above it are added.
         let (order, bus_order) = (std::mem::take(&mut self.order), std::mem::take(&mut self.bus_order));
+        let layer_of = |u: &Unit| match u {
+            Unit::Clip(i) => state.clips[*i].layer,
+            Unit::Group(b, _) => state.buses[*b].layer,
+        };
         let mut next = 0;
         for &b in &bus_order {
             let bus = &state.buses[b];
-            while next < order.len() && state.clips[order[next]].layer < bus.layer {
-                self.mix_clip(&state.clips[order[next]], out, start, stop);
+            while next < order.len() && layer_of(&order[next]) < bus.layer {
+                self.mix_unit(&state, &order[next], out, start, stop);
                 next += 1;
             }
             self.run_bus(bus, out, start, stop);
         }
-        for &i in &order[next..] {
-            self.mix_clip(&state.clips[i], out, start, stop);
+        for unit in &order[next..] {
+            self.mix_unit(&state, unit, out, start, stop);
         }
         (self.order, self.bus_order) = (order, bus_order);
 
@@ -824,7 +972,7 @@ mod tests {
         high.layer = 2;
         // A tone with none of the original and next to no level: it silences its input.
         let silence = effect_with(90, "oa.audio.tone", &[("original", Value::Float(0.0)), ("gain", Value::Float(-60.0))]);
-        let bus = AudioBus { id: 70, range: TimeRange::new(secs(0.5), secs(0.5)), effects: vec![silence], layer: 1 };
+        let bus = AudioBus { id: 70, range: TimeRange::new(secs(0.5), secs(0.5)), effects: vec![silence], layer: 1, members: None };
         let state = MixState { clips: vec![high, low], buses: vec![bus], end: secs(2.0) };
         let mut m = TimelineAudio::with_handle(MixHandle::new(state), FORMAT, Time::ZERO)
             .with_opener(Box::new(|c, format| Ok(Box::new(Probe { level: c.media as f32, format, frame: 0, seeks: Default::default() }) as Box<dyn AudioSource>)));
@@ -832,6 +980,21 @@ mod tests {
         assert!(s[250] > 3.9, "both layers before it: {}", s[250]);
         assert!((s[750] - (3.0 + 0.0075)).abs() < 0.01, "only the layer above it while it lasts: {}", s[750]);
         assert!(s[1250] > 3.9, "both again after it: {}", s[1250]);
+    }
+
+    /// A compound clip's own sound effects run over its clips alone: here they silence
+    /// its two clips while a clip beside it (same layer, not in the group) plays on.
+    #[test]
+    fn a_compound_clips_effects_run_over_its_own_clips() {
+        let (a, b, beside) = (clip(20, 1, 0.0, 2.0, 0.0), clip(21, 2, 0.0, 2.0, 0.0), clip(22, 4, 0.0, 2.0, 0.0));
+        let silence = effect_with(91, "oa.audio.tone", &[("original", Value::Float(0.0)), ("gain", Value::Float(-60.0))]);
+        let group = AudioBus { id: 71, range: TimeRange::new(secs(0.0), secs(2.0)), effects: vec![silence], layer: 0, members: Some(vec![20, 21]) };
+        let state = MixState { clips: vec![a, b, beside], buses: vec![group], end: secs(2.0) };
+        let mut m = TimelineAudio::with_handle(MixHandle::new(state), FORMAT, Time::ZERO)
+            .with_opener(Box::new(|c, format| Ok(Box::new(Probe { level: c.media as f32, format, frame: 0, seeks: Default::default() }) as Box<dyn AudioSource>)));
+        let s = drain(&mut m);
+        // Only the clip beside it: level 4 (plus its tiny timecode ramp).
+        assert!((s[500] - (4.0 + 0.005)).abs() < 0.01, "the group's clips are silenced, the other plays: {}", s[500]);
     }
 
     #[test]
@@ -1002,6 +1165,27 @@ mod tests {
         m.read(&mut block);
         m.read(&mut block);
         assert!(before > 0.3 && rms(&block) < 0.01, "{before} → {}", rms(&block));
+    }
+
+    #[test]
+    fn reversed_clips_play_their_file_backwards() {
+        // Starting at 3 s in the file and playing down: half-way along a 1 s clip the
+        // file is at 2.5 s, at its end nearly 2 s; at 2× it covers 3 → 1 s.
+        for speed in [1.0, 2.0] {
+            let mut c = clip(1, 3, 0.0, 1.0, 0.0);
+            c.speed = speed;
+            c.reverse = Some(secs(3.0));
+            let seeks: Arc<Mutex<u32>> = Default::default();
+            let mut m = mixer(vec![c], 1.0, seeks.clone());
+            let s = drain(&mut m);
+            let at = |i: usize| (s[i] - 3.0) * 100.0; // the file's seconds
+            // The sample just below 3 s (a sample's length at the test's rate).
+            assert!((at(0) - 3.0).abs() < 0.002, "{speed}×: starts at {}", at(0));
+            assert!((at(500) - (3.0 - 0.5 * speed as f32)).abs() < 0.01, "{speed}×: half-way at {}", at(500));
+            assert!(at(900) < at(100), "{speed}×: going down");
+            // A seek per second of the file, not per block the mixer asks for.
+            assert!(*seeks.lock().unwrap() <= 1 + speed as u32 + 1, "{speed}×: {} seeks", seeks.lock().unwrap());
+        }
     }
 
     #[test]

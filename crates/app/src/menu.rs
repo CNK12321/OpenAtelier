@@ -76,6 +76,8 @@ impl App {
                     }
                 });
             }
+            // Plugins' actions and overlays (and the plugins waiting to be allowed).
+            self.plugins_menu(ui);
             if let Some(id) = run {
                 self.run_command(id);
             }
@@ -116,20 +118,30 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(style::GAP_S);
                 if icons::button(ui, icons::HOME, "Home: projects and plugins", "", true).clicked() {
-                    self.screen = crate::home::Screen::Home;
+                    self.go_home();
                 }
                 match &self.export {
                     Some(exporter) => {
                         let (done, total) = exporter.progress();
+                        let stage = exporter.stage();
                         let queued = self.export_queue.len();
                         if ui.button(if queued > 0 { "Cancel exports" } else { "Cancel export" }).clicked() {
                             self.cancel_exports();
                         }
                         let fraction = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                        let text = if queued > 0 { format!("{:.0}% · {queued} more", fraction * 100.0) } else { format!("{:.0}%", fraction * 100.0) };
+                        let status = match stage {
+                            Some((crate::export_worker::Stage::Opening, _)) => "Starting…".to_string(),
+                            Some((crate::export_worker::Stage::Finishing, _)) => "Finishing…".to_string(),
+                            None => format!("{:.0}%", fraction * 100.0),
+                        };
+                        let text = if queued > 0 { format!("{status} · {queued} more") } else { status };
                         let bar = ui.add(egui::ProgressBar::new(fraction).desired_width(140.0).text(text)).interact(egui::Sense::click());
-                        if bar.on_hover_text("Show the export").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        if bar.on_hover_text("Show the export and what's queued").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             self.export_view.hidden = false;
+                        }
+                        // More can be queued while this one runs.
+                        if icons::button(ui, icons::EXPORT, "Queue another export…", "", true).clicked() {
+                            self.start_export();
                         }
                     }
                     None => {

@@ -94,6 +94,33 @@ fn solids_and_blend_modes() {
     }
 }
 
+/// A turned layer's edges are smooth — pixels along them are partly covered — while a
+/// straight layer on whole pixels stays crisp (every pixel all in or all out), and the
+/// amount drawn is the square's area either way.
+#[test]
+fn rotated_layers_have_smooth_edges() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let draw = |r: &mut Renderer, m: Affine2| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let s = solid(&mut b, [1.0, 1.0, 1.0, 1.0], 40.0);
+        let t = b.add(NodeOp::Transform { matrix: m }, vec![s], m.map_rect(Rect::from_size(40.0, 40.0)), false);
+        let out = composite(&mut b, 100, [0.0, 0.0, 0.0, 1.0], &[(t, BlendMode::Normal)]);
+        render_one(r, &b.finish(out))
+    };
+    let partial = |px: &[[f32; 4]]| px.iter().filter(|p| p[0] > 0.02 && p[0] < 0.98).count();
+    let ink = |px: &[[f32; 4]]| px.iter().map(|p| p[0]).sum::<f32>();
+
+    let straight = draw(&mut r, Affine2::translate(30.0, 30.0));
+    assert_eq!(partial(&straight), 0, "a straight layer on whole pixels stays crisp");
+    assert!((ink(&straight) - 1600.0).abs() < 1.0);
+
+    let turned = draw(&mut r, Affine2::translate(-20.0, -20.0).then(&Affine2::rotate_degrees(30.0)).then(&Affine2::translate(50.0, 50.0)));
+    // Four edges of 40 px each, most pixels along them partly covered.
+    assert!(partial(&turned) > 100, "only {} soft pixels along the turned edges", partial(&turned));
+    assert!((ink(&turned) - 1600.0).abs() < 16.0, "{}", ink(&turned));
+}
+
 #[test]
 fn exposure_is_exact_in_linear_light() {
     let Some(ctx) = gpu() else { return };
@@ -191,6 +218,178 @@ fn fused_output_matches_reference_path() {
         render_one(&mut renderer(&ctx, FusionMode::Off), &g)
     };
     assert!(plain.iter().zip(&a).any(|(x, y)| (x[0] - y[0]).abs() > 0.05));
+}
+
+/// Warps in a row run as one pass drawn straight into the layer: fewer passes, the same
+/// picture as one pass per warp (up to the resamples saved — each unfused pass blurs a
+/// little).
+#[test]
+fn fused_warps_match_reference_path() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let (p, seq) = pattern_project(|clip| {
+        add_effect(clip, 20, "oa.warp.swirl", "angle", ParamSource::Static(Value::Float(60.0)));
+        add_effect(clip, 21, "oa.warp.fisheye", "amount", ParamSource::Static(Value::Float(0.4)));
+        add_effect(clip, 22, "oa.warp.ripple", "amplitude", ParamSource::Static(Value::Float(3.0)));
+    });
+    let planned = plan_frame(&p, seq, Time::from_seconds(2), &PlanOptions::default(), &registry).unwrap().graph;
+    let reference = optimize(&planned, OptLevel::Reference, KeyContext::default());
+    let optimized = optimize(&planned, OptLevel::Full, KeyContext::default());
+    assert!(optimized.describe().contains("FusedUvWarps oa.warp.swirl → oa.warp.fisheye → oa.warp.ripple"), "{}", optimized.describe());
+
+    let mut r_ref = renderer(&ctx, FusionMode::Off);
+    let mut r_opt = renderer(&ctx, FusionMode::Blocking);
+    let a = render_one(&mut r_ref, &reference);
+    let b = render_one(&mut r_opt, &optimized);
+    assert!(r_opt.stats.fused_warps >= 1, "{:?}", r_opt.stats);
+    assert!(r_opt.stats.passes + 3 <= r_ref.stats.passes, "{} passes vs {}", r_opt.stats.passes, r_ref.stats.passes);
+    let diff: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0, f32::max)).collect();
+    let mean = diff.iter().sum::<f32>() / diff.len() as f32;
+    assert!(mean < 0.01, "mean channel difference {mean}");
+    // Sanity: the warps moved the picture.
+    let plain = {
+        let (p2, _) = pattern_project(|_| {});
+        let g = plan_frame(&p2, seq, Time::from_seconds(2), &PlanOptions::default(), &registry).unwrap().graph;
+        render_one(&mut renderer(&ctx, FusionMode::Off), &g)
+    };
+    let moved = plain.iter().zip(&a).filter(|(x, y)| (x[0] - y[0]).abs() > 0.05).count();
+    assert!(moved > plain.len() / 20, "only {moved} pixels changed");
+}
+
+/// A layer shrunk past 2× keeps its warps in a pass of their own (read once at the
+/// layer's size, every pixel counted), not drawn straight into the shrink.
+#[test]
+fn warps_under_a_big_shrink_keep_their_own_pass() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let draw = |shrink: f64| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let s = solid(&mut b, [1.0, 0.5, 0.2, 1.0], 64.0);
+        let w = effect(&mut b, &registry, s, "oa.warp.swirl", vec![90.0, 0.8, 0.5, 0.5], 0.0);
+        let m = Affine2::scale(shrink, shrink);
+        let t = b.add(NodeOp::Transform { matrix: m }, vec![w], m.map_rect(Rect::from_size(64.0, 64.0)), false);
+        let out = composite(&mut b, 64, [0.0, 0.0, 0.0, 1.0], &[(t, BlendMode::Normal)]);
+        let mut r = renderer(&ctx, FusionMode::Blocking);
+        render_with(&mut r, &b.finish(out), &registry);
+        r.stats
+    };
+    let near = draw(0.75);
+    assert_eq!(near.fused_warps, 1, "drawn into the layer: {near:?}");
+    let far = draw(0.25);
+    assert_eq!(far.fused_warps, 0, "a pass of its own: {far:?}");
+    assert_eq!(far.passes, near.passes + 1);
+}
+
+/// A clip zoomed in 4× (a quarter of it seen each way) inside a compound clip that hangs
+/// half off the canvas: its color effects and the compound only render the part that
+/// shows, and the frame is the same as rendering everything whole.
+#[test]
+fn only_what_shows_is_rendered() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut b = GraphBuilder::new(KeyContext::default());
+    // A picture with detail everywhere (a ramp), so a misplaced part would show.
+    let ramp = b.add(
+        NodeOp::Source { media: 1, fingerprint: Some("pattern".into()), source_time: Time::ZERO, rep: Representation::Original, decode_scale: 1.0, size: [128, 128], yuv: [0, 0] },
+        vec![],
+        Rect::from_size(128.0, 128.0),
+        true,
+    );
+    let e1 = effect(&mut b, &registry, ramp, "oa.color.exposure", vec![0.5], 0.0);
+    let e2 = effect(&mut b, &registry, e1, "oa.color.saturation", vec![1.5], 0.0);
+    let zoom = Affine2::translate(-64.0, -64.0).then(&Affine2::scale(4.0, 4.0)).then(&Affine2::translate(64.0, 64.0));
+    let zoomed = b.add(NodeOp::Transform { matrix: zoom }, vec![e2], zoom.map_rect(Rect::from_size(128.0, 128.0)), true);
+    let inner = composite(&mut b, 128, [0.0, 0.0, 0.0, 1.0], &[(zoomed, BlendMode::Normal)]);
+    let slide = Affine2::translate(80.0, 10.0);
+    let placed = b.add(NodeOp::Transform { matrix: slide }, vec![inner], slide.map_rect(Rect::from_size(128.0, 128.0)), true);
+    let out = composite(&mut b, 128, [0.1, 0.1, 0.1, 1.0], &[(placed, BlendMode::Normal)]);
+    let g = optimize(&b.finish(out), OptLevel::Full, KeyContext::default());
+
+    let mut whole = renderer(&ctx, FusionMode::Off);
+    let mut roi = renderer(&ctx, FusionMode::Blocking);
+    let a = render_with(&mut whole, &g, &registry);
+    let c = render_with(&mut roi, &g, &registry);
+    assert_eq!(whole.stats.partial_passes, 0);
+    assert!(roi.stats.partial_passes >= 2, "the color pass and the compound: {:?}", roi.stats);
+    let worst = a.iter().zip(&c).map(|(x, y)| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0, f32::max)).fold(0.0, f32::max);
+    assert!(worst < 1e-3, "max channel difference {worst}");
+    // And it's the picture, not an empty frame: the ramp shows through the zoom.
+    assert!(a.iter().any(|p| p[0] > 0.3), "{:?}", a[128 * 64 + 100]);
+}
+
+/// A frame shaped like the last (the same nodes, other numbers — playback, a drag)
+/// reuses last frame's bind groups and uploads only the uniforms that changed, and still
+/// draws exactly what a fresh renderer would.
+#[test]
+fn frames_of_the_same_shape_reuse_their_setup() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let frame = |stops: f32, x: f64| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let s = solid(&mut b, [0.2, 0.3, 0.4, 1.0], 16.0);
+        let e = effect(&mut b, &registry, s, "oa.color.exposure", vec![stops], 0.0);
+        let w = effect(&mut b, &registry, e, "oa.warp.swirl", vec![45.0, 0.8, 0.5, 0.5], 0.0);
+        let m = Affine2::translate(x, 8.0);
+        let t = b.add(NodeOp::Transform { matrix: m }, vec![w], m.map_rect(Rect::from_size(16.0, 16.0)), false);
+        let out = composite(&mut b, 32, [0.0, 0.0, 0.0, 1.0], &[(t, BlendMode::Normal)]);
+        b.finish(out)
+    };
+    let mut r = Renderer::new(ctx.clone(), RenderOptions { fusion: FusionMode::Blocking, cache_budget: 0, ..Default::default() });
+    render_with(&mut r, &frame(0.5, 4.0), &registry);
+    assert_eq!(r.stats.bind_groups_kept, 0, "the first frame makes everything");
+    // The same again: nothing uploaded or made again.
+    render_with(&mut r, &frame(0.5, 4.0), &registry);
+    assert_eq!(r.stats.bind_groups_kept, r.stats.passes, "{:?}", r.stats);
+    assert_eq!(r.stats.uniforms_kept, r.stats.passes, "{:?}", r.stats);
+    // Moved, and brighter: every pass's bind group kept, only the changed uniforms sent.
+    let moved = render_with(&mut r, &frame(1.0, 10.0), &registry);
+    assert_eq!(r.stats.bind_groups_kept, r.stats.passes, "{:?}", r.stats);
+    assert!(r.stats.uniforms_kept < r.stats.passes, "{:?}", r.stats);
+    let fresh = render_with(&mut Renderer::new(ctx.clone(), RenderOptions { fusion: FusionMode::Blocking, cache_budget: 0, ..Default::default() }), &frame(1.0, 10.0), &registry);
+    assert_eq!(moved, fresh, "reused setup, same picture");
+}
+
+/// The grading effects at their neutral settings change nothing (the Color tab adds
+/// them the moment a control is touched), and each control does what it says: gain
+/// brightens, lift raises the blacks, a curve bends, the HSL mixer moves only its band.
+#[test]
+fn grading_is_neutral_until_moved() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let render = |configure: &dyn Fn(&mut Item)| {
+        let (p, seq) = pattern_project(|clip| configure(clip));
+        let g = plan_frame(&p, seq, Time::from_seconds(1), &PlanOptions::default(), &registry).unwrap().graph;
+        render_one(&mut renderer(&ctx, FusionMode::Blocking), &g)
+    };
+    let plain = render(&|_| {});
+    let worst = |a: &[[f32; 4]], b: &[[f32; 4]]| a.iter().zip(b).map(|(x, y)| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0, f32::max)).fold(0.0, f32::max);
+    let mean = |px: &[[f32; 4]]| px.iter().map(|p| p[0] + p[1] + p[2]).sum::<f32>() / px.len() as f32;
+    for (n, id) in ["oa.color.grade", "oa.color.curves", "oa.color.hsl"].into_iter().enumerate() {
+        let neutral = render(&|clip| clip.effects.push(EffectInstance::new(EffectId(40 + n as u64), id)));
+        assert!(worst(&plain, &neutral) < 2e-3, "{id} at its defaults changed the picture by {}", worst(&plain, &neutral));
+    }
+    let brighter = render(&|clip| add_effect(clip, 41, "oa.color.grade", "gain", ParamSource::Static(Value::Float(0.3))));
+    assert!(mean(&brighter) > mean(&plain) * 1.1, "gain brightens");
+    let lifted = render(&|clip| add_effect(clip, 42, "oa.color.grade", "lift", ParamSource::Static(Value::Float(0.2))));
+    let darkest = |px: &[[f32; 4]]| px.iter().map(|p| p[0] + p[1] + p[2]).fold(f32::MAX, f32::min);
+    assert!(darkest(&lifted) > darkest(&plain) + 0.01, "lift raises the blacks: {} vs {}", darkest(&lifted), darkest(&plain));
+    // Curves on a mid grey (the pattern is all bars at the ends, where curves are fixed):
+    // raising the middle point brightens it.
+    let grey = |raise: f32| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let s = solid(&mut b, [0.2, 0.2, 0.2, 1.0], 8.0);
+        let mut u: Vec<f32> = (0..32).map(|i| (i % 8) as f32 / 7.0).collect();
+        u[3] += raise;
+        u.extend([1.0; 8]);
+        let e = effect(&mut b, &registry, s, "oa.color.curves", u, 0.0);
+        let out = composite(&mut b, 8, [0.0, 0.0, 0.0, 1.0], &[(e, BlendMode::Normal)]);
+        render_with(&mut renderer(&ctx, FusionMode::Blocking), &b.finish(out), &registry)[0][0]
+    };
+    let (flat, raised) = (grey(0.0), grey(0.1));
+    assert!((flat - 0.2).abs() < 2e-3, "a straight curve leaves it: {flat}");
+    assert!(raised > flat + 0.02, "raising the middle brightens: {raised} vs {flat}");
+    let bluer = render(&|clip| add_effect(clip, 44, "oa.color.hsl", "blue_lum", ParamSource::Static(Value::Float(1.0))));
+    assert!(worst(&plain, &bluer) > 0.02, "the blue band's luminance moved something");
 }
 
 #[test]
@@ -609,6 +808,31 @@ fn text_layers_draw_their_glyphs_centered() {
     });
     let (_, big_total) = ink(&render_project(&mut r, &big, Time::from_seconds(1)));
     assert!((big_total / total - 4.0).abs() < 0.6, "{}", big_total / total);
+}
+
+/// Export's anti-aliased text: drawn at twice the size and shrunk in a pass of its own
+/// (the optimizer keeps it apart from the layer's placement), the title lands in the
+/// same place with the same amount of ink — only its edges are smoother.
+#[test]
+fn supersampled_text_matches_and_stays_a_pass_of_its_own() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let registry = Registry::with_builtins();
+    let (p, _) = text_project(|_| {});
+    let render = |r: &mut Renderer, k: u32| {
+        let opts = PlanOptions { text_supersample: k, ..Default::default() };
+        let plan = plan_frame(&p, SeqId(1), Time::from_seconds(1), &opts, &registry).unwrap();
+        let g = optimize(&plan.graph, OptLevel::Full, KeyContext::default());
+        let img = r.render(&g, &registry, &mut TestPatternSource::default()).unwrap();
+        (read_linear(r.context(), &img).unwrap(), format!("{g:?}"))
+    };
+    let (plain, plain_graph) = render(&mut r, 1);
+    let (smooth, smooth_graph) = render(&mut r, 2);
+    assert_eq!(smooth_graph.matches("Transform").count(), plain_graph.matches("Transform").count() + 1, "the shrink was merged away:\n{smooth_graph}");
+    let (([px, py], plain_ink), ([sx, sy], smooth_ink)) = (ink(&plain), ink(&smooth));
+    assert!((px - sx).abs() < 0.5 && (py - sy).abs() < 0.5, "moved: {px},{py} → {sx},{sy}");
+    assert!((smooth_ink / plain_ink - 1.0).abs() < 0.03, "ink {plain_ink} → {smooth_ink}");
+    assert!(smooth.iter().any(|p| p[0] > 0.1 && p[0] < 0.9), "edges are still anti-aliased");
 }
 
 /// A bounded per-letter effect only changes the letters in its range: rainbow on the

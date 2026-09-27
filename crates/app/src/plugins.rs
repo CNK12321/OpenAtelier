@@ -77,10 +77,26 @@ impl Plugins {
     /// The registry to render with: the effects of every enabled plugin. Clashes and
     /// other complaints come back as messages for the user. Also hands the enabled
     /// plugins' sound shaders to the mixer (compiled; errors come back the same way).
-    pub fn registry(&self) -> (Registry, Vec<String>) {
-        let (registry, mut issues) = Registry::from_plugins(self.enabled());
+    /// Whether `p`'s scripts may run: it has none, it's built in, or the user allowed
+    /// exactly these (`trusted`: plugin id → the fingerprint allowed).
+    pub fn scripts_allowed(p: &Plugin, trusted: &std::collections::BTreeMap<String, u64>) -> bool {
+        p.builtin || p.script_digest.is_none() || trusted.get(&p.id) == p.script_digest.as_ref()
+    }
+
+    /// The effects everything renders and mixes with. A plugin whose scripts the user
+    /// hasn't allowed (`trusted`) is loaded without them — no script of it runs until
+    /// they've said yes (Plugins page, or the Plugins menu).
+    pub fn registry(&self, trusted: &std::collections::BTreeMap<String, u64>) -> (Registry, Vec<String>) {
+        let usable: Vec<Plugin> = self
+            .enabled()
+            .map(|p| if Self::scripts_allowed(p, trusted) { p.clone() } else { p.without_scripts() })
+            .collect();
+        let (registry, mut issues) = Registry::from_plugins(usable.iter());
+        for p in self.enabled().filter(|p| !Self::scripts_allowed(p, trusted)) {
+            issues.push(format!("{}: its scripts are waiting for your OK (Plugins menu) — its script effects are off until then", p.name));
+        }
         let mut shaders = Vec::new();
-        for p in self.enabled().filter(|p| !p.builtin) {
+        for p in usable.iter().filter(|p| !p.builtin) {
             for d in p.sounds() {
                 match oa_audio::fx::FxInfo::from_descriptor(d) {
                     Ok(fx) => shaders.push(fx),
@@ -122,6 +138,11 @@ mod tests {
     /// Building a registry installs sound shaders in the mixer, which is process-wide.
     static MIXER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Every loaded plugin's scripts allowed (as if the user had said yes to each).
+    fn trust(plugins: &Plugins) -> std::collections::BTreeMap<String, u64> {
+        plugins.list.iter().filter_map(|p| Some((p.id.clone(), p.script_digest?))).collect()
+    }
+
     fn empty_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("oa-plugins-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -137,7 +158,7 @@ mod tests {
         let dir = empty_dir("core");
         let on = Plugins::load(dir.clone(), &[]);
         assert_eq!(on.list.len(), 1);
-        let (registry, issues) = on.registry();
+        let (registry, issues) = on.registry(&trust(&on));
         assert!(issues.is_empty(), "{issues:?}");
         assert!(on.sounds(&registry).iter().any(|d| &*d.type_id == "oa.audio.fade"), "sound effects come with it");
         assert!(registry.effect("oa.blur.gaussian").is_some());
@@ -145,7 +166,7 @@ mod tests {
         assert!(on.provider_of("oa.audio.echo").is_some_and(|p| p.id == CORE_ID));
 
         let off = Plugins::load(dir.clone(), &[CORE_ID.to_string()]);
-        let (none, _) = off.registry();
+        let (none, _) = off.registry(&trust(&off));
         assert!(none.effects().all(|d| oa_graph::registry::is_internal_effect(&d.type_id)), "only the host's own effects are left with core off");
         assert!(none.offered(EffectUsage::Passive).is_empty() && none.transitions().next().is_none(), "and nothing is offered");
         assert!(off.sounds(&none).is_empty(), "and nothing is heard");
@@ -161,9 +182,13 @@ mod tests {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let plugins = Plugins::load(dir, &[]);
         assert!(plugins.issues().is_empty(), "{:?}", plugins.issues());
-        let (registry, issues) = plugins.registry();
+        let (registry, issues) = plugins.registry(&trust(&plugins));
         assert!(issues.is_empty(), "{issues:?}");
         assert!(registry.effect("com.example.vignette").is_some());
+        // Its overlay and action compile, and its scripts need allowing.
+        let looks = plugins.list.iter().find(|p| p.id == "com.example.looks").expect("listed");
+        assert_eq!(looks.scripts.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["thirds", "stagger"]);
+        assert!(looks.has_scripts() && !Plugins::scripts_allowed(looks, &Default::default()));
         assert!(plugins.sounds(&registry).iter().any(|d| &*d.type_id == "com.example.telephone"));
         // Its motion intro drops in from above and comes to rest.
         let drop = registry.effect("com.example.drop").expect("a motion effect");
@@ -174,7 +199,7 @@ mod tests {
         };
         assert!((at(0.0).offset[1] + 540.0).abs() < 1.0, "starts half a canvas up: {:?}", at(0.0));
         assert_eq!((at(1.0).offset, at(1.0).opacity), ([0.0, 0.0], 1.0), "and lands");
-        let _ = Plugins::load(empty_dir("reset"), &[]).registry();
+        let _ = Plugins::load(empty_dir("reset"), &[]).registry(&Default::default());
     }
 
     /// A plugin's sound effect reaches the mixer when the plugin is on, and a shader that
@@ -194,15 +219,26 @@ mod tests {
         .expect("manifest");
         let on = Plugins::load(dir.clone(), &[]);
         assert!(on.issues().iter().any(|i| i.contains("com.example.broken") && i.contains("line 1")), "{:?}", on.issues());
-        let (registry, issues) = on.registry();
+        let (registry, issues) = on.registry(&trust(&on));
         assert!(issues.is_empty(), "{issues:?}");
         let offered: Vec<&str> = on.sounds(&registry).iter().map(|d| &*d.type_id).collect();
         assert!(offered.contains(&"com.example.half") && !offered.contains(&"com.example.broken"), "{offered:?}");
         assert!(oa_audio::fx::info("com.example.half").is_some());
 
         let off = Plugins::load(dir.clone(), &["com.example.noisy".to_string()]);
-        let _ = off.registry();
+        let _ = off.registry(&trust(&off));
         assert!(oa_audio::fx::info("com.example.half").is_none(), "turned off: gone from the mixer too");
+
+        // Scripts nobody allowed don't run: the sound shader isn't installed, and it says
+        // why. Allowed, then changed: held back again until allowed again.
+        let (_, issues) = on.registry(&Default::default());
+        assert!(oa_audio::fx::info("com.example.half").is_none(), "not before it's allowed");
+        assert!(issues.iter().any(|i| i.contains("Noisy") && i.contains("waiting for your OK")), "{issues:?}");
+        let mut stale = trust(&on);
+        stale.insert("com.example.noisy".into(), 12345);
+        let _ = on.registry(&stale);
+        assert!(oa_audio::fx::info("com.example.half").is_none(), "an allowance for other scripts doesn't count");
+        let _ = Plugins::load(empty_dir("reset2"), &[]).registry(&Default::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -27,11 +27,50 @@ pub struct ViewerView {
     pub thirds: bool,
     pub safe_areas: bool,
     pub center: bool,
+    /// The last press on the canvas: when, where, and the title under it (for our own
+    /// double-press, see [`title_double_press`]).
+    pub last_press: Option<(f64, egui::Pos2, Option<oa_doc::ItemId>)>,
 }
 
 impl Default for ViewerView {
     fn default() -> Self {
-        ViewerView { zoom: None, pan: egui::Vec2::ZERO, thirds: false, safe_areas: false, center: false }
+        ViewerView { zoom: None, pan: egui::Vec2::ZERO, thirds: false, safe_areas: false, center: false, last_press: None }
+    }
+}
+
+/// Seconds and screen points within which a second press on the same title opens it for
+/// typing: roomier than egui's double-click, which also fails once the pointer has drifted
+/// far enough to count as a drag.
+const DOUBLE_PRESS_SECONDS: f64 = 0.5;
+const DOUBLE_PRESS_PX: f32 = 10.0;
+
+/// Whether a press at `pos`, time `now`, over `title`, is the second of a double press
+/// on it (after `last`).
+pub fn title_double_press(last: Option<(f64, egui::Pos2, Option<oa_doc::ItemId>)>, now: f64, pos: egui::Pos2, title: Option<oa_doc::ItemId>) -> bool {
+    match (last, title) {
+        (Some((then, at, Some(before))), Some(title)) => before == title && now - then <= DOUBLE_PRESS_SECONDS && at.distance(pos) <= DOUBLE_PRESS_PX,
+        _ => false,
+    }
+}
+
+/// A title being typed into where it's drawn (`canvas_text_editor`).
+pub struct CanvasText {
+    pub item: oa_doc::ItemId,
+    pub caret: crate::text_edit::Caret,
+    /// The pointer went down inside the title: dragging selects.
+    pub selecting: bool,
+    /// UI time the cursor last moved or the text changed (the cursor shows solid, then
+    /// blinks).
+    pub since: f64,
+    /// Opened by the press still held down: until it's let go, the pointer neither moves
+    /// the layer nor changes the selection.
+    pub opening: bool,
+}
+
+impl CanvasText {
+    /// Starts with all of `text` selected (typing replaces it).
+    pub fn new(item: oa_doc::ItemId, text: &str) -> Self {
+        CanvasText { item, caret: crate::text_edit::Caret::all(text), selecting: false, since: 0.0, opening: false }
     }
 }
 
@@ -113,6 +152,10 @@ impl App {
                 .clicked()
             {
                 self.toggle_layout();
+            }
+            if ui.button("Fullscreen").on_hover_text("Play it back on the whole screen (F; F, Esc or a double-click to leave)").clicked() {
+                let ctx = ui.ctx().clone();
+                self.set_fullscreen(&ctx, true);
             }
             ui.label(egui::RichText::new(format!("{}×{}", canvas[0], canvas[1])).weak().small())
                 .on_hover_text("Ctrl+wheel zooms around the pointer; middle-drag (or the wheel, when zoomed) pans");
@@ -214,6 +257,11 @@ impl App {
         let size = egui::vec2(canvas[0] as f32 * scale, canvas[1] as f32 * scale);
         let rect = egui::Rect::from_center_size(available.center() + pan, size);
         let clip = ui.painter_at(available);
+        // Inside a compound clip the picture is see-through where it has nothing: a
+        // checkerboard shows where.
+        if !self.compound_trail.is_empty() {
+            crate::widgets::checkerboard(&clip, rect);
+        }
         clip.image(preview_id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         self.draw_guides(&clip, rect);
 
@@ -221,6 +269,22 @@ impl App {
         let zoom = rect.width() as f64 / canvas[0]; // screen px per canvas px
         let to_canvas = |p: egui::Pos2| [((p.x - rect.left()) as f64) / zoom, ((p.y - rect.top()) as f64) / zoom];
         let to_screen = |c: [f64; 2]| egui::pos2(rect.left() + (c[0] * zoom) as f32, rect.top() + (c[1] * zoom) as f32);
+        // Plugins' overlays that are on, over the picture.
+        if !self.settings.overlays_on.is_empty() {
+            let selected = self.selection.and_then(|id| oa_edit::transform::placement_of(self.editor.doc.project(), self.editor.seq, self.variant_id(), id, self.playhead).ok()).map(|p| {
+                let c = p.corners();
+                let (xs, ys) = (c.map(|p| p[0]), c.map(|p| p[1]));
+                [xs.iter().copied().fold(f64::MAX, f64::min), ys.iter().copied().fold(f64::MAX, f64::min), xs.iter().copied().fold(f64::MIN, f64::max), ys.iter().copied().fold(f64::MIN, f64::max)]
+            });
+            let input = oa_graph::script::OverlayInput {
+                canvas: [canvas[0], canvas[1]],
+                seconds: self.playhead.as_seconds_f64(),
+                duration: self.editor.duration().as_seconds_f64(),
+                playing: self.playing,
+                selected,
+            };
+            self.draw_overlays(&clip, &to_screen, zoom, &input);
+        }
         let (seq, variant_id, t) = (self.editor.seq, self.variant_id(), self.playhead);
         let modifiers = ui.input(|i| i.modifiers);
         let mods = Modifiers { free: modifiers.shift, step: modifiers.command };
@@ -251,7 +315,18 @@ impl App {
         // Its effects' points (a Swirl's center…), grabbed before anything else.
         let effect_points = selected.as_ref().map(|p| self.effect_points(p.item, t)).unwrap_or_default();
         let effect_point = |pointer: egui::Pos2| -> Option<usize> { crate::points::point_near(&effect_points, selected.as_ref()?, &to_screen, pointer) };
-        let hit = |pointer: [f64; 2]| variant.as_ref().and_then(|v| scene::hit_test(&project, seq, v, t, pointer));
+        // A layer with a Surface is only hit inside its warped mesh (worked out up front:
+        // the closure can't hold on to `self`).
+        let meshes: Vec<(oa_doc::ItemId, scene::Placement, crate::surface::Surface)> = variant
+            .as_ref()
+            .map(|v| scene::layers_at(&project, seq, v, t).into_iter().filter_map(|l| Some((l.item, self.surface_of(l.item, t)?, l))).map(|(id, s, l)| (id, l, s)).collect())
+            .unwrap_or_default();
+        let hit = |pointer: [f64; 2]| {
+            let v = variant.as_ref()?;
+            scene::hits(&project, seq, v, t, pointer)
+                .into_iter()
+                .find(|id| meshes.iter().find(|(m, ..)| m == id).is_none_or(|(_, l, s)| l.to_layer_fraction(pointer).is_some_and(|q| s.covers(q))))
+        };
 
         // Pointer feedback.
         let mut hovered_layer = None;
@@ -327,9 +402,86 @@ impl App {
             }
         }
 
+        // A second press on a title opens it for typing, on the press itself: anywhere in
+        // its box (its gaps too), however slightly the pointer moved between the presses,
+        // and the press can't go on to drag the layer. (egui's double-click needed both
+        // clicks to land on a letter and to stay clicks, which made it hit and miss.)
+        if ui.input(|i| i.pointer.primary_pressed())
+            && self.crop_mode.is_none()
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin()).filter(|p| response.rect.contains(*p))
+        {
+            let now = ui.input(|i| i.time);
+            let title = variant.as_ref().and_then(|v| scene::title_at(&project, seq, v, t, to_canvas(pos)));
+            let editing = self.canvas_text.as_ref().map(|c| c.item);
+            if editing.is_none_or(|e| Some(e) != title) && title_double_press(self.view.last_press, now, pos, title) {
+                let id = title.expect("a double press is on a title");
+                self.finish_canvas_text();
+                self.selection = Some(id);
+                self.set_playing(false);
+                let text = self.title_text(id, t);
+                self.canvas_text = Some(CanvasText { since: now, opening: true, ..CanvasText::new(id, &text) });
+                self.view.last_press = None;
+            } else {
+                self.view.last_press = Some((now, pos, title));
+            }
+        }
+        let opening = self.canvas_text.as_ref().is_some_and(|c| c.opening);
+        if opening
+            && !ui.input(|i| i.pointer.primary_down())
+            && let Some(c) = self.canvas_text.as_mut()
+        {
+            c.opening = false;
+        }
+
+        // Typing into a title: inside it, the pointer places the cursor (Shift extends),
+        // drags to select, double-clicks a word; pressing anywhere else on the canvas
+        // finishes. While it does, the viewer's own clicks and drags stand aside.
+        let mut text_pointer = opening;
+        if let Some(item) = self.canvas_text.as_ref().map(|c| c.item)
+            && let Some(p) = on_screen(item)
+            && let Some(layout) = self.title_layout(item, t)
+        {
+            let index_at = |pos: egui::Pos2| p.to_layer(to_canvas(pos)).map(|l| layout.index_at(l));
+            let inside = |pos: egui::Pos2| p.contains(to_canvas(pos));
+            let now = ui.input(|i| i.time);
+            let (pressed, down, latest, origin, shift) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.latest_pos(), i.pointer.press_origin(), i.modifiers.shift));
+            if response.hover_pos().is_some_and(inside) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            }
+            if pressed && !opening && let Some(o) = origin.filter(|o| response.rect.contains(*o)) {
+                match index_at(o).filter(|_| inside(o)) {
+                    Some(i) => {
+                        let c = self.canvas_text.as_mut().expect("checked");
+                        c.caret = if shift { crate::text_edit::Caret { cursor: i, anchor: c.caret.anchor } } else { crate::text_edit::Caret::at(i) };
+                        (c.selecting, c.since) = (true, now);
+                    }
+                    None => self.finish_canvas_text(),
+                }
+            }
+            if let Some(c) = self.canvas_text.as_mut().filter(|c| c.selecting) {
+                text_pointer = true;
+                if down && let Some(i) = latest.and_then(&index_at) {
+                    c.caret.cursor = i;
+                } else if !down {
+                    c.selecting = false;
+                }
+            }
+            if response.double_clicked()
+                && !opening
+                && let Some(pos) = response.interact_pointer_pos().filter(|pos| inside(*pos))
+                && let Some(i) = index_at(pos)
+            {
+                let text = self.title_text(item, t);
+                if let Some(c) = self.canvas_text.as_mut() {
+                    (c.caret, c.selecting, c.since) = (crate::text_edit::word_at(&text, i), false, now);
+                }
+                text_pointer = true;
+            }
+        }
+
         // Press: grab a handle of the selected layer, or select-and-move what's under it
         // (not while cropping: the pointer belongs to the crop then).
-        if response.drag_started_by(egui::PointerButton::Primary) && self.crop_mode.is_none() {
+        if response.drag_started_by(egui::PointerButton::Primary) && self.crop_mode.is_none() && !text_pointer {
             let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
             if let (Some(origin), Some(p)) = (origin, selected.as_ref())
                 && let Some(i) = effect_point(origin)
@@ -457,6 +609,7 @@ impl App {
             self.editor.doc.seal();
         }
         if response.clicked()
+            && !text_pointer
             && let Some(pos) = response.interact_pointer_pos()
         {
             let c = to_canvas(pos);
@@ -467,13 +620,15 @@ impl App {
         // Double-click a title to type into it right where it is; any other clip, to
         // crop it.
         if response.double_clicked()
+            && !text_pointer
             && let Some(pos) = response.interact_pointer_pos()
             && let Some(id) = hit(to_canvas(pos))
         {
             self.selection = Some(id);
             self.set_playing(false);
             if self.editor.item(id).is_some_and(|i| i.kind == oa_doc::ItemKind::Text) {
-                self.canvas_text = Some((id, true));
+                let text = self.title_text(id, t);
+                self.canvas_text = Some(CanvasText { since: ui.input(|i| i.time), ..CanvasText::new(id, &text) });
             } else {
                 self.start_crop(id);
             }
@@ -530,14 +685,11 @@ impl App {
             let points = self.effect_points(p.item, t);
             self.paint_points(&painter, p, &points, &to_screen, hovered_effect_point);
         }
-        if let Some((id, _)) = self.canvas_text {
+        if let Some(id) = self.canvas_text.as_ref().map(|c| c.item) {
             match visible(id) {
-                Some(p) => self.canvas_text_editor(ui, &p, &to_screen, zoom),
+                Some(p) => self.canvas_text_editor(ui, &p, &to_screen),
                 // Scrolled away from it, or it's gone: stop editing.
-                None => {
-                    self.canvas_text = None;
-                    self.editor.doc.seal();
-                }
+                None => self.finish_canvas_text(),
             }
         }
         if let Some(drag) = &self.viewer_drag {
@@ -552,64 +704,136 @@ impl App {
         }
     }
 
-    /// Typing into a title on the canvas: a text box over the title's box, at roughly its
-    /// on-screen size, writing through as you type (one undo step per editing session).
-    /// Escape, Ctrl+Enter or clicking elsewhere finishes.
-    fn canvas_text_editor(&mut self, ui: &mut egui::Ui, p: &scene::Placement, to_screen: &dyn Fn([f64; 2]) -> egui::Pos2, zoom: f64) {
-        use oa_doc::{schema, ParamTarget};
-        use oa_params::{ParamSource, Value};
-        let Some((item, first)) = self.canvas_text else { return };
-        let t = self.playhead;
-        let value = |app: &Self, id: &str| app.editor.param_value(item, &ParamTarget::Item, id, t);
-        let mut content = value(self, schema::TEXT_CONTENT).and_then(|v| v.as_text().map(str::to_string)).unwrap_or_default();
-        let em = value(self, schema::TEXT_SIZE).and_then(|v| v.as_float()).unwrap_or(96.0);
-        let size = (em * zoom * p.values.vec2(schema::SCALE)[1].abs()).clamp(11.0, 72.0) as f32;
-        let align = match value(self, schema::TEXT_ALIGN).and_then(|v| v.as_enum().map(str::to_string)).as_deref() {
-            Some("left") => egui::Align::LEFT,
-            Some("right") => egui::Align::RIGHT,
-            _ => egui::Align::Center,
-        };
-        let corners = p.corners().map(to_screen);
-        let area = egui::Rect::from_points(&corners);
-        let width = area.width().max(180.0);
-        let accent = crate::style::ACCENT;
-        ui.painter().rect_stroke(area.expand(3.0), 3.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+    /// The words of title `item` at `t`.
+    pub(crate) fn title_text(&self, item: oa_doc::ItemId, t: oa_time::Time) -> String {
+        self.editor.param_value(item, &oa_doc::ParamTarget::Item, oa_doc::schema::TEXT_CONTENT, t).and_then(|v| v.as_text().map(str::to_string)).unwrap_or_default()
+    }
 
-        let inner = egui::Area::new(egui::Id::new(("canvas-text", item.0)))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(area.center().x - width / 2.0, area.top()))
-            .show(ui.ctx(), |ui| {
-                egui::Frame::new().fill(egui::Color32::from_black_alpha(170)).corner_radius(4.0).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
-                    let edit = egui::TextEdit::multiline(&mut content)
-                        .font(egui::FontId::proportional(size))
-                        .horizontal_align(align)
-                        .desired_width(width - 8.0)
-                        .desired_rows(1)
-                        .frame(egui::Frame::NONE)
-                        .hint_text("Type your title");
-                    let r = ui.add(edit);
-                    ui.label(egui::RichText::new("Esc or Ctrl+Enter to finish").small().weak());
-                    r
-                })
-                .inner
-            });
-        let r = inner.inner;
-        if first {
-            r.request_focus();
-            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), r.id) {
-                let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(content.chars().count()));
-                state.cursor.set_char_range(Some(all));
-                state.store(ui.ctx(), r.id);
-            }
-            self.canvas_text = Some((item, false));
-        }
-        if r.changed() {
-            self.editor.set_param(item, ParamTarget::Item, schema::TEXT_CONTENT, ParamSource::Static(Value::Text(content)), "canvas-text");
-        }
-        let (escape, submit) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.modifiers.command && i.key_pressed(egui::Key::Enter)));
-        if !first && (escape || submit || r.lost_focus() || !r.has_focus()) {
-            self.canvas_text = None;
+    /// Title `item`'s layout at `t` — the same one it's drawn from (format overrides
+    /// included), in the layer's own px.
+    fn title_layout(&self, item: oa_doc::ItemId, t: oa_time::Time) -> Option<std::sync::Arc<oa_text::Layout>> {
+        let it = self.editor.item(item)?;
+        let variant = self.editor.sequence().variant(self.variant_id())?;
+        let ctx = it.eval_context(t);
+        let values = it.params.eval(oa_doc::schema::text(), variant.overrides.get(&item), &ctx);
+        Some(oa_text::layout(&scene::text_spec(&values)))
+    }
+
+    /// Stops typing into the title (one undo step for the whole session).
+    pub(crate) fn finish_canvas_text(&mut self) {
+        if self.canvas_text.take().is_some() {
             self.editor.doc.seal();
         }
+    }
+
+    /// Typing into a title where it's drawn: the keys, typing, copy, cut and paste go
+    /// straight into its words (`text_edit`), written through as you type, and the real
+    /// render — effects and all — is what you see, with the cursor and the selection
+    /// drawn over it. Escape, Ctrl+Enter, or pressing elsewhere finishes.
+    fn canvas_text_editor(&mut self, ui: &mut egui::Ui, p: &scene::Placement, to_screen: &dyn Fn([f64; 2]) -> egui::Pos2) {
+        use crate::text_edit;
+        use oa_doc::{schema, ParamTarget};
+        use oa_params::{ParamSource, Value};
+        let Some(item) = self.canvas_text.as_ref().map(|c| c.item) else { return };
+        // Another text field took the keyboard (the inspector's, say): done here.
+        if ui.ctx().text_edit_focused() {
+            self.finish_canvas_text();
+            return;
+        }
+        let t = self.playhead;
+        let now = ui.input(|i| i.time);
+        let (escape, submit) = ui.input(|i| (i.key_pressed(egui::Key::Escape), i.modifiers.command && i.key_pressed(egui::Key::Enter)));
+        if escape || submit {
+            self.finish_canvas_text();
+            return;
+        }
+
+        // Edits, in the order they came.
+        let mut text = self.title_text(item, t);
+        let events = ui.input(|i| i.events.clone());
+        let mut changed = false;
+        if !events.is_empty()
+            && let Some(layout) = self.title_layout(item, t)
+            && let Some(c) = self.canvas_text.as_mut()
+        {
+            // Up and down: the same x on the line above or below (the layout as it was
+            // before this frame's typing — close enough for a keypress).
+            let vertical = |i: usize, down: bool| -> Option<usize> {
+                let (line, x) = layout.caret(i)?;
+                let n = layout.carets.iter().position(|l| std::ptr::eq(l, line))?;
+                let to = layout.carets.get(if down { n + 1 } else { n.checked_sub(1)? })?;
+                let k = to.xs.iter().enumerate().min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs()))?.0;
+                Some(to.first_char + k)
+            };
+            for e in &events {
+                let before = c.caret;
+                let out = text_edit::apply(&mut text, &mut c.caret, e, &vertical);
+                if let Some(copied) = out.copied {
+                    ui.ctx().copy_text(copied);
+                }
+                changed |= out.changed;
+                if out.changed || c.caret != before {
+                    c.since = now;
+                }
+            }
+        }
+        if changed {
+            self.editor.set_param(item, ParamTarget::Item, schema::TEXT_CONTENT, ParamSource::Static(Value::Text(text.clone())), "canvas-text");
+        }
+
+        // The title's box, marked as being edited; the selection and the cursor over the
+        // letters, where they are after this frame's typing.
+        let accent = crate::style::ACCENT;
+        let corners = p.corners().map(to_screen);
+        let outline: Vec<egui::Pos2> = corners.iter().copied().chain(std::iter::once(corners[0])).collect();
+        ui.painter().add(egui::Shape::dashed_line(&outline, egui::Stroke::new(1.0, accent), 5.0, 4.0));
+        let (Some(layout), Some(c)) = (self.title_layout(item, t), self.canvas_text.as_ref()) else { return };
+        let screen = |x: f64, y: f64| to_screen(p.to_canvas.apply([x, y]));
+        let (a, b) = c.caret.range();
+        for line in &layout.carets {
+            let last = line.first_char + line.xs.len() - 1;
+            let (from, to) = (a.max(line.first_char), b.min(last));
+            // Selected through the line's end: a sliver for its line break.
+            let past_end = b > last && a <= last;
+            if from < to || (past_end && from <= to) {
+                let x0 = line.xs[from - line.first_char];
+                let x1 = line.xs[to - line.first_char] + if past_end { layout.em * 0.25 } else { 0.0 };
+                let quad = vec![screen(x0, line.top), screen(x1, line.top), screen(x1, line.bottom), screen(x0, line.bottom)];
+                ui.painter().add(egui::Shape::convex_polygon(quad, accent.gamma_multiply(0.35), egui::Stroke::NONE));
+            }
+        }
+        // Solid for a moment after each change, then blinking.
+        let shown = now - c.since < 0.5 || (now - c.since) % 1.0 < 0.6;
+        if shown && let Some((line, x)) = layout.caret(c.caret.cursor) {
+            let (top, bottom) = (screen(x, line.top), screen(x, line.bottom));
+            ui.painter().line_segment([top, bottom], egui::Stroke::new(3.0, egui::Color32::from_black_alpha(160)));
+            ui.painter().line_segment([top, bottom], egui::Stroke::new(1.5, egui::Color32::WHITE));
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        if text.is_empty() {
+            let at = to_screen(p.to_canvas.apply([layout.size[0] / 2.0, layout.size[1] / 2.0]));
+            ui.painter().text(at, egui::Align2::CENTER_CENTER, "Type your title", egui::FontId::proportional(14.0), egui::Color32::from_white_alpha(140));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::title_double_press;
+    use eframe::egui::pos2;
+    use oa_doc::ItemId;
+
+    /// A second press opens a title when it's soon, near, and on the same title — even a
+    /// few points off, which egui's double-click counted as a drag.
+    #[test]
+    fn a_second_press_on_the_same_title_opens_it() {
+        let title = Some(ItemId(7));
+        let first = Some((1.0, pos2(100.0, 100.0), title));
+        assert!(title_double_press(first, 1.3, pos2(106.0, 103.0), title));
+        assert!(!title_double_press(first, 1.7, pos2(100.0, 100.0), title), "too late");
+        assert!(!title_double_press(first, 1.2, pos2(130.0, 100.0), title), "too far");
+        assert!(!title_double_press(first, 1.2, pos2(100.0, 100.0), Some(ItemId(8))), "another title");
+        assert!(!title_double_press(Some((1.0, pos2(100.0, 100.0), None)), 1.2, pos2(100.0, 100.0), title), "the first press missed");
+        assert!(!title_double_press(None, 1.2, pos2(100.0, 100.0), title));
     }
 }

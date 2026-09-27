@@ -61,6 +61,14 @@ impl Affine2 {
         (a * a + b * b).sqrt().max((c * c + d * d).sqrt())
     }
 
+    /// Smallest stretch along either source axis: below 1 the transform shrinks, and at
+    /// 0.5 one output pixel spans two source pixels (a single bilinear read starts to
+    /// skip some of them).
+    pub fn min_axis_scale(&self) -> f64 {
+        let [a, b, c, d, ..] = self.m;
+        (a * a + b * b).sqrt().min((c * c + d * d).sqrt())
+    }
+
     /// No rotation or skew, so rectangles stay rectangles (needed for occlusion).
     pub fn is_axis_aligned(&self) -> bool {
         self.m[1].abs() < 1e-12 && self.m[2].abs() < 1e-12
@@ -122,6 +130,11 @@ impl Rect {
     /// The smallest rectangle holding both.
     pub fn union(&self, o: &Rect) -> Rect {
         Rect::new(self.x0.min(o.x0), self.y0.min(o.y0), self.x1.max(o.x1), self.y1.max(o.y1))
+    }
+
+    /// Where both are (empty — `is_empty` — if they don't meet).
+    pub fn intersect(&self, o: &Rect) -> Rect {
+        Rect::new(self.x0.max(o.x0), self.y0.max(o.y0), self.x1.min(o.x1), self.y1.min(o.y1))
     }
 }
 

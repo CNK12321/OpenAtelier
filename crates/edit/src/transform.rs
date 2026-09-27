@@ -146,6 +146,10 @@ pub struct Gesture {
     start_pointer: [f64; 2],
     start: Placement,
     canvas: [f64; 2],
+    /// The project when the drag began (its sequences are shared, so this is cheap): edits
+    /// that depend on more than the start placement are worked out from it, so each
+    /// pointer move recomputes from the start rather than from the last move.
+    origin: Project,
 }
 
 fn locate(p: &Project, seq: SeqId, item: ItemId) -> R<(&Item, TrackId)> {
@@ -192,6 +196,7 @@ impl Gesture {
             start_pointer: pointer,
             canvas: [size.width as f64, size.height as f64],
             start,
+            origin: p.clone(),
         })
     }
 
@@ -263,10 +268,66 @@ impl Gesture {
             }
         }
         for (param, value) in &values {
+            // Moving the anchor of an animated layer: its position is made up for at every
+            // key of the transform, not only at the playhead (see `anchor_position`).
+            if self.handle == Handle::Anchor
+                && *param == schema::POSITION
+                && let Some(op) = self.anchor_position(&values)?
+            {
+                out.ops.push(op);
+                continue;
+            }
             out.ops.push(write_param(p, self.seq, self.item, self.variant, self.scope, self.t, param, value.clone())?);
         }
         out.values = values;
         Ok(out)
+    }
+
+    /// The position edit for an anchor move when the layer's transform is animated. How
+    /// far the position must move to keep the picture still depends on the scale and
+    /// rotation *at that moment*, so writing it at the playhead alone shifted the layer
+    /// everywhere else. Here the position gets a key at every key time of the position,
+    /// scale, squash and rotation (and the playhead), each made up for with the transform
+    /// at that time — exact at those moments, and between them as close as the keys'
+    /// interpolation allows. `None`: nothing's animated, the plain edit is exact.
+    fn anchor_position(&self, values: &[(&'static str, Value)]) -> R<Option<Op>> {
+        let p = &self.origin;
+        let Some(a) = values.iter().find(|(k, _)| *k == schema::ANCHOR).and_then(|(_, v)| v.as_vec2()) else { return Ok(None) };
+        let a0 = self.start.values.vec2(schema::ANCHOR);
+        let (it, track) = locate(p, self.seq, self.item)?;
+        let v = variant(p, self.seq, self.variant)?;
+        let (target, existing) = param_home(p, self.seq, it, self.variant, self.scope, schema::POSITION);
+        let source_of = |param: &str| param_home(p, self.seq, it, self.variant, self.scope, param).1;
+        let transform = [schema::POSITION, schema::SCALE, schema::SQUASH, schema::ROTATION];
+        let mut times: Vec<Time> = transform
+            .iter()
+            .filter_map(|param| source_of(param)?.curve())
+            .filter(|c| c.anchor == oa_params::KeyframeAnchor::ClipStart)
+            .flat_map(|c| c.keys.iter().map(|k| it.range.start + k.t))
+            .filter(|t| it.range.contains(*t))
+            .collect();
+        if times.is_empty() {
+            return Ok(None);
+        }
+        times.push(self.t);
+        times.sort();
+        times.dedup();
+        // The same make-up as for a still layer (`update`), with the transform at `at`.
+        let make_up = |at: &Placement| -> [f64; 2] {
+            let w = [(a[0] - a0[0]) * at.native[0] * at.reframe.scale[0], (a[1] - a0[1]) * at.native[1] * at.reframe.scale[1]];
+            let lw = linear(&at.to_canvas, [w[0] / at.reframe.scale[0], w[1] / at.reframe.scale[1]]);
+            [(lw[0] - w[0]) / self.canvas[0], (lw[1] - w[1]) / self.canvas[1]]
+        };
+        let original = existing.cloned().unwrap_or(ParamSource::Static(Value::Vec2(self.start.values.vec2(schema::POSITION))));
+        let mut source = original.clone().keyframed(&it.eval_context(self.t), oa_params::KeyframeAnchor::ClipStart);
+        for t in times {
+            let Ok(at) = scene::placement(p, track, it, v, t) else { continue };
+            let ctx = it.eval_context(t);
+            let Some(was) = original.eval(&ctx).as_vec2() else { continue };
+            let d = make_up(&at);
+            source.set_at(&ctx, Value::Vec2([was[0] + d[0], was[1] + d[1]]));
+        }
+        Ok(Some(Op::SetParam { seq: self.seq, item: self.item, target, param: ParamId::new(schema::POSITION), source: Some(source) }))
     }
 
     /// New `transform.scale` for a corner or edge drag: scale about the anchor so the
@@ -346,6 +407,17 @@ pub fn reset_transform(p: &Project, seq: SeqId, item: ItemId, scope: Scope) -> R
         .collect())
 }
 
+/// Where an edit of `param` goes (see [`write_param`]) and what's there now.
+fn param_home<'a>(p: &'a Project, seq: SeqId, it: &'a Item, viewed: VariantId, scope: Scope, param: &str) -> (ParamTarget, Option<&'a ParamSource>) {
+    let s = p.sequence(seq);
+    let override_of = |v: VariantId| s.and_then(|s| s.variant(v)).and_then(|v| v.overrides.get(&it.id)).and_then(|o| o.get(param));
+    match (override_of(viewed), scope) {
+        (Some(src), _) => (ParamTarget::VariantOverride(viewed), Some(src)),
+        (None, Scope::Variant(v)) => (ParamTarget::VariantOverride(v), override_of(v).or_else(|| it.params.get(param))),
+        (None, Scope::AllFormats) => (ParamTarget::Item, it.params.get(param)),
+    }
+}
+
 /// Sets `param` to `value` at timeline time `t`, keyframe-aware, writing to wherever the
 /// value seen in `viewed` comes from:
 /// * if `viewed` already overrides the param, that override is edited;
@@ -363,13 +435,7 @@ pub fn write_param(
     value: Value,
 ) -> R<Op> {
     let (it, _) = locate(p, seq, item)?;
-    let s = p.sequence(seq).expect("located above");
-    let override_of = |v: VariantId| s.variant(v).and_then(|v| v.overrides.get(&item)).and_then(|o| o.get(param));
-    let (target, existing) = match (override_of(viewed), scope) {
-        (Some(src), _) => (ParamTarget::VariantOverride(viewed), Some(src)),
-        (None, Scope::Variant(v)) => (ParamTarget::VariantOverride(v), override_of(v).or_else(|| it.params.get(param))),
-        (None, Scope::AllFormats) => (ParamTarget::Item, it.params.get(param)),
-    };
+    let (target, existing) = param_home(p, seq, it, viewed, scope, param);
     let ctx: EvalContext = it.eval_context(t);
     let source = match existing {
         Some(src) => {

@@ -222,10 +222,31 @@ This is the contract the optimizer must never change.
 * ✅ **Async shader compilation**: fused pipelines compile on a worker thread; until ready
   the unfused chain renders (per-effect pipelines are precompiled by `Renderer::warm_up`).
   Output is tested equal to the reference path. ⏳ Persist the pipeline cache on disk.
-* ⏳ UV-warp fusion with fallback to explicit mip selection / multi-tap filtering when the
-  combined transform minifies by more than ~2×.
-* ⏳ Region-of-interest propagation, CPU-island grouping (≤1 download + 1 upload per chain).
-* ⏳ Structural graph reuse between frames (only uniforms change) for large projects.
+* ✅ **UV-warp fusion** (2026-09-26): `uv_warp` effects are position maps
+  (`fn(pos, base) -> vec2f`, where to read; `clamp_to_input`/`outside_input` for edges) —
+  Fisheye, Swirl, Mirror, Kaleidoscope, Ripple, Tile and Wobble are. Chains of them that
+  cover their input's area fuse into `NodeOp::FusedUvWarps` (one read for all), and the
+  executor draws a warp straight into the composite layer it feeds (`shaders::layer_warped`:
+  warp and placement in one resample, no image between) — unless the placement shrinks
+  it past 2× (`Affine2::min_axis_scale` < 0.5), where a single read would skip pixels and
+  the warp keeps its own pass at the layer's size. Tested against the reference path.
+* ✅ **Region-of-interest propagation** (`oa_graph::roi`, 2026-09-26): from the output
+  back, the part of each node the frame reads — through composites and transforms (a
+  source pixel of margin for filtering) and point ops; anything whose reach isn't declared
+  exactly (neighborhood effects, warps, transitions, text, second inputs) asks for all
+  of its input. Composites and point ops (fused or not) render only their part, on the
+  input's own pixel grid (`roi::snap_region`), so a zoomed-in clip or a compound hanging
+  off the canvas costs what shows; a partial output is cached under its own key
+  (`CacheKey::within`). Off with `FusionMode::Off` (the reference path). Tested
+  identical to rendering everything whole.
+* ✅ **Reuse between frames** (2026-09-26). Measured on 60 effected layers
+  (`gpu/tests/bench_frame.rs`): planning 0.18 ms and optimizing 0.06 ms a frame, but
+  recording the GPU work 6.8 ms — so the reuse is in the renderer (`Reuse`): pass *i*
+  keeps uniform buffer *i* and writes it only when its numbers changed, and its bind
+  group (buffer + input texture + sampler) is kept while the pair recurs — the pool hands
+  out the same textures in the same order for a frame of the same shape (playback, a
+  drag). Effect descriptors are no longer copied per node. 6.8 → 2.2 ms a frame.
+* ⏳ CPU-island grouping (≤1 download + 1 upload per chain).
 
 ## 8. Effects & plugins
 
@@ -413,8 +434,17 @@ scratch copy of the project in which the clip is **frozen on the playhead's fram
 from the node cache — nothing seeks or waits on the decoder. Previews are **framed on
 the clip** (its bounds plus room to move), so a small title fills the cell, and render
 at a resolution matched to that framing. Still previews are cached per (document,
-playhead, format, clip) and rendered within a 12 ms budget per UI frame; the hover
-animation draws into one reused texture. **While playing** the previews stay on the
+playhead, format, clip). **They render on the preview thread** (`preview_worker.rs`,
+2026-09-25), not in the UI loop: a renderer and decoders of its own (like the export's),
+a small VRAM budget, shaders and decodes waited for there — so every preview is the
+exact frame and none costs the UI a frame. Requests have a *slot* (one cell, the hover
+animation, the caption preview, the project picture) and only the newest per slot
+renders; still previews carry the moment's *generation* and are skipped once it has
+moved on. GPU hand-off: the thread draws each result into a texture of its own and
+submits it before handing it over (one queue runs submissions in order, so the UI's
+later frame sees it finished); the UI points the cell's egui id at it and frees what it
+replaces — nothing is ever drawn into while on screen. The hover animation asks for a
+frame every UI frame and shows the latest done (a frame or two behind). **While playing** the previews stay on the
 moment playback started from (the moving playhead used to throw them away every frame,
 so they flickered to the loading skeleton), and whenever they do need redoing — a new
 moment, a slider being dragged — each keeps showing its last picture until the new one
@@ -451,6 +481,27 @@ Plugin tiers:
    limits.
 3. **Native** (opt-in) — ML, codecs, OFX/CLAP bridges; preferably out-of-process.
 
+**Plugin overlays and actions** ✅ (2026-09-26, `oa_graph::script::{OverlayScript,
+ActionScript}`, `app/src/plugin_scripts.rs`): a manifest's `"scripts"` are OA scripts of
+their own, listed in the **Plugins** menu. An *overlay* draws over the viewer each frame
+(it reads the canvas size, playhead, duration and the selected clip's box; draws lines,
+rects, circles, dots and grids — at most 512 shapes; it never sees the project's
+contents). An *action* runs over the selected clips in timeline order and may change
+their start, duration, position, scale, rotation, opacity and volume — one undo step,
+keyframe-aware. `plugins/example-looks` has one of each.
+
+**Security confirmation**: every OA script a plugin carries (sound shaders; motion,
+bounds, pass and tail scripts; overlays; actions) runs only once the user has allowed
+that plugin's scripts in a confirmation listing what they'd do. The allowance is the
+scripts' FNV-1a fingerprint (`Plugin::script_digest`, kept in `Settings::trusted_scripts`),
+so any change to any script (an update) asks again; until then the plugin loads without
+them (`Plugin::without_scripts`: its WGSL-only effects stay) and the Plugins menu and
+page offer to review it. It can be taken back on the Plugins page. WGSL needs no
+allowing — sandboxed on the GPU; OA script itself can't loop, reach files or the
+network, or see anything but what its host hands it — the confirmation is for code
+from someone else running at all, and for what actions and overlays are handed.
+Atelier Core is part of the editor.
+
 ## 9. Color ✅ (8-bit decode ⏳)
 
 * **Working space**: scene-linear Rec.709 primaries in `Rgba16Float`, premultiplied. 1.0 is
@@ -484,6 +535,30 @@ Plugin tiers:
 * **UI**: right-click a file → *Source color* (curve, gamut, levels, matrix, reset); a
   picture clip's Properties tab → *Source color* (curve, gamut, exposure); with nothing
   selected → *Output* (tone map, exposure).
+* **Grading — the Color tab** (with Advanced color on; `app/color_tab.rs`, 2026-09-27).
+  Three Atelier Core effects with `editor: "color"` (their Effects-tab card points at the
+  tab and keeps the numbers, with keyframe buttons, under a fold), added first in the
+  clip's chain the first time a control is touched — on every selected clip
+  (`Editor::ensure_effect`) — so a grade renders, exports, keyframes and copies like any
+  effect, and is neutral until moved (tested):
+  * **Color Grade** (`color/grade.wgsl`, display-encoded): exposure and white balance
+    (temperature, tint; brightness kept) in light first, then lift/gamma/gain/offset —
+    each an RGB offset from a wheel plus a master — contrast around a pivot, highlights,
+    shadows, whites, blacks, saturation, vibrance, hue (turned about the grey axis).
+    Wheels: red right, green up-left, blue down-left, the rim ±0.25; drag the dot (Shift
+    finely), double-click to reset; the slider under each is its master.
+  * **Curves** (`color/curves.wgsl`): master then red, green, blue — eight points each at
+    fixed inputs, joined by a monotone cubic (it never overshoots a point: a smooth
+    spline through raised points darkened the stretch beside them) — and saturation by
+    hue, eight points round the wheel.
+  * **HSL Mixer** (`color/hsl.wgsl`): hue shift, saturation and luminance for eight bands
+    (red, orange, yellow, green, aqua, blue, purple, magenta), blended between
+    neighboring bands and faded out towards grey.
+  * **Scopes** (`app/scopes.rs`): waveform, RGB parade, vectorscope (75% targets, the
+    skin-tone line) and histogram, from a 320-px readback of the frame on screen made
+    on the preview thread (`PreviewWorker::pixels`, newest only) whenever the frame
+    changes — not while playing (the viewer comes first).
+  * Grade on/off (to compare), copy and paste a grade onto the selection, reset.
 * ⏳ 10-bit decode (P010) so HDR and log don't band; HDR output (PQ/HLG export);
   OCIO configs / LUTs; opt-in `Rgba32Float` for data passes (displacement, depth).
 
@@ -565,6 +640,23 @@ Memory & robustness ✅ / ⏳ (`health.rs`):
 * ⏳ Hardware decode → GPU textures: ship the copy path first, add zero-copy per platform.
 
 ## 11. Media ✅ (Windows, Linux; macOS untried)
+
+* **SVG** (2026-09-27, `oa_media::svg`): drawings import as stills, parsed and drawn in
+  Rust (`resvg`, Apache-2.0/MIT) since ffmpeg only reads SVG when built with librsvg.
+  A drawing has no pixel size, so it's rasterized at its own size or 2048 px on the
+  longer side if that's more (at most 8192): that's its "native" size, sharp when scaled
+  up. Transparency kept; bin cards and filmstrips draw it at their own size.
+* **Reverse playback** (2026-09-27): a clip's speed can be negative (Properties →
+  Speed → Reverse, `oa_edit::timeline::reversed`: the same part of the file, last frame
+  first). Decoding backwards frame by frame would be a seek and a GOP of decoding per
+  frame; instead a decoder asked for a frame a step behind its last decodes the
+  stretch (up to `REVERSE_CHUNK` = 12 frames, not past its keyframe) forward once and
+  hands it out last first, and decodes the stretch before it while a few are left
+  (`Decoding::behind`, `prefetch_behind`) — tested exact on a long GOP, a seek per
+  stretch. Routing sends a step back to the decoder that has it. The sound plays
+  backwards too: `AudioClip::reverse` reads the file down from the clip's start through
+  `Reversed` (a second at a time, decoded and turned round), with speed, keep-pitch and
+  effects as for any clip. Reversed compound clips are still silent.
 
 **Probe & index** (`ffprobe`, metadata only — never pixels): container, duration, an
 optional **video track** (codec, size, coded size, rotation, time base, rate, color,
@@ -649,6 +741,13 @@ asks, and `-fps_mode passthrough` (`-vsync` before ffmpeg 5.1, detected once) st
 frames being duplicated or dropped. Frames are uploaded as two plain textures — R8 luma
 and RG8 chroma (`Surface::chroma`, `Nv12Frame::chroma`) — which every backend samples,
 unlike NV12 textures; the conversion shader already took the planes as two bindings.
+**Preview-sized decoding** (2026-09-25): the source's `fetch`/`frame_now` pass the size the
+preview wants (`Shared::ask_size`), and the worker (`Decoding::follow_size`) picks a divisor
+bucket (1, 2, 4, 8 — the largest that still covers the asked size) and calls
+`VideoDecoder::set_scale_divisor`; ffmpeg then adds `scale=w:h:flags=fast_bilinear` and
+restarts at the same place, so a 4K file previewed in a 960-wide viewer pipes and uploads a
+16th of the bytes. Buckets keep restarts rare; timing is unchanged (`small_previews_decode_small_and_exact`).
+Media Foundation ignores it (zero-copy already).
 The same frame-accuracy suite as Media Foundation's (numbered frames: playback, scrubs,
 stepping back, VFR, HEVC, rotation) passes on it on DX12, Vulkan and OpenGL
 (`tests/ffmpeg_decode.rs`). `oa_media::frame_source` picks per file: Media Foundation
@@ -664,10 +763,41 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
 * egui/eframe runs on **the same wgpu device** as the renderer and the decoder (eframe
   makes it with our adapter rules, §10, and the app wraps it), so a decoded frame goes
   decoder → graph → display transform → screen without ever leaving the GPU.
-* **The window** opens at last time's size and state; since asking for "maximized" at
-  creation doesn't always take, it's asked again once the window exists, and a window much
-  smaller than the screen (or bigger) is fitted to 85% of it, centered. Sizes under
-  800×500 are never remembered.
+* **The window** opens at last time's size and state — maximized on the first run, and
+  when the remembered size doesn't fit this screen (another monitor, a lower
+  resolution: the system then fits it, taskbar included); since asking for "maximized"
+  at creation doesn't always take, it's asked again once the window exists. A window
+  much smaller than the screen grows to 80% of it around where it is (it used to be
+  centered on the first monitor's coordinates, jumping windows across screens). Sizes
+  under 800×500 are never remembered. A project's remembered panel sizes are fitted to
+  the window it opens in (`layout::fit_panels`: the viewer keeps ≥ 40% of the width,
+  the timeline ≤ 45% of the height), so sizes from a big screen don't crowd a laptop.
+* **Windows stay on screen** (`widgets::on_screen`): no bigger than the screen and
+  never dragged off it — a window taller than the screen used to push its title bar out
+  of reach, stuck. **Settings** is a fixed-size window of pages (Editing, Interface,
+  Performance, Graphics, Updates, AI tracker) listed on the left, each scrolling on its
+  own, instead of one long column.
+* **Known issues fixed** (2026-09-26):
+  * *Transparent video* (animated GIFs, ProRes 4444, VP9 alpha) is no longer conformed
+    to H.264: ffmpeg decodes it as `yuva420p` (BT.709 video range), the alpha plane is
+    uploaded beside luma/chroma, and the YUV pass outputs premultiplied RGBA (opaque
+    video binds a 1×1 white alpha). Media Foundation, NV12-only, never gets those files
+    (`gif_transparency_survives_decoding`).
+  * *Splits at odd speeds* are exact: `TimeMap::phase` carries the sub-flick remainder
+    of the source position past a cut (`TimeMap::from`), so the back half shows exactly
+    the frames the whole clip did (`split_at_an_odd_speed_is_exact`).
+  * *Anchor moves on animated layers* key the position at every key time of position,
+    scale, squash and rotation, each made up for with the transform at that time
+    (worked out from the project as the drag began, `Gesture::origin`).
+  * *Hit testing*: titles by their letters (`scene::hits`), Surfaces by their warped mesh
+    (`Surface::covers`); misses fall through to what's beneath.
+  * *Word times* follow what's said: shifted with the in point on head trims and splits
+    (`oa_doc::word_shift`), carried along by moves, exactly undone.
+  * *Inside a compound clip* the preview is see-through (`PlanOptions::see_through`) on
+    a checkerboard, as it looks where it's used.
+  * *Rotated layers* have anti-aliased edges: the layer quad is drawn a pixel larger and
+    each pixel weighted by its coverage (unrotated, whole-pixel layers unchanged —
+    `rotated_layers_have_smooth_edges`).
 * **Compact properties panel** (Settings → Interface): the inspector with tighter rows,
   slightly smaller text and controls, a shorter tab bar, snugger effect cards, and each
   section's explanation moved into its heading's tooltip (`inspector::set_compact`).
@@ -721,7 +851,20 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
     out at all. Zoomed out so far that clips are under 3 px wide (the whole hour
     fitted), neighbors are drawn as one block per run (`ClipRun`: no names, keyframes,
     thumbnails or waveforms to work out), lit when any clip in it is selected; a
-    marquee over a run selects the clips it crosses.
+    marquee over a run selects the clips it crosses. Only when it's needed (2026-09-26):
+    the timeline learns what a clip costs to lay out and draw while drawing them one by
+    one, and joins them only once the clips in view would take over 6 ms — back to one
+    by one under 3 ms (`join_tiny_clips`, the gap keeps it from flickering).
+  * **Arrange** (right-click with several clips → Arrange; `oa_edit::timeline::arrange`,
+    one undo step, refused whole if a clip that isn't moving is in the way): *Move
+    together* (on each track, each starts where the one before ends), *Line up starts*,
+    *Move to playhead* (spacing kept), *Space evenly* (first and last stay).
+  * **Length** (Properties, every clip; not keyframable): the clip's duration in seconds
+    with the frame count, ±1 frame, and *To the end* of the file — it moves the end like
+    a tail trim (stopping at the file's end and the next clip). With several clips
+    selected, a typed or dragged length becomes every one's length (it used to move each
+    end by the first clip's change), ±1 frame and *To the end* work on each for itself,
+    and clips that couldn't be that long are counted in a note (`Editor::length_ops`).
   * **Saving off the UI thread**: the recovery autosave (15 s) and save-as-you-go (20 s)
     turned the whole project into JSON on the UI thread — ~0.2–0.3 s, a regular hitch.
     Both now write an immutable snapshot on a thread of their own, one write at a time;
@@ -771,7 +914,13 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
   injected into egui's raw input, plus `print` to log the selection's transform — how the
   UI is tested without touching the real mouse.
 * **Timeline view**: Ctrl+wheel zooms around the pointer, the wheel scrolls, "Fit" goes
-  back to the whole sequence, and the view follows the playhead while playing. Track
+  back to the whole sequence, and the view follows the playhead while playing — it glides
+  with it once it is three quarters across (no page jumps), and a scroll or zoom while
+  playing is left alone until the playhead is back in view (`TimelineView::looked_away`).
+  Drags snap to edges and the playhead unless Shift is held (Ctrl flips "Snap").
+  Scrubbing against either edge of the lane (the last 40 px, or past it) scrolls the view
+  that way — deeper and longer go faster, from ~0.6 views/s up to 8 (`edge_scroll_speed`)
+  — with the playhead riding the edge. Track
   headers have on/off toggles; "+V"/"+A" add tracks. Transition windows are drawn as
   bands over the cuts; T adds a cross dissolve at the nearest cut (or a fade on the
   selected clip); the inspector picks the type, duration and settings.
@@ -780,8 +929,34 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
   the exact frame is decoded the preview shows the nearest frame on hand (a stand-in —
   never cached). When the playhead stops, the exact frame replaces it within a few ms.
   Slowest scrub render measured 5.5 ms (debug build, long-GOP clip).
+  A file never shown yet keeps the last picture up (`NotReady`) instead of the app
+  waiting on its decoder to open and seek.
+* **Playback never stalls on a decoder** (2026-09-25): a frame waits at most
+  `PLAYBACK_WAIT` (20 ms; `MediaFrameSource::wait_budget`). Late (a clip starting whose
+  decoder is still seeking, a jump), the request stays with its decoder
+  (`Slot::pending`, collected before another is sent, so requests never pile up) and a
+  frame within 24 of it stands in — or the last picture stays up. Decoders are warmed 2 s
+  before a clip first shows — from the start of a transition into it (it shows before its
+  own start, earlier in its file), and for clips inside compound clips too, at their
+  place and speed (`App::upcoming_in`), soonest first; a file already at its 4 decoders
+  (one long file cut into many clips) moves one not on screen rather than skipping the
+  warm-up. A warmed decoder is **held for its clip** (`Slot::warmed_at`,
+  `WARM_HOLD_FRAMES`): the clip playing now doesn't take it for a seek of its own (it
+  used to, when it was the nearest or least recently used — and the cut then sought
+  anyway), and one warmed for a clip playback jumped past is free again after ~3 s
+  (before, it stayed marked busy and the file ran short of decoders). "Not ready" goes all
+  the way up (`Sources` used to turn every video error into the color-bar test pattern,
+  which then flashed in whenever the decoder fell behind — fast clips most); the test
+  pattern is left for files that can't be read, and opening another project blanks the
+  viewer rather than keeping the last one's picture up
+  (`playback_never_stalls_on_a_seek`: ~35 ms worst render across a cut, a warmed clip's
+  first frame in ~3 ms).
+  Scrubbing during playback pauses it; letting go plays on from there (`begin_scrub` /
+  `end_scrub`).
 * **Preview resolution Auto** (default): renders at the size the viewer shows (physical
-  pixels), so a small viewer doesn't render 4K; Full/½/¼ override it.
+  pixels), so a small viewer doesn't render 4K; Full/½/¼ override it. Either way it never goes
+  past Settings → Performance → "Preview up to" (1080p on the short side by default;
+  `Settings::preview_limit`), so a 4K format and its files preview at 1080p.
 * **Viewer zoom & guides**: Fit/50%/100%/200% (Ctrl+0 / Ctrl+1), Ctrl+wheel zooms about
   the pointer, wheel or middle-drag pans; toggleable rule-of-thirds, center cross and
   title/action safe areas.
@@ -797,7 +972,12 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
   (a linked audio clip; the picture clip goes quiet via `audio.enabled`). Right-click
   menus for clips, track headers (rename, move up/down, delete…) and empty space; a Snap
   toggle. Clips draw a **filmstrip and waveform** (`previews.rs`, extracted by ffmpeg on
-  worker threads, one texture per file) and a **keyframe line** (`band.rs`): volume for
+  worker threads, one texture per file, one seek per cell (`-ss t … -frames:v 1`, four at
+  a time), the first frame filling every cell at once, so a multi-GB file isn't decoded
+  end to end before anything shows) and a **keyframe line** (`band.rs`). Only the
+  on-screen part of a clip is drawn — filmstrip tiles (`shown_tiles`), waveform columns,
+  keyframe line samples and key marks — so a long clip zoomed in, millions of px wide,
+  costs what a short one does. The keyframe line shows volume for
   sound, opacity for pictures, or any number property picked with right-click →
   "Default keyframe property"; drag a key or the whole line, Ctrl+click adds/removes keys.
 * **Copy/paste of effects and values**: right-click an effect card's name (copy one or
@@ -994,7 +1174,10 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
   error colors, and 24 px icon buttons whose tooltip always names the shortcut. Panels
   are a shade darker than the content they hold.
 * **Project cards** (`home.rs`, `thumbnail.rs`): saving a project writes
-  `<project>.thumb.png` beside it — one frame, rendered the way the viewer renders — and
+  `<project>.thumb.png` beside it — one frame, rendered the way the viewer renders, on
+  the preview thread (render, readback and PNG encode off the UI; written to a `.part`
+  file and moved into place, so it's never read half-written); the start page decodes
+  each picture on a thread of its own too — and
   the start page shows projects as cards with that picture, the project's **name** (taken
   from the file name the first time it's saved, e.g. `my_holiday_edit.oaproj.json` →
   "my holiday edit") and when it was last touched. Names and thumbnails are cached in
@@ -1006,9 +1189,44 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
 * **Start page** (`home.rs`): what opens with nothing to edit — recent projects (kept in
   `<config>/settings.json`), unsaved-session recovery, New / Open / Import, and a
   Plugins tab listing every plugin with a switch, its version, author, what it provides
-  and any problems, plus Reload and Open plugins folder. "Home" in the top bar goes back
-  without closing the project; files on the command line or dropped on the window go
-  straight to the editor.
+  and any problems, plus Reload and Open plugins folder. Files on the command line or
+  dropped on the window go straight to the editor.
+* **Importing goes to the bin only** (2026-09-27): files opened or dropped land in the
+  folder the bin is showing and wait there; they go on the timeline when put there
+  (drag a card, double-click it, ＋). Using an asset from the library still places it.
+* **Fullscreen playback** (`fullscreen.rs`, 2026-09-27): F (or the viewer's
+  Fullscreen button) — the frame alone on black, the window fullscreen, rendered at the
+  screen's size (Auto resolution). Space plays, ←/→ step, a click plays or pauses; the
+  controls (play, time, a scrub bar, leave) show while the pointer moves; F, Esc or a
+  double-click leave. Only playing and stepping keys work there — no edit from a key
+  pressed while watching. (It returns before the editor's end of frame, so it asks for
+  the next frame itself while playing — at first it didn't, and only redrew when the
+  mouse moved.)
+* **Compound clips' pictures** (2026-09-27): rendered from what's inside, on the preview
+  thread (`StripRequest`: up to 30 frames, one a second, 96 px, laid out as a file's
+  filmstrip) — the bin card (hover to skim) and the clip on the timeline both show it.
+  It's made again after the compound is edited (a new `Arc<Sequence>` is a new version),
+  the old one staying up meanwhile, never more than one render per compound at once.
+* **The plugin window** (`plugin_previews.rs`, 2026-09-27): clicking a plugin's name or
+  its effects summary opens it over the Plugins page (an `egui::Modal`, the page dimmed):
+  on the left its name, version, author, description, where it's from, its switch and
+  its scripts; on the right its effects, in tabs by category (and All), each with a
+  preview rendered on a sample picture — a sunset sky (`assets/preview/sky.jpg`, built
+  in, written beside the settings once and kept by the preview thread whatever project
+  is open: `PreviewWorker::keep`) with a big "Aa" over it, as a compound clip carrying
+  the effect (text effects on the letters). Previews play on hover: intros run, moving
+  effects move, still ones sweep their strength. Transitions and sound effects list
+  with an icon.
+* **Switching projects clears the workspace** (2026-09-26): "Home", New, Open and a
+  recovery all go through `App::set_aside_project` then `App::reset_workspace`. Setting
+  aside keeps unsaved work — a saved project that saves as you go is saved; anything else
+  has its autosave written and left behind (`Autosave::move_on` starts a new file), so the
+  start page offers it under Unsaved work straight away. The reset drops everything that
+  belonged to the old project: selection, gestures, crop/typing, the curve/wave/
+  connection/track editors, Captions, clipboards (they point at its media), filmstrips,
+  waveforms and effect thumbnails (keyed by ids the next project reuses), the sound, the
+  timeline and viewer views (guides and track height stay), the bin's folder and search.
+  Exports carry on: each has its own copy of its project.
 * **Layout**: the inspector runs the full height on the right; the timeline spans the
   rest of the bottom; the media bin (filling its column) and the viewer share the top.
 * **Compound clips** ("As media" / "Nest into one clip" in the clip menu,
@@ -1108,9 +1326,20 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
   Performance panel (off by default), save as you go, GPU memory. A keyframe diamond
   shows a small curve in its corner when the property has shaped (non-default,
   non-linear) easing. Playback volume moved from the inspector to the transport row.
-* **On-canvas text**: double-click a title in the viewer to type into it in place, at
-  about its size on screen; it renders as you type, one undo step per session; Esc,
-  Ctrl+Enter or clicking away finishes.
+* **On-canvas text** (2026-09-25): double-click a title in the viewer to type into it
+  *where it's drawn* (opened on the second press itself, anywhere in the title's box —
+  `scene::title_at`, the gaps between letters included — within 0.5 s and 10 points of
+  the first, and that press can't go on to drag the layer; egui's double-click needed
+  both clicks on a letter and still enough to stay clicks, which made it hit and miss) — no text box on top: the real render (effects and all) is what you
+  see, with a blinking cursor and the selection drawn over the letters, following the
+  title's position, scale and rotation. Click to place the cursor (Shift extends), drag
+  to select, double-click a word; arrows (Ctrl: by word, Up/Down: same x on the next
+  line), Home/End, Backspace/Delete (Ctrl: a word), Enter for a new line, Ctrl+A, and
+  copy/cut/paste through the system clipboard. The editing is `text_edit.rs` (pure,
+  tested); positions come from the layout's **carets** (`oa_text::Layout::carets`: per
+  line, x before every character and after the last, from the shaped clusters;
+  `caret`, `index_at`). While editing, the app's shortcuts stand aside; one undo step per
+  session; Esc, Ctrl+Enter or pressing elsewhere finishes.
 * ⏳ Curve editor for vector properties (position/scale per axis); several curves at once.
 
 ## 12. Audio 🟡
@@ -1180,6 +1409,62 @@ position, and — with `audio.keep_pitch`, on by default — runs the pitch shif
 tape. The inspector's Sound section has a speed field (0.25–4×, presets ½/1/2×) that
 keeps the same part of the file and changes the clip's length on the timeline (an
 error if the next clip is in the way). Freeze frames and reverse play stay silent.
+**Compound clips at another speed** (2026-09-25) play their sound too: inner time τ is
+heard at `start + (τ − in) / k`, each clip inside at k × its own speed (pitch per the
+compound clip's "keep pitch"), fades and lengths squeezed by k (`nested_audio`).
+
+**Audio, 2026-09-26**:
+* **Time-stretch** (`oa_audio::stretch`, WSOLA): "keep pitch" at another speed lays down
+  40 ms Hann-windowed pieces of the source every 20 ms, each read `speed` × 20 ms further
+  in and nudged ±12 ms to where its waveform best continues the last (normalized
+  cross-correlation, coarse then fine); the first piece comes out unfaded. It replaced
+  resampling + a two-tap delay-line pitch shifter, which warbled at ½× and 2×
+  (`stretching_keeps_the_pitch`: pitch within 3%, the source read at the speed, no
+  clicks).
+* **Compound clips' own sound effects** run as a **group bus** (`AudioBus::members`): the
+  compound's clips are mixed apart, its effects run over that mix (tails ringing on),
+  and the result is added in at its layer — effect tracks' buses still see it as one of
+  the layers below them. A compound inside another keeps its clips' effects; its own
+  aren't heard yet.
+* **Volume and mute after the ring**: applied in the device callback, ramped across one
+  buffer (`apply_gain`): instant (not after the ~250 ms queued), never a click; unmute
+  comes back at the volume it was.
+* **Output delay** (Settings → Audio, 0–500 ms): Bluetooth headsets buffer far more than
+  they report; the playback clock runs that much behind, so the picture waits for the
+  sound (`AudioEngine::set_output_delay`).
+* **Export's sound clock counts frames**: the WAV is exactly as many samples as the
+  frames last (`samples_for_frames`, integer arithmetic on the frame boundaries —
+  144,144 for 90 frames at 29.97), not the timeline's duration rounded up, so the muxer
+  never trims a last frame or runs sound past it; samples round to 16 bits instead of
+  truncating.
+
+**Speed and decoding**: a sped-up clip asks the decoder for every k-th frame. When the
+last three steps agree, work-ahead still decodes every frame (it must) but only uploads
+the ones that will be asked for (`DecodeStats::skipped_uploads`: 60 of 80 at 4× in
+`fast_clips_upload_only_the_frames_they_show`) — the uploads were most of the cost of a
+fast clip in playback and export. **Decode on or seek** is a cost comparison, not a
+fixed distance: going on decodes every frame in between; a seek decodes from the
+target's keyframe plus the decoder's `seek_cost` (Media Foundation 12 frames; ffmpeg
+100 — its seek restarts the process). A 16× clip used to seek past every keyframe:
+ffmpeg exported it at **6 fps, now 45** (360p long-GOP test clip; 1× is ~550), no seeks
+(`fast_clips_decode_on_instead_of_seeking`); requests are routed by the same rule
+(`forward_reach`). A fast clip still decodes every frame it passes — k× the decoding at
+k× speed. `AnyDecoder` (what the app decodes through) now forwards `seek_cost` and
+`set_scale_divisor`: the preview-sized ffmpeg decoding had only ever worked in tests.
+ffmpeg's `seek_cost` is **measured**, not fixed: a restart costs roughly a fixed time and
+a frame's decode grows with its size, so it's the running average of restart time over
+frame time (~100 frames at 360p, ~15 at 4K; 8–240).
+
+**Routing two places in one file** (2026-09-26 regression, fixed): with the longer
+decode-on reach, one decoder could be "near" enough for both sides of a transition in
+the same file and was handed both, going back and forth every frame — the app's export
+of a 1-minute stress project fell from 159 to 120 fps (render loop). A decoder another
+request used this frame is now never routed to (unless it's at that very frame), and
+of the rest the closest behind wins: **219 fps** (Media Foundation decoding; ffmpeg 102
+→ 117), faster than before the regression. `two_places_at_once_keep_their_own_decoders`
+routes both orders directly (and fails with the old rule); `app_export_speed` in
+`app/src/export_worker.rs` exports a project through the app's own export path
+(`OA_BENCH_PROJECT=…`, ignored by default).
 
 **Effect tracks** ✅ (2026-09-24): thinner tracks (`Track::effects`) that hold only
 **effect containers** (`ItemKind::Adjustment` items; `kind_fits` keeps everything else
@@ -1259,13 +1544,43 @@ the Compressor, Limiter, De-esser and Stereo Width cards show it live while play
 
 ## 13. Threading & scheduling 🟡
 
-Today: UI/render thread, one decode thread per video file (lookahead), the audio producer
-thread and the device callback. ⏳ The rest:
+Today: the UI thread renders the viewer; decode threads per video file (lookahead);
+the preview thread (`preview_worker`: effect previews, caption preview, project picture);
+the planning thread (`plan_ahead`); export threads, with the export's sound mixed on a
+thread of its own beside the frames (§ export); the audio producer and the device
+callback.
 
-UI · coordinator · single GPU submit thread · decode pool · audio mixer + RT callback ·
-background pool. Newest-request-wins with generation counters; priority: current frame →
-playback lookahead → scrub neighbors → background. Pipelining (plan N+1 while N renders).
-Progressive refinement after ~150 ms idle.
+✅ (2026-09-26):
+* **Pipelining**: playback shows the sequence's own frames (`App::render_time`), so the
+  next is known; `plan_ahead` plans it (graph + optimize, same snapshot, same options)
+  while the UI thread renders this one, and the render uses it only for exactly that
+  key (`PlanKey`) — an edit, jump or format change plans on the spot. Frame-stepped
+  playback also means a 144 Hz screen no longer renders each frame several times.
+* **Priorities**: the current frame first. Decoders answer waiting `Frame`s before
+  scrub `Want`s (newest want wins by generation); a playback frame waits ≤ 20 ms
+  (`wait_budget`); the preview thread holds its work while the viewer plays
+  (`PreviewWorker::set_busy`), its requests coalescing per slot meanwhile.
+* **Progressive refinement**: once the picture has held still ~350 ms (paused, nothing
+  dragged or scrubbed, the exact frame in — `refine_when_idle`), it's rendered once more
+  2× supersampled (up to 2× the canvas, within the preview limit) with smooth text;
+  any change drops back to the fast preview.
+
+✅ **Coordinator** (2026-09-26, `app/src/viewer_render.rs`): the viewer renders on a
+thread of its own. The UI sends a `Request` (project snapshot, time, plan options,
+interactive/wait budget, clips to warm, the next frame to plan) whenever the picture on
+screen isn't the frame wanted, and draws the last picture that came back meanwhile; the
+thread owns the viewer's renderer, its decoders (`Sources`, registered by `Media`
+messages) and the plan-ahead planner, works on the newest request only, and hands back
+display textures drawn and submitted there (three cycling, so the one on screen isn't
+the one drawn into), with the plan report, render stats, memory and decoder status. A
+heavy frame no longer holds up the editor. Results from before a project switch are
+dropped (`fresh_from`). `frames_render_off_the_ui_thread`.
+
+**Single GPU submit thread — decided against.** wgpu's queue already is one serialized
+submission point shared by every thread, and each thread's `write_buffer`/`write_texture`
+uploads are ordered against its own submissions; funneling submissions through another
+thread would reorder them against those uploads — a correctness risk, for ordering we
+already have.
 
 ## 13b. Captions ✅ (engine download not yet tried end to end)
 
@@ -1477,16 +1792,76 @@ with proxies off — that is what makes what you saw what you get.
     (NVIDIA's H.264 MFT, for example — which works on drivers where ffmpeg's NVENC
     doesn't). It muxes the sound itself (PCM in, AAC out), interleaved ~100 ms ahead of
     the picture, and writes BT.709 limited-range tags. Quality maps x264's CRF scale to a
-    bitrate (crf 18 ≈ 0.12 bits/pixel, halving every 6 steps).
+    bitrate (crf 18 ≈ 0.12 bits/pixel, halving every 6 steps). The writer runs
+    unthrottled, so frames are held back while the encoder is more than 12 behind
+    (`keep_up_with_the_encoder`, from its own statistics): before, a slow encoder let
+    frames pile up in memory, the bar reached 100 % with minutes still queued, and
+    `Finalize` drained them in silence. The Exporting window (and the top bar) now also
+    say what's happening outside the frames — "Mixing the sound…", "Finishing the
+    file…" with a timer (`export_worker::Stage`).
   * An **`ffmpeg` process** (libx264/libx265/ProRes), for ProRes, other platforms, and as
-    the fallback when the platform encoder refuses a codec or size.
+    the fallback when the platform encoder refuses a codec or size. It also drives the
+    **GPU's encoder on Linux/macOS** (`HwEncoder`: NVENC, VA-API, Quick Sync, AMF,
+    VideoToolbox — the same bitrate mapping), each tried on a few blank frames at the
+    export's size before it's used (remembered per run).
+  Automatic and Hardware (H.264/HEVC) take the first that works — Media Foundation
+  (Windows), the GPU through ffmpeg, then software — so no platform or computer fails an
+  export for want of a GPU encoder (`hardware_export_falls_back_instead_of_failing`).
   Both take CPU NV12 today; giving the sink writer GPU surfaces through the DXGI device
   manager is the remaining step to frames never leaving the GPU.
-* **Sound** is rendered offline through the same timeline audio used for playback, written
-  to a temporary WAV and muxed by the encoder. Silence pads any stretch without audio, so
-  the two streams stay the same length.
+* **Where an export's time goes** (2026-09-26, `tests/bench_export.rs`, release, RTX 3060
+  + its CPU; 10 s 1080p30 with a title, blur, contrast and sound into 1080p H.264):
+  Media Foundation/NVENC **~285 fps**, x264 medium **~170 fps**; with 4K footage 156 and
+  154 fps (Media Foundation decoding), 120 and 81 fps (ffmpeg decoding, as on Linux).
+  Planning (~0.1 ms/frame) and the sound (≈170× real time) are small; the rest is the
+  encoder (x264 is its own ceiling; NVENC shares the GPU with the render) and, from 4K
+  footage, the decoder. Tried and dropped, measured no faster: the encoder on a thread
+  of its own (both encoders already run in parallel — MF asynchronously, x264 as its
+  own process), and deeper decode-ahead (8 frames instead of 4). Fixed on the way: an
+  export smaller than its footage decoded by ffmpeg was shrunk with `fast_bilinear`
+  (now `area`, as good as the GPU's supersampled shrink). What's left is structural:
+  GPU surfaces straight into Media Foundation (no NV12 readback and re-upload, ~20% of
+  a hardware export) and decoding a long clip on two decoders (alternate GOPs) where
+  decode is the ceiling.
+* **Smooth text** (on by default; `ExportOptions::text_antialias`, the Export window's
+  "Smooth text", `oa export --no-text-aa`): each title is planned at twice its raster
+  (`PlanOptions::text_supersample` — outline widths and text-effect pixel sizes scale
+  with it) and shrunk back by a `Transform` of its own before the crop and the clip's
+  effects. A 2× shrink samples between each 2×2 block, so it's an exact average of four
+  samples per pixel. The optimizer leaves that shrink unmerged (merged into the layer's
+  placement it would be one sparser resample). The preview stays at 1×.
+* **Sound** is rendered offline through the same timeline audio used for playback, on a
+  thread of its own **while the frames render** (`mixdown.rs`; it used to be mixed to a
+  WAV before the first frame). Silence pads any stretch without audio, so the two streams
+  stay the same length. Each encoder takes it the way it can:
+  * Media Foundation reads raw PCM as it interleaves it, so the mixer writes a WAV that
+    grows as it goes (`LiveAudio`: frames written so far, done, error) and the sink reads
+    up to there, waiting only if the picture ever gets ahead of the mix (it's ~100× faster).
+  * ffmpeg takes its inputs when it starts, so the picture goes to a file of its own
+    (`<out>.export-video.<ext>`) while the mixer pipes s16le into a second ffmpeg encoding
+    AAC (Opus for WebM) to `<out>.export-audio.m4a|mka`. At the end one copying pass puts
+    them together (`-c copy`, `-movflags +faststart` for MP4/MOV — the same rewrite
+    faststart always cost), cut with `-t` to the frame count for an export stopped early.
+    GIFs have no sound.
+  * An export stopped early stops the mix; a canceled one (the `Exporter` dropped) stops
+    it before the encoder and removes the temporary files.
+  * `ExportTimings::sound` is the mixer thread's own time, alongside the rest, not added
+    to it: 0.06 s for 10 s of sound with Media Foundation, 0.23 s with ffmpeg's AAC
+    (bench_export).
 * Color metadata (BT.709, limited range) is written into the file rather than left for
   players to guess.
+* **Image sequences and the sound alone** (2026-09-26): `VideoCodec::PngSequence` writes
+  one straight-alpha PNG per frame through ffmpeg's image2 muxer (`x.png` →
+  `x_00000.png`…, numbered from 0; no sound). `VideoCodec::Audio` renders no picture: the
+  mixer thread is the whole export — a WAV is the live file itself, M4A/MP3/FLAC/Opus are
+  encoded straight into the output by the file's extension — and its progress (samples
+  written) is the export's, in timeline frames. With no sound on the timeline it's an
+  error, not a silent file. Both are in the Export window and `oa export --codec png|audio`.
+* **Export queue** (2026-09-26): each queued `ExportJob` carries the project snapshot and
+  media list from when it was queued, so editing on (or opening another project) doesn't
+  change what a waiting export writes. The Export window opens while one runs ("Add to
+  the queue…", and a button beside the top bar's progress); the Exporting window lists
+  what's next with sooner/later/remove, and Skip stops the running one and goes on.
 * [`Exporter`] runs in steps, so the UI renders a few frames per repaint and shows
   progress instead of freezing; the CLI loops the same API.
 * **Verified**: exporting a clip whose frames carry their own number, decoding the result

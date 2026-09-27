@@ -94,10 +94,15 @@ an outro, 1 otherwise), `progress()` and `clip_seconds()`.
 
 * **`point`**: `fn name(c: vec4f, base: u32) -> vec4f` — one pixel's straight (not
   premultiplied) color; `layer_pos()`, `in_origin()`, `in_size()` say where it is.
-* **`uv_warp`**, **`spatial`**: `fn name(pos: vec2f, base: u32) -> vec4f` — `pos` in
-  layer px; read the picture with `sample_input(pos)` / `sample_input_clamped(pos)`
-  (premultiplied) and the second input with `sample_media(pos)`. `pass_index()`,
-  `out_origin()`, `out_size()` for multi-pass effects.
+* **`uv_warp`**: `fn name(pos: vec2f, base: u32) -> vec2f` — where to read the picture
+  for the pixel at `pos` (layer px). Return `clamp_to_input(p)` to repeat the edges
+  outward, `outside_input()` for transparent. The host reads the picture once for a
+  whole run of warps, or draws them straight into the layer — so a warp only maps
+  positions, it doesn't sample.
+* **`spatial`**: `fn name(pos: vec2f, base: u32) -> vec4f` — `pos` in layer px; read the
+  picture with `sample_input(pos)` / `sample_input_clamped(pos)` (premultiplied) and the
+  second input with `sample_media(pos)`. `pass_index()`, `out_origin()`, `out_size()`
+  for multi-pass effects.
 * **`transition`**: `fn name(pos: vec2f, progress: f32, base: u32) -> vec4f` — mixes
   `sample_a(pos)` (outgoing) and `sample_b(pos)` (incoming), in canvas px.
 * **`glyph`** (text, per letter): `fn name(g: Glyph, base: u32) -> Glyph` — change
@@ -231,6 +236,41 @@ Some effects need more than sliders. A plugin opts into one of the host's editor
 * **`equalizer`**: the sound card draws the response curve with draggable bands:
   `low_freq`/`low_gain` (a low shelf), `p1_freq`/`p1_gain`/`p1_q` … `p3_*` (peaks) and
   `high_freq`/`high_gain` (a high shelf).
+
+## Overlays and actions
+
+Besides effects, a plugin can carry **scripts of its own** — in `"scripts"`, each
+`{ "id", "name", "kind": "overlay" | "action", "description", "params", "script" }`
+(the script inline, or `{ "file": … }`). They're listed in the editor's **Plugins**
+menu. `example-looks` has one of each.
+
+* **Overlay**: drawn over the viewer every frame while it's switched on — guides, grids,
+  safe areas, marks. Reads `canvas_w`, `canvas_h` (px), `seconds` (the playhead),
+  `duration`, `playing`, and the selected clip's box: `selected` (0/1), `sel_x0`,
+  `sel_y0`, `sel_x1`, `sel_y1` (canvas px). Draws with `color(r, g, b, a)` (0–1; it
+  applies to what's drawn after), `line(x0, y0, x1, y1, width)`,
+  `rect(x0, y0, x1, y1, width)`, `fill(x0, y0, x1, y1)`, `circle(x, y, radius, width)`,
+  `dot(x, y, radius)` and `grid(x0, y0, x1, y1, columns, rows, width)` (up to 512 shapes a
+  frame). It only draws: it never sees the project's contents or changes anything.
+* **Action**: run from the menu over the selected clips, one at a time in timeline
+  order (`index` of `count`), with `playhead` (seconds) and `canvas_w`/`canvas_h`. It
+  reads and may set `start`, `duration` (seconds), `position_x`, `position_y` (shares of
+  the canvas), `scale`, `rotation` (degrees), `opacity` (0–1) and `volume_db`. Whatever
+  it changes is one edit, undone in one step; keyframed properties get a key at the
+  playhead. `noise(x, stream)` and `jitter(x, stream)` give it randomness.
+
+Parameters work as for effects; overlays and actions run with their defaults.
+
+### Allowing scripts
+
+Every OA script a plugin carries — its sound effects, its effects' motion, bounds,
+pass and tail scripts, its overlays and actions — runs only once the user has allowed
+that plugin's scripts: a confirmation lists what they'd do. Until then the plugin loads
+without them (its WGSL-only effects work; the rest wait). The allowance is for exactly
+those scripts: change any of them (a new version) and the user is asked again. They
+can take it back on the Plugins page. WGSL shaders need no allowing — they run
+sandboxed on the GPU, with nothing to reach but their inputs. Atelier Core is part of
+the editor.
 
 ## What plugins can't do (yet)
 

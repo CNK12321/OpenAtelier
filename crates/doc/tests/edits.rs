@@ -128,7 +128,7 @@ fn slider_drag_coalesces_into_one_undo_step() {
 #[test]
 fn head_trim_keeps_source_anchored_keyframes_on_the_footage() {
     let mut item = clip(10, 0, 10);
-    item.time_map = TimeMap { source_in: secs(0), speed: Rational::integer(2) };
+    item.time_map = TimeMap::new(secs(0), Rational::integer(2));
     let curve = |anchor| {
         ParamSource::Animated(Curve::new(
             anchor,

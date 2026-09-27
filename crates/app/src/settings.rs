@@ -39,6 +39,21 @@ pub struct Settings {
     /// How much GPU memory the renderer may hold, in MB. None: the default (2 GB).
     #[serde(default)]
     pub vram_budget_mb: Option<u64>,
+    /// The preview is never rendered with more than this many pixels on its short side
+    /// (0: no limit). Exports always use the full size.
+    #[serde(default = "full_hd")]
+    pub preview_limit: u32,
+    /// How much later than the device reports the sound reaches the ears, in ms
+    /// (Bluetooth headphones buffer ~150–250 ms): playback's picture waits this long for it.
+    #[serde(default)]
+    pub output_delay_ms: u32,
+    /// Plugins whose scripts the user has allowed, by id: the fingerprint of the exact
+    /// scripts allowed (`Plugin::script_digest`). A changed plugin asks again.
+    #[serde(default)]
+    pub trusted_scripts: std::collections::BTreeMap<String, u64>,
+    /// Plugin overlays drawn over the viewer ("plugin id/script id").
+    #[serde(default)]
+    pub overlays_on: std::collections::BTreeSet<String>,
     /// Keep the project file itself up to date while editing (on by default). The
     /// crash-recovery autosave happens either way.
     #[serde(default = "yes")]
@@ -186,6 +201,10 @@ fn five() -> f64 {
     5.0
 }
 
+fn full_hd() -> u32 {
+    1080
+}
+
 /// The shape new keyframes get.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -240,11 +259,13 @@ pub struct ExportPrefs {
     pub audio: bool,
     /// Frames per second for GIFs.
     pub gif_fps: u32,
+    /// Anti-aliased text (titles drawn at twice the size, averaged down before effects).
+    pub text_antialias: bool,
 }
 
 impl Default for ExportPrefs {
     fn default() -> Self {
-        ExportPrefs { codec: "h264".into(), short_edge: 0, crf: 18, encoder: "auto".into(), audio: true, gif_fps: 15 }
+        ExportPrefs { codec: "h264".into(), short_edge: 0, crf: 18, encoder: "auto".into(), audio: true, gif_fps: 15, text_antialias: true }
     }
 }
 
@@ -277,6 +298,10 @@ impl Default for Settings {
             disabled_plugins: Vec::new(),
             language: None,
             vram_budget_mb: None,
+            preview_limit: full_hd(),
+            output_delay_ms: 0,
+            trusted_scripts: Default::default(),
+            overlays_on: Default::default(),
             save_as_you_go: true,
             advanced_color: false,
             advanced_transform: false,

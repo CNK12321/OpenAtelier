@@ -79,7 +79,7 @@ impl App {
         };
         let mut open = true;
         let title = format!("Connection — {} · {}", it.name, band.param.rsplit('.').next().unwrap_or(&band.param));
-        egui::Window::new(title)
+        crate::widgets::on_screen(egui::Window::new(title), ctx)
             .id(egui::Id::new("connection-editor"))
             .open(&mut open)
             .default_width(460.0)

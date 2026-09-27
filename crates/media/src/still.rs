@@ -118,6 +118,9 @@ impl FrameSource for StillSource {
 
 /// Decodes one frame as straight-alpha RGBA8 at exactly `size`.
 fn decode_rgba(path: &Path, size: [u32; 2]) -> Result<Vec<u8>, MediaError> {
+    if crate::svg::is_svg(path) {
+        return crate::svg::rasterize(path, size);
+    }
     let out = crate::tool("ffmpeg")
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)

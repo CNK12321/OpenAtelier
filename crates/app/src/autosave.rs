@@ -79,6 +79,8 @@ pub struct Autosave {
     pending: Option<std::thread::JoinHandle<Result<(), String>>>,
     last: Instant,
     pub interval: Duration,
+    /// Projects put away with their unsaved work this session (see [`Autosave::move_on`]).
+    moved: u32,
 }
 
 impl Autosave {
@@ -92,6 +94,7 @@ impl Autosave {
             last: Instant::now(),
             // `OA_AUTOSAVE_SECS` shortens it for testing.
             interval: Duration::from_secs(std::env::var("OA_AUTOSAVE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15)),
+            moved: 0,
         }
     }
 
@@ -184,6 +187,17 @@ impl Autosave {
         self.written = None;
     }
 
+    /// Leaves the autosave written so far where it is — the unsaved work of a project
+    /// that was put away, for the start page to offer back — and carries on in a new
+    /// file for whatever is opened next.
+    pub fn move_on(&mut self) {
+        let _ = self.wait();
+        self.moved += 1;
+        let base = self.session.split('~').next().unwrap_or_default().to_string();
+        self.session = format!("{base}~{}", self.moved);
+        self.written = None;
+    }
+
     /// Removes this session's autosave (after a save, a new project, or a clean exit).
     pub fn clear(&mut self) {
         // A write still going would put the file back after it's removed.
@@ -236,6 +250,29 @@ mod tests {
         // Saving (no longer dirty) removes the autosave.
         a.tick(&p1, false, None);
         assert!(b.recoverable().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project put away with unsaved work: its autosave stays (offered back on the start
+    /// page, even in this session), and the next project's autosave is a file of its own.
+    #[test]
+    fn moving_on_keeps_the_last_projects_work() {
+        let dir = std::env::temp_dir().join(format!("oa-autosave-move-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = Autosave::new(dir.clone());
+        a.write_now(&Arc::new(Project::new("one")), Some(Path::new("C:/x/one.oaproj.json"))).unwrap();
+        let first = a.file();
+        a.move_on();
+        assert_ne!(a.file(), first);
+        let found = a.recoverable();
+        assert_eq!(found.iter().map(|r| r.file.clone()).collect::<Vec<_>>(), vec![first.clone()]);
+        assert_eq!(found[0].original.as_deref(), Some(Path::new("C:/x/one.oaproj.json")));
+        // Clearing the next project's autosave leaves the first alone.
+        a.write_now(&Arc::new(Project::new("two")), None).unwrap();
+        a.clear();
+        assert!(first.exists());
+        a.move_on();
+        assert_eq!(a.file().file_name().unwrap().to_string_lossy().matches('~').count(), 1, "one suffix, not a growing chain");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

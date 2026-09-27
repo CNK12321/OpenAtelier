@@ -23,6 +23,122 @@
       "shader": {"entry": "oa_color_saturation", "file": "color/saturation.wgsl"}
     },
     {
+      "id": "oa.color.grade", "name": "Color Grade", "kind": "point", "category": "Color", "space": "display", "editor": "color",
+      "description": "Primary correction: exposure, white balance, lift/gamma/gain/offset wheels, contrast, tone and saturation. Edited in the Color tab.",
+      "preview": {"saturation": 1.5, "gain_b": 0.15, "lift_r": 0.06},
+      "params": [
+        {"id": "exposure", "type": "float", "default": 0, "min": -5, "max": 5},
+        {"id": "temperature", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "tint", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "lift_r", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "lift_g", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "lift_b", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "lift", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "gamma_r", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "gamma_g", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "gamma_b", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "gamma", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "gain_r", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "gain_g", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "gain_b", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "gain", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "offset_r", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "offset_g", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "offset_b", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "offset", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "contrast", "type": "float", "default": 1, "min": 0, "max": 3},
+        {"id": "pivot", "type": "float", "default": 0.435, "min": 0, "max": 1},
+        {"id": "highlights", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "shadows", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "whites", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "blacks", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "saturation", "type": "float", "default": 1, "min": 0, "max": 3},
+        {"id": "vibrance", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "hue", "type": "float", "default": 0, "min": -180, "max": 180, "unit": "degrees"}
+      ],
+      "shader": {"entry": "oa_color_grade", "file": "color/grade.wgsl"}
+    },
+    {
+      "id": "oa.color.curves", "name": "Curves", "kind": "point", "category": "Color", "space": "display", "editor": "color",
+      "description": "Master, red, green and blue curves, and saturation by hue. Edited in the Color tab.",
+      "preview": {"master_2": 0.18, "master_5": 0.82},
+      "params": [
+        {"id": "master_0", "type": "float", "default": 0, "min": -0.5, "max": 1.5},
+        {"id": "master_1", "type": "float", "default": 0.142857, "min": -0.5, "max": 1.5},
+        {"id": "master_2", "type": "float", "default": 0.285714, "min": -0.5, "max": 1.5},
+        {"id": "master_3", "type": "float", "default": 0.428571, "min": -0.5, "max": 1.5},
+        {"id": "master_4", "type": "float", "default": 0.571429, "min": -0.5, "max": 1.5},
+        {"id": "master_5", "type": "float", "default": 0.714286, "min": -0.5, "max": 1.5},
+        {"id": "master_6", "type": "float", "default": 0.857143, "min": -0.5, "max": 1.5},
+        {"id": "master_7", "type": "float", "default": 1, "min": -0.5, "max": 1.5},
+        {"id": "red_0", "type": "float", "default": 0, "min": -0.5, "max": 1.5},
+        {"id": "red_1", "type": "float", "default": 0.142857, "min": -0.5, "max": 1.5},
+        {"id": "red_2", "type": "float", "default": 0.285714, "min": -0.5, "max": 1.5},
+        {"id": "red_3", "type": "float", "default": 0.428571, "min": -0.5, "max": 1.5},
+        {"id": "red_4", "type": "float", "default": 0.571429, "min": -0.5, "max": 1.5},
+        {"id": "red_5", "type": "float", "default": 0.714286, "min": -0.5, "max": 1.5},
+        {"id": "red_6", "type": "float", "default": 0.857143, "min": -0.5, "max": 1.5},
+        {"id": "red_7", "type": "float", "default": 1, "min": -0.5, "max": 1.5},
+        {"id": "green_0", "type": "float", "default": 0, "min": -0.5, "max": 1.5},
+        {"id": "green_1", "type": "float", "default": 0.142857, "min": -0.5, "max": 1.5},
+        {"id": "green_2", "type": "float", "default": 0.285714, "min": -0.5, "max": 1.5},
+        {"id": "green_3", "type": "float", "default": 0.428571, "min": -0.5, "max": 1.5},
+        {"id": "green_4", "type": "float", "default": 0.571429, "min": -0.5, "max": 1.5},
+        {"id": "green_5", "type": "float", "default": 0.714286, "min": -0.5, "max": 1.5},
+        {"id": "green_6", "type": "float", "default": 0.857143, "min": -0.5, "max": 1.5},
+        {"id": "green_7", "type": "float", "default": 1, "min": -0.5, "max": 1.5},
+        {"id": "blue_0", "type": "float", "default": 0, "min": -0.5, "max": 1.5},
+        {"id": "blue_1", "type": "float", "default": 0.142857, "min": -0.5, "max": 1.5},
+        {"id": "blue_2", "type": "float", "default": 0.285714, "min": -0.5, "max": 1.5},
+        {"id": "blue_3", "type": "float", "default": 0.428571, "min": -0.5, "max": 1.5},
+        {"id": "blue_4", "type": "float", "default": 0.571429, "min": -0.5, "max": 1.5},
+        {"id": "blue_5", "type": "float", "default": 0.714286, "min": -0.5, "max": 1.5},
+        {"id": "blue_6", "type": "float", "default": 0.857143, "min": -0.5, "max": 1.5},
+        {"id": "blue_7", "type": "float", "default": 1, "min": -0.5, "max": 1.5},
+        {"id": "huesat_0", "type": "float", "default": 1, "min": 0, "max": 2},
+        {"id": "huesat_1", "type": "float", "default": 1, "min": 0, "max": 2},
+        {"id": "huesat_2", "type": "float", "default": 1, "min": 0, "max": 2},
+        {"id": "huesat_3", "type": "float", "default": 1, "min": 0, "max": 2},
+        {"id": "huesat_4", "type": "float", "default": 1, "min": 0, "max": 2},
+        {"id": "huesat_5", "type": "float", "default": 1, "min": 0, "max": 2},
+        {"id": "huesat_6", "type": "float", "default": 1, "min": 0, "max": 2},
+        {"id": "huesat_7", "type": "float", "default": 1, "min": 0, "max": 2}
+      ],
+      "shader": {"entry": "oa_color_curves", "file": "color/curves.wgsl"}
+    },
+    {
+      "id": "oa.color.hsl", "name": "HSL Mixer", "kind": "point", "category": "Color", "space": "display", "editor": "color",
+      "description": "Hue, saturation and luminance per color band (red, orange, yellow, green, aqua, blue, purple, magenta). Edited in the Color tab.",
+      "preview": {"blue_hue": 40, "red_sat": 0.8},
+      "params": [
+        {"id": "red_hue", "type": "float", "default": 0, "min": -60, "max": 60, "unit": "degrees"},
+        {"id": "red_sat", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "red_lum", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "orange_hue", "type": "float", "default": 0, "min": -60, "max": 60, "unit": "degrees"},
+        {"id": "orange_sat", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "orange_lum", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "yellow_hue", "type": "float", "default": 0, "min": -60, "max": 60, "unit": "degrees"},
+        {"id": "yellow_sat", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "yellow_lum", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "green_hue", "type": "float", "default": 0, "min": -60, "max": 60, "unit": "degrees"},
+        {"id": "green_sat", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "green_lum", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "aqua_hue", "type": "float", "default": 0, "min": -60, "max": 60, "unit": "degrees"},
+        {"id": "aqua_sat", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "aqua_lum", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "blue_hue", "type": "float", "default": 0, "min": -60, "max": 60, "unit": "degrees"},
+        {"id": "blue_sat", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "blue_lum", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "purple_hue", "type": "float", "default": 0, "min": -60, "max": 60, "unit": "degrees"},
+        {"id": "purple_sat", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "purple_lum", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "magenta_hue", "type": "float", "default": 0, "min": -60, "max": 60, "unit": "degrees"},
+        {"id": "magenta_sat", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "magenta_lum", "type": "float", "default": 0, "min": -1, "max": 1}
+      ],
+      "shader": {"entry": "oa_color_hsl", "file": "color/hsl.wgsl"}
+    },
+    {
       "id": "oa.color.posterize", "name": "Posterize", "kind": "point", "category": "Color", "space": "display",
       "preview": {"levels": 4},
       "params": [
@@ -49,7 +165,7 @@
       "shader": {"entry": "oa_blur_smear", "file": "blur/smear.wgsl"}
     },
     {
-      "id": "oa.warp.wobble", "name": "Wobble", "kind": "spatial", "category": "Warp", "time_varying": true,
+      "id": "oa.warp.wobble", "name": "Wobble", "kind": "uv_warp", "category": "Warp", "time_varying": true,
       "params": [
         {"id": "amount", "type": "float", "default": 0.15, "min": 0, "max": 4},
         {"id": "speed", "type": "float", "default": 2, "min": 0, "max": 40},
@@ -125,7 +241,7 @@
       "shader": {"entry": "oa_stylize_edges", "file": "stylize/edges.wgsl"}
     },
     {
-      "id": "oa.warp.fisheye", "name": "Fisheye", "kind": "spatial", "category": "Warp",
+      "id": "oa.warp.fisheye", "name": "Fisheye", "kind": "uv_warp", "category": "Warp",
       "params": [
         {"id": "amount", "type": "float", "default": 0.6, "min": -3, "max": 3},
         {"id": "zoom", "type": "float", "default": 1, "min": 0.2, "max": 4},
@@ -134,7 +250,7 @@
       "shader": {"entry": "oa_warp_fisheye", "file": "warp/fisheye.wgsl"}
     },
     {
-      "id": "oa.warp.swirl", "name": "Swirl", "kind": "spatial", "category": "Warp",
+      "id": "oa.warp.swirl", "name": "Swirl", "kind": "uv_warp", "category": "Warp",
       "params": [
         {"id": "angle", "type": "float", "default": 90, "min": -1080, "max": 1080, "unit": "degrees"},
         {"id": "radius", "type": "float", "default": 0.8, "min": 0.05, "max": 3},
@@ -143,7 +259,7 @@
       "shader": {"entry": "oa_warp_swirl", "file": "warp/swirl.wgsl"}
     },
     {
-      "id": "oa.warp.mirror", "name": "Mirror", "kind": "spatial", "category": "Warp",
+      "id": "oa.warp.mirror", "name": "Mirror", "kind": "uv_warp", "category": "Warp",
       "params": [
         {"id": "axis", "type": "enum", "options": ["vertical", "horizontal"], "static_only": true},
         {"id": "position", "type": "float", "default": 0.5, "min": 0, "max": 1},
@@ -194,7 +310,7 @@
       "shader": {"entry": "oa_stylize_glitch", "file": "stylize/glitch.wgsl"}
     },
     {
-      "id": "oa.warp.kaleidoscope", "name": "Kaleidoscope", "kind": "spatial", "category": "Warp",
+      "id": "oa.warp.kaleidoscope", "name": "Kaleidoscope", "kind": "uv_warp", "category": "Warp",
       "params": [
         {"id": "segments", "type": "float", "default": 6, "min": 2, "max": 24},
         {"id": "rotation", "type": "float", "default": 0, "min": -180, "max": 180, "unit": "degrees"},
@@ -203,7 +319,7 @@
       "shader": {"entry": "oa_warp_kaleidoscope", "file": "warp/kaleidoscope.wgsl"}
     },
     {
-      "id": "oa.warp.ripple", "name": "Ripple", "kind": "spatial", "category": "Warp", "time_varying": true,
+      "id": "oa.warp.ripple", "name": "Ripple", "kind": "uv_warp", "category": "Warp", "time_varying": true,
       "params": [
         {"id": "amplitude", "type": "float", "default": 8, "min": 0, "max": 100, "unit": "layer_pixels"},
         {"id": "wavelength", "type": "float", "default": 60, "min": 4, "max": 1000, "unit": "layer_pixels"},
@@ -222,7 +338,7 @@
       "shader": {"entry": "oa_color_temperature", "file": "color/temperature.wgsl"}
     },
     {
-      "id": "oa.warp.tile", "name": "Tile", "kind": "spatial", "category": "Warp",
+      "id": "oa.warp.tile", "name": "Tile", "kind": "uv_warp", "category": "Warp",
       "params": [
         {"id": "columns", "type": "float", "default": 3, "min": 1, "max": 20},
         {"id": "rows", "type": "float", "default": 3, "min": 1, "max": 20},

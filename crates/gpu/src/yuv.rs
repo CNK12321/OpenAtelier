@@ -57,6 +57,9 @@ pub struct Nv12Frame<'a> {
     /// The chroma plane as its own `Rg8Unorm` texture (half size), for decoders that
     /// upload planes separately: works on every backend, where NV12 textures don't.
     pub chroma: Option<&'a wgpu::Texture>,
+    /// Transparency (`R8Unorm`, the luma plane's size) for video that has it — animated
+    /// GIFs, ProRes 4444, VP9 with alpha. `None`: opaque.
+    pub alpha: Option<&'a wgpu::Texture>,
     pub coded_size: [u32; 2],
     /// Picture size inside the coded surface, before rotation.
     pub visible_size: [u32; 2],
@@ -76,7 +79,7 @@ impl Nv12Frame<'_> {
 }
 
 pub(crate) fn pipelines(device: &wgpu::Device) -> Pipelines {
-    Pipelines::with_layout(device, "oa-yuv", &pass_layout_entries(2))
+    Pipelines::with_layout(device, "oa-yuv", &pass_layout_entries(3))
 }
 
 pub(crate) fn spec() -> PipelineSpec {
@@ -117,7 +120,8 @@ struct Pass { h: array<vec4f, 16> }
 @group(0) @binding(0) var<uniform> P: Pass;
 @group(0) @binding(1) var luma: texture_2d<f32>;
 @group(0) @binding(2) var chroma: texture_2d<f32>;
-@group(0) @binding(3) var samp: sampler;
+@group(0) @binding(3) var alpha: texture_2d<f32>;
+@group(0) @binding(4) var samp: sampler;
 
 @vertex
 fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
@@ -175,6 +179,8 @@ fn fs_main(@builtin(position) fc: vec4f) -> @location(0) vec4f {
     } else {
         rgb = linearize(yuv_to_rgb(uv));
     }
-    return vec4f(rgb, 1.0);
+    // Premultiplied, as everything downstream expects (opaque video binds a white 1×1).
+    let a = textureSampleLevel(alpha, samp, uv, 0.0).r;
+    return vec4f(rgb * a, a);
 }
 "#;

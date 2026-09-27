@@ -15,6 +15,7 @@ mod band;
 mod bin;
 mod clips;
 mod color;
+mod color_tab;
 mod compound;
 mod crop;
 mod logo;
@@ -32,6 +33,7 @@ mod editor;
 mod export_dialog;
 mod export_worker;
 mod fontpick;
+mod fullscreen;
 mod formats;
 mod guard;
 mod home;
@@ -43,18 +45,25 @@ mod notify;
 mod plugins;
 mod prefs;
 mod picker;
+mod plan_ahead;
+mod plugin_previews;
+mod plugin_scripts;
+mod preview_worker;
 mod previews;
 mod record;
 mod captions;
 mod layout;
 mod script;
 mod settings;
+mod scopes;
 mod sources;
 mod style;
 mod thumbnail;
+mod text_edit;
 mod thumbs;
 mod timeline;
 mod viewer;
+mod viewer_render;
 mod waves;
 mod widgets;
 
@@ -62,13 +71,11 @@ use eframe::egui;
 use editor::Editor;
 use oa_audio::{AudioClip, AudioEngine, MixHandle, MixState, TimelineAudio};
 use oa_doc::{ItemId, VariantId};
-use oa_gpu::{readback, FrameSource, FusionMode, GpuContext, GpuImage, RenderOptions, RenderStats, Renderer};
+use oa_gpu::{readback, FusionMode, GpuContext, RenderOptions, RenderStats};
 use oa_graph::registry::Registry;
-use oa_graph::{optimize, KeyContext, OptLevel};
 use oa_media::{Imported, MediaKind, MediaProbe};
-use oa_plan::{plan_frame, PlanOptions, PlanReport};
+use oa_plan::{PlanOptions, PlanReport};
 use oa_time::Time;
-use sources::Sources;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -91,8 +98,12 @@ struct PendingImport {
     folder: String,
 }
 
+/// During playback, how long the preview waits on a video frame before showing a
+/// stand-in instead: time for the decode-ahead to hand over a frame, never a stall.
+const PLAYBACK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+
 const MEDIA_EXTENSIONS: &[&str] =
-    &["mp4", "mov", "mkv", "m4v", "webm", "avi", "gif", "png", "jpg", "jpeg", "bmp", "webp", "mp3", "m4a", "wav", "flac", "aac", "ogg"];
+    &["mp4", "mov", "mkv", "m4v", "webm", "avi", "gif", "png", "jpg", "jpeg", "bmp", "webp", "svg", "mp3", "m4a", "wav", "flac", "aac", "ogg"];
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -141,8 +152,10 @@ fn main() -> eframe::Result {
         .with_title("OpenAtelier")
         .with_app_id("openatelier")
         .with_icon(logo::icon(256));
+    // Maximized last time, or the first run: maximized from the start.
     let viewport = match &saved {
         Some(w) if w.maximized => viewport.with_maximized(true),
+        None if script.is_none() => viewport.with_maximized(true),
         _ => viewport,
     };
     let options = eframe::NativeOptions {
@@ -251,11 +264,10 @@ fn system_ui_fonts() -> (Option<PathBuf>, Option<PathBuf>) {
 }
 
 struct Preview {
-    texture: wgpu::Texture,
+    /// Held while egui shows it (the render thread cycles its textures).
+    _texture: wgpu::Texture,
     id: egui::TextureId,
     size: [u32; 2],
-    /// Held so the pool doesn't reuse the working-format image mid-frame.
-    _image: GpuImage,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -267,14 +279,17 @@ struct FrameKey {
     document: usize,
     /// Envelopes ready for connected properties (a frame redraws as they arrive).
     follow: usize,
+    /// The idle, refined render (see [`App::refine_when_idle`]).
+    refined: bool,
+    see_through: bool,
 }
 
 struct App {
     gpu: Arc<GpuContext>,
-    renderer: Renderer,
+    /// The viewer's picture: planned and rendered on a thread of its own (`viewer_render`).
+    viewer_render: viewer_render::ViewerRender,
     /// Shared with export threads.
     registry: Arc<Registry>,
-    sources: Sources,
     editor: Editor,
     /// How video files get decoded (Media Foundation where it can, ffmpeg otherwise).
     decoders: oa_media::DecoderChoice,
@@ -287,6 +302,8 @@ struct App {
     /// The document snapshot the mix was last built from.
     mixed: Option<Arc<oa_doc::Project>>,
     volume: f32,
+    /// Playback muted (the volume kept for when it isn't).
+    muted: bool,
 
     playhead: Time,
     playing: bool,
@@ -349,11 +366,16 @@ struct App {
     timeline_view: timeline::TimelineView,
     view: viewer::ViewerView,
     thumbs: thumbs::Thumbs,
+    /// Effect previews, the caption preview and the project picture render here, on a
+    /// thread of their own.
+    preview_worker: preview_worker::PreviewWorker,
     /// Filmstrips and waveforms drawn on timeline clips.
     clip_previews: previews::ClipPreviews,
     render_state: Option<eframe::egui_wgpu::RenderState>,
     /// Dragging the playhead: audio seeks wait until the drag ends.
     scrubbing: bool,
+    /// The scrub paused playback; letting go plays on from where it was dropped.
+    resume_after_scrub: bool,
     /// The playhead jumped during playback: frames don't wait for the decoder until it
     /// has caught up.
     seek_settling: bool,
@@ -382,12 +404,19 @@ struct App {
     /// When the project file was last brought up to date (save as you go).
     last_saved: Instant,
     /// Project pictures on the start page, loaded once each (`None`: there isn't one).
-    project_thumbs: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    project_thumbs: std::collections::HashMap<String, Arc<std::sync::OnceLock<Option<egui::TextureHandle>>>>,
     /// Put the keyboard in the inspector's text box next frame (a title was just added).
     focus_text: bool,
-    /// A title being typed into right on the canvas (double-click it in the viewer), and
-    /// whether its editor still has to take the keyboard.
-    canvas_text: Option<(oa_doc::ItemId, bool)>,
+    /// A title being typed into right on the canvas (double-click it in the viewer).
+    canvas_text: Option<viewer::CanvasText>,
+    /// Fullscreen playback (the frame alone), and its controls' state.
+    fullscreen: fullscreen::Fullscreen,
+    /// The Plugins page's opened effect list and its previews.
+    plugin_previews: plugin_previews::PluginPreviews,
+    /// The Color tab's scopes, curve and mixer choices, and a copied grade.
+    color_tab: color_tab::ColorTab,
+    /// The security confirmation for a plugin's scripts, while it's asked.
+    script_consent: Option<plugin_scripts::ScriptConsent>,
     /// The timelines stepped out of to edit inside compound clips, outermost first.
     compound_trail: Vec<compound::Crumb>,
     /// The curve editor window, when open.
@@ -432,6 +461,8 @@ struct App {
     captions_added: Option<Box<captions::CaptionsUi>>,
     export_queue: std::collections::VecDeque<export_dialog::ExportJob>,
     export_path: Option<PathBuf>,
+    /// What the running export is ("MP4 · H.264 · 1920×1080 — Project").
+    export_label: String,
     /// The part of the timeline the Export window is set to (None: all of it), and the
     /// live view of the running export.
     export_range: Option<(Time, Time)>,
@@ -441,7 +472,19 @@ struct App {
 
     preview: Option<Preview>,
     rendered: Option<FrameKey>,
+    /// The picture on screen is (to be) the refined one — see `refine_when_idle`.
+    refine: bool,
+    /// The frame the picture last settled on, and since when (for `refine_when_idle`).
+    idle_since: Option<(FrameKey, Instant)>,
     stats: RenderStats,
+    /// The viewer's renderer's memory and its decoders' status, as of its last frame.
+    memory: oa_gpu::Memory,
+    sources_status: Option<String>,
+    /// The frame asked of the render thread and not answered yet (its number and key).
+    asked: Option<(u64, FrameKey)>,
+    requests: u64,
+    /// Results of requests before this one are of another project: not shown.
+    fresh_from: u64,
     report: PlanReport,
     frame_ms: std::collections::VecDeque<f32>,
     messages: Vec<String>,
@@ -468,12 +511,9 @@ impl App {
         let settings = settings::Settings::load();
         i18n::init(settings.language.as_deref(), &settings::config_dir().join("locales"));
         let plugins = plugins::Plugins::load(settings::plugins_dir(), &settings.disabled_plugins);
-        let (registry, issues) = plugins.registry();
-        let renderer = Renderer::new(
-            gpu.clone(),
-            RenderOptions { fusion: FusionMode::Async, wait: false, vram_budget: settings.vram_budget(), ..Default::default() },
-        );
-        let _ = renderer.warm_up(&registry);
+        let (registry, issues) = plugins.registry(&settings.trusted_scripts);
+        let registry = Arc::new(registry);
+        let render_options = RenderOptions { fusion: FusionMode::Async, wait: false, vram_budget: settings.vram_budget(), ..Default::default() };
         // The font index is built once (it reads every installed font's names); do it now,
         // off the UI thread, so the first title doesn't wait for it.
         std::thread::spawn(|| {
@@ -491,11 +531,12 @@ impl App {
         };
         let autosave = autosave::Autosave::new(autosave::default_dir());
         let recoveries = autosave.recoverable();
+        let preview_worker = preview_worker::PreviewWorker::start(gpu.clone(), decoders.clone(), settings.vram_budget(), cc.egui_ctx.clone());
+        let viewer_render = viewer_render::ViewerRender::start(gpu.clone(), decoders.clone(), render_options, registry.clone(), cc.egui_ctx.clone());
         App {
             gpu,
-            renderer,
-            registry: Arc::new(registry),
-            sources: Sources::new(),
+            viewer_render,
+            registry,
             editor: Editor::new(),
             decoders,
             gpu_names: Vec::new(),
@@ -503,6 +544,7 @@ impl App {
             mix: MixHandle::default(),
             mixed: None,
             volume: 1.0,
+            muted: false,
             playhead: Time::ZERO,
             playing: false,
             last_tick: Instant::now(),
@@ -557,12 +599,18 @@ impl App {
             timeline_view: timeline::TimelineView::default(),
             view: viewer::ViewerView::default(),
             thumbs: thumbs::Thumbs::default(),
+            preview_worker,
             clip_previews: Default::default(),
             render_state: cc.wgpu_render_state.clone(),
             scrubbing: false,
+            resume_after_scrub: false,
             seek_settling: false,
             focus_text: false,
             canvas_text: None,
+            fullscreen: Default::default(),
+            plugin_previews: Default::default(),
+            color_tab: Default::default(),
+            script_consent: None,
             compound_trail: Vec::new(),
             curve_editor: None,
             wave_editor: None,
@@ -583,12 +631,20 @@ impl App {
             export_dialog: false,
             export_queue: Default::default(),
             export_path: None,
+            export_label: String::new(),
             export_range: None,
             export_view: Default::default(),
             recording: Default::default(),
             preview: None,
             rendered: None,
+            refine: false,
+            idle_since: None,
             stats: RenderStats::default(),
+            memory: oa_gpu::Memory::default(),
+            sources_status: None,
+            asked: None,
+            requests: 0,
+            fresh_from: 0,
             report: PlanReport::default(),
             frame_ms: std::collections::VecDeque::new(),
             messages: issues,
@@ -608,18 +664,111 @@ impl App {
 
     /// An empty project, as "New project" makes it.
     pub(crate) fn new_project(&mut self) {
-        self.finish_background_save();
+        self.set_aside_project();
         self.editor = Editor::new();
+        self.reset_workspace();
+        self.viewer_render.set_media(Vec::new(), true);
+    }
+
+    /// Back to the start page: the project is put away (saved, or kept as unsaved work
+    /// the start page offers back) and the editor starts empty next time.
+    pub(crate) fn go_home(&mut self) {
+        self.new_project();
+        self.screen = home::Screen::Home;
+    }
+
+    /// Before another project takes the editor's place: its unsaved work isn't lost. A
+    /// saved project that saves as you go is saved now; otherwise (never saved, or
+    /// saving as you go is off) its autosave is written and left for the start page's
+    /// "Unsaved work", and a fresh autosave begins for what comes next.
+    fn set_aside_project(&mut self) {
+        self.finish_background_save();
+        if !self.editor.dirty() {
+            self.autosave.clear();
+            return;
+        }
+        if let Some(path) = self.editor.path.clone().filter(|_| self.settings.save_as_you_go)
+            && self.editor.save(&path).is_ok()
+        {
+            let name = self.editor.doc.project().name.clone();
+            let thumb = thumbnail::path_for(&path);
+            self.settings.remember_project(&path, &name, thumb.exists().then_some(thumb));
+            self.autosave.clear();
+            return;
+        }
+        let project = self.editor.doc.snapshot();
+        match self.autosave.write_now(&project, self.editor.path.as_deref()) {
+            Ok(()) => {
+                self.autosave.move_on();
+                self.recoveries = self.autosave.recoverable();
+            }
+            Err(e) => self.report_error(format!("couldn't keep the unsaved work: {e}")),
+        }
+    }
+
+    /// Everything that belonged to the project that was open, gone: what was selected,
+    /// being dragged, cropped or typed into, the editor windows, clipboards (they point
+    /// at its media), cached pictures and filmstrips (keyed by its ids, which the next
+    /// project reuses), the sound, the viewer's view. Called once the new project (or
+    /// an empty one) is in `self.editor`; exports carry on — each has its own copy.
+    fn reset_workspace(&mut self) {
         self.compound_trail.clear();
-        self.sources.forget_all();
+        self.playhead = Time::ZERO;
+        self.set_playing(false);
         self.reset_audio();
+        self.audition = None;
+        self.variant = 0;
         self.selection = None;
         self.selected.clear();
-        self.playhead = Time::ZERO;
-        self.playing = false;
-        self.renderer.clear_cache();
-        self.autosave.clear();
-        self.variant = 0;
+        self.selected_track = None;
+        self.clipboard.clear();
+        self.clipboard_note = None;
+        self.effect_clipboard.clear();
+        self.effect_clipboard_reverse = None;
+        self.value_clipboard = None;
+        self.transform_clipboard = None;
+        self.renaming = None;
+        self.bands.clear();
+        self.viewer_drag = None;
+        self.timeline_drag = None;
+        self.effect_drag = None;
+        self.drop_targets.clear();
+        self.fx_lanes.clear();
+        self.viewer_canvas = None;
+        self.scrubbing = false;
+        self.resume_after_scrub = false;
+        self.seek_settling = false;
+        self.focus_text = false;
+        self.canvas_text = None;
+        self.crop_mode = None;
+        self.crop_drag = None;
+        self.surface_drag = None;
+        self.point_drag = None;
+        self.curve_editor = None;
+        self.wave_editor = None;
+        self.connection_editor = None;
+        self.track_editor = None;
+        self.captions = None;
+        self.captions_added = None;
+        self.follower = None;
+        self.follower_key = (0, 0);
+        self.follower_complete = false;
+        self.export_range = None;
+        self.bin.folder.clear();
+        self.bin.search.clear();
+        self.bin.naming = None;
+        self.timeline_view = timeline::TimelineView { row_height: self.timeline_view.row_height, ..Default::default() };
+        self.view = viewer::ViewerView { thirds: self.view.thirds, safe_areas: self.view.safe_areas, center: self.view.center, ..Default::default() };
+        self.forget_thumbs();
+        self.clip_previews = Default::default();
+        self.error = None;
+        self.report = PlanReport::default();
+        self.frame_ms.clear();
+        self.idle_since = None;
+        self.refine = false;
+        self.failed_frames = 0;
+        self.viewer_render.clear_cache();
+        self.blank_preview();
         self.restore_view();
     }
 
@@ -637,11 +786,10 @@ impl App {
 
     /// The enabled plugins' effects become the registry everything renders with.
     fn rebuild_registry(&mut self) {
-        let (registry, issues) = self.plugins.registry();
+        let (registry, issues) = self.plugins.registry(&self.settings.trusted_scripts);
         self.registry = Arc::new(registry);
         self.messages.extend(issues);
-        let _ = self.renderer.warm_up(&self.registry);
-        self.renderer.clear_cache();
+        self.viewer_render.warm_up(self.registry.clone());
         self.forget_thumbs();
         self.rendered = None;
     }
@@ -653,6 +801,11 @@ impl App {
     /// it can't take are conformed so they play on it too; otherwise ffmpeg decodes
     /// anything as it is.
     fn decodable(choice: &oa_media::DecoderChoice, path: &Path, probe: &MediaProbe) -> bool {
+        // Video with transparency (an animated GIF…) plays as it is, through ffmpeg:
+        // conformed to H.264 it would lose it.
+        if probe.video.as_ref().is_some_and(|v| v.has_alpha) {
+            return true;
+        }
         #[cfg(windows)]
         if choice.hardware()
             && let (Some(bridge), Some(video)) = (choice.bridge.clone(), probe.video.as_ref())
@@ -664,6 +817,36 @@ impl App {
         }
         let _ = (choice, path, probe);
         true
+    }
+
+    /// Clips of `seq` first seen between `from` and `to` (its own time), as (when on the
+    /// outer timeline, media, where in the file): a clip counts from where it first shows
+    /// — the start of a transition into it, which shows it before its own start — and
+    /// clips inside compound clips count too, at their place and speed. `offset` is where
+    /// `seq`'s time 0 is on the outer timeline (for ordering only).
+    fn upcoming_in(project: &oa_doc::Project, seq: oa_doc::SeqId, from: Time, to: Time, offset: Time, depth: usize, found: &mut Vec<(Time, u64, Time)>) {
+        let Some(s) = project.sequence(seq).filter(|_| depth < 8) else { return };
+        for track in s.tracks.iter().filter(|t| t.enabled && t.kind == oa_doc::TrackKind::Video) {
+            for (i, item) in track.items.iter().enumerate().filter(|(_, i)| i.enabled) {
+                let shows_from = oa_plan::transitions::window(track, i, oa_doc::ClipEnd::Head).map_or(item.range.start, |w| w.start.min(item.range.start));
+                match item.kind {
+                    oa_doc::ItemKind::Media { media } if shows_from > from && shows_from <= to => {
+                        found.push((offset + shows_from, media.0, item.time_map.source_time(shows_from - item.range.start)));
+                    }
+                    // A compound clip playing now or soon: what starts inside it over the
+                    // same stretch, in its own time.
+                    oa_doc::ItemKind::Nested { sequence } if item.range.end() > from && shows_from <= to => {
+                        let inner = |t: Time| item.time_map.source_time(t.max(item.range.start) - item.range.start);
+                        let (a, b) = (inner(from), inner(to.min(item.range.end())));
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        // Its first frame counts as coming when the compound itself is.
+                        let lo = if shows_from > from { lo - Time(1) } else { lo };
+                        Self::upcoming_in(project, sequence, lo, hi, offset + item.range.start, depth + 1, found);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Probes (and if needed converts) one file. Slow — seconds for a conversion — so it
@@ -680,16 +863,19 @@ impl App {
         Self::import_with(self.bridge(), path)
     }
 
-    /// Opens a project file, or imports media files and appends them to the timeline.
+    /// Opens a project file, or imports media files into the media bin (only there: they
+    /// go on the timeline when you put them there — drag a card, double-click it or ＋).
     /// Both happen on worker threads: the editor stays responsive, and the media bin
-    /// shows a loading row per file until it's in.
+    /// shows a loading card per file until it's in.
     pub(crate) fn open_paths(&mut self, paths: &[PathBuf]) {
         let is_project = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
         if let Some(project) = paths.iter().find(|p| is_project(p)) {
             self.open_project(project);
             return;
         }
-        self.import_paths(paths, true, "");
+        // Into the folder the bin is showing, so they appear where you're looking.
+        let folder = if self.bin.tab == bin::BinTab::Project { self.bin.folder.clone() } else { String::new() };
+        self.import_paths(paths, false, &folder);
     }
 
     /// Imports media files; with `to_timeline` they're also added to the end of the
@@ -765,6 +951,7 @@ impl App {
                 let ok = result.is_ok();
                 self.finish_open(result, recovered.as_ref());
                 if let Some((r, _)) = recovered.filter(|_| ok) {
+                    self.recoveries.retain(|x| x.file != r.file);
                     if let Err(e) = r.discard() {
                         self.report_error(format!("{}: {e}", r.file.display()));
                     }
@@ -813,29 +1000,36 @@ impl App {
                     let thumb = thumbnail::path_for(&path);
                     self.settings.remember_project(&path, &name, thumb.exists().then_some(thumb));
                 }
-                // A save of the old project still going belongs to the old project.
-                self.finish_background_save();
+                // The old project's unsaved work is kept (and a save of it still going
+                // belongs to it).
+                self.set_aside_project();
                 self.editor = editor;
-                self.compound_trail.clear();
+                self.reset_workspace();
                 self.messages.extend(warnings);
-                self.playhead = Time::ZERO;
-                self.variant = 0;
-                self.restore_view();
-                self.selection = None;
-                self.playing = false;
-                self.reset_audio();
-                self.renderer.clear_cache();
                 self.rebuild_sources();
             }
             Err(e) => self.error = Some(e),
         }
     }
 
+    /// Takes the viewer's picture down (another project was opened): until the new one's
+    /// first frame is ready, the viewer shows nothing rather than a frame of the last
+    /// project — the viewer keeps its last picture while a frame isn't ready.
+    fn blank_preview(&mut self) {
+        if let Some(old) = self.preview.take()
+            && let Some(rs) = &self.render_state
+        {
+            rs.renderer.write().free_texture(&old.id);
+        }
+        self.rendered = None;
+        // A frame of the last project still on its way isn't shown when it comes.
+        self.asked = None;
+        self.fresh_from = self.requests + 1;
+    }
+
     /// Rebuilds the frame sources from the pool (after import, open, or relink).
     fn rebuild_sources(&mut self) {
-        self.sources.forget_all();
-        self.renderer.clear_cache();
-        self.sources.set_video(None);
+        self.viewer_render.set_media(self.media_entries(), true);
         self.add_new_sources();
     }
 
@@ -843,35 +1037,24 @@ impl App {
     /// alone (an import doesn't restart playback of what's already there). Still images
     /// decode on worker threads.
     fn add_new_sources(&mut self) {
-        {
-            let mut video = Some(self.sources.take_video().unwrap_or_else(|| oa_media::frame_source(&self.gpu, self.decoders.clone())));
-            let items: Vec<(u64, MediaKind, PathBuf, Option<oa_media::VideoTrack>, String)> = self
-                .editor
-                .pool
-                .iter()
-                .filter(|item| !item.missing && !self.sources.knows(item.id.0))
-                .map(|item| (item.id.0, item.kind, item.decode_path.clone(), item.probe.video.clone(), item.name.clone()))
-                .collect();
-            for (id, kind, path, track, name) in items {
-                self.sources.register(id, kind);
-                let Some(track) = track else { continue };
-                match kind {
-                    MediaKind::Still => {
-                        let _ = &name;
-                        self.sources.stills_mut().add_in_background(id, &path, &track);
-                    }
-                    MediaKind::Video => {
-                        if let Some(video) = video.as_mut() {
-                            video.add(id, &path, track);
-                        }
-                    }
-                    MediaKind::Audio => {}
-                }
-            }
-            self.sources.set_video(video);
-        }
+        // The viewer's render thread registers the files it doesn't know yet (its
+        // decoders; stills decode in the background); the preview thread decodes for
+        // itself too.
+        let entries = self.media_entries();
+        self.viewer_render.set_media(entries.clone(), false);
+        self.preview_worker.set_media(entries);
         // Pool changes (relinks, imports) can change what's audible without a new clip.
         self.mixed = None;
+    }
+
+    /// The pool's files, for a thread that decodes on its own (exports, previews).
+    fn media_entries(&self) -> Vec<export_worker::MediaEntry> {
+        self.editor
+            .pool
+            .iter()
+            .filter(|m| !m.missing)
+            .map(|m| export_worker::MediaEntry { id: m.id.0, kind: m.kind, path: m.decode_path.clone(), track: m.probe.video.clone() })
+            .collect()
     }
 
     /// The audible clips on the timeline, in order.
@@ -920,6 +1103,8 @@ impl App {
             match AudioEngine::new(move |format| Box::new(TimelineAudio::with_handle(mix, format, start)), start) {
                 Ok(engine) => {
                     engine.set_gain(self.volume);
+                    engine.set_muted(self.muted);
+                    engine.set_output_delay(std::time::Duration::from_millis(self.settings.output_delay_ms as u64));
                     engine.set_playing(self.playing);
                     self.audio = Some(engine);
                 }
@@ -960,9 +1145,17 @@ impl App {
     /// The viewer, rendering a fresh frame first when the one on screen is stale.
     fn viewer_area(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         self.refresh_follower(ui.ctx());
+        self.refine_when_idle(ui.ctx());
+        // Playing: the frame on screen first; background previews wait.
+        self.preview_worker.set_busy(self.playing);
+        // The render thread's finished pictures first; then, if what's on screen isn't
+        // the frame wanted now, it's asked for (and drawn meanwhile as it is).
+        if let Some(render_state) = frame.wgpu_render_state() {
+            self.receive_frames(render_state);
+        }
         let stale = self.preview.is_none() || self.rendered.as_ref() != Some(&self.frame_key());
-        if let Some(render_state) = frame.wgpu_render_state().filter(|_| stale && !self.gpu_lost) {
-            self.render_frame(render_state);
+        if stale && !self.gpu_lost {
+            self.request_frame();
         }
         self.viewer(ui);
     }
@@ -985,20 +1178,15 @@ impl App {
             return;
         }
         let Some(job) = self.export_queue.pop_front() else { return };
-        let media = self
-            .editor
-            .pool
-            .iter()
-            .filter(|m| !m.missing)
-            .map(|m| export_worker::MediaEntry { id: m.id.0, kind: m.kind, path: m.decode_path.clone(), track: m.probe.video.clone() })
-            .collect();
         self.messages.push(format!("exporting to {}", job.path.display()));
+        self.export_label = job.label.clone();
         self.export = Some(export_worker::start(export_worker::Job {
             gpu: self.gpu.clone(),
             decoders: self.decoders.clone(),
             registry: self.registry.clone(),
-            project: self.editor.doc.snapshot(),
-            media,
+            // As it was queued.
+            project: job.project,
+            media: job.media,
             seq: job.seq,
             path: job.path.clone(),
             options: job.options,
@@ -1036,9 +1224,20 @@ impl App {
 
     /// Stops the running export and everything queued after it.
     pub(crate) fn cancel_exports(&mut self) {
-        self.export = None;
-        self.export_path = None;
         self.export_queue.clear();
+        self.skip_export();
+    }
+
+    /// Stops the running export (its file isn't finished) and goes on with the next
+    /// queued one.
+    pub(crate) fn skip_export(&mut self) {
+        if self.export.take().is_some()
+            && let Some(path) = self.export_path.take()
+        {
+            self.notify(format!("Canceled {}.", path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().to_string())));
+        }
+        self.export_label.clear();
+        self.next_export();
     }
 
     pub(crate) fn save(&mut self, save_as: bool) {
@@ -1060,6 +1259,10 @@ impl App {
                 let name = if name.is_empty() || name == "Untitled" { thumbnail::name_from_path(&path) } else { name };
                 self.editor.set_project_name(&name);
                 let thumb = self.write_thumbnail(&path);
+                // The start page loads the new picture next time it's shown.
+                if let Some(t) = &thumb {
+                    self.project_thumbs.remove(&t.to_string_lossy().to_string());
+                }
                 self.settings.remember_project(&path, &name, thumb);
                 self.autosave.clear();
             }
@@ -1088,15 +1291,26 @@ impl App {
         }
     }
 
+    /// Scrubbing pauses playback (the picture follows the pointer, not the clock);
+    /// `end_scrub` plays on from where it was let go.
     pub(crate) fn begin_scrub(&mut self) {
         self.scrubbing = true;
+        self.resume_after_scrub = self.playing;
+        if self.playing {
+            self.set_playing(false);
+        }
     }
 
     pub(crate) fn end_scrub(&mut self) {
-        if std::mem::take(&mut self.scrubbing)
-            && let Some(audio) = &self.audio
-        {
+        if !std::mem::take(&mut self.scrubbing) {
+            return;
+        }
+        if let Some(audio) = &self.audio {
             audio.seek(self.playhead);
+        }
+        if std::mem::take(&mut self.resume_after_scrub) {
+            self.last_tick = Instant::now();
+            self.set_playing(true);
         }
     }
 
@@ -1148,7 +1362,11 @@ impl App {
     /// (rounded up to full, ½ or ¼, so zooming doesn't re-render at every step): a 1080p
     /// frame shown at 40% is rendered at ½, a quarter of the pixels.
     fn preview_scale(&self) -> f64 {
-        let asked = if self.scale > 0.0 {
+        self.preview_scale_at(self.refine)
+    }
+
+    fn preview_scale_at(&self, refine: bool) -> f64 {
+        let mut asked = if self.scale > 0.0 {
             self.scale as f64
         } else {
             match self.display_scale {
@@ -1157,6 +1375,17 @@ impl App {
                 _ => 0.25,
             }
         };
+        // Refining an idle frame: twice the pixels each way the viewer shows (up to 2×
+        // the canvas), averaged down on screen — anti-aliasing for everything.
+        if refine {
+            asked = asked.max((self.display_scale as f64 * 2.0).min(2.0));
+        }
+        // Never more than the preview limit on the short side: a 4K format previews at
+        // 1080p by default (and its 4K files are fetched at that size, too).
+        let limit = self.settings.preview_limit;
+        let size = self.editor.sequence().variants[self.variant.min(self.editor.sequence().variants.len() - 1)].size;
+        let short = size.width.min(size.height).max(1);
+        let asked = if limit > 0 && short > limit { asked.min(limit as f64 / short as f64) } else { asked };
         // Short of GPU memory, render fewer pixels rather than failing to render at all.
         (asked * self.memory_backoff).max(0.125)
     }
@@ -1287,7 +1516,7 @@ impl App {
             self.report_error(format!("{why}. Your work has been autosaved — restart OpenAtelier to carry on."));
             return;
         }
-        let memory = self.renderer.memory();
+        let memory = self.memory;
         let was = self.memory_backoff;
         self.memory_backoff = match memory.pressure {
             oa_gpu::Pressure::Over => (self.memory_backoff * 0.8).max(0.25),
@@ -1310,87 +1539,147 @@ impl App {
     }
 
     fn frame_key(&self) -> FrameKey {
-        FrameKey {
-            playhead: self.playhead,
-            variant: self.variant,
-            scale: (self.preview_scale() as f32).to_bits(),
-            reference: self.reference,
-            document: Arc::as_ptr(&self.editor.doc.snapshot()) as usize,
-            follow: self.follower_key.1,
+        self.frame_key_with(self.refine)
+    }
+
+    /// The moment the preview shows: the playhead — or, playing, the start of the
+    /// sequence frame it's in. Playback shows the timeline's own frames (as an export
+    /// does): a screen faster than the frame rate doesn't render one frame several
+    /// times, and the next frame is known, so it can be planned ahead (`plan_ahead`).
+    fn render_time(&self) -> Time {
+        if self.playing {
+            let rate = self.editor.sequence().rate;
+            rate.frame_start(rate.frame_at(self.playhead))
+        } else {
+            self.playhead
         }
     }
 
-    fn render_frame(&mut self, render_state: &eframe::egui_wgpu::RenderState) {
-        let started = Instant::now();
-        let opts = PlanOptions { variant: Some(self.variant_id()), render_scale: self.preview_scale(), ..Default::default() };
-        let level = if self.reference { OptLevel::Reference } else { OptLevel::Full };
-        let plan = || plan_frame(self.editor.doc.project(), self.editor.seq, self.playhead, &opts, &self.registry);
-        let planned = match self.follower.as_ref().map_or_else(plan, |f| oa_params::signal::with(f.at(self.playhead), plan)) {
-            Ok(p) => p,
-            Err(e) => {
-                self.error = Some(e.to_string());
-                return;
-            }
-        };
-        self.report = planned.report;
-        let graph = optimize(&planned.graph, level, KeyContext::default());
-        // Paused (scrubbing, stepping, editing): never wait on the decoder — show the
-        // nearest frame on hand and fill in the exact one as soon as it's decoded.
-        // Playing: exact frames, which the decode-ahead has ready anyway.
-        self.sources.set_interactive(!self.playing || self.seek_settling);
-        if self.playing {
-            self.warm_upcoming();
+    fn frame_key_with(&self, refine: bool) -> FrameKey {
+        FrameKey {
+            playhead: self.render_time(),
+            variant: self.variant,
+            scale: (self.preview_scale_at(refine) as f32).to_bits(),
+            reference: self.reference,
+            document: Arc::as_ptr(&self.editor.doc.snapshot()) as usize,
+            follow: self.follower_key.1,
+            refined: refine,
+            see_through: !self.compound_trail.is_empty(),
         }
-        let image = match self.renderer.render(&graph, &self.registry, &mut self.sources) {
-            Ok(img) => img,
-            // A shader or glyphs are still being prepared in the background: keep the
-            // last frame on screen and try again next frame.
-            Err(oa_gpu::RenderError::NotReady) => {
-                self.sources.set_interactive(false);
+    }
+
+    /// Progressive refinement: once the picture has held still for a moment (paused,
+    /// nothing being dragged or scrubbed, the exact frame in), it's rendered once more at
+    /// a higher quality — supersampled 2× and with smooth text, as an export would draw
+    /// it. Anything that changes the frame drops back to the fast preview at once.
+    fn refine_when_idle(&mut self, ctx: &egui::Context) {
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(350);
+        let base = self.frame_key_with(false);
+        let busy = self.playing || self.scrubbing || self.timeline_drag.is_some() || self.viewer_drag.is_some() || ctx.input(|i| i.pointer.any_down());
+        if self.idle_since.as_ref().is_none_or(|(k, _)| *k != base) || busy {
+            self.idle_since = Some((base, Instant::now()));
+            self.refine = false;
+            return;
+        }
+        if self.refine || self.rendered.is_none() {
+            return;
+        }
+        let waited = self.idle_since.as_ref().map_or(std::time::Duration::ZERO, |(_, since)| since.elapsed());
+        if waited >= SETTLE {
+            self.refine = true;
+        } else {
+            ctx.request_repaint_after(SETTLE - waited);
+        }
+    }
+
+
+    /// Asks the viewer's render thread (`viewer_render`) for the frame on screen now:
+    /// the project as it is, the moment, the options — it plans and renders there, and
+    /// the picture comes back through `receive_frames`.
+    fn request_frame(&mut self) {
+        let key = self.frame_key();
+        if self.asked.as_ref().is_some_and(|(_, k)| *k == key) {
+            return; // on its way
+        }
+        let opts = PlanOptions {
+            variant: Some(self.variant_id()),
+            render_scale: self.preview_scale(),
+            // Inside a compound clip: see-through, as it is where it's used.
+            see_through: !self.compound_trail.is_empty(),
+            // The refined idle frame draws titles as an export does.
+            text_supersample: if self.refine { 2 } else { 1 },
+            ..Default::default()
+        };
+        let t = self.render_time();
+        let rate = self.editor.sequence().rate;
+        let next = rate.frame_start(rate.frame_at(t) + 1);
+        self.requests += 1;
+        self.asked = Some((self.requests, key));
+        self.viewer_render.request(viewer_render::Request {
+            id: self.requests,
+            project: self.editor.doc.snapshot(),
+            seq: self.editor.seq,
+            t,
+            opts,
+            reference: self.reference,
+            registry: self.registry.clone(),
+            follower: self.follower.clone(),
+            follow: self.follower_key.1,
+            // Paused (scrubbing, stepping, editing): never wait on the decoder — the
+            // nearest frame on hand now, the exact one as soon as it's decoded. Playing:
+            // exact frames, which the decode-ahead has ready anyway, waiting at most a
+            // moment on one (a clip starting whose decoder is still seeking).
+            interactive: !self.playing || self.seek_settling,
+            wait_budget: self.playing.then_some(PLAYBACK_WAIT),
+            warm: if self.playing { self.upcoming_clips() } else { Vec::new() },
+            // Playing: the next frame is planned while this one renders.
+            next: (self.playing && next < self.editor.duration()).then_some(next),
+        });
+    }
+
+    /// Puts the pictures the render thread finished on screen (the newest), with what it
+    /// reports alongside.
+    fn receive_frames(&mut self, render_state: &eframe::egui_wgpu::RenderState) {
+        for done in self.viewer_render.results() {
+            self.stats = done.stats;
+            self.memory = done.memory;
+            self.sources_status = done.status;
+            if done.id < self.fresh_from {
+                continue; // a frame of the project before
+            }
+            let answered = self.asked.as_ref().filter(|(id, _)| *id == done.id).map(|(_, k)| k.clone());
+            if answered.is_some() {
+                self.asked = None;
+            }
+            if let Some(e) = done.error {
+                self.error = Some(e);
+                continue;
+            }
+            self.report = done.report;
+            let Some(texture) = done.texture else {
+                // Not ready yet: the last picture stays up; asked again next frame.
                 self.rendered = None;
-                return;
+                continue;
+            };
+            let view = readback::display_view(&texture);
+            let id = match self.preview.take() {
+                Some(old) => {
+                    render_state.renderer.write().update_egui_texture_from_wgpu_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear, old.id);
+                    old.id
+                }
+                None => render_state.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear),
+            };
+            self.preview = Some(Preview { _texture: texture, id, size: done.size });
+            if done.settled {
+                self.seek_settling = false;
             }
-            Err(e) => {
-                self.error = Some(e.to_string());
-                return;
+            // Stand-ins were shown: asked again, for the exact frames.
+            self.rendered = if done.settled { answered } else { None };
+            self.error = None;
+            self.frame_ms.push_back(done.ms);
+            if self.frame_ms.len() > 120 {
+                self.frame_ms.pop_front();
             }
-        };
-        self.sources.set_interactive(false);
-        let settled = self.sources.settled();
-        if settled {
-            self.seek_settling = false;
-        }
-        self.stats = self.renderer.stats.clone();
-        // Draw into the texture already on screen when the size hasn't changed: no
-        // allocation and no re-registration with egui per frame.
-        let old = self.preview.take();
-        let reuse = old.as_ref().map(|p| p.texture.clone());
-        let texture = match readback::display_texture_into(&self.gpu, self.renderer.pipelines(), &image, reuse) {
-            Ok(t) => t,
-            Err(e) => {
-                self.error = Some(e.to_string());
-                return;
-            }
-        };
-        let id = match old {
-            Some(old) if old.texture == texture => old.id,
-            Some(old) => {
-                let view = readback::display_view(&texture);
-                render_state.renderer.write().update_egui_texture_from_wgpu_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear, old.id);
-                old.id
-            }
-            None => {
-                let view = readback::display_view(&texture);
-                render_state.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear)
-            }
-        };
-        self.preview = Some(Preview { texture, id, size: image.size, _image: image });
-        // Stand-ins were shown: render again next frame, when the exact frames will be in.
-        self.rendered = if settled { Some(self.frame_key()) } else { None };
-        self.error = None;
-        self.frame_ms.push_back(started.elapsed().as_secs_f32() * 1000.0);
-        if self.frame_ms.len() > 120 {
-            self.frame_ms.pop_front();
         }
     }
 
@@ -1441,10 +1730,29 @@ impl App {
         {
             ctx.memory_mut(|m| m.surrender_focus(id));
         }
-        if ctx.egui_wants_keyboard_input() {
+        // Typing into a title on the canvas: the keys (and copy/cut/paste) are its.
+        if ctx.egui_wants_keyboard_input() || self.canvas_text.is_some() {
             return;
         }
         let pressed = |m: M, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
+        // F: fullscreen playback, in and out. While it's on, only playing and stepping —
+        // no edits made by a key pressed while watching.
+        if self.screen == home::Screen::Editor && pressed(M::NONE, Key::F) {
+            self.set_fullscreen(ctx, !self.fullscreen.on);
+        }
+        if self.fullscreen.on {
+            if pressed(M::NONE, Key::Space) {
+                self.set_playing(!self.playing);
+                self.last_tick = Instant::now();
+            }
+            if pressed(M::NONE, Key::ArrowRight) {
+                self.step(1);
+            }
+            if pressed(M::NONE, Key::ArrowLeft) {
+                self.step(-1);
+            }
+            return;
+        }
         // With the Captions window open, Ctrl+Z is its own (it takes the keys itself).
         if self.captions.is_none() {
             if pressed(M::COMMAND | M::SHIFT, Key::Z) || pressed(M::COMMAND, Key::Y) {
@@ -1601,27 +1909,18 @@ impl App {
 
     /// S: cuts every selected clip under the playhead (the back halves become the
     /// selection); with none of them there, every clip under it.
-    /// While playing: opens the decoders of the clips starting in the next couple of
-    /// seconds, at their first frames, so a new file doesn't stall the frame it first
-    /// shows in.
-    fn warm_upcoming(&mut self) {
+    /// While playing: the clips starting in the next couple of seconds and where in
+    /// their files — their decoders are opened there ahead of time, so a new file doesn't
+    /// stall the frame it first shows in.
+    fn upcoming_clips(&self) -> Vec<(u64, Time)> {
         const AHEAD: Time = Time::from_seconds(2);
-        let now = self.playhead;
-        let s = self.editor.sequence();
-        let upcoming: Vec<(u64, Time)> = s
-            .tracks
-            .iter()
-            .filter(|t| t.enabled && t.kind == oa_doc::TrackKind::Video)
-            .flat_map(|t| t.items.iter())
-            .filter(|i| i.enabled && i.range.start > now && i.range.start <= now + AHEAD)
-            .filter_map(|i| match i.kind {
-                oa_doc::ItemKind::Media { media } => Some((media.0, i.time_map.source_time(Time::ZERO))),
-                _ => None,
-            })
-            .collect();
-        for (media, at) in upcoming {
-            self.sources.warm(media, at);
-        }
+        let project = self.editor.doc.project();
+        let mut found = Vec::new();
+        Self::upcoming_in(project, self.editor.seq, self.playhead, self.playhead + AHEAD, Time::ZERO, 0, &mut found);
+        // Soonest first: when one file is cut into more clips than it has decoders, the
+        // next cuts get them.
+        found.sort_by_key(|(at, _, _)| *at);
+        found.into_iter().map(|(_, media, source)| (media, source)).collect()
     }
 
     pub(crate) fn split_at_playhead(&mut self) {
@@ -1746,7 +2045,7 @@ impl App {
         let v = &self.timeline_view;
         let tracks: Vec<String> = self.editor.sequence().tracks.iter().map(|t| format!("{}{}", t.name, if t.enabled { "" } else { "(off)" })).collect();
         eprintln!("[script]   timeline: start {:.2}s span {:.2}s fit {} tracks {tracks:?}", v.start, v.span, v.fit);
-        if let Some(status) = self.sources.status() {
+        if let Some(status) = &self.sources_status {
             eprintln!("[script]   sources: {status}");
         }
         if let Some(audio) = &self.audio {
@@ -1763,7 +2062,7 @@ impl App {
         let s = &self.stats;
         ui.label(format!("{} passes, {} cache hits, {} fused", s.passes, s.cache_hits, s.fused_chains));
         ui.label(format!("pool {:.0} MB, cache {:.0} MB", s.pool_bytes as f64 / 1e6, s.cache_bytes as f64 / 1e6));
-        let memory = self.renderer.memory();
+        let memory = self.memory;
         let note = match memory.pressure {
             oa_gpu::Pressure::Over => " — full, rendering smaller",
             oa_gpu::Pressure::Tight => " — trimming the cache",
@@ -1775,7 +2074,7 @@ impl App {
         let r = ui.add(egui::Slider::new(&mut budget_mb, 256..=16384).text("budget (MB)").logarithmic(true));
         if r.changed() {
             self.settings.set_vram_budget(budget_mb);
-            self.renderer.options.vram_budget = budget_mb << 20;
+            self.viewer_render.set_budget(budget_mb << 20);
         }
         let mut as_you_go = self.settings.save_as_you_go;
         if ui
@@ -1791,7 +2090,7 @@ impl App {
         if self.gpu.health.errors() > 0 {
             ui.colored_label(egui::Color32::YELLOW, format!("{} GPU errors reported", self.gpu.health.errors()));
         }
-        if let Some(status) = self.sources.status() {
+        if let Some(status) = self.sources_status.clone() {
             ui.label(egui::RichText::new(status).small());
         }
         for u in &s.unsupported {
@@ -1907,10 +2206,15 @@ impl App {
         }
         self.poll_updates(ctx);
         self.settings_window(ctx);
+        self.script_consent_window(ctx);
         if self.screen == home::Screen::Home {
             self.update_banner(root);
             self.deps_banner(root);
             egui::CentralPanel::default().show(root, |ui| self.home(ui));
+            return;
+        }
+        if self.fullscreen.on {
+            self.fullscreen_view(root, frame);
             return;
         }
         self.curve_window(ctx);
@@ -1948,7 +2252,12 @@ impl App {
         // the viewer, and the middle holds the other.
         let vertical = self.vertical_layout();
         let epoch = self.view_epoch;
-        let (right_width, right_range) = if vertical { (self.project_view.viewer, 220.0..=1600.0) } else { (self.project_view.inspector, 260.0..=560.0) };
+        // The project's panel sizes, fitted to this window (they only apply when a
+        // project opens or the layout changes: `epoch`).
+        let room = root.available_rect_before_wrap().size();
+        let (fit_right, fit_media, fit_timeline) = layout::fit_panels(&self.project_view, vertical, [room.x, room.y]);
+        let right_range = if vertical { 220.0..=1600.0 } else { 260.0..=560.0 };
+        let right_width = fit_right;
         let right = egui::Panel::right(egui::Id::new(("right-column", epoch, vertical))).default_size(right_width).size_range(right_range).show(root, |ui| {
             if vertical {
                 self.viewer_area(ui, frame);
@@ -1958,7 +2267,7 @@ impl App {
         });
         let right_width = right.response.rect.width();
 
-        let controls = egui::Panel::bottom(egui::Id::new(("controls", epoch))).resizable(true).default_size(self.project_view.timeline).size_range(150.0..=760.0).show(root, |ui| {
+        let controls = egui::Panel::bottom(egui::Id::new(("controls", epoch))).resizable(true).default_size(fit_timeline).size_range(150.0..=760.0).show(root, |ui| {
             ui.add_space(style::GAP_S);
             // Playback, centered under the viewer; then where we are in the sequence.
             ui.horizontal(|ui| {
@@ -1987,10 +2296,15 @@ impl App {
                 );
                 ui.label(egui::RichText::new(format!("frame {}", rate.frame_at(self.playhead))).small().weak());
                 // How loud playback is here (not part of the project or the export).
+                // Both act at the output (after what's already buffered): at once, and
+                // unmuting comes back at the volume it was.
                 let mut volume = self.volume;
-                let speaker = if volume <= 0.001 { "🔇" } else { "🔊" };
+                let speaker = if self.muted || volume <= 0.001 { "🔇" } else { "🔊" };
                 if ui.small_button(speaker).on_hover_text("Mute playback (only here — the project and export are unchanged)").clicked() {
-                    volume = if volume <= 0.001 { 1.0 } else { 0.0 };
+                    self.muted = !self.muted;
+                    if let Some(audio) = &self.audio {
+                        audio.set_muted(self.muted);
+                    }
                 }
                 let r = ui.add(egui::Slider::new(&mut volume, 0.0..=1.5).show_value(false)).on_hover_text("Playback volume, only here");
                 if (volume - self.volume).abs() > f32::EPSILON || r.changed() {
@@ -2056,7 +2370,7 @@ impl App {
             });
         });
 
-        let media = egui::Panel::left(egui::Id::new(("media", epoch))).default_size(self.project_view.media).size_range(220.0..=520.0).show(root, |ui| {
+        let media = egui::Panel::left(egui::Id::new(("media", epoch))).default_size(fit_media).size_range(220.0..=520.0).show(root, |ui| {
             self.media_panel(ui);
         });
 

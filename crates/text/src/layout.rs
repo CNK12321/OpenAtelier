@@ -84,6 +84,41 @@ pub struct Layout {
     pub lines: u32,
     pub words: u32,
     pub em: f64,
+    /// Where a text cursor goes, line by line — for editing a title where it's drawn.
+    pub carets: Vec<LineCarets>,
+}
+
+/// One line's cursor positions, px from the layout's top-left.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineCarets {
+    /// The content's character index (line breaks count) of the line's first character.
+    pub first_char: usize,
+    /// x before each of the line's characters, then after the last (`chars + 1` of them).
+    pub xs: Vec<f64>,
+    /// The line's top and bottom (its ascent and descent around the baseline).
+    pub top: f64,
+    pub bottom: f64,
+}
+
+impl Layout {
+    /// The line and x of the cursor before character `index` of the content (the end of
+    /// a line for its line break; past the end: the end of the text).
+    pub fn caret(&self, index: usize) -> Option<(&LineCarets, f64)> {
+        let line = self.carets.iter().rev().find(|l| l.first_char <= index).or(self.carets.first())?;
+        let k = (index - line.first_char.min(index)).min(line.xs.len() - 1);
+        Some((line, line.xs[k]))
+    }
+
+    /// The character index a click at `p` (layout px) puts the cursor before.
+    pub fn index_at(&self, p: [f64; 2]) -> usize {
+        // The line whose middle is nearest (lines can overlap when set tight).
+        let Some(line) = self.carets.iter().min_by(|a, b| ((a.top + a.bottom) / 2.0 - p[1]).abs().total_cmp(&((b.top + b.bottom) / 2.0 - p[1]).abs())) else {
+            return 0;
+        };
+        // The nearest caret on that line.
+        let k = line.xs.iter().enumerate().min_by(|a, b| (a.1 - p[0]).abs().total_cmp(&(b.1 - p[0]).abs())).map_or(0, |(k, _)| k);
+        line.first_char + k
+    }
 }
 
 struct Shaped {
@@ -94,6 +129,8 @@ struct Shaped {
     advance: f64,
     word: u32,
     blank: bool,
+    /// Byte offset in the line of the character (cluster) it draws.
+    cluster: usize,
 }
 
 /// The font for each character: the chosen one when it has the glyph, else a fallback.
@@ -156,6 +193,7 @@ fn shape_line(primary: &'static Face, line: &str, spec: &TextSpec, word: &mut u3
                 advance: pos.x_advance as f64 * k,
                 word: w,
                 blank,
+                cluster: start + info.cluster as usize,
             });
             pen += pos.x_advance as f64 * k;
         }
@@ -191,15 +229,30 @@ fn build(spec: &TextSpec) -> Layout {
     let box_h = (lines.len().saturating_sub(1)) as f64 * line_h + (ascent - descent);
 
     let mut glyphs = Vec::new();
+    let mut carets = Vec::new();
     let mut ink_box = [0.0, 0.0, box_w, box_h];
     let mut index = 0;
-    for (n, (line, width)) in lines.iter().zip(&widths).enumerate() {
+    let mut first_char = 0;
+    for (n, ((line, width), raw)) in lines.iter().zip(&widths).zip(spec.content.split('\n')).enumerate() {
         let x0 = match spec.align {
             Align::Left => 0.0,
             Align::Center => (box_w - width) / 2.0,
             Align::Right => box_w - width,
         };
         let baseline = ascent + n as f64 * line_h;
+        // Cursor positions: before each character where its glyphs start (inside a
+        // ligature, where the one before is), and after the line.
+        let text = raw.trim_end_matches('\r');
+        let mut xs = Vec::with_capacity(text.chars().count() + 1);
+        let mut prev = x0;
+        for (b, _) in text.char_indices() {
+            let at = line.iter().filter(|g| g.cluster == b).map(|g| g.x).fold(f64::INFINITY, f64::min);
+            prev = if at.is_finite() { x0 + at } else { prev };
+            xs.push(prev);
+        }
+        xs.push(x0 + width);
+        carets.push(LineCarets { first_char, xs, top: baseline - ascent, bottom: baseline - descent });
+        first_char += raw.chars().count() + 1;
         for g in line.iter().filter(|g| !g.blank) {
             let face = fonts::face(g.font);
             let Some(outline) = face.font.outline(ab_glyph::GlyphId(g.glyph)) else { continue };
@@ -223,12 +276,17 @@ fn build(spec: &TextSpec) -> Layout {
         g.origin = [g.origin[0] + dx, g.origin[1] + dy];
         g.ink = [g.ink[0] + dx, g.ink[1] + dy, g.ink[2] + dx, g.ink[3] + dy];
     }
+    for l in &mut carets {
+        l.xs.iter_mut().for_each(|x| *x += dx);
+        (l.top, l.bottom) = (l.top + dy, l.bottom + dy);
+    }
     Layout {
         size: [(ink_box[2] - ink_box[0]).max(1.0), (ink_box[3] - ink_box[1]).max(1.0)],
         glyphs,
         lines: lines.len() as u32,
         words: word + in_word as u32,
         em: spec.size,
+        carets,
     }
 }
 

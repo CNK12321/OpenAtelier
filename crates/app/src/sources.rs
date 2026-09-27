@@ -39,6 +39,14 @@ impl Sources {
         }
     }
 
+    /// Playback: how long a frame may wait on its decoder before a stand-in (or the last
+    /// picture) is shown instead. `None`: always wait (export).
+    pub fn set_wait_budget(&mut self, budget: Option<std::time::Duration>) {
+        if let Some(video) = self.video.as_mut() {
+            video.wait_budget = budget;
+        }
+    }
+
     /// Opens a decoder for `media` at `source_time` ahead of time (a clip about to play).
     pub fn warm(&mut self, media: u64, source_time: oa_time::Time) {
         if let Some(video) = self.video.as_mut() {
@@ -82,11 +90,13 @@ impl FrameSource for Sources {
                     self.last_exact = video.exact();
                     return Ok(image);
                 }
+                // Not decoded yet (playback or a jump running ahead of the decoder): the
+                // last picture stays up until it is — never the test pattern, which
+                // used to flash in whenever the decoder fell behind (fast clips most).
+                Err(RenderError::NotReady) => return Err(RenderError::NotReady),
                 // A missing or undecodable file shows the test pattern rather than
                 // failing the whole frame.
-                Err(e) => {
-                    let _ = e;
-                }
+                Err(_) => {}
             }
         }
         self.pattern.frame(gpu, req)

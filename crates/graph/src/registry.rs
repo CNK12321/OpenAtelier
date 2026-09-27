@@ -21,6 +21,8 @@ pub const EDITOR_SURFACE: &str = "surface";
 /// The sound card draws the effect's response curve and drags its bands (params
 /// `low_freq`/`low_gain`, `p1_freq`/`p1_gain`/`p1_q` … `p3_*`, `high_freq`/`high_gain`).
 pub const EDITOR_EQUALIZER: &str = "equalizer";
+/// Edited in the Color tab (wheels, curves, the HSL mixer), not as a list of sliders.
+pub const EDITOR_COLOR: &str = "color";
 /// How far the effect is turning the sound down (what its shader writes to `reduction`).
 pub const METER_REDUCTION: &str = "reduction";
 /// How alike the two channels are.
@@ -227,9 +229,12 @@ pub struct EffectDescriptor {
     ///   `layer_pos()` is the pixel's layer position (for gradients and sweeps).
     /// * Any stage: a `Gradient` param packs 32 floats; `oa_gradient(base, pos, lo, size)`
     ///   gives its straight color at `pos` across the box at `lo` of `size`.
-    /// * `Spatial`/`UvWarp`: `fn <entry>(pos: vec2f, base: u32) -> vec4f` — `pos` is in
-    ///   layer pixels; read the input with `sample_input(pos)` (premultiplied);
+    /// * `Spatial`: `fn <entry>(pos: vec2f, base: u32) -> vec4f` — `pos` is in layer
+    ///   pixels; read the input with `sample_input(pos)` (premultiplied);
     ///   `pass_index()` gives the current pass for multi-pass effects.
+    /// * `UvWarp`: `fn <entry>(pos: vec2f, base: u32) -> vec2f` — where to read the input
+    ///   for `pos` (`clamp_to_input`, `outside_input` for edges); the host does the reading,
+    ///   once for a run of warps (see `optimize`).
     /// * `Transition`: `fn <entry>(pos: vec2f, progress: f32, base: u32) -> vec4f` — `pos`
     ///   in canvas pixels; read the outgoing picture with `sample_a(pos)` and the incoming
     ///   one with `sample_b(pos)` (both premultiplied); `progress` runs 0 → 1.

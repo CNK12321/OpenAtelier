@@ -53,6 +53,58 @@ fn source_node(g: &oa_graph::Graph) -> &oa_graph::Node {
     find(g, |op| matches!(op, NodeOp::Source { .. }))[0]
 }
 
+/// A title is clicked on its letters: the wide gap between two words, and the empty end
+/// of a short line, select the footage beneath; a letter selects the title.
+#[test]
+fn titles_are_hit_on_their_letters() {
+    let mut p = project(|_| {});
+    let title = ItemId(30);
+    {
+        let seq = Arc::make_mut(p.sequences.get_mut(&SEQ).unwrap());
+        let v2 = Arc::make_mut(&mut seq.tracks[1]);
+        let mut t = Item::new(title, "title", ItemKind::Text, TimeRange::new(secs(0), secs(10)));
+        t.params.set(schema::TEXT_CONTENT, ParamSource::Static(Value::Text("I                    I\nI".into())));
+        t.params.set(schema::TEXT_SIZE, ParamSource::Static(Value::Float(120.0)));
+        t.params.set(schema::TEXT_ALIGN, ParamSource::Static(Value::Enum("left".into())));
+        v2.items.push(t);
+    }
+    let v = p.sequence(SEQ).unwrap().variant(WIDE).unwrap().clone();
+    let l = oa_plan::scene::layers_at(&p, SEQ, &v, secs(1)).into_iter().find(|l| l.item == title).unwrap();
+    let layout = oa_text::layout(&oa_plan::scene::text_spec(&p.sequence(SEQ).unwrap().item(title).unwrap().params.eval(schema::text(), None, &oa_params::EvalContext::at(secs(1), secs(1)))));
+    let canvas = |x: f64, y: f64| l.to_canvas.apply([x, y]);
+    let first = &layout.glyphs[0];
+    let mid = |g: &oa_text::PlacedGlyph| [(g.ink[0] + g.ink[2]) / 2.0, (g.ink[1] + g.ink[3]) / 2.0];
+    let hit = |at: [f64; 2]| oa_plan::scene::hit_test(&p, SEQ, &v, secs(1), canvas(at[0], at[1]));
+    assert_eq!(hit(mid(first)), Some(title), "on a letter");
+    assert_eq!(hit([layout.size[0] / 2.0, mid(first)[1]]), Some(CLIP), "between the words");
+    assert_eq!(hit([layout.size[0] * 0.8, mid(&layout.glyphs[2])[1]]), Some(CLIP), "past the end of the short line");
+    // A double-click opens the title for typing anywhere in its box, gaps included.
+    let title_at = |at: [f64; 2]| oa_plan::scene::title_at(&p, SEQ, &v, secs(1), canvas(at[0], at[1]));
+    assert_eq!(title_at(mid(first)), Some(title));
+    assert_eq!(title_at([layout.size[0] / 2.0, mid(first)[1]]), Some(title), "between the words");
+    assert_eq!(title_at([layout.size[0] * 0.8, mid(&layout.glyphs[2])[1]]), Some(title), "past the end of the short line");
+    assert_eq!(oa_plan::scene::title_at(&p, SEQ, &v, secs(1), [5.0, 5.0]), None, "the footage outside it");
+}
+
+/// Planned see-through (the preview inside a compound clip), the sequence has no
+/// background: the frame is transparent where there's nothing, as where it's used.
+#[test]
+fn see_through_leaves_the_background_out() {
+    let p = project(|_| {});
+    let background = |opts: PlanOptions| {
+        let g = plan(&p, secs(1), opts).graph;
+        find(&g, |op| matches!(op, NodeOp::Composite { .. }))
+            .into_iter()
+            .find_map(|n| match &n.op {
+                NodeOp::Composite { background, .. } => Some(*background),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(background(PlanOptions::default()), [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(background(PlanOptions { see_through: true, ..Default::default() }), [0.0; 4]);
+}
+
 #[test]
 fn uhd_clip_decodes_at_half_res_for_1080p_and_transform_disappears() {
     let p = project(|_| {});

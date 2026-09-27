@@ -106,7 +106,7 @@ impl App {
         let mut open = true;
         let mut action: Option<&str> = None;
         let mut play: Option<(PathBuf, Time)> = None;
-        egui::Window::new("Record audio").open(&mut open).collapsible(false).resizable(true).default_width(560.0).show(ctx, |ui| {
+        crate::widgets::on_screen(egui::Window::new("Record audio"), ctx).open(&mut open).collapsible(false).resizable(true).default_width(560.0).show(ctx, |ui| {
             let r = &mut self.recording;
             let recording = r.recorder.is_some();
 

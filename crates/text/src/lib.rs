@@ -9,4 +9,4 @@ pub mod layout;
 pub mod sdf;
 
 pub use fonts::{default_family, families, FontId};
-pub use layout::{layout, Align, Layout, PlacedGlyph, TextSpec};
+pub use layout::{layout, Align, Layout, LineCarets, PlacedGlyph, TextSpec};

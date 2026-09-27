@@ -52,7 +52,7 @@ pub(crate) fn set_compact(ui: &mut egui::Ui, on: bool) {
 
 /// A section heading with a one-line explanation (compact: a smaller heading, and the
 /// explanation shows on hover).
-fn section(ui: &mut egui::Ui, title: &str, hint: &str) {
+pub(crate) fn section(ui: &mut egui::Ui, title: &str, hint: &str) {
     if compact(ui) {
         ui.add_space(3.0);
         ui.separator();
@@ -154,6 +154,8 @@ pub enum Tab {
     Properties,
     Transitions,
     Effects,
+    /// Grading (with Advanced color on): scopes, wheels, curves, the HSL mixer.
+    Color,
     Sound,
 }
 
@@ -163,6 +165,7 @@ impl Tab {
             Tab::Properties => "Properties",
             Tab::Transitions => "Transitions",
             Tab::Effects => "Effects",
+            Tab::Color => "Color",
             Tab::Sound => "Sound",
         }
     }
@@ -233,11 +236,12 @@ impl App {
         let audible = self.is_audible(item);
 
         // The tabs: only the ones this clip has anything in.
-        let tabs: Vec<Tab> = [Tab::Properties, Tab::Transitions, Tab::Effects, Tab::Sound]
+        let tabs: Vec<Tab> = [Tab::Properties, Tab::Transitions, Tab::Effects, Tab::Color, Tab::Sound]
             .into_iter()
             .filter(|tab| match tab {
                 Tab::Properties => true,
                 Tab::Transitions | Tab::Effects => visual,
+                Tab::Color => visual && self.settings.advanced_color,
                 Tab::Sound => audible,
             })
             .collect();
@@ -255,6 +259,7 @@ impl App {
             Tab::Effects => {
                 self.effects_section(ui, item, t);
             }
+            Tab::Color => self.color_tab(ui, item, t),
             Tab::Sound => self.sound_tab(ui, item, t),
         }
     }
@@ -263,6 +268,8 @@ impl App {
     /// then its transform.
     fn properties_tab(&mut self, ui: &mut egui::Ui, item: ItemId, visual: bool, t: Time) {
         let Some(it) = self.editor.item(item).cloned() else { return };
+        section(ui, "Length", "How long the clip runs on the timeline: moves its end, frame by frame if you like. Not animated.");
+        self.length_row(ui, item);
         // Footage plays at a speed; a title or a solid has nothing to speed up.
         if matches!(it.kind, ItemKind::Media { .. } | ItemKind::Nested { .. }) {
             section(ui, "Speed", "The whole clip, picture and sound together. It gets shorter or longer on the timeline.");
@@ -1095,6 +1102,21 @@ impl App {
                         Some(d) if d.editor.as_deref() == Some(oa_graph::registry::EDITOR_EQUALIZER) => {
                             self.eq_settings(ui, item, fx, d, t);
                         }
+                        // A grade: edited in the Color tab; its numbers (and keyframes) here.
+                        Some(d) if d.editor.as_deref() == Some(oa_graph::registry::EDITOR_COLOR) => {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new("Edited in the Color tab.").small().weak());
+                                if self.settings.advanced_color && ui.small_button("Open the Color tab").clicked() {
+                                    self.inspector_tab = Tab::Color;
+                                }
+                            });
+                            let target = ParamTarget::Effect(fx.id);
+                            egui::CollapsingHeader::new(egui::RichText::new("Numbers").small()).id_salt(("color-numbers", fx.id.0)).show(ui, |ui| {
+                                for schema in &d.params {
+                                    self.param_widget(ui, item, &target, schema, t, &fx.id.0.to_string());
+                                }
+                            });
+                        }
                         Some(d) => {
                             let target = ParamTarget::Effect(fx.id);
                             for schema in &d.params {
@@ -1284,15 +1306,90 @@ impl App {
         }
     }
 
+    /// The clip's length (not keyframable): where its end is, to the frame. The end moves
+    /// like a tail trim — it stops at the end of the file and at the next clip. With
+    /// several clips selected, a length typed or dragged is every one's length; ±1 frame
+    /// and "To the end" work on each clip for itself.
+    fn length_row(&mut self, ui: &mut egui::Ui, item: ItemId) {
+        enum Change {
+            Set(Time),
+            By(Time),
+            ToEnd,
+        }
+        let Some(it) = self.editor.item(item) else { return };
+        let (start, old) = (it.range.start, it.range.duration);
+        let rate = self.editor.sequence().rate;
+        let frame = rate.frame_start(1);
+        let limit = oa_edit::timeline::media_limits(self.editor.doc.project(), it).1.map(|end| end - start);
+        let mut seconds = old.as_seconds_f64();
+        let (mut wanted, mut dragging) = (None, false);
+        ui.horizontal(|ui| {
+            ui.add_space(24.0);
+            let r = ui
+                .add(egui::DragValue::new(&mut seconds).speed(1.0 / rate.as_f64().max(1.0)).range(0.0..=86_400.0).max_decimals(3).suffix(" s"))
+                .on_hover_text("Seconds; the end snaps to a frame. Drag, or type a length.");
+            if r.changed() {
+                wanted = Some(Change::Set(Time::from_seconds_f64(seconds)));
+            }
+            dragging = r.dragged();
+            if r.drag_stopped() || r.lost_focus() {
+                self.editor.doc.seal();
+            }
+            if ui.small_button("−1 frame").on_hover_text("One frame shorter").clicked() {
+                wanted = Some(Change::By(Time::ZERO - frame));
+            }
+            if ui.small_button("+1 frame").on_hover_text("One frame longer").clicked() {
+                wanted = Some(Change::By(frame));
+            }
+            if limit.is_some() && ui.add_enabled(limit.is_some_and(|max| max > old) || !self.editor.linked.is_empty(), egui::Button::new("To the end").small()).on_hover_text("As long as the file allows (or up to the next clip)").clicked() {
+                wanted = Some(Change::ToEnd);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(24.0);
+            let frames = rate.frame_at(old);
+            let text = match limit {
+                Some(max) => format!("{frames} frames · the file allows up to {:.3} s", max.as_seconds_f64()),
+                None => format!("{frames} frames"),
+            };
+            ui.label(egui::RichText::new(text).small().weak());
+        });
+        let Some(wanted) = wanted else { return };
+        let (ops, short) = self.editor.length_ops(item, &wanted_length(wanted));
+        if short > 0 && !dragging {
+            self.notify(format!("{short} of the clips couldn't be that long: the file ends, or the next clip is in the way."));
+        }
+        if !ops.is_empty()
+            && let Err(e) = self.editor.apply_drag("Clip length", "clip-length", ops)
+        {
+            self.error = Some(e.to_string());
+        }
+
+        /// Each clip's new length, from the change asked for (`None`: as far as it goes).
+        fn wanted_length(change: Change) -> impl Fn(Time) -> Option<Time> {
+            move |old| match change {
+                Change::Set(t) => Some(t),
+                Change::By(d) => Some(old + d),
+                Change::ToEnd => None,
+            }
+        }
+    }
+
+
     /// Playback speed: the clip plays the same part of its file faster or slower, so its
     /// length on the timeline changes. Pitch is kept unless "keep pitch" is off.
     fn speed_row(&mut self, ui: &mut egui::Ui, item: ItemId) {
         let Some(it) = self.editor.item(item) else { return };
-        let old = it.time_map.speed.num() as f64 / it.time_map.speed.den() as f64;
+        let signed = it.time_map.speed.num() as f64 / it.time_map.speed.den() as f64;
+        // Shown as a size; which way it plays is the Reverse switch.
+        let (old, reversed) = (signed.abs(), signed < 0.0);
         let keep = !matches!(it.params.get(schema::AUDIO_KEEP_PITCH).map(|s| s.eval(&it.eval_context(it.range.start))), Some(Value::Bool(false)));
         let mut speed = old;
+        let mut reverse = reversed;
         ui.horizontal(|ui| {
             ui.add_space(24.0);
+            ui.add_enabled(signed != 0.0, egui::Checkbox::new(&mut reverse, "Reverse"))
+                .on_hover_text("Plays the same part of the file backwards, last frame first — the sound too.");
             let r = ui
                 .add(egui::DragValue::new(&mut speed).speed(0.01).range(0.05..=20.0).max_decimals(3).suffix("×"))
                 .on_hover_text("Playback speed, picture and sound together (0.05× to 20×). The clip gets shorter or longer on the timeline.");
@@ -1311,20 +1408,30 @@ impl App {
                 self.editor.doc.seal();
             }
         });
+        if reverse != reversed {
+            let ids: Vec<ItemId> = std::iter::once(item).chain(self.editor.linked.iter().copied().filter(|l| *l != item)).collect();
+            let ops: Vec<oa_doc::Op> = ids.iter().filter_map(|id| self.editor.item(*id)).filter_map(|it| oa_edit::timeline::reversed(it, reverse).map(|(range, time_map)| oa_doc::Op::SetItemTiming { seq: self.editor.seq, item: it.id, range, time_map })).collect();
+            if let Err(e) = self.editor.apply(if reverse { "Reverse clip" } else { "Play clip forwards" }, ops) {
+                self.error = Some(e.to_string());
+            }
+            return;
+        }
         if (speed - old).abs() < 1e-9 || speed <= 0.0 || old <= 0.0 {
             return;
         }
-        // Each selected clip: the same part of its file, played at the new speed.
+        // Each selected clip: the same part of its file, played at the new speed (and the
+        // way it was going).
         let mut ops = Vec::new();
         for id in std::iter::once(item).chain(self.editor.linked.iter().copied().filter(|l| *l != item)) {
             let Some(it) = self.editor.item(id) else { continue };
             let was = it.time_map.speed.num() as f64 / it.time_map.speed.den().max(1) as f64;
-            if was <= 0.0 {
+            if was == 0.0 {
                 continue;
             }
-            let span = it.range.duration.as_seconds_f64() * was;
+            let span = it.range.duration.as_seconds_f64() * was.abs();
             let duration = Time::from_seconds_f64(span / speed).max(Time(1));
-            let time_map = oa_doc::TimeMap { source_in: it.time_map.source_in, speed: oa_time::Rational::new((speed * 1000.0).round() as i64, 1000) };
+            let milli = (speed * 1000.0).round() as i64 * if was < 0.0 { -1 } else { 1 };
+            let time_map = oa_doc::TimeMap::new(it.time_map.source_in, oa_time::Rational::new(milli, 1000));
             ops.push(oa_doc::Op::SetItemTiming { seq: self.editor.seq, item: id, range: oa_time::TimeRange::new(it.range.start, duration), time_map });
         }
         if let Err(e) = self.editor.apply_drag("Clip speed", "clip-speed", ops) {

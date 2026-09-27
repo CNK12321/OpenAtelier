@@ -50,7 +50,7 @@ impl App {
         };
         let mut open = true;
         let title = format!("Wave — {} · {}", it.name, band.param.rsplit('.').next().unwrap_or(&band.param));
-        egui::Window::new(title)
+        crate::widgets::on_screen(egui::Window::new(title), ctx)
             .id(egui::Id::new("wave-editor"))
             .open(&mut open)
             .default_width(460.0)

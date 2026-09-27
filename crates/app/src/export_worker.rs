@@ -27,6 +27,7 @@ const PREVIEW_EVERY: Duration = Duration::from_millis(250);
 const BATCH: u64 = 8;
 
 /// A file the export may need to decode.
+#[derive(Clone)]
 pub struct MediaEntry {
     pub id: u64,
     pub kind: MediaKind,
@@ -49,6 +50,25 @@ struct Shared {
     cancel: AtomicBool,
     preview: Mutex<Option<Preview>>,
     encoder: Mutex<String>,
+    /// What it's doing besides rendering frames, and since when (`None`: rendering).
+    stage: Mutex<Option<(Stage, Instant)>>,
+}
+
+/// The parts of an export that aren't frames going by, so the window can say what's
+/// happening instead of sitting at 0 % or 100 % in silence.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Before the first frame: opening the encoder (trying the GPU's first). The sound
+    /// is mixed on a thread of its own while the frames render.
+    Opening,
+    /// After the last frame: the encoder's last frames, the sound, the file's index.
+    Finishing,
+}
+
+impl Shared {
+    fn set_stage(&self, stage: Option<Stage>) {
+        *self.stage.lock().unwrap_or_else(|e| e.into_inner()) = stage.map(|s| (s, Instant::now()));
+    }
 }
 
 /// A running export.
@@ -63,7 +83,7 @@ pub enum Poll {
 }
 
 impl ExportRun {
-    /// (frames written, frames in all) — 0 of 0 while the sound is being mixed down.
+    /// (frames written, frames in all) — 0 of 0 while the encoder is being opened.
     pub fn progress(&self) -> (u64, u64) {
         (self.shared.done.load(Ordering::Relaxed), self.shared.total.load(Ordering::Relaxed))
     }
@@ -71,6 +91,11 @@ impl ExportRun {
     /// The newest picture of the export, if there's one the UI hasn't taken yet.
     pub fn take_preview(&self) -> Option<Preview> {
         self.shared.preview.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// What it's doing when it isn't rendering frames, and for how long.
+    pub fn stage(&self) -> Option<(Stage, Duration)> {
+        self.shared.stage.lock().unwrap_or_else(|e| e.into_inner()).map(|(s, since)| (s, since.elapsed()))
     }
 
     /// Which encoder is writing the file (once it's open).
@@ -125,7 +150,9 @@ pub fn start(job: Job) -> ExportRun {
 }
 
 fn run(job: Job, shared: &Shared) -> Result<ExportSummary, String> {
+    shared.set_stage(Some(Stage::Opening));
     let mut exporter = Exporter::start(&job.project, job.seq, &job.path, &job.options).map_err(|e| e.to_string())?;
+    shared.set_stage(None);
     shared.total.store(exporter.progress().1, Ordering::Relaxed);
     *shared.encoder.lock().unwrap_or_else(|e| e.into_inner()) = exporter.encoder();
 
@@ -155,6 +182,7 @@ fn run(job: Job, shared: &Shared) -> Result<ExportSummary, String> {
             last_preview = Some(Instant::now());
         }
         if finished {
+            shared.set_stage(Some(Stage::Finishing));
             return exporter.finish().map_err(|e| e.to_string());
         }
     }
@@ -180,4 +208,61 @@ fn sources_for(job: &Job) -> Sources {
     }
     sources.set_video(Some(video));
     sources
+}
+
+#[cfg(test)]
+mod bench {
+    //! The app's own export path, headless: a project opened as the editor opens it and
+    //! exported as the Export window does (`OA_BENCH_PROJECT=<file> cargo test --release
+    //! -p oa-app app_export_speed -- --ignored --nocapture`).
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn app_export_speed() {
+        let Ok(path) = std::env::var("OA_BENCH_PROJECT") else { return };
+        let gpu = Arc::new(GpuContext::new_headless().unwrap());
+        let decoders = oa_media::DecoderChoice {
+            #[cfg(windows)]
+            bridge: if gpu.is_dx12() { oa_media::windows::D3D11Bridge::new(&gpu).ok() } else { None },
+            force_ffmpeg: std::env::var("OA_DECODER").is_ok_and(|v| v == "ffmpeg"),
+        };
+        let choice = decoders.clone();
+        let (editor, _) = crate::editor::Editor::open(std::path::Path::new(&path), |p| crate::App::import_with(choice.clone(), p)).unwrap();
+        let seq = editor.seq;
+        let (audio, buses, _) = oa_export::audio_mix(editor.doc.project(), seq, |media| {
+            let pool = editor.pool_item(media)?;
+            (!pool.missing && pool.probe.has_audio()).then(|| pool.decode_path.clone())
+        });
+        let media = editor.pool.iter().filter(|m| !m.missing).map(|m| MediaEntry { id: m.id.0, kind: m.kind, path: m.decode_path.clone(), track: m.probe.video.clone() }).collect();
+        let out = std::env::temp_dir().join("oa-app-export-bench.mp4");
+        let options = ExportOptions { audio, buses, text_antialias: std::env::var("OA_BENCH_NO_AA").is_err(), ..Default::default() };
+        let started = Instant::now();
+        let run = start(Job {
+            gpu,
+            decoders,
+            registry: Arc::new(Registry::with_builtins()),
+            project: editor.doc.snapshot(),
+            media,
+            seq,
+            path: out,
+            options,
+            vram_budget: 2 << 30,
+        });
+        let summary = loop {
+            if let Poll::Finished(r) = run.poll() {
+                break r.unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        eprintln!(
+            "app export: {} frames in {:.1}s = {:.0} fps (render loop {:.0} fps) with {} — {}",
+            summary.frames,
+            started.elapsed().as_secs_f64(),
+            summary.frames as f64 / started.elapsed().as_secs_f64(),
+            summary.frames_per_second(),
+            summary.encoder,
+            summary.timings
+        );
+    }
 }

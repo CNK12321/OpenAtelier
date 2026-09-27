@@ -198,10 +198,24 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # The title people see: "OpenAtelier Beta 4" for v0.1.0-beta.4, "OpenAtelier 0.2.0"
+      # for v0.2.0. The tag keeps the full version: the app's update check reads it.
+      - name: Title
+        id: title
+        run: |
+          tag="${{ github.ref_name }}"
+          case "$tag" in
+            *-beta.*) title="Beta ${tag##*-beta.}" ;;
+            *-*) pre="${tag#*-}"; title="${pre^}" ;;
+            *) title="${tag#v}" ;;
+          esac
+          echo "title=OpenAtelier $title" >> "$GITHUB_OUTPUT"
+          echo "OpenAtelier $title"
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: OpenAtelier ${{ github.ref_name }}
+          name: ${{ steps.title.outputs.title }}
           # "v0.1.0-beta.1" and the like are pre-releases (the Beta update channel).
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true

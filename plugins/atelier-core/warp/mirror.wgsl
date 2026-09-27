@@ -1,4 +1,4 @@
-fn oa_warp_mirror(pos: vec2f, base: u32) -> vec4f {
+fn oa_warp_mirror(pos: vec2f, base: u32) -> vec2f {
     // Everything past the line is the reflection of what's before it.
     let size = max(in_size(), vec2f(1.0));
     let vertical = u(base) < 0.5;
@@ -12,5 +12,5 @@ fn oa_warp_mirror(pos: vec2f, base: u32) -> vec4f {
         let past = select(pos.y > at.y, pos.y < at.y, flip);
         if (past) { p.y = 2.0 * at.y - pos.y; }
     }
-    return sample_input(p);
+    return p;
 }

@@ -3,8 +3,9 @@
 //! Click a clip to select it (and its group); Ctrl/Shift+click adds or removes; drag on
 //! empty space draws a selection box. Drag a clip's middle to move the selection (onto
 //! other tracks of the same kind, too), or an edge to trim. Moves and trims snap to clip
-//! edges and the playhead ("Snap"; Ctrl flips it while dragging) and land on frame
-//! boundaries. Drag or click in the ruler to scrub. Right-click a clip, a track header or
+//! edges and the playhead ("Snap"; hold Shift to drag without it, Ctrl flips it) and land on frame
+//! boundaries. Drag or click in the ruler to scrub; held against an edge, the view
+//! scrolls that way, faster the longer it's held. Right-click a clip, a track header or
 //! empty space for a menu (cut/copy/paste/duplicate, split, group, enable, delete; track
 //! rename/reorder/delete). Ctrl+wheel zooms, the wheel scrolls, and the view follows the
 //! playhead while playing. The commands live in `oa_edit::timeline` and `clips.rs`.
@@ -39,10 +40,32 @@ pub struct TimelineView {
     pub span: f64,
     /// Follow the sequence length (until the user zooms or scrolls).
     pub fit: bool,
+    /// Scrolled or zoomed away from the playhead while playing: the view stays where it
+    /// was put until the playhead comes back into it.
+    pub looked_away: bool,
+    /// Seconds the playhead has been dragged against an edge of the lane: the view
+    /// scrolls that way, faster the longer it's held (and the further past the edge).
+    pub edge_held: f64,
     /// What the open right-click menu is for.
     pub(crate) menu: Option<Menu>,
     /// Index into [`ROW_HEIGHTS`]: how tall each track is drawn.
     pub row_height: usize,
+    /// Milliseconds the timeline takes to draw per clip in view (learned while each clip
+    /// is drawn on its own), and whether clips too narrow to see are being joined into
+    /// blocks — only when drawing them one by one would be slow (see [`join_tiny_clips`]).
+    pub per_clip_ms: f32,
+    pub joining: bool,
+}
+
+/// Whether to join clips too narrow to see into blocks, given how many are in view and
+/// what one costs to draw: only once drawing them one by one would take more than
+/// `JOIN_ABOVE_MS`, and back to one by one below `SPLIT_BELOW_MS` (a gap between the two,
+/// so it doesn't flicker on the edge).
+pub fn join_tiny_clips(joining: bool, per_clip_ms: f32, clips_in_view: usize) -> bool {
+    const JOIN_ABOVE_MS: f32 = 6.0;
+    const SPLIT_BELOW_MS: f32 = 3.0;
+    let predicted = per_clip_ms * clips_in_view as f32;
+    if joining { predicted > SPLIT_BELOW_MS } else { predicted > JOIN_ABOVE_MS }
 }
 
 impl TimelineView {
@@ -53,7 +76,7 @@ impl TimelineView {
 
 impl Default for TimelineView {
     fn default() -> Self {
-        TimelineView { start: 0.0, span: 10.0, fit: true, menu: None, row_height: 1 }
+        TimelineView { start: 0.0, span: 10.0, fit: true, looked_away: false, edge_held: 0.0, menu: None, row_height: 1, per_clip_ms: 0.0, joining: false }
     }
 }
 
@@ -102,6 +125,8 @@ struct ClipBox {
     outro: Option<f32>,
     /// Media clips: the file, and where the clip's start falls in it and how fast it plays.
     media: Option<(oa_doc::MediaId, f64, f64)>,
+    /// Compound clips: the same for the timeline inside.
+    compound: Option<(oa_doc::SeqId, f64, f64)>,
     start: f64,
     /// An effect container (on an effect track).
     container: bool,
@@ -131,6 +156,14 @@ struct Mark {
 }
 
 type Row = (TrackId, TrackKind, String, bool);
+
+/// How fast the view scrolls, in views per second (negative: back), while the playhead
+/// is dragged against an edge: `push` is how deep into the edge the pointer is (1 = at
+/// the lane's edge, up to 3 well past it), `held` how long it's been there. Gentle at
+/// first, it gathers speed — up to 8 views a second.
+fn edge_scroll_speed(push: f32, held: f64) -> f64 {
+    (push as f64 * 0.6 * (1.0 + 2.5 * held)).clamp(-8.0, 8.0)
+}
 
 /// The row a dragged track header would land on (among tracks of its kind), if it would
 /// move at all.
@@ -219,17 +252,62 @@ impl App {
                 view.span = (view.span / zoom as f64).clamp(0.2, 3600.0);
                 view.start = (at - ((pointer.x - lane.left()) / lane.width()).clamp(0.0, 1.0) as f64 * view.span).max(0.0);
                 view.fit = false;
+                view.looked_away = self.playing;
             } else if scroll.x != 0.0 || scroll.y != 0.0 {
                 let px = if scroll.x != 0.0 { scroll.x } else { scroll.y };
                 view.start = (view.start - px as f64 / lane.width() as f64 * view.span).max(0.0);
                 view.fit = false;
+                view.looked_away = self.playing;
             }
         }
-        if self.playing && !view.fit {
+        // While playing, the view glides along with the playhead — it stays put until the
+        // playhead is three quarters across, then scrolls with it every frame (no page
+        // jumps). Scrolled or zoomed away: left alone until the playhead is back in the
+        // part of the view where following wouldn't move it.
+        const FOLLOW_AT: f64 = 0.75;
+        if !self.playing {
+            view.looked_away = false;
+        } else if !view.fit && self.timeline_drag.is_none() {
             let t = self.playhead.as_seconds_f64();
-            if t < view.start || t > view.start + view.span * 0.95 {
-                view.start = (t - view.span * 0.05).max(0.0);
+            // Back where following wouldn't move the view: follow again.
+            if view.looked_away && t >= view.start && t <= view.start + view.span * FOLLOW_AT {
+                view.looked_away = false;
             }
+            if !view.looked_away {
+                if t < view.start {
+                    // Looped back to the start (or jumped behind the view).
+                    view.start = (t - view.span * 0.05).max(0.0);
+                } else if t > view.start + view.span * FOLLOW_AT {
+                    view.start = t - view.span * FOLLOW_AT;
+                }
+            }
+        }
+        // Scrubbing against an edge of the lane (or past it) scrolls the view that way,
+        // speeding up the longer it's held and the deeper into the edge the pointer is —
+        // so a long timeline can be crossed in one drag, and a short nudge moves a little.
+        const SCROLL_EDGE_PX: f32 = 40.0;
+        let edge_push = match (&self.timeline_drag, response.interact_pointer_pos()) {
+            (Some(TimelineDrag::Scrub), Some(pos)) if response.dragged() => {
+                if pos.x < lane.left() + SCROLL_EDGE_PX && view.start > 0.0 {
+                    -((lane.left() + SCROLL_EDGE_PX - pos.x) / SCROLL_EDGE_PX).min(3.0)
+                } else if pos.x > lane.right() - SCROLL_EDGE_PX && view.start + view.span < duration + view.span * 0.05 {
+                    ((pos.x - (lane.right() - SCROLL_EDGE_PX)) / SCROLL_EDGE_PX).min(3.0)
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+        if edge_push != 0.0 {
+            let dt = ui.input(|i| i.stable_dt).min(0.1) as f64;
+            view.edge_held += dt;
+            let speed = edge_scroll_speed(edge_push, view.edge_held);
+            let end = (duration + view.span * 0.05 - view.span).max(0.0);
+            view.start = (view.start + speed * view.span * dt).clamp(0.0, end);
+            view.fit = false;
+            ui.ctx().request_repaint();
+        } else {
+            view.edge_held = 0.0;
         }
         let (start, span) = (view.start, view.span);
         let x_of = |t: Time| lane.left() + ((t.as_seconds_f64() - start) / span) as f32 * lane.width();
@@ -253,6 +331,11 @@ impl App {
         let mut boxes = Vec::new();
         let mut bands: Vec<(ItemId, egui::Rect)> = Vec::new();
         let mut runs: Vec<ClipRun> = Vec::new();
+        // Only when drawing each clip would be slow: clips too narrow to see join blocks.
+        let clips_in_view: usize = rows.iter().filter_map(|(id, ..)| seq.track(*id)).map(|t| in_view(&t.items).len()).sum();
+        let joining = join_tiny_clips(self.timeline_view.joining, self.timeline_view.per_clip_ms, clips_in_view);
+        self.timeline_view.joining = joining;
+        let layout_clock = std::time::Instant::now();
         for (r, (track_id, kind, _, _)) in rows.iter().enumerate() {
             let Some(track) = seq.track(*track_id) else { continue };
             let shown = in_view(&track.items);
@@ -260,7 +343,7 @@ impl App {
                 let x0 = x_of(item.range.start);
                 // Clips too narrow to see (zoomed far out) join a run drawn as one block:
                 // nothing to read on them, so none of the work below.
-                if x_of(item.range.end()) - x0 < TINY_CLIP_PX {
+                if joining && x_of(item.range.end()) - x0 < TINY_CLIP_PX {
                     let x1 = x_of(item.range.end()).max(x0 + 1.0);
                     match runs.last_mut().filter(|run: &&mut ClipRun| run.row == r && run.rect.right() >= x0 - 1.0) {
                         Some(run) => {
@@ -287,7 +370,8 @@ impl App {
                     .chain(item.effects.iter().flat_map(|e| e.params.0.values()))
                     .filter_map(|s| s.curve().filter(|c| c.anchor == oa_params::KeyframeAnchor::ClipStart))
                     .flat_map(|c| c.keys.iter().map(|k| x_of(item.range.start + k.t)))
-                    .filter(|x| *x >= x0 && *x <= x1)
+                    // In the clip, and on screen (a tracked clip can carry thousands).
+                    .filter(|x| *x >= x0.max(lane.left() - 8.0) && *x <= x1.min(lane.right() + 8.0))
                     .collect();
                 keys.sort_by(f32::total_cmp);
                 keys.dedup_by(|a, b| (*a - *b).abs() < 1.0);
@@ -326,8 +410,15 @@ impl App {
                     }
                     _ => None,
                 };
+                let compound = match item.kind {
+                    oa_doc::ItemKind::Nested { sequence } => {
+                        let speed = item.time_map.speed.num() as f64 / item.time_map.speed.den() as f64;
+                        Some((sequence, item.time_map.source_in.as_seconds_f64(), speed))
+                    }
+                    _ => None,
+                };
                 let start = item.range.start.as_seconds_f64();
-                boxes.push(ClipBox { id: item.id, name, rect, kind: *kind, enabled, keys, text, intro, outro, media, start, container });
+                boxes.push(ClipBox { id: item.id, name, rect, kind: *kind, enabled, keys, text, intro, outro, media, compound, start, container });
             }
             // Transition windows, drawn over the clips they join.
             for (i, item) in track.items.iter().enumerate().skip(shown.start).take(shown.len()) {
@@ -344,6 +435,7 @@ impl App {
                 }
             }
         }
+        let layout_ms = layout_clock.elapsed().as_secs_f32() * 1000.0;
         let clip_at = |p: egui::Pos2| boxes.iter().rev().find(|b| b.rect.contains(p));
         let edge_at = |b: &ClipBox, x: f32| {
             let near = EDGE_PX.min(b.rect.width() / 3.0);
@@ -411,7 +503,7 @@ impl App {
         let band_hit = |app: &App, p: egui::Pos2| -> Option<(ItemId, crate::band::Band, Option<usize>, egui::Rect)> {
             let b = clip_at(p).filter(|b| app.selected.contains(&b.id))?;
             let band = app.clip_band(b.id)?;
-            let shape = app.band_shape(b.id, &band, b.rect, &x_of, &time_at)?;
+            let shape = app.band_shape(b.id, &band, b.rect, lane, &x_of, &time_at)?;
             if let Some((i, _)) = shape.keys.iter().find(|(_, k)| k.distance(p) <= 6.0) {
                 return Some((b.id, band, Some(*i), b.rect));
             }
@@ -483,14 +575,15 @@ impl App {
         if response.dragged()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            // Ctrl flips snapping for the duration of the drag.
-            let snapping = self.snapping != ui.input(|i| i.modifiers.command);
+            // Shift turns snapping off for the duration of the drag; Ctrl flips it.
+            let snapping = self.snapping != mods.command && !mods.shift;
             let tolerance = px_to_time(SNAP_PX);
             let s = self.editor.sequence();
             let (sid, playhead) = (self.editor.seq, self.playhead);
             let result = match &self.timeline_drag {
                 Some(TimelineDrag::Scrub) | None => {
-                    self.set_playhead(cmd::snap_to_frame(s, time_at(pos.x)));
+                    // Past the lane's edge, the playhead rides the edge as the view scrolls.
+                    self.set_playhead(cmd::snap_to_frame(s, time_at(pos.x.clamp(lane.left(), lane.right()))));
                     Ok(())
                 }
                 // Painted below; applied on release.
@@ -780,6 +873,7 @@ impl App {
         for m in &marks {
             clip_painter.rect_filled(m.band, 0.0, rgb(m.divider.color).gamma_multiply(0.12));
         }
+        let draw_clock = std::time::Instant::now();
         // Runs of clips too narrow to tell apart: one block each, lit if any is selected.
         for run in &runs {
             let base = match run.kind {
@@ -803,6 +897,21 @@ impl App {
             clip_painter.rect_filled(b.rect, 3.0, fill);
             if let Some((media, source_in, speed)) = b.media {
                 self.paint_clip_preview(ui.ctx(), &clip_painter.with_clip_rect(b.rect.shrink(1.0).intersect(lane)), b, media, source_in, speed, &time_at);
+            }
+            // A compound clip: its own filmstrip, rendered from the timeline inside.
+            if let Some((seq, source_in, speed)) = b.compound
+                && let Some(strip) = self.compound_strip(ui.ctx(), seq)
+            {
+                let painter = clip_painter.with_clip_rect(b.rect.shrink(1.0).intersect(lane));
+                let r = b.rect;
+                let tile = (r.height() * strip.aspect).max(8.0);
+                let visible = painter.clip_rect();
+                for x in shown_tiles([r.left(), r.right()], tile, [visible.left(), visible.right()]) {
+                    let at = source_in + (time_at(x).as_seconds_f64() - b.start) * speed;
+                    let dest = egui::Rect::from_min_size(egui::pos2(x, r.top()), egui::vec2(tile, r.height()));
+                    painter.image(strip.texture.id(), dest, strip.uv(at), egui::Color32::from_gray(190));
+                }
+                painter.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 14.0)), 0.0, egui::Color32::from_black_alpha(90));
             }
             // Intro and outro ramps: the clip rising from / falling to its edges.
             let ramp = egui::Color32::from_white_alpha(40);
@@ -840,7 +949,7 @@ impl App {
             // The clip's keyframe line (volume / opacity / the chosen property): bright
             // and editable on selected clips, faint on the rest.
             if let Some(band) = self.clip_band(b.id)
-                && let Some(shape) = self.band_shape(b.id, &band, b.rect, &x_of, &time_at)
+                && let Some(shape) = self.band_shape(b.id, &band, b.rect, lane, &x_of, &time_at)
             {
                 let color = if selected { egui::Color32::from_rgb(255, 220, 110) } else { egui::Color32::from_rgba_unmultiplied(255, 220, 110, 70) };
                 let clipped = clip_painter.with_clip_rect(b.rect.intersect(lane));
@@ -860,6 +969,13 @@ impl App {
                     egui::Stroke::NONE,
                 ));
             }
+        }
+        // What a clip costs to lay out and draw, learned while each is drawn on its own
+        // (smoothed, so one slow frame doesn't flip the joining on).
+        if !joining && clips_in_view > 0 {
+            let ms = (layout_ms + draw_clock.elapsed().as_secs_f32() * 1000.0) / clips_in_view as f32;
+            let v = &mut self.timeline_view.per_clip_ms;
+            *v = if *v == 0.0 { ms } else { *v * 0.9 + ms * 0.1 };
         }
         // Dividers over the clips: a line in the section's color and a flag to drag it by.
         for m in &marks {
@@ -1006,6 +1122,31 @@ fn item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> bool {
 }
 
 impl App {
+    /// A compound clip's filmstrip — rendered from what's in it, on the preview thread,
+    /// and made again after it's edited (the last one stays up meanwhile).
+    pub(crate) fn compound_strip(&mut self, ctx: &egui::Context, seq: oa_doc::SeqId) -> Option<crate::previews::Strip> {
+        let project = self.editor.doc.snapshot();
+        let sequence = project.sequences.get(&seq)?;
+        // What it is now: a new sequence value (an edit inside it) is a new version.
+        let version = std::sync::Arc::as_ptr(sequence) as u64;
+        let frames = (sequence.duration().as_seconds_f64().ceil() as usize).clamp(1, crate::previews::COMPOUND_FRAMES);
+        let (worker, registry) = (&self.preview_worker, self.registry.clone());
+        self.clip_previews
+            .compound_strip(ctx, seq, version, |reply| {
+                worker.strip(crate::preview_worker::StripRequest {
+                    seq,
+                    version,
+                    project: project.clone(),
+                    registry,
+                    frames,
+                    frame_w: crate::previews::FRAME_W,
+                    cols: crate::previews::COLS,
+                    reply,
+                })
+            })
+            .cloned()
+    }
+
     /// Right-click on clips: edits for the whole selection.
     fn clip_menu(&mut self, ui: &mut egui::Ui) {
         let n = self.selected.len();
@@ -1032,6 +1173,23 @@ impl App {
         if item(ui, "Split at playhead", "S", has) {
             self.split_at_playhead();
             ui.close();
+        }
+        if n >= 2 {
+            ui.menu_button("Arrange", |ui| {
+                use oa_edit::timeline::Arrange;
+                let choices: [(&str, &str, Arrange); 4] = [
+                    ("Move together", "Close the gaps between them: on each track, each starts where the one before ends", Arrange::Together),
+                    ("Line up starts", "Every one starts where the earliest does", Arrange::LineUpStarts),
+                    ("Move to playhead", "The earliest starts at the playhead; the rest keep their spacing", Arrange::StartAt(self.playhead)),
+                    ("Space evenly", "The first and last stay; the ones between are spread out evenly", Arrange::SpaceEvenly),
+                ];
+                for (label, hint, how) in choices {
+                    if ui.button(label).on_hover_text(hint).clicked() {
+                        self.arrange_selection(how, label);
+                        ui.close();
+                    }
+                }
+            });
         }
         if n >= 2 && item(ui, "Group", "Ctrl+G", true) {
             self.group_selection();
@@ -1368,14 +1526,10 @@ impl App {
         {
             let pic = egui::Rect::from_min_max(r.min, egui::pos2(r.right(), if audible { r.bottom() - wave_h } else { r.bottom() }));
             let tile = (pic.height() * strip.aspect).max(8.0);
-            let mut x = r.left();
-            while x < r.right() {
-                if x + tile >= visible.left() && x <= visible.right() {
-                    let uv = strip.uv(if still { 0.0 } else { source_at(x) });
-                    let dest = egui::Rect::from_min_size(egui::pos2(x, pic.top()), egui::vec2(tile, pic.height()));
-                    painter.image(strip.texture.id(), dest, uv, egui::Color32::from_gray(190));
-                }
-                x += tile;
+            for x in shown_tiles([r.left(), r.right()], tile, [visible.left(), visible.right()]) {
+                let uv = strip.uv(if still { 0.0 } else { source_at(x) });
+                let dest = egui::Rect::from_min_size(egui::pos2(x, pic.top()), egui::vec2(tile, pic.height()));
+                painter.image(strip.texture.id(), dest, uv, egui::Color32::from_gray(190));
             }
             // Keep the name readable over the pictures.
             painter.rect_filled(egui::Rect::from_min_size(pic.min, egui::vec2(r.width(), 14.0)), 0.0, egui::Color32::from_black_alpha(90));
@@ -1393,5 +1547,56 @@ impl App {
                 painter.line_segment([egui::pos2(px as f32, mid - a), egui::pos2(px as f32, mid + a.max(0.5))], egui::Stroke::new(1.0, color));
             }
         }
+    }
+}
+
+/// The left edges of a filmstrip's tiles (`tile` px apart from the clip's start,
+/// `clip` = [left, right]) that reach into `view` = [left, right]: only the ones on
+/// screen, found without walking from the clip's start — a long clip zoomed in is
+/// millions of px wide.
+fn shown_tiles(clip: [f32; 2], tile: f32, view: [f32; 2]) -> impl Iterator<Item = f32> {
+    let first = ((view[0] - clip[0]).max(0.0) / tile).floor();
+    let end = clip[1].min(view[1]);
+    (0..).map(move |i| clip[0] + (first + i as f32) * tile).take_while(move |x| *x < end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{edge_scroll_speed, join_tiny_clips, shown_tiles};
+
+    #[test]
+    fn only_tiles_on_screen_are_visited() {
+        // A clip ten million px wide, a 1000 px view in the middle of it: ~20 tiles, all
+        // on the clip's own grid, covering the view.
+        let tiles: Vec<f32> = shown_tiles([-5_000_000.0, 5_000_000.0], 50.0, [0.0, 1000.0]).collect();
+        assert!((20..=21).contains(&tiles.len()), "{}", tiles.len());
+        assert!(tiles[0] <= 0.0 && tiles[0] > -50.0);
+        assert!(tiles.iter().all(|x| ((x + 5_000_000.0) / 50.0).fract() == 0.0));
+        assert!(*tiles.last().unwrap() + 50.0 >= 1000.0);
+        // A clip starting inside the view begins at its own start; one off screen has none.
+        assert_eq!(shown_tiles([300.0, 420.0], 50.0, [0.0, 1000.0]).collect::<Vec<_>>(), vec![300.0, 350.0, 400.0]);
+        assert_eq!(shown_tiles([2000.0, 3000.0], 50.0, [0.0, 1000.0]).count(), 0);
+    }
+
+    #[test]
+    fn tiny_clips_join_only_when_drawing_them_is_slow() {
+        // 0.002 ms a clip: 1000 in view is 2 ms — drawn one by one.
+        assert!(!join_tiny_clips(false, 0.002, 1000));
+        // 5000 is 10 ms: joined.
+        assert!(join_tiny_clips(false, 0.002, 5000));
+        // Once joined, it stays so until well under the line (no flicker at 6 ms).
+        assert!(join_tiny_clips(true, 0.002, 2000));
+        assert!(!join_tiny_clips(true, 0.002, 1000));
+    }
+
+    #[test]
+    fn edge_scrolling_speeds_up() {
+        // Its direction is the edge's; deeper and longer both go faster; it tops out.
+        assert!(edge_scroll_speed(-1.0, 0.0) < 0.0 && edge_scroll_speed(1.0, 0.0) > 0.0);
+        assert!(edge_scroll_speed(1.0, 1.0) > edge_scroll_speed(1.0, 0.0));
+        assert!(edge_scroll_speed(2.0, 0.5) > edge_scroll_speed(1.0, 0.5));
+        assert!(edge_scroll_speed(0.2, 0.0) < 0.2, "a nudge barely moves");
+        assert_eq!(edge_scroll_speed(3.0, 60.0), 8.0);
+        assert_eq!(edge_scroll_speed(-3.0, 60.0), -8.0);
     }
 }

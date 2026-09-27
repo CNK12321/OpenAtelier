@@ -6,9 +6,14 @@
 //! * **Occlusion/visibility cull** in composites: drop layers under a full-canvas
 //!   opaque layer, fully transparent layers, and layers outside the canvas.
 //! * **Transform merge**: directly chained transforms become one matrix (one
-//!   resample). Never merged across effects — effects run in layer space.
+//!   resample). Never merged across effects — effects run in layer space — nor into
+//!   the shrink of supersampled (anti-aliased) text.
 //! * **Point-op fusion**: chains of fusible point ops in the same working space become
 //!   one [`NodeOp::FusedPointOps`] pass.
+//! * **UV-warp fusion**: chains of fusible warps that each cover their input's area
+//!   become one [`NodeOp::FusedUvWarps`] pass (positions carried back through every
+//!   warp, the input read once). The executor goes further and draws a warp straight
+//!   into the layer it feeds, when the layer's transform doesn't shrink it past 2×.
 //! * Dead nodes disappear because the output graph is rebuilt from the output node.
 
 use crate::{BlendMode, EffectKind, Graph, GraphBuilder, KeyContext, NodeId, NodeOp, Rect};
@@ -38,6 +43,14 @@ struct Rewriter<'a> {
 }
 
 impl Rewriter<'_> {
+    /// A warp that reads one input and covers exactly its area — what warps can be
+    /// chained (and drawn straight into a layer) on: each one's positions are the next
+    /// one's.
+    fn warp_in_place(&self, id: NodeId) -> bool {
+        let node = self.old.node(id);
+        node.inputs.len() == 1 && same_area(node.bounds, self.old.node(node.inputs[0]).bounds)
+    }
+
     fn visit(&mut self, id: NodeId) -> NodeId {
         if let Some(done) = self.memo[id.0 as usize] {
             return done;
@@ -60,6 +73,13 @@ impl Rewriter<'_> {
                 let mut m = *matrix;
                 let mut src = node.inputs[0];
                 while let NodeOp::Transform { matrix: inner } = &self.old.node(src).op {
+                    // Anti-aliased text (drawn larger, then shrunk): the shrink is a pass of
+                    // its own, an even average of the larger drawing's pixels — folded
+                    // into the layer's placement it would be a single, sparser resample.
+                    let supersampled = matches!(self.old.node(self.old.node(src).inputs[0]).op, NodeOp::Text { .. }) && inner.max_axis_scale() < 1.0;
+                    if supersampled {
+                        break;
+                    }
                     m = inner.then(&m);
                     src = self.old.node(src).inputs[0];
                 }
@@ -99,6 +119,28 @@ impl Rewriter<'_> {
                 let input = self.visit(cur);
                 self.out.add(NodeOp::FusedPointOps { space, chain, nearest }, vec![input], node.bounds, node.opaque)
             }
+            NodeOp::Effect { kind: EffectKind::UvWarp, fusible: true, stateful: false, nearest, .. } if self.warp_in_place(id) => {
+                let nearest = *nearest;
+                let mut chain = Vec::new();
+                let mut cur = id;
+                loop {
+                    match &self.old.node(cur).op {
+                        NodeOp::Effect { kind: EffectKind::UvWarp, fusible: true, stateful: false, type_id, version, uniforms, nearest: n, .. }
+                            if *n == nearest && self.warp_in_place(cur) =>
+                        {
+                            chain.push((type_id.clone(), *version, uniforms.clone()));
+                            cur = self.old.node(cur).inputs[0];
+                        }
+                        _ => break,
+                    }
+                }
+                if chain.len() < 2 {
+                    return self.copy(id);
+                }
+                chain.reverse(); // innermost (applied first) first
+                let input = self.visit(cur);
+                self.out.add(NodeOp::FusedUvWarps { chain, nearest }, vec![input], node.bounds, node.opaque)
+            }
             NodeOp::Composite { size, background, layers } => {
                 let canvas = Rect::from_size(size[0] as f64, size[1] as f64);
                 let mut keep: Vec<usize> = Vec::new();
@@ -121,6 +163,11 @@ impl Rewriter<'_> {
             _ => self.copy(id),
         }
     }
+}
+
+/// Two regions the same to within a hundredth of a pixel.
+pub fn same_area(a: Rect, b: Rect) -> bool {
+    [(a.x0, b.x0), (a.y0, b.y0), (a.x1, b.x1), (a.y1, b.y1)].iter().all(|(p, q)| (p - q).abs() < 0.01)
 }
 
 #[cfg(test)]
@@ -201,6 +248,31 @@ mod tests {
         // source, fused, d, transform, composite
         assert_eq!(o.live_count(), 5);
         assert_eq!(optimize(&g, OptLevel::Reference, KeyContext::default()), g);
+    }
+
+    fn warp(b: &mut GraphBuilder, input: NodeId, id: &str, grow: f64) -> NodeId {
+        let bounds = b.node(input).bounds.expand(grow);
+        let op = NodeOp::Effect { type_id: id.into(), version: 1, kind: EffectKind::UvWarp, space: WorkingSpace::Linear, fusible: true, stateful: false, uniforms: vec![1.0], nearest: false };
+        b.add(op, vec![input], bounds, false)
+    }
+
+    /// Warps covering their input's area fuse into one pass, innermost first; one that
+    /// grows past its input doesn't join (its positions aren't the next one's).
+    #[test]
+    fn fuses_uv_warps_that_stay_in_place() {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let s = src(&mut b, 100.0);
+        let a = warp(&mut b, s, "a", 0.0);
+        let c = warp(&mut b, a, "c", 0.0);
+        let d = warp(&mut b, c, "d", 0.0);
+        let grown = warp(&mut b, d, "grown", 4.0);
+        let out = comp(&mut b, &[(grown, 1.0)]);
+        let o = optimize(&b.finish(out), OptLevel::Full, KeyContext::default());
+        let text = o.describe();
+        assert!(text.contains("FusedUvWarps a → c → d"), "{text}");
+        assert!(text.contains("Effect grown"), "{text}");
+        // source, fused, grown, composite
+        assert_eq!(o.live_count(), 4, "{text}");
     }
 
     #[test]

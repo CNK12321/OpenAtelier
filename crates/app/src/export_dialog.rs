@@ -15,11 +15,35 @@ use oa_export::{Encoder, ExportOptions, VideoCodec};
 use oa_time::{Time, TimeRange};
 use std::path::PathBuf;
 
-/// One file to write.
+/// One file to write: what the project was when it was queued (editing on, or opening
+/// another project, doesn't change what a waiting export writes).
 pub struct ExportJob {
     pub seq: SeqId,
     pub path: PathBuf,
     pub options: ExportOptions,
+    pub project: std::sync::Arc<oa_doc::Project>,
+    pub media: Vec<crate::export_worker::MediaEntry>,
+    /// "MP4 · H.264 · 1920×1080 — Project name", for the queue.
+    pub label: String,
+}
+
+impl ExportJob {
+    /// The file's name, for lists and messages.
+    pub fn file_name(&self) -> String {
+        self.path.file_name().map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().to_string())
+    }
+}
+
+/// Moves queued export `i` one place earlier (`up`) or later; false if it can't go.
+pub fn move_queued<T>(queue: &mut std::collections::VecDeque<T>, i: usize, up: bool) -> bool {
+    let j = if up { i.checked_sub(1) } else { Some(i + 1) };
+    match j.filter(|j| *j < queue.len() && i < queue.len()) {
+        Some(j) => {
+            queue.swap(i, j);
+            true
+        }
+        None => false,
+    }
 }
 
 /// The export in progress, as the Exporting window shows it.
@@ -36,14 +60,21 @@ pub struct ExportView {
 }
 
 /// File types: (key, name, detail, extension, what it's for).
-const TYPES: [(&str, &str, &str, &str, &str); 6] = [
+const TYPES: [(&str, &str, &str, &str, &str); 8] = [
     ("h264", "MP4", "H.264", "mp4", "Plays everywhere: the web, phones, social apps"),
     ("hevc", "MP4", "HEVC", "mp4", "About half the size at the same quality; newer devices"),
     ("prores", "MOV", "ProRes 422 HQ", "mov", "Large, near-lossless: for handing to another editor"),
     ("prores4444", "MOV", "ProRes 4444 · alpha", "mov", "Keeps transparency: overlays and titles for other editors"),
     ("webm", "WebM", "VP9 · alpha", "webm", "Keeps transparency, small: overlays for the web"),
     ("gif", "GIF", "Animated", "gif", "Loops anywhere, no sound — keep it short and small"),
+    ("png", "PNG", "Image sequence", "png", "One picture per frame, transparency kept: for compositing and grading elsewhere"),
+    ("audio", "Audio", "WAV · M4A · MP3", "wav", "The sound alone, no picture"),
 ];
+
+/// Types whose options aren't a video's: no picture, or pictures one by one.
+fn is_audio(key: &str) -> bool {
+    key == "audio"
+}
 
 fn codec_of(key: &str, gif_fps: u32) -> VideoCodec {
     match key {
@@ -52,6 +83,8 @@ fn codec_of(key: &str, gif_fps: u32) -> VideoCodec {
         "prores4444" => VideoCodec::ProRes4444,
         "webm" => VideoCodec::WebmAlpha,
         "gif" => VideoCodec::Gif { fps: gif_fps },
+        "png" => VideoCodec::PngSequence,
+        "audio" => VideoCodec::Audio,
         _ => VideoCodec::H264,
     }
 }
@@ -104,8 +137,12 @@ fn safe_name(name: &str) -> String {
 /// Rough file size in bytes.
 fn estimate(prefs: &crate::settings::ExportPrefs, [w, h]: [u32; 2], rate: f64, seconds: f64) -> f64 {
     let px = w as f64 * h as f64 * seconds;
-    let sound = if prefs.audio && prefs.codec != "gif" { 24_000.0 * seconds } else { 0.0 };
+    let sound = if prefs.audio && !matches!(prefs.codec.as_str(), "gif" | "png") { 24_000.0 * seconds } else { 0.0 };
     match prefs.codec.as_str() {
+        // 16-bit stereo at 48 kHz.
+        "audio" => 192_000.0 * seconds,
+        // PNG compresses a typical frame to about 1.5 bytes a pixel (with alpha).
+        "png" => 1.5 * px * rate,
         // ProRes 422 HQ runs about 10 bits per pixel.
         "prores" => 10.0 * px * rate / 8.0 + sound,
         "prores4444" => 15.0 * px * rate / 8.0 + sound,
@@ -153,7 +190,9 @@ impl App {
         let mut go = false;
         let mut open = true;
         let gif = prefs.codec == "gif";
-        egui::Window::new("Export")
+        let audio_only = is_audio(&prefs.codec);
+        let stills = prefs.codec == "png";
+        crate::widgets::on_screen(egui::Window::new("Export"), ctx)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -178,7 +217,9 @@ impl App {
                         });
                         // A see-through background only survives in formats with alpha.
                         let keeps_alpha = codec_of(&prefs.codec, prefs.gif_fps).has_alpha();
-                        if transparent && !keeps_alpha {
+                        if audio_only {
+                            // No picture: its format and size don't matter.
+                        } else if transparent && !keeps_alpha {
                             egui::Frame::new().fill(style::WARNING.gamma_multiply(0.15)).corner_radius(6.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.colored_label(style::WARNING, "The background is transparent, but this type can't keep it — it'll be black.");
@@ -194,22 +235,24 @@ impl App {
                             ui.label(egui::RichText::new("✓ Transparent background kept").small().color(egui::Color32::from_rgb(90, 200, 120)));
                         }
 
-                        heading(ui, "FORMAT");
-                        ui.horizontal_wrapped(|ui| {
-                            for (i, v) in sequence.variants.iter().enumerate() {
-                                chip(ui, which == i, &v.name).on_hover_text(format!("{}×{}", v.size.width, v.size.height)).clicked().then(|| which = i);
-                            }
-                            if sequence.variants.len() > 1 {
-                                chip(ui, which == usize::MAX, format!("Every format ({})", sequence.variants.len())).on_hover_text("One file each, into a folder").clicked().then(|| which = usize::MAX);
-                            }
-                        });
+                        if !audio_only {
+                            heading(ui, "FORMAT");
+                            ui.horizontal_wrapped(|ui| {
+                                for (i, v) in sequence.variants.iter().enumerate() {
+                                    chip(ui, which == i, &v.name).on_hover_text(format!("{}×{}", v.size.width, v.size.height)).clicked().then(|| which = i);
+                                }
+                                if sequence.variants.len() > 1 {
+                                    chip(ui, which == usize::MAX, format!("Every format ({})", sequence.variants.len())).on_hover_text("One file each, into a folder").clicked().then(|| which = usize::MAX);
+                                }
+                            });
 
-                        heading(ui, "RESOLUTION");
-                        ui.horizontal_wrapped(|ui| {
-                            for (edge, label) in RESOLUTIONS {
-                                chip(ui, prefs.short_edge == edge, label).clicked().then(|| prefs.short_edge = edge);
-                            }
-                        });
+                            heading(ui, "RESOLUTION");
+                            ui.horizontal_wrapped(|ui| {
+                                for (edge, label) in RESOLUTIONS {
+                                    chip(ui, prefs.short_edge == edge, label).clicked().then(|| prefs.short_edge = edge);
+                                }
+                            });
+                        }
 
                         heading(ui, "PART");
                         ui.horizontal_wrapped(|ui| {
@@ -255,7 +298,7 @@ impl App {
                                     chip(ui, prefs.gif_fps == fps, format!("{fps} fps")).clicked().then(|| prefs.gif_fps = fps);
                                 }
                             });
-                        } else if !prefs.codec.starts_with("prores") {
+                        } else if !prefs.codec.starts_with("prores") && !audio_only && !stills {
                             heading(ui, "QUALITY");
                             ui.horizontal(|ui| {
                                 // Shown as better → smaller; stored on x264's scale (lower is better).
@@ -271,7 +314,13 @@ impl App {
                             });
                         }
 
-                        if !gif {
+                        if audio_only {
+                            heading(ui, "SOUND");
+                            ui.label(egui::RichText::new("Saved as a WAV — or pick M4A, MP3, FLAC or Opus when choosing where it goes.").small().weak());
+                        } else if stills {
+                            heading(ui, "FRAMES");
+                            ui.label(egui::RichText::new("Numbered from 0: name_00000.png, name_00001.png… beside the name you choose. No sound.").small().weak());
+                        } else if !gif {
                             heading(ui, "ENCODER & SOUND");
                             ui.horizontal(|ui| {
                                 // Only H.264 and HEVC have a hardware encoder.
@@ -283,6 +332,9 @@ impl App {
                                 chip(ui, prefs.encoder == "software" || prores, "Software").on_hover_text("x264/x265: slower, slightly better per byte").clicked().then(|| prefs.encoder = "software".into());
                                 ui.separator();
                                 ui.checkbox(&mut prefs.audio, "Sound");
+                                ui.checkbox(&mut prefs.text_antialias, "Smooth text").on_hover_text(
+                                    "Anti-aliasing: titles are drawn at twice the size and smoothed down before any effect runs on them. Cleaner edges on thin letters and text effects; a little slower.",
+                                );
                             });
                         }
                     });
@@ -312,13 +364,17 @@ impl App {
                         let (_, name, detail, _, _) = TYPES.iter().copied().find(|t| t.0 == prefs.codec).unwrap_or(TYPES[0]);
                         ui.label(egui::RichText::new(format!("{name} · {detail}")).strong());
                         let mut total = 0.0;
+                        let targets = if audio_only { vec![targets[0]] } else { targets };
                         for &i in &targets {
                             let v = &sequence.variants[i];
                             let size = out_size(v.size, prefs.short_edge);
                             total += estimate(&prefs, size, sequence.rate.as_f64(), seconds);
-                            ui.label(egui::RichText::new(format!("{} — {}×{}", v.name, size[0], size[1])).small());
+                            if !audio_only {
+                                ui.label(egui::RichText::new(format!("{} — {}×{}", v.name, size[0], size[1])).small());
+                            }
                         }
-                        ui.label(egui::RichText::new(format!("{} · {:.3} fps{}", clock(b - a), rate, if range.is_some() { format!(" · from {}", clock(a)) } else { String::new() })).small());
+                        let per = if audio_only { "48 kHz stereo".to_string() } else { format!("{rate:.3} fps") };
+                        ui.label(egui::RichText::new(format!("{} · {per}{}", clock(b - a), if range.is_some() { format!(" · from {}", clock(a)) } else { String::new() })).small());
                         ui.label(egui::RichText::new(format!("about {}{}", crate::bytes(total as u64), if targets.len() > 1 { format!(" in {} files", targets.len()) } else { String::new() })).small().weak());
                         if gif && seconds > 20.0 {
                             ui.colored_label(style::WARNING, "Long GIFs get very large — a short part is best.");
@@ -365,17 +421,31 @@ impl App {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().trim_end_matches(".json").trim_end_matches(".oaproj").to_string())
             .unwrap_or_else(|| "export".into());
+        let audio_only = codec == VideoCodec::Audio;
+        // The sound alone is the same for every format: one file.
+        let which = if audio_only { which.min(sequence.variants.len() - 1) } else { which };
         let targets: Vec<(VariantId, String)> = if which == usize::MAX {
             sequence.variants.iter().map(|v| (v.id, v.name.clone())).collect()
         } else {
             let v = &sequence.variants[which.min(sequence.variants.len() - 1)];
             vec![(v.id, v.name.clone())]
         };
-        let paths: Vec<PathBuf> = if targets.len() == 1 {
+        let paths: Vec<PathBuf> = if audio_only {
+            // The type is whichever extension is picked (WAV unless it's one of the others).
+            let kinds = oa_export::audio_extensions();
+            let mut dialog = rfd::FileDialog::new();
+            for k in kinds {
+                dialog = dialog.add_filter(k.to_uppercase(), &[*k]);
+            }
+            let Some(p) = dialog.set_file_name(format!("{stem}.wav")).save_file() else { return };
+            let known = p.extension().and_then(|e| e.to_str()).is_some_and(|e| kinds.contains(&e.to_ascii_lowercase().as_str()));
+            vec![if known { p } else { p.with_extension("wav") }]
+        } else if targets.len() == 1 {
             let filter = match ext {
                 "mov" => "QuickTime movie",
                 "gif" => "Animated GIF",
                 "webm" => "WebM video",
+                "png" => "PNG images (numbered one per frame)",
                 _ => "MP4 video",
             };
             let Some(p) = rfd::FileDialog::new().add_filter(filter, &[ext]).set_file_name(format!("{stem}.{ext}")).save_file() else { return };
@@ -390,10 +460,20 @@ impl App {
             ("hardware", _) => Encoder::MediaFoundation,
             _ => Encoder::Auto,
         };
-        let (audio, buses) = if prefs.audio && !matches!(codec, VideoCodec::Gif { .. }) { self.audio_mix_of(seq) } else { Default::default() };
+        let (audio, buses) = if (prefs.audio || audio_only) && codec.has_sound() { self.audio_mix_of(seq) } else { Default::default() };
+        if audio_only && audio.is_empty() {
+            self.error = Some("nothing to hear: the timeline has no sound to export".into());
+            return;
+        }
+        // The project as it is now: what these files will be of, whatever happens next.
+        let (project, media) = (self.editor.doc.snapshot(), self.media_entries());
+        let (_, type_name, type_detail, _, _) = TYPES.iter().copied().find(|t| t.0 == prefs.codec).unwrap_or(TYPES[0]);
+        let project_name = if project.name.is_empty() { "Untitled".to_string() } else { project.name.clone() };
         for ((variant, _), path) in targets.into_iter().zip(paths) {
             let size = sequence.variant(variant).map(|v| v.size).unwrap_or(sequence.canvas());
             let scale = if prefs.short_edge == 0 { 1.0 } else { prefs.short_edge as f64 / size.short_edge().max(1) as f64 };
+            let [w, h] = out_size(size, prefs.short_edge);
+            let label = format!("{type_name} · {type_detail} · {w}×{h} — {project_name}");
             let options = ExportOptions {
                 variant: Some(variant),
                 scale,
@@ -404,8 +484,9 @@ impl App {
                 buses: buses.clone(),
                 encoder,
                 range: range.map(|(a, b)| TimeRange::new(a, b - a)),
+                text_antialias: prefs.text_antialias,
             };
-            self.export_queue.push_back(ExportJob { seq, path, options });
+            self.export_queue.push_back(ExportJob { seq, path, options, project: project.clone(), media: media.clone(), label });
         }
         self.set_playing(false);
         self.export_dialog = false;
@@ -439,14 +520,19 @@ impl App {
         }
         let (done, total) = exporter.progress();
         let encoder = exporter.encoder();
+        let stage = exporter.stage();
         let fraction = if total > 0 { done as f32 / total as f32 } else { 0.0 };
         let elapsed = self.export_view.began.map_or(0.0, |b| b.elapsed().as_secs_f64());
         let fps = if elapsed > 0.2 { done as f64 / elapsed } else { 0.0 };
         let left = if fps > 0.0 { (total - done) as f64 / fps } else { 0.0 };
         let name = self.export_path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let queued = self.export_queue.len();
-        let (mut hide, mut cancel) = (false, false);
-        egui::Window::new("Exporting")
+        let label = self.export_label.clone();
+        let waiting: Vec<(String, String)> = self.export_queue.iter().map(|j| (j.file_name(), j.label.clone())).collect();
+        let (mut hide, mut cancel, mut skip) = (false, false, false);
+        // A change to the queue: (index, up / down / out).
+        let mut change: Option<(usize, i8)> = None;
+        crate::widgets::on_screen(egui::Window::new("Exporting"), ctx)
             .id(egui::Id::new("exporting"))
             .collapsible(true)
             .resizable(false)
@@ -454,6 +540,9 @@ impl App {
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new(&name).strong());
+                if !label.is_empty() {
+                    ui.label(egui::RichText::new(&label).small().weak());
+                }
                 let width = 360.0;
                 let size = self.export_view.picture.as_ref().map_or([16, 9], |p| p.2);
                 let h = (width * size[1] as f32 / size[0].max(1) as f32).min(240.0);
@@ -464,38 +553,98 @@ impl App {
                 if let Some((_, id, _)) = &self.export_view.picture {
                     ui.painter().image(*id, pic, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
                 }
-                ui.add(egui::ProgressBar::new(fraction).desired_width(width).text(format!("{:.0}%", fraction * 100.0)));
-                ui.horizontal(|ui| {
-                    ui.label(format!("Frame {} of {}", done.min(total), total));
-                    ui.label(egui::RichText::new(format!("at {}", clock(self.export_view.at))).weak());
-                });
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{:.0} fps · {} left{}",
-                        fps,
-                        if fps > 0.0 { clock(Time::from_seconds_f64(left)) } else { "…".into() },
-                        if queued > 0 { format!(" · {queued} more queued") } else { String::new() }
-                    ))
-                    .small()
-                    .weak(),
-                );
+                match stage {
+                    // Not frames going by: say what it's doing, and for how long.
+                    Some((s, for_how_long)) => {
+                        let (what, why) = match s {
+                            crate::export_worker::Stage::Opening => ("Opening the encoder…", "Trying the graphics card's encoder first."),
+                            crate::export_worker::Stage::Finishing => (
+                                "Finishing the file…",
+                                "The encoder's last frames, the sound, and the file's index. Long exports take a little while here.",
+                            ),
+                        };
+                        ui.add(egui::ProgressBar::new(fraction).desired_width(width).animate(true).text(what));
+                        ui.label(egui::RichText::new(format!("{what} {}", clock(Time::from_seconds_f64(for_how_long.as_secs_f64())))).small());
+                        ui.label(egui::RichText::new(why).small().weak());
+                    }
+                    None => {
+                        ui.add(egui::ProgressBar::new(fraction).desired_width(width).text(format!("{:.0}%", fraction * 100.0)));
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Frame {} of {}", done.min(total), total));
+                            ui.label(egui::RichText::new(format!("at {}", clock(self.export_view.at))).weak());
+                        });
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.0} fps · {} left{}",
+                                fps,
+                                if fps > 0.0 { clock(Time::from_seconds_f64(left)) } else { "…".into() },
+                                if queued > 0 { format!(" · {queued} more queued") } else { String::new() }
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                }
                 if !encoder.is_empty() {
                     ui.label(egui::RichText::new(format!("with {encoder}")).small().weak());
+                }
+                // What's next: in order, each can be moved or taken out. Each keeps the
+                // project as it was when it was queued.
+                if !waiting.is_empty() {
+                    heading(ui, &format!("UP NEXT ({})", waiting.len()));
+                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                        for (i, (file, what)) in waiting.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("{}.", i + 1)).weak());
+                                ui.vertical(|ui| {
+                                    ui.set_width(250.0);
+                                    ui.label(egui::RichText::new(file).small().strong()).on_hover_text(what);
+                                    ui.label(egui::RichText::new(what).small().weak());
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("✕").on_hover_text("Take it out of the queue").clicked() {
+                                        change = Some((i, 0));
+                                    }
+                                    if ui.add_enabled(i + 1 < waiting.len(), egui::Button::new("↓").small()).on_hover_text("Later").clicked() {
+                                        change = Some((i, 1));
+                                    }
+                                    if ui.add_enabled(i > 0, egui::Button::new("↑").small()).on_hover_text("Sooner").clicked() {
+                                        change = Some((i, -1));
+                                    }
+                                });
+                            });
+                        }
+                    });
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Hide").on_hover_text("Keep exporting; progress stays in the top bar").clicked() {
                         hide = true;
                     }
+                    if queued > 0 && ui.button("Skip").on_hover_text("Stop this one and go on with the next").clicked() {
+                        skip = true;
+                    }
                     if ui.button(if queued > 0 { "Cancel all" } else { "Cancel" }).clicked() {
                         cancel = true;
                     }
                 });
+                ui.label(egui::RichText::new("Add more from Export… while this runs: they wait their turn.").small().weak());
             });
         if hide {
             self.export_view.hidden = true;
         }
+        match change {
+            Some((i, 0)) => {
+                self.export_queue.remove(i);
+            }
+            Some((i, d)) => {
+                move_queued(&mut self.export_queue, i, d < 0);
+            }
+            None => {}
+        }
         if cancel {
             self.cancel_exports();
+        } else if skip {
+            self.skip_export();
         }
         ctx.request_repaint();
     }
@@ -513,5 +662,18 @@ mod tests {
         assert_eq!(safe_name("Vertical 9:16"), "Vertical 9-16");
         assert_eq!(clock(Time::from_seconds_f64(65.2)), "1:05.20");
         assert_eq!(codec_of("gif", 12), VideoCodec::Gif { fps: 12 });
+    }
+
+    #[test]
+    fn queued_exports_move_within_the_queue() {
+        let mut q: std::collections::VecDeque<char> = "abc".chars().collect();
+        assert!(move_queued(&mut q, 2, true));
+        assert_eq!(q.iter().collect::<String>(), "acb");
+        assert!(move_queued(&mut q, 0, false));
+        assert_eq!(q.iter().collect::<String>(), "cab");
+        assert!(!move_queued(&mut q, 0, true), "the first can't go sooner");
+        assert!(!move_queued(&mut q, 2, false), "the last can't go later");
+        assert!(!move_queued(&mut q, 7, true), "nothing there");
+        assert_eq!(q.iter().collect::<String>(), "cab");
     }
 }

@@ -571,6 +571,43 @@ impl Editor {
             .collect()
     }
 
+    /// The trims giving `item` and the rest of the selection (`Editor::linked`) the length
+    /// `length(old)` says — `None`: as long as each can be — and how many fell short of it
+    /// (stopped by the file's end or the next clip). Each is worked out on the timeline as
+    /// it is, so they never depend on one another.
+    pub fn length_ops(&self, item: ItemId, length: &dyn Fn(Time) -> Option<Time>) -> (Vec<oa_doc::Op>, usize) {
+        let project = self.doc.project();
+        let (seq, s) = (self.seq, self.sequence());
+        let frame = s.rate.frame_start(1);
+        let mut ops = Vec::new();
+        let mut short = 0;
+        let mut ids = vec![item];
+        ids.extend(self.linked.iter().copied().filter(|l| *l != item));
+        for id in ids {
+            let Some(it) = self.item(id) else { continue };
+            let asked = length(it.range.duration).map(|l| oa_edit::timeline::snap_to_frame(s, it.range.start + l.max(frame)));
+            // As far as it goes: the trim stops at the file's end and the next clip.
+            let to = asked.unwrap_or(Time::from_seconds(1_000_000));
+            match oa_edit::timeline::trim(project, seq, id, oa_edit::timeline::Edge::Tail, to) {
+                Ok(o) => {
+                    let got = o
+                        .iter()
+                        .find_map(|op| match op {
+                            oa_doc::Op::SetItemTiming { range, .. } => Some(range.end()),
+                            _ => None,
+                        })
+                        .unwrap_or(it.range.end());
+                    if asked.is_some_and(|a| got != a) {
+                        short += 1;
+                    }
+                    ops.extend(o);
+                }
+                Err(_) => short += 1,
+            }
+        }
+        (ops, short)
+    }
+
     /// `ops` made for one clip, done to the linked clips too: an effect switched on or
     /// off, removed or retimed happens to the same effect on each; an intro reversed as
     /// the outro, on each clip. (Moves within one clip's list stay its own.)
@@ -604,6 +641,36 @@ impl Editor {
             }
         }
         out
+    }
+
+    /// The `type_id` effect on `item` (the first of that kind), added if it isn't there —
+    /// first in its chain, so it works on the picture as it comes in (as a grade does) —
+    /// on the linked clips too, so an edit made to it reaches each of them.
+    pub fn ensure_effect(&mut self, item: ItemId, type_id: &str) -> Option<oa_doc::EffectId> {
+        let mut ops = Vec::new();
+        let mut mine = None;
+        let ids: Vec<ItemId> = std::iter::once(item).chain(self.linked.iter().copied().filter(|l| *l != item)).collect();
+        for id in ids {
+            let Some(it) = self.item(id) else { continue };
+            if let Some(fx) = it.effects.iter().find(|e| e.type_id == type_id) {
+                if id == item {
+                    mine = Some(fx.id);
+                }
+                continue;
+            }
+            let effect = oa_doc::EffectInstance::new(oa_doc::EffectId(self.doc.alloc_id()), type_id);
+            if id == item {
+                mine = Some(effect.id);
+            }
+            ops.push(Op::InsertEffect { seq: self.seq, item: id, index: 0, effect });
+        }
+        if !ops.is_empty()
+            && let Err(e) = self.doc.edit_coalesced("Color", Some("color-add"), ops)
+        {
+            eprintln!("edit failed: {e}");
+            return None;
+        }
+        mine
     }
 
     /// Replaces a parameter's source outright (coalescing drags under `drag_key`) — on
@@ -968,5 +1035,36 @@ mod tests {
         let again = importer(&picture).expect("import");
         assert_eq!(editor.add_media(again).expect("dedupe"), media);
         assert_eq!(editor.pool.len(), 1);
+    }
+
+    /// Length on a multiple selection: a typed length is every clip's; a frame more is
+    /// each clip's own plus one; a clip stopped by its neighbor is counted, not dropped.
+    #[test]
+    fn length_applies_to_every_selected_clip() {
+        let mut e = Editor::new();
+        let a = e.add_text(Time::ZERO, "A", Time::from_seconds(2)).unwrap();
+        let b = e.add_text(Time::from_seconds(3), "B", Time::from_seconds(4)).unwrap();
+        // Not selected: C, right after A on A's track, at 3 s.
+        let (ti, _) = e.sequence().find_item(a).unwrap();
+        let track = e.sequence().tracks[ti].id;
+        let c = Item::new(ItemId(e.doc.alloc_id()), "C", ItemKind::Text, TimeRange::new(Time::from_seconds(3), Time::from_seconds(1)));
+        let seq = e.seq;
+        e.doc.edit("c", vec![Op::InsertItem { seq, track, item: c }]).unwrap();
+        e.linked = vec![a, b];
+        let (ops, short) = e.length_ops(a, &|_| Some(Time::from_seconds(1)));
+        assert_eq!(short, 0);
+        e.doc.edit("length", ops).unwrap();
+        assert_eq!([a, b].map(|id| e.item(id).unwrap().range.duration), [Time::from_seconds(1); 2]);
+        // Each one frame longer, from its own length.
+        let frame = e.sequence().rate.frame_start(1);
+        let (ops, _) = e.length_ops(a, &|old| Some(old + frame));
+        e.doc.edit("frame", ops).unwrap();
+        assert_eq!([a, b].map(|id| e.item(id).unwrap().range.duration), [Time::from_seconds(1) + frame; 2]);
+        // 5 s each: B can, A stops at C (3 s in) — made as long as it can be, and counted.
+        let (ops, short) = e.length_ops(a, &|_| Some(Time::from_seconds(5)));
+        assert_eq!(short, 1);
+        e.doc.edit("long", ops).unwrap();
+        assert_eq!(e.item(a).unwrap().range.end(), Time::from_seconds(3));
+        assert_eq!(e.item(b).unwrap().range.duration, Time::from_seconds(5));
     }
 }

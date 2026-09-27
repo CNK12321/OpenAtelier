@@ -4,7 +4,7 @@ use crate::shaders::{self, Nv12Plane, PARAM_BASE, UNIFORM_SLOTS};
 use crate::yuv::{self, Nv12Frame};
 use crate::{FrameSource, GpuContext, GpuImage, RenderError, SourceRequest};
 use oa_graph::registry::{EffectDescriptor, Registry};
-use oa_graph::{BlendMode, CacheKey, EffectKind, Graph, NodeId, NodeOp, WorkingSpace};
+use oa_graph::{roi, BlendMode, CacheKey, EffectKind, Graph, NodeId, NodeOp, Rect, WorkingSpace};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -47,6 +47,14 @@ pub struct RenderStats {
     pub passes: u32,
     pub cache_hits: u32,
     pub fused_chains: u32,
+    /// UV warps run together in one pass, or drawn straight into their layer.
+    pub fused_warps: u32,
+    /// Passes that rendered only the part of their node the frame sees (`oa_graph::roi`).
+    pub partial_passes: u32,
+    /// Passes whose uniforms were as last frame (not uploaded again), and whose bind group
+    /// was last frame's (not made again) — a frame shaped like the one before.
+    pub uniforms_kept: u32,
+    pub bind_groups_kept: u32,
     /// Fused chains rendered unfused because their pipeline wasn't ready.
     pub fallback_chains: u32,
     pub unsupported: Vec<String>,
@@ -103,6 +111,37 @@ impl Uniforms {
     }
 }
 
+/// What carries over from one frame to the next, so a frame shaped like the last one
+/// (the same nodes, other numbers — playback, a drag) records its passes cheaply: pass
+/// *i* uses uniform buffer *i*, written only when its numbers changed, and the bind group
+/// tying that buffer to the pass's input texture is made once and kept while the pair
+/// keeps turning up (the pool hands the same textures out in the same order).
+#[derive(Default)]
+pub(crate) struct Reuse {
+    buffers: Vec<(wgpu::Buffer, [f32; UNIFORM_SLOTS])>,
+    bind_groups: HashMap<BindKey, (wgpu::BindGroup, u64)>,
+    frame: u64,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct BindKey {
+    /// The two-input layout (transitions, effects with a second picture).
+    two: bool,
+    uniform: usize,
+    a: wgpu::TextureView,
+    b: Option<wgpu::TextureView>,
+    nearest: bool,
+}
+
+impl Reuse {
+    /// After a frame: bind groups not used in it go (they hold their textures).
+    fn end_frame(&mut self) {
+        let frame = self.frame;
+        self.bind_groups.retain(|_, (_, used)| *used == frame);
+        self.frame += 1;
+    }
+}
+
 /// GPU resources a frame (and any [`FrameSource`]) renders with.
 pub struct GpuServices<'a> {
     pub ctx: &'a GpuContext,
@@ -114,7 +153,9 @@ pub struct GpuServices<'a> {
     /// Nearest-neighbor, for pixelated layers.
     nearest: &'a wgpu::Sampler,
     dummy: &'a GpuImage,
-    uniform_buffers: &'a mut Vec<wgpu::Buffer>,
+    /// A 1×1 fully opaque alpha plane, for video without transparency.
+    opaque: &'a wgpu::TextureView,
+    reuse: &'a mut Reuse,
     uniforms_used: usize,
     pub(crate) encoder: wgpu::CommandEncoder,
     pub(crate) stats: RenderStats,
@@ -245,6 +286,8 @@ impl GpuServices<'_> {
             }
             _ => return Err(RenderError::Source(format!("expected NV12 or R8 + RG8 planes, got {:?}", frame.texture.format()))),
         };
+        let alpha = frame.alpha.map(|a| a.create_view(&Default::default()));
+        let alpha = alpha.as_ref().unwrap_or(self.opaque);
         let pipeline = self.yuv_pipelines.get_blocking("yuv-nv12", yuv::spec)?;
         let target = self.target(out_size)?;
         let buf = self.uniform_buffer(&Uniforms(yuv::uniforms(frame, out_size)));
@@ -255,7 +298,8 @@ impl GpuServices<'_> {
                 wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&luma) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&chroma) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(self.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(alpha) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(self.sampler) },
             ],
         });
         self.draw_fullscreen(&pipeline, &target, &bg);
@@ -290,33 +334,54 @@ impl GpuServices<'_> {
         u.0[9] = b.origin[1] as f32;
         u.0[10] = b.size[0] as f32;
         u.0[11] = b.size[1] as f32;
-        let buf = self.uniform_buffer(&u);
-        let bg = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("oa-two-input"),
-            layout: &self.mix_pipelines.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&a.tex.view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&b.tex.view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(self.sampler) },
-            ],
-        });
+        let (slot, buf) = self.uniform_slot(&u);
+        let key = BindKey { two: true, uniform: slot, a: a.tex.view.clone(), b: Some(b.tex.view.clone()), nearest: false };
+        let bg = match self.reused_bind_group(&key) {
+            Some(bg) => bg,
+            None => {
+                let bg = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("oa-two-input"),
+                    layout: &self.mix_pipelines.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&a.tex.view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&b.tex.view) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(self.sampler) },
+                    ],
+                });
+                self.reuse.bind_groups.insert(key, (bg.clone(), self.reuse.frame));
+                bg
+            }
+        };
         self.draw_fullscreen(pipeline, target, &bg);
     }
 
     fn uniform_buffer(&mut self, u: &Uniforms) -> wgpu::Buffer {
-        if self.uniforms_used == self.uniform_buffers.len() {
-            self.uniform_buffers.push(self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        self.uniform_slot(u).1
+    }
+
+    /// The next pass's uniform buffer (the same one as this pass had last frame), with
+    /// `u` in it — written only if it isn't what's there already.
+    fn uniform_slot(&mut self, u: &Uniforms) -> (usize, wgpu::Buffer) {
+        let slot = self.uniforms_used;
+        self.uniforms_used += 1;
+        if slot == self.reuse.buffers.len() {
+            let buf = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("oa-pass-uniforms"),
                 size: (UNIFORM_SLOTS * 4) as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            }));
+            });
+            self.ctx.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&u.0));
+            self.reuse.buffers.push((buf, u.0));
+        } else if self.reuse.buffers[slot].1 != u.0 {
+            let (buf, last) = &mut self.reuse.buffers[slot];
+            self.ctx.queue.write_buffer(buf, 0, bytemuck::cast_slice(&u.0));
+            *last = u.0;
+        } else {
+            self.stats.uniforms_kept += 1;
         }
-        let buf = self.uniform_buffers[self.uniforms_used].clone();
-        self.uniforms_used += 1;
-        self.ctx.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&u.0));
-        buf
+        (slot, self.reuse.buffers[slot].0.clone())
     }
 
     fn bind_group(&mut self, u: &Uniforms, input: Option<&GpuImage>) -> wgpu::BindGroup {
@@ -325,10 +390,14 @@ impl GpuServices<'_> {
 
     /// `nearest`: sample the input without smoothing (pixel art).
     fn bind_group_sampled(&mut self, u: &Uniforms, input: Option<&GpuImage>, nearest: bool) -> wgpu::BindGroup {
-        let sampler = if nearest { self.nearest } else { self.sampler };
-        let buf = self.uniform_buffer(u);
+        let (slot, buf) = self.uniform_slot(u);
         let input = input.unwrap_or(self.dummy);
-        self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let key = BindKey { two: false, uniform: slot, a: input.tex.view.clone(), b: None, nearest };
+        if let Some(bg) = self.reused_bind_group(&key) {
+            return bg;
+        }
+        let sampler = if nearest { self.nearest } else { self.sampler };
+        let bg = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("oa-pass"),
             layout: &self.pipelines.bind_group_layout,
             entries: &[
@@ -336,7 +405,18 @@ impl GpuServices<'_> {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&input.tex.view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
             ],
-        })
+        });
+        self.reuse.bind_groups.insert(key, (bg.clone(), self.reuse.frame));
+        bg
+    }
+
+    /// A bind group made on an earlier frame for the same buffer and textures.
+    fn reused_bind_group(&mut self, key: &BindKey) -> Option<wgpu::BindGroup> {
+        let frame = self.reuse.frame;
+        let (bg, used) = self.reuse.bind_groups.get_mut(key)?;
+        *used = frame;
+        self.stats.bind_groups_kept += 1;
+        Some(bg.clone())
     }
 
     /// [`GpuServices::fullscreen_pass`] reading the input without smoothing when
@@ -413,7 +493,8 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     nearest: wgpu::Sampler,
     dummy: GpuImage,
-    uniform_buffers: Vec<wgpu::Buffer>,
+    opaque: wgpu::TextureView,
+    reuse: Reuse,
     text: crate::text::TextState,
     cache: HashMap<CacheKey, CacheEntry>,
     /// Keys seen once. A node is only worth caching when it comes back (scrubbing and
@@ -439,6 +520,20 @@ impl Renderer {
         });
         let nearest = ctx.device.create_sampler(&wgpu::SamplerDescriptor { label: Some("oa-nearest-clamp"), ..Default::default() });
         let dummy = GpuImage { tex: pool.acquire(&ctx.device, [1, 1]), origin: [0.0; 2], size: [1, 1] };
+        let opaque = {
+            let t = ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("oa-opaque-alpha"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            ctx.queue.write_texture(t.as_image_copy(), &[255], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1), rows_per_image: None }, t.size());
+            t.create_view(&Default::default())
+        };
         let text = crate::text::TextState::new(&ctx.device);
         Renderer {
             ctx,
@@ -449,7 +544,8 @@ impl Renderer {
             sampler,
             nearest,
             dummy,
-            uniform_buffers: Vec::new(),
+            opaque,
+            reuse: Reuse::default(),
             text,
             cache: HashMap::new(),
             seen: HashMap::new(),
@@ -484,10 +580,15 @@ impl Renderer {
                         let key = point_key(&[(shader.entry.as_str(), len)], d.space);
                         ready(self.pipelines.get(&key, wait, || working_spec(&key, shaders::point_chain(&[(shader, len)], d.space))))?;
                     }
-                    EffectKind::Spatial { .. } | EffectKind::UvWarp => {
+                    EffectKind::Spatial { .. } => {
                         let len = d.uniform_len();
                         let key = spatial_key(&shader.entry, len, false);
                         ready(self.pipelines.get(&key, wait, || working_spec(&key, shaders::spatial(shader, len, false))))?;
+                    }
+                    EffectKind::UvWarp => {
+                        let len = d.uniform_len();
+                        let key = warp_key(&[(shader.entry.as_str(), len)]);
+                        ready(self.pipelines.get(&key, wait, || working_spec(&key, shaders::uv_warp_chain(&[(shader, len)]))))?;
                     }
                     _ => {}
                 }
@@ -519,7 +620,8 @@ impl Renderer {
             sampler: &self.sampler,
             nearest: &self.nearest,
             dummy: &self.dummy,
-            uniform_buffers: &mut self.uniform_buffers,
+            opaque: &self.opaque,
+            reuse: &mut self.reuse,
             uniforms_used: 0,
             encoder,
             stats: RenderStats::default(),
@@ -545,7 +647,8 @@ impl Renderer {
                 sampler: &self.sampler,
                 nearest: &self.nearest,
                 dummy: &self.dummy,
-                uniform_buffers: &mut self.uniform_buffers,
+                opaque: &self.opaque,
+                reuse: &mut self.reuse,
                 uniforms_used: 0,
                 encoder,
                 stats: RenderStats::default(),
@@ -562,12 +665,15 @@ impl Renderer {
             frame: self.frame,
             tainted: false,
             text: &mut self.text,
+            // Off with fusion (the reference path renders every node whole).
+            need: if self.options.fusion == FusionMode::Off { Vec::new() } else { roi::regions_needed(graph) },
         };
         let result = exec.node(graph.output);
         let Exec { gpu, source, .. } = exec;
         let mut stats = gpu.stats;
         self.ctx.queue.submit([gpu.encoder.finish()]);
         source.submitted(&self.ctx.queue);
+        self.reuse.end_frame();
         let image = result?;
 
         self.evict_cache();
@@ -666,12 +772,28 @@ fn spatial_key(entry: &str, len: usize, media: bool) -> String {
     format!("spatial{}:{entry}/{len}", if media { "+media" } else { "" })
 }
 
+/// A layer drawn with its warps: the pipeline, the unwarped picture, the warps' params,
+/// and whether any of them reads whole pixels (pixel art).
+type WarpedLayer = (Arc<wgpu::RenderPipeline>, GpuImage, Vec<f32>, bool);
+
+fn warp_key(chain: &[(&str, usize)]) -> String {
+    let parts: Vec<String> = chain.iter().map(|(e, n)| format!("{e}/{n}")).collect();
+    format!("warp:{}", parts.join("+"))
+}
+
 fn point_key(chain: &[(&str, usize)], space: WorkingSpace) -> String {
     let parts: Vec<String> = chain.iter().map(|(e, n)| format!("{e}/{n}")).collect();
     format!("point:{space:?}:{}", parts.join("+"))
 }
 
 fn layer_pipeline(pipelines: &Pipelines, blend: BlendMode) -> Result<Arc<wgpu::RenderPipeline>, RenderError> {
+    let key = format!("layer:{blend:?}");
+    pipelines.get_blocking(&key, || layer_spec(&key, blend, shaders::layer(blend == BlendMode::Darken)))
+}
+
+/// The layer pipeline for `blend` drawing `source` (the plain layer shader, or one with
+/// warps drawn in).
+fn layer_spec(key: &str, blend: BlendMode, source: String) -> PipelineSpec {
     use wgpu::{BlendComponent as C, BlendFactor as F, BlendOperation as O};
     let over_alpha = C { src_factor: F::One, dst_factor: F::OneMinusSrcAlpha, operation: O::Add };
     let color = match blend {
@@ -685,15 +807,14 @@ fn layer_pipeline(pipelines: &Pipelines, blend: BlendMode) -> Result<Arc<wgpu::R
         BlendMode::Darken => C { src_factor: F::One, dst_factor: F::One, operation: O::Min },
         BlendMode::Lighten => C { src_factor: F::One, dst_factor: F::One, operation: O::Max },
     };
-    let key = format!("layer:{blend:?}");
-    pipelines.get_blocking(&key, || PipelineSpec {
-        label: key.clone(),
-        source: shaders::layer(blend == BlendMode::Darken),
+    PipelineSpec {
+        label: key.into(),
+        source,
         vertex_entry: "vs_layer",
         fragment_entry: "fs_layer",
         format: WORKING_FORMAT,
         blend: Some(wgpu::BlendState { color, alpha: over_alpha }),
-    })
+    }
 }
 
 struct Exec<'a> {
@@ -711,6 +832,8 @@ struct Exec<'a> {
     /// be built on the stand-in).
     tainted: bool,
     text: &'a mut crate::text::TextState,
+    /// The part of each node the frame reads (`oa_graph::roi`).
+    need: Vec<Option<Rect>>,
 }
 
 impl Exec<'_> {
@@ -718,7 +841,11 @@ impl Exec<'_> {
         if let Some(img) = self.memo.get(&id) {
             return Ok(img.clone());
         }
-        let key = self.graph.node(id).key.filter(|_| self.cache_enabled);
+        // Only part of it rendered: a key of its own (the whole one's image is another).
+        let key = self.graph.node(id).key.filter(|_| self.cache_enabled).map(|k| match self.region(id) {
+            Some(r) => k.within(r),
+            None => k,
+        });
         if let Some(entry) = key.and_then(|k| self.cache.get_mut(&k)) {
             entry.last_used = self.frame;
             self.gpu.stats.cache_hits += 1;
@@ -763,9 +890,10 @@ impl Exec<'_> {
                 let input = self.node(node.inputs[0])?;
                 // A media parameter's picture (a mask's matte…) arrives as a second input.
                 let media = node.inputs.get(1).map(|&m| self.node(m)).transpose()?;
-                let descriptor = self.registry.effect(type_id).cloned();
-                match descriptor {
-                    Some(d) if !*stateful && d.shader.is_some() => self.effect(id, &d, uniforms, input, media, *nearest),
+                // The registry outlives the frame: no copy of the descriptor needed.
+                let registry = self.registry;
+                match registry.effect(type_id) {
+                    Some(d) if !*stateful && d.shader.is_some() => self.effect(id, d, uniforms, input, media, *nearest),
                     _ => {
                         let why = if *stateful { "stateful effects not yet executed" } else { "no GPU shader" };
                         self.gpu.stats.unsupported.push(format!("{type_id}: {why}"));
@@ -776,18 +904,47 @@ impl Exec<'_> {
             NodeOp::FusedPointOps { space, chain, nearest } => {
                 let (space, nearest) = (*space, *nearest);
                 let input = self.node(node.inputs[0])?;
-                self.fused(space, chain, input, nearest)
+                let region = self.region(id);
+                self.fused(space, chain, input, nearest, region)
             }
-            NodeOp::Composite { size, background, layers } => {
+            NodeOp::FusedUvWarps { chain, nearest } => {
+                let nearest = *nearest;
+                let input = self.node(node.inputs[0])?;
+                self.warps(chain, input, nearest, true)
+            }
+            NodeOp::Composite { size: full, background, layers } => {
+                // Just the part that's seen, when that's less than all of it (a compound
+                // clip zoomed in or half off screen): every layer shifted to its corner.
+                let whole = Rect::from_size(full[0] as f64, full[1] as f64);
+                let (origin, size) = match self.region(id).map(|r| roi::snap_region(r, [0.0; 2], whole)).filter(|r| !r.is_empty()) {
+                    Some(r) => ([r.x0, r.y0], [(r.x1 - r.x0).round().max(1.0) as u32, (r.y1 - r.y0).round().max(1.0) as u32]),
+                    None => ([0.0; 2], *full),
+                };
+                let shift = oa_graph::Affine2::translate(-origin[0], -origin[1]);
+                if size != *full {
+                    self.gpu.stats.partial_passes += 1;
+                }
+                let size = &size;
                 let target = self.gpu.target(*size)?;
                 let mut draws = Vec::with_capacity(layers.len());
                 for (info, &input) in layers.iter().zip(&node.inputs) {
+                    // A warped picture: the warp drawn in as the layer is placed.
+                    let (warp, placed) = match &self.graph.node(input).op {
+                        NodeOp::Transform { matrix } => (self.graph.node(input).inputs[0], *matrix),
+                        _ => (input, oa_graph::Affine2::IDENTITY),
+                    };
+                    if let Some((pipeline, img, params, nearest)) = self.warped_layer(warp, &placed, info.blend)? {
+                        let u = Uniforms::default().output([0.0; 2], *size).input(&img).affine(placed.then(&shift).m, info.opacity).params(0, &params)?;
+                        let bg = self.gpu.bind_group_sampled(&u, Some(&img), info.pixelated || nearest);
+                        draws.push((pipeline, bg, img));
+                        continue;
+                    }
                     let (img, matrix) = match &self.graph.node(input).op {
-                        NodeOp::Transform { matrix } => (self.node(self.graph.node(input).inputs[0])?, matrix.m),
-                        _ => (self.node(input)?, oa_graph::Affine2::IDENTITY.m),
+                        NodeOp::Transform { matrix } => (self.node(self.graph.node(input).inputs[0])?, *matrix),
+                        _ => (self.node(input)?, oa_graph::Affine2::IDENTITY),
                     };
                     let pipeline = layer_pipeline(self.gpu.pipelines, info.blend)?;
-                    let u = Uniforms::default().output([0.0; 2], *size).input(&img).affine(matrix, info.opacity);
+                    let u = Uniforms::default().output([0.0; 2], *size).input(&img).affine(matrix.then(&shift).m, info.opacity);
                     let bg = self.gpu.bind_group_sampled(&u, Some(&img), info.pixelated);
                     draws.push((pipeline, bg, img));
                 }
@@ -815,7 +972,7 @@ impl Exec<'_> {
                 }
                 drop(pass);
                 self.gpu.stats.passes += 1;
-                Ok(GpuImage { tex: target, origin: [0.0; 2], size: *size })
+                Ok(GpuImage { tex: target, origin, size: *size })
             }
             // A transform is normally drawn straight into the composite it feeds (above).
             // Used anywhere else — an effect's input — it's drawn into an image of its
@@ -896,7 +1053,13 @@ impl Exec<'_> {
                     .gpu
                     .pipelines
                     .get(&key, self.gpu.wait, || working_spec(&key, shaders::point_chain(&[(shader, uniforms.len())], d.space)))?;
-                self.point_pass(&pipeline, uniforms, input, nearest)
+                let region = self.region(id);
+                self.point_pass_in(&pipeline, uniforms, input, nearest, region)
+            }
+            // A warp without a second picture: positions carried back, the input read once.
+            EffectKind::UvWarp if media.is_none() => {
+                let chain = [(d.type_id.clone(), d.version, uniforms.to_vec())];
+                self.warps(&chain, input, nearest, false)
             }
             EffectKind::Spatial { .. } | EffectKind::UvWarp => {
                 let len = uniforms.len();
@@ -938,27 +1101,146 @@ impl Exec<'_> {
         }
     }
 
-    fn point_pass(&mut self, pipeline: &wgpu::RenderPipeline, uniforms: &[f32], input: GpuImage, nearest: bool) -> Result<GpuImage, RenderError> {
-        let target = self.gpu.target(input.size)?;
-        let u = Uniforms::default().output(input.origin, input.size).input(&input).params(0, uniforms)?;
-        self.gpu.sampled_pass(pipeline, &target, &u, Some(&input), nearest);
-        Ok(GpuImage { tex: target, origin: input.origin, size: input.size })
-    }
-
-    fn fused(&mut self, space: WorkingSpace, chain: &[(Arc<str>, u32, Vec<f32>)], input: GpuImage, nearest: bool) -> Result<GpuImage, RenderError> {
+    /// UV warps (innermost first) over `input`, into an image of the same area: one pass
+    /// for all of them when `fuse` (and the fused pipeline is ready), else one each.
+    fn warps(&mut self, chain: &[(Arc<str>, u32, Vec<f32>)], input: GpuImage, nearest: bool, fuse: bool) -> Result<GpuImage, RenderError> {
         let mut shaders_in_chain = Vec::with_capacity(chain.len());
         for (type_id, _, uniforms) in chain {
             match self.registry.effect(type_id).and_then(|d| d.shader.clone()) {
                 Some(s) => shaders_in_chain.push((s, uniforms.len())),
                 None => {
                     self.gpu.stats.unsupported.push(format!("{type_id}: no GPU shader"));
-                    return self.unfused(space, chain, input, nearest);
+                    return Ok(input);
+                }
+            }
+        }
+        let total: usize = chain.iter().map(|c| c.2.len()).sum();
+        let key = warp_key(&shaders_in_chain.iter().map(|(s, n)| (s.entry.as_str(), *n)).collect::<Vec<_>>());
+        let spec = || {
+            let refs: Vec<_> = shaders_in_chain.iter().map(|(s, n)| (s, *n)).collect();
+            working_spec(&key, shaders::uv_warp_chain(&refs))
+        };
+        let pipeline = match (chain.len(), fuse && total <= UNIFORM_SLOTS - PARAM_BASE) {
+            (1, _) => Some(self.gpu.pipelines.get(&key, self.gpu.wait, spec)?),
+            (_, false) => None,
+            (_, true) => match self.fusion {
+                FusionMode::Off => None,
+                FusionMode::Blocking => self.gpu.pipelines.get_blocking(&key, spec).ok(),
+                FusionMode::Async => self.gpu.pipelines.get_async(&key, spec),
+            },
+        };
+        let Some(pipeline) = pipeline else {
+            // One pass each: the reference path.
+            if fuse {
+                self.gpu.stats.fallback_chains += 1;
+            }
+            let mut img = input;
+            for link in chain {
+                img = self.warps(std::slice::from_ref(link), img, nearest, false)?;
+            }
+            return Ok(img);
+        };
+        if chain.len() > 1 {
+            self.gpu.stats.fused_warps += 1;
+        }
+        let flat: Vec<f32> = chain.iter().flat_map(|c| c.2.iter().copied()).collect();
+        self.point_pass(&pipeline, &flat, input, nearest)
+    }
+
+    /// A layer whose picture is UV warps over another: drawn straight from that one, the
+    /// warps worked out as the layer is placed — the warp and the placement in one
+    /// resample, and no image in between. Only when the placement doesn't shrink the
+    /// picture past 2× (a single read would skip pixels then; the warp's own pass, at the
+    /// layer's size, keeps them) and the warps' pipeline is ready. `None`: draw it the
+    /// usual way.
+    fn warped_layer(&mut self, warp: NodeId, matrix: &oa_graph::Affine2, blend: BlendMode) -> Result<Option<WarpedLayer>, RenderError> {
+        if self.fusion == FusionMode::Off || matrix.min_axis_scale() < 0.5 {
+            return Ok(None);
+        }
+        let node = self.graph.node(warp);
+        let (chain, nearest) = match &node.op {
+            NodeOp::Effect { kind: EffectKind::UvWarp, stateful: false, type_id, version, uniforms, nearest, .. } if node.inputs.len() == 1 => {
+                (vec![(type_id.clone(), *version, uniforms.clone())], *nearest)
+            }
+            NodeOp::FusedUvWarps { chain, nearest } => (chain.clone(), *nearest),
+            _ => return Ok(None),
+        };
+        let below = node.inputs[0];
+        if !oa_graph::same_area(node.bounds, self.graph.node(below).bounds) {
+            return Ok(None);
+        }
+        // Already made (the warp's output is cached): drawing that is cheaper still.
+        if node.key.filter(|_| self.cache_enabled).is_some_and(|k| self.cache.contains_key(&k)) {
+            return Ok(None);
+        }
+        let mut shaders_in_chain = Vec::with_capacity(chain.len());
+        for (type_id, _, uniforms) in &chain {
+            let Some(s) = self.registry.effect(type_id).and_then(|d| d.shader.clone()) else { return Ok(None) };
+            shaders_in_chain.push((s, uniforms.len()));
+        }
+        let flat: Vec<f32> = chain.iter().flat_map(|c| c.2.iter().copied()).collect();
+        if flat.len() > UNIFORM_SLOTS - PARAM_BASE {
+            return Ok(None);
+        }
+        let key = format!("layer:{blend:?}:{}", warp_key(&shaders_in_chain.iter().map(|(s, n)| (s.entry.as_str(), *n)).collect::<Vec<_>>()));
+        let spec = || {
+            let refs: Vec<_> = shaders_in_chain.iter().map(|(s, n)| (s, *n)).collect();
+            layer_spec(&key, blend, shaders::layer_warped(&refs, blend == BlendMode::Darken))
+        };
+        let pipeline = match self.fusion {
+            FusionMode::Async if !self.gpu.wait => self.gpu.pipelines.get_async(&key, spec),
+            _ => self.gpu.pipelines.get_blocking(&key, spec).ok(),
+        };
+        let Some(pipeline) = pipeline else { return Ok(None) };
+        let img = self.node(below)?;
+        self.gpu.stats.fused_warps += 1;
+        Ok(Some((pipeline, img, flat, nearest)))
+    }
+
+    fn point_pass(&mut self, pipeline: &wgpu::RenderPipeline, uniforms: &[f32], input: GpuImage, nearest: bool) -> Result<GpuImage, RenderError> {
+        self.point_pass_in(pipeline, uniforms, input, nearest, None)
+    }
+
+    /// A per-pixel pass over `input`, only over `region` of it when given (the rest isn't
+    /// seen; see `oa_graph::roi`), on the input's own pixel grid.
+    fn point_pass_in(&mut self, pipeline: &wgpu::RenderPipeline, uniforms: &[f32], input: GpuImage, nearest: bool, region: Option<Rect>) -> Result<GpuImage, RenderError> {
+        let whole = Rect::new(input.origin[0], input.origin[1], input.origin[0] + input.size[0] as f64, input.origin[1] + input.size[1] as f64);
+        let (origin, size) = match region.map(|r| roi::snap_region(r, input.origin, whole)).filter(|r| !r.is_empty()) {
+            Some(r) => ([r.x0, r.y0], [(r.x1 - r.x0).round().max(1.0) as u32, (r.y1 - r.y0).round().max(1.0) as u32]),
+            None => (input.origin, input.size),
+        };
+        if size != input.size {
+            self.gpu.stats.partial_passes += 1;
+        }
+        let target = self.gpu.target(size)?;
+        let u = Uniforms::default().output(origin, size).input(&input).params(0, uniforms)?;
+        self.gpu.sampled_pass(pipeline, &target, &u, Some(&input), nearest);
+        Ok(GpuImage { tex: target, origin, size })
+    }
+
+    /// The part of node `id` this frame needs, when that's less than all of it and the
+    /// node can render just a part (composites and point ops).
+    fn region(&self, id: NodeId) -> Option<Rect> {
+        let node = self.graph.node(id);
+        let partial = matches!(node.op, NodeOp::Composite { .. } | NodeOp::FusedPointOps { .. } | NodeOp::Effect { kind: EffectKind::PointOp, .. });
+        let need = (*self.need.get(id.0 as usize)?)?;
+        (partial && !need.contains_rect(&node.bounds)).then_some(need)
+    }
+
+    fn fused(&mut self, space: WorkingSpace, chain: &[(Arc<str>, u32, Vec<f32>)], input: GpuImage, nearest: bool, region: Option<Rect>) -> Result<GpuImage, RenderError> {
+        let mut shaders_in_chain = Vec::with_capacity(chain.len());
+        for (type_id, _, uniforms) in chain {
+            match self.registry.effect(type_id).and_then(|d| d.shader.clone()) {
+                Some(s) => shaders_in_chain.push((s, uniforms.len())),
+                None => {
+                    self.gpu.stats.unsupported.push(format!("{type_id}: no GPU shader"));
+                    return self.unfused(space, chain, input, nearest, region);
                 }
             }
         }
         let total: usize = chain.iter().map(|c| c.2.len()).sum();
         if total > UNIFORM_SLOTS - PARAM_BASE {
-            return self.unfused(space, chain, input, nearest);
+            return self.unfused(space, chain, input, nearest, region);
         }
         let key = point_key(&shaders_in_chain.iter().map(|(s, n)| (s.entry.as_str(), *n)).collect::<Vec<_>>(), space);
         let spec = || {
@@ -972,15 +1254,15 @@ impl Exec<'_> {
         };
         let Some(pipeline) = pipeline else {
             self.gpu.stats.fallback_chains += 1;
-            return self.unfused(space, chain, input, nearest);
+            return self.unfused(space, chain, input, nearest, region);
         };
         let flat: Vec<f32> = chain.iter().flat_map(|c| c.2.iter().copied()).collect();
         self.gpu.stats.fused_chains += 1;
-        self.point_pass(&pipeline, &flat, input, nearest)
+        self.point_pass_in(&pipeline, &flat, input, nearest, region)
     }
 
     /// The reference path for a fused chain: one pass per effect.
-    fn unfused(&mut self, space: WorkingSpace, chain: &[(Arc<str>, u32, Vec<f32>)], mut img: GpuImage, nearest: bool) -> Result<GpuImage, RenderError> {
+    fn unfused(&mut self, space: WorkingSpace, chain: &[(Arc<str>, u32, Vec<f32>)], mut img: GpuImage, nearest: bool, region: Option<Rect>) -> Result<GpuImage, RenderError> {
         for (type_id, _, uniforms) in chain {
             let Some(shader) = self.registry.effect(type_id).and_then(|d| d.shader.clone()) else { continue };
             let key = point_key(&[(shader.entry.as_str(), uniforms.len())], space);
@@ -988,7 +1270,7 @@ impl Exec<'_> {
                 .gpu
                 .pipelines
                 .get(&key, self.gpu.wait, || working_spec(&key, shaders::point_chain(&[(&shader, uniforms.len())], space)))?;
-            img = self.point_pass(&pipeline, uniforms, img, nearest)?;
+            img = self.point_pass_in(&pipeline, uniforms, img, nearest, region)?;
         }
         Ok(img)
     }

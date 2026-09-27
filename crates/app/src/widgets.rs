@@ -11,6 +11,37 @@ pub(crate) fn color32(c: [f64; 4]) -> egui::Color32 {
 
 /// A loading placeholder: a soft block with a band of light sweeping across it, so
 /// waiting looks like progress instead of a frozen app. Keeps repainting while shown.
+/// A window kept on the screen: never bigger than it (a window taller than the screen
+/// pushed its own title bar out of reach, leaving it stuck) and never dragged off it.
+pub fn on_screen<'open>(window: egui::Window<'open>, ctx: &egui::Context) -> egui::Window<'open> {
+    let screen = ctx.content_rect();
+    window.constrain_to(screen).max_width((screen.width() - 24.0).max(200.0)).max_height((screen.height() - 48.0).max(150.0))
+}
+
+/// `size`, no bigger than the screen allows a window to be (see [`on_screen`]).
+pub fn fit_screen(ctx: &egui::Context, size: [f32; 2]) -> [f32; 2] {
+    let screen = ctx.content_rect();
+    [size[0].min((screen.width() - 24.0).max(200.0)), size[1].min((screen.height() - 48.0).max(150.0))]
+}
+
+/// A grey checkerboard over `rect` (behind see-through pictures): one small repeating
+/// texture, made once, so it costs one quad however big the rect is.
+pub fn checkerboard(painter: &egui::Painter, rect: egui::Rect) {
+    const CELL: f32 = 12.0;
+    let id = egui::Id::new("oa-checkerboard");
+    let ctx = painter.ctx();
+    let texture = ctx.data_mut(|d| d.get_temp::<egui::TextureHandle>(id)).unwrap_or_else(|| {
+        let (a, b) = (egui::Color32::from_gray(58), egui::Color32::from_gray(82));
+        let image = egui::ColorImage::new([2, 2], vec![a, b, b, a]);
+        let options = egui::TextureOptions { magnification: egui::TextureFilter::Nearest, minification: egui::TextureFilter::Nearest, wrap_mode: egui::TextureWrapMode::Repeat, ..Default::default() };
+        let handle = ctx.load_texture("checkerboard", image, options);
+        ctx.data_mut(|d| d.insert_temp(id, handle.clone()));
+        handle
+    });
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(rect.width() / (2.0 * CELL), rect.height() / (2.0 * CELL)));
+    painter.image(texture.id(), rect, uv, egui::Color32::WHITE);
+}
+
 pub fn skeleton(ui: &egui::Ui, painter: &egui::Painter, rect: egui::Rect) {
     let base = ui.visuals().faint_bg_color;
     painter.rect_filled(rect, 3.0, base);

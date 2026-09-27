@@ -29,6 +29,11 @@ struct Shared {
     /// Device buffering between the callback and the speakers, in samples per channel.
     latency: AtomicU64,
     gain: AtomicU32,
+    /// Silenced at the device, after the ring: instant, and the clock runs on.
+    muted: AtomicBool,
+    /// Extra delay between the device and the ears (Bluetooth headphones), in samples per
+    /// channel: the clock runs this far behind, so the picture waits for the sound.
+    offset: AtomicU64,
     playing: AtomicBool,
     /// Samples (per channel) that must be buffered before playback starts, so the first
     /// callback after play or seek never runs dry.
@@ -43,7 +48,8 @@ struct Shared {
 
 impl Shared {
     fn position(&self) -> Time {
-        let played = self.played.load(Ordering::Relaxed).saturating_sub(self.latency.load(Ordering::Relaxed));
+        let behind = self.latency.load(Ordering::Relaxed) + self.offset.load(Ordering::Relaxed);
+        let played = self.played.load(Ordering::Relaxed).saturating_sub(behind);
         let base = Time(self.base.load(Ordering::Relaxed));
         base + Time::from_rational_floor(oa_time::Rational::new(played as i64, self.format.sample_rate as i64))
     }
@@ -84,6 +90,8 @@ impl AudioEngine {
             played: AtomicU64::new(0),
             latency: AtomicU64::new(0),
             gain: AtomicU32::new(1.0f32.to_bits()),
+            muted: AtomicBool::new(false),
+            offset: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             prefill: format.sample_rate as usize / 20, // 50 ms
             primed: AtomicBool::new(false),
@@ -98,6 +106,9 @@ impl AudioEngine {
             buffer_size: cpal::BufferSize::Default,
         };
         let callback_shared = shared.clone();
+        // The gain the last buffer ended on: changes (and mutes) ramp across one buffer
+        // instead of stepping, which would click.
+        let mut applied = 1.0f32;
         let stream = device
             .build_output_stream(
                 config,
@@ -129,12 +140,10 @@ impl AudioEngine {
                     if filled < out.len() && !s.ended.load(Ordering::Relaxed) {
                         s.underruns.fetch_add(1, Ordering::Relaxed);
                     }
-                    let gain = f32::from_bits(s.gain.load(Ordering::Relaxed));
-                    if gain != 1.0 {
-                        for sample in out[..filled].iter_mut() {
-                            *sample *= gain;
-                        }
-                    }
+                    // Volume and mute, after the ring: they take effect at once, not after
+                    // the quarter second already queued.
+                    let target = if s.muted.load(Ordering::Relaxed) { 0.0 } else { f32::from_bits(s.gain.load(Ordering::Relaxed)) };
+                    applied = apply_gain(&mut out[..filled], s.format.channels as usize, applied, target);
                     // Count the whole buffer: the device played it, silence included, so
                     // the clock keeps moving even when a source has nothing to give.
                     s.played.fetch_add((out.len() / s.format.channels as usize) as u64, Ordering::Relaxed);
@@ -196,6 +205,23 @@ impl AudioEngine {
         f32::from_bits(self.shared.gain.load(Ordering::Relaxed))
     }
 
+    /// Silences the output at once (the clock keeps running), or brings it back.
+    pub fn set_muted(&self, muted: bool) {
+        self.shared.muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn muted(&self) -> bool {
+        self.shared.muted.load(Ordering::Relaxed)
+    }
+
+    /// How much later than the device reports the sound actually reaches the ears (a
+    /// Bluetooth headset's own buffering, ~150–250 ms): the playback clock runs that far
+    /// behind, so the picture lines up with what's heard.
+    pub fn set_output_delay(&self, delay: std::time::Duration) {
+        let samples = (delay.as_secs_f64().clamp(0.0, 2.0) * self.shared.format.sample_rate as f64).round() as u64;
+        self.shared.offset.store(samples, Ordering::Relaxed);
+    }
+
     pub fn underruns(&self) -> u64 {
         self.shared.underruns.load(Ordering::Relaxed)
     }
@@ -214,6 +240,24 @@ impl Drop for AudioEngine {
             let _ = producer.join();
         }
     }
+}
+
+/// Scales interleaved `buf` from gain `from` to `to`, ramped linearly across it (a
+/// change of volume or a mute never steps, which would click). Returns the gain it ended
+/// on.
+fn apply_gain(buf: &mut [f32], channels: usize, from: f32, to: f32) -> f32 {
+    if from == to {
+        if to != 1.0 {
+            buf.iter_mut().for_each(|x| *x *= to);
+        }
+        return to;
+    }
+    let frames = (buf.len() / channels.max(1)).max(1);
+    for (i, frame) in buf.chunks_mut(channels.max(1)).enumerate() {
+        let g = from + (to - from) * ((i + 1) as f32 / frames as f32);
+        frame.iter_mut().for_each(|x| *x *= g);
+    }
+    to
 }
 
 /// Producer thread: keep the ring full, and honor seeks.
@@ -257,5 +301,24 @@ fn feed(shared: Arc<Shared>, mut source: Box<dyn AudioSource>) {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_gain;
+
+    /// A change of volume ramps across the buffer (no step), and a steady one scales it.
+    #[test]
+    fn gain_changes_ramp_instead_of_stepping() {
+        let mut buf = vec![1.0f32; 8]; // 4 stereo frames
+        assert_eq!(apply_gain(&mut buf, 2, 1.0, 0.0), 0.0);
+        assert_eq!(buf, [0.75, 0.75, 0.5, 0.5, 0.25, 0.25, 0.0, 0.0]);
+        let mut buf = vec![1.0f32; 4];
+        apply_gain(&mut buf, 2, 0.5, 0.5);
+        assert_eq!(buf, [0.5; 4]);
+        let mut quiet = vec![1.0f32; 4];
+        apply_gain(&mut quiet, 2, 0.0, 0.0);
+        assert_eq!(quiet, [0.0; 4], "muted stays silent");
     }
 }

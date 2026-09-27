@@ -42,7 +42,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage:\n  oa presets\n  oa probe <video>\n  oa demo [out.oaproj.json] [--media <video>]\n  oa plan <project> <seconds> [--variant <name>] [--scale <s>] [--reference]\n  oa render <project> <seconds> <out.png> [--variant <name>] [--scale <s>] [--reference]\n  oa bench <project> <seconds> [--variant <name>] [--scale <s>] [--reference]
-  oa export <project> <out.mp4> [--variant <name>] [--scale <s>] [--codec h264|hevc|prores] [--crf <n>] [--encoder auto|mf|ffmpeg] [--reference]
+  oa export <project> <out.mp4> [--variant <name>] [--scale <s>] [--codec h264|hevc|prores|png|audio] [--crf <n>] [--encoder auto|mf|ffmpeg] [--no-text-aa] [--reference]
   oa stress <minutes> [--intensity 0..1] [--media <files>...] [--sample <s> | --full] [--seed <n>] [--size WxH] [--fps <n>] [--encoder auto|mf|ffmpeg] [--out project.json] [--export out.mp4]"
             );
             return ExitCode::from(2);
@@ -475,10 +475,11 @@ fn bench(args: &[String]) -> Res {
 /// Renders the whole sequence to a file, sound included.
 fn export(args: &[String]) -> Res {
     let [path, out, rest @ ..] = args else {
-        return Err("usage: oa export <project> <out.mp4> [--variant <name>] [--scale <s>] [--codec h264|hevc|prores] [--crf <n>] [--encoder auto|mf|ffmpeg] [--reference]".into());
+        return Err("usage: oa export <project> <out.mp4> [--variant <name>] [--scale <s>] [--codec h264|hevc|prores|png|audio] [--crf <n>] [--encoder auto|mf|ffmpeg] [--no-text-aa] [--reference]".into());
     };
     // `--codec` and `--crf` are ours; everything else is the shared session parsing.
     let (mut codec, mut crf, mut encoder) = (oa_export::VideoCodec::H264, 18, oa_export::Encoder::Auto);
+    let mut text_antialias = true;
     let mut session_args = Vec::new();
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
@@ -488,10 +489,13 @@ fn export(args: &[String]) -> Res {
                     Some("h264") => oa_export::VideoCodec::H264,
                     Some("hevc") => oa_export::VideoCodec::Hevc,
                     Some("prores") => oa_export::VideoCodec::ProRes,
+                    Some("png") => oa_export::VideoCodec::PngSequence,
+                    Some("audio") => oa_export::VideoCodec::Audio,
                     other => return Err(format!("unknown codec {other:?}").into()),
                 }
             }
             "--crf" => crf = it.next().ok_or("--crf needs a value")?.parse()?,
+            "--no-text-aa" => text_antialias = false,
             "--encoder" => {
                 encoder = match it.next().map(String::as_str) {
                     Some("auto") => oa_export::Encoder::Auto,
@@ -525,6 +529,7 @@ fn export(args: &[String]) -> Res {
         buses,
         encoder,
         range: None,
+        text_antialias,
     };
     let out_path = std::path::Path::new(out);
     let mut last_percent = -1i64;
@@ -720,10 +725,9 @@ fn stress(args: &[String]) -> Res {
     })?;
     let wall = started.elapsed().as_secs_f64();
     let finished = std::time::Instant::now();
-    // Besides the frames: the sound mixdown (grows with the length) and opening and
-    // closing the file (doesn't).
-    let sound = summary.timings.sound;
-    let fixed = (wall - summary.seconds_elapsed - sound).max(0.0);
+    // Besides the frames: opening and closing the file (doesn't grow with the length; the
+    // sound is mixed on its own thread while the frames render).
+    let fixed = (wall - summary.seconds_elapsed).max(0.0);
     println!();
     if keep.is_none() {
         let _ = std::fs::remove_file(&target);
@@ -741,9 +745,6 @@ fn stress(args: &[String]) -> Res {
         }
     };
     if fps > 0.0 {
-        // The sound mixdown grows with the length, like the frames.
-        let sampled = range.map_or(length, |r| r.duration).as_seconds_f64();
-        let sound_whole = sound * length.as_seconds_f64() / sampled.max(1e-3);
         // The start (the file opened, the first frames building shaders and opening
         // decoders) happens once; every frame after it runs at the steady rate. That rate
         // runs to the file being closed: a hardware encoder queues frames and does much
@@ -753,15 +754,14 @@ fn stress(args: &[String]) -> Res {
             _ if full => wall,
             Some((n, at)) => {
                 let steady = (summary.frames - n) as f64 / finished.duration_since(at).as_secs_f64().max(1e-6);
-                let start = (at.duration_since(started).as_secs_f64() - sound).max(0.0);
-                start + sound_whole + (total_frames - n as f64).max(0.0) / steady
+                let start = at.duration_since(started).as_secs_f64();
+                start + (total_frames - n as f64).max(0.0) / steady
             }
-            None => total_frames / fps + sound_whole + fixed,
+            None => total_frames / fps + fixed,
         };
         let verb = if full { "took" } else { "about" };
-        let mixing = if sound_whole > 0.05 { format!(", {sound_whole:.1}s of it mixing the sound") } else { String::new() };
         println!(
-            "  {verb} {} for the whole {minutes:.1} min ({total_frames} frames{mixing}): {:.1}× real time",
+            "  {verb} {} for the whole {minutes:.1} min ({total_frames} frames): {:.1}× real time",
             clock(estimate),
             length.as_seconds_f64() / estimate.max(1e-3)
         );

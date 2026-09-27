@@ -34,6 +34,74 @@ fn trims_clamp_to_neighbors_and_one_frame() {
     assert_eq!(item(&doc, 10).range.end(), secs(5.0));
 }
 
+/// Bulk arranging: clips close up on each track, line up, move to a time as a block, or
+/// spread evenly — one edit, refused whole if anything is in the way.
+#[test]
+fn selected_clips_arrange_together() {
+    use timeline::Arrange;
+    // V1: 10 at 1–3 s, 11 at 6–8 s; V2: 12 at 4–5 s; 13 (not selected) at 9–10 s on V2.
+    let base = [(V1, 10, STILL, 1.0, 2.0, 0.0), (V1, 11, STILL, 6.0, 2.0, 0.0), (V2, 12, STILL, 4.0, 1.0, 0.0), (V2, 13, STILL, 9.0, 1.0, 0.0)];
+    let chosen = [ItemId(10), ItemId(11), ItemId(12)];
+    let starts = |doc: &Document| [10, 11, 12].map(|id| item(doc, id).range.start);
+
+    let mut doc = doc_with(&base);
+    let ops = timeline::arrange(doc.project(), SEQ, &chosen, Arrange::Together).unwrap();
+    apply(&mut doc, ops);
+    // 11 closes up behind 10; 12 is alone on its track (among those chosen): it stays.
+    assert_eq!(starts(&doc), [secs(1.0), secs(3.0), secs(4.0)]);
+
+    let mut doc = doc_with(&base);
+    let ops = timeline::arrange(doc.project(), SEQ, &[ItemId(10), ItemId(12)], Arrange::LineUpStarts).unwrap();
+    apply(&mut doc, ops);
+    assert_eq!(item(&doc, 12).range.start, secs(1.0));
+
+    let mut doc = doc_with(&base);
+    let ops = timeline::arrange(doc.project(), SEQ, &chosen, Arrange::StartAt(secs(0.0))).unwrap();
+    apply(&mut doc, ops);
+    assert_eq!(starts(&doc), [secs(0.0), secs(5.0), secs(3.0)], "moved as a block, spacing kept");
+
+    let mut doc = doc_with(&base);
+    let ops = timeline::arrange(doc.project(), SEQ, &chosen, Arrange::SpaceEvenly).unwrap();
+    apply(&mut doc, ops);
+    // Starts 1, 4, 6 → 1, 3.5, 6.
+    assert_eq!(starts(&doc), [secs(1.0), secs(6.0), secs(3.5)]);
+
+    // In the way: moved to 6 s, 10 would land on 11 (not chosen), and nothing moves.
+    let doc = doc_with(&base);
+    assert!(timeline::arrange(doc.project(), SEQ, &[ItemId(10), ItemId(12)], Arrange::StartAt(secs(6.0))).is_err());
+}
+
+/// Reversing plays the same part of the file backwards — the first frame shown is the
+/// part's last, the last shown its first — and reversing back is where it started.
+#[test]
+fn reversing_plays_the_same_frames_backwards() {
+    use oa_time::Rational;
+    let doc = doc_with(&[(V1, 10, MEDIA, 1.0, 4.0, 2.0)]); // shows source 2..6 s
+    let it = item(&doc, 10);
+    let (range, map) = timeline::reversed(&it, true).expect("reversible");
+    assert_eq!(range, it.range, "the clip keeps its place and length");
+    assert!(map.speed.num() < 0);
+    let rate = oa_time::FrameRate::FPS_30;
+    let frame = |t: Time| rate.frame_at(t);
+    // Local 0 shows the frame just before 6 s; the end shows 2 s's frame.
+    assert_eq!(frame(map.source_time(Time::ZERO)), frame(secs(6.0)) - 1);
+    assert_eq!(frame(map.source_time(it.range.duration - rate.frame_start(1))), frame(secs(2.0)));
+    // It plays backwards all the way, one frame per frame.
+    let a = frame(map.source_time(rate.frame_start(10)));
+    let b = frame(map.source_time(rate.frame_start(11)));
+    assert_eq!(a - b, 1);
+    // Reversing back restores it exactly; already that way, nothing to do.
+    let mut back = it.clone();
+    back.time_map = map;
+    let (_, restored) = timeline::reversed(&back, false).unwrap();
+    assert_eq!((restored.source_in, restored.speed), (it.time_map.source_in, it.time_map.speed));
+    assert!(timeline::reversed(&it, false).is_none());
+    // A 2× clip stays 2×, backwards.
+    let mut fast = it.clone();
+    fast.time_map.speed = Rational::new(2, 1);
+    assert_eq!(timeline::reversed(&fast, true).unwrap().1.speed, Rational::new(-2, 1));
+}
+
 #[test]
 fn head_trim_is_limited_by_the_source_in_point() {
     let mut doc = doc_with(&[(V1, 10, MEDIA, 10.0, 5.0, 3.0)]);
@@ -124,6 +192,76 @@ fn split_changes_no_frame() {
     doc.undo().unwrap();
     assert!(doc.project().sequence(SEQ).unwrap().item(back).is_none());
     assert_eq!(item(&doc, 10).range.end(), secs(7.0));
+}
+
+/// At a speed whose source positions fall between flicks (7/3×), both halves of a split
+/// — and a split of a split — show exactly the source times the whole clip did.
+#[test]
+fn split_at_an_odd_speed_is_exact() {
+    let mut doc = doc_with(&[(V1, 10, MEDIA, 0.0, 6.0, 1.0)]);
+    let slow = oa_time::Rational::new(7, 3);
+    let range = item(&doc, 10).range;
+    apply(&mut doc, vec![Op::SetItemTiming { seq: SEQ, item: ItemId(10), range, time_map: TimeMap::new(secs(1.0), slow) }]);
+    let whole = item(&doc, 10).clone();
+    let source_at = |it: &Item, t: Time| it.time_map.source_time(t - it.range.start);
+    let mut next = 7000;
+    let mut alloc = || {
+        next += 1;
+        next
+    };
+    // Cut at an odd number of flicks in, then again inside the back half.
+    let (ops, back) = timeline::split(doc.project(), SEQ, ItemId(10), Time(2 * oa_time::FLICKS_PER_SECOND + 1), &mut alloc).unwrap();
+    apply(&mut doc, ops);
+    let (ops, last) = timeline::split(doc.project(), SEQ, back, Time(4 * oa_time::FLICKS_PER_SECOND + 2), &mut alloc).unwrap();
+    apply(&mut doc, ops);
+    for step in 0..6000 {
+        let t = Time(step * oa_time::FLICKS_PER_SECOND / 1000 + step % 7);
+        let piece = [ItemId(10), back, last].into_iter().map(|id| item(&doc, id.0).clone()).find(|it| it.range.contains(t)).unwrap();
+        assert_eq!(source_at(&piece, t), source_at(&whole, t), "at {t:?}");
+    }
+}
+
+/// A caption's word times stay on what's said: trimming its head, moving it, splitting
+/// it and undoing all keep each word lit at the same moments on the timeline.
+#[test]
+fn word_times_follow_trims_moves_and_splits() {
+    let mut doc = doc_with(&[]);
+    let mut caption = Item::new(ItemId(20), "caption", ItemKind::Text, oa_time::TimeRange::new(secs(10.0), secs(4.0)));
+    caption.word_times = [0.0, 1.0, 2.0, 3.0].iter().map(|s| oa_time::TimeRange::new(secs(*s), secs(0.5))).collect();
+    apply(&mut doc, vec![Op::InsertItem { seq: SEQ, track: V1, item: caption }]);
+    // Which word is lit at each timeline moment, over whichever pieces cover it.
+    let lit = |doc: &Document, ids: &[u64]| -> Vec<Option<usize>> {
+        (0..40)
+            .map(|k| secs(10.0 + k as f64 * 0.1 + 0.05))
+            .map(|t| ids.iter().map(|id| item(doc, *id)).find(|it| it.range.contains(t)).and_then(|it| it.spoken_word(t - it.range.start, 4)))
+            .collect()
+    };
+    let before = lit(&doc, &[20]);
+
+    let ops = timeline::trim(doc.project(), SEQ, ItemId(20), Edge::Head, secs(11.0)).unwrap();
+    apply(&mut doc, ops);
+    let trimmed = lit(&doc, &[20]);
+    assert_eq!(&trimmed[10..], &before[10..], "after a head trim the words keep their moments");
+
+    let mut next = 9000;
+    let (ops, back) = timeline::split(doc.project(), SEQ, ItemId(20), secs(12.5), &mut || {
+        next += 1;
+        next
+    })
+    .unwrap();
+    apply(&mut doc, ops);
+    assert_eq!(&lit(&doc, &[20, back.0])[10..], &before[10..], "and across a split");
+
+    doc.undo().unwrap();
+    doc.undo().unwrap();
+    assert_eq!(item(&doc, 20).word_times[0].start, secs(0.0), "undo puts them back");
+    assert_eq!(lit(&doc, &[20]), before);
+
+    // A move takes them along.
+    let moved = oa_time::TimeRange::new(secs(20.0), secs(4.0));
+    let map = item(&doc, 20).time_map;
+    apply(&mut doc, vec![Op::SetItemTiming { seq: SEQ, item: ItemId(20), range: moved, time_map: map }]);
+    assert_eq!(item(&doc, 20).word_times[1].start, secs(1.0));
 }
 
 #[test]

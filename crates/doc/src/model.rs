@@ -261,23 +261,60 @@ impl Track {
     }
 }
 
-/// Maps clip-local time to source time: `source = source_in + floor(local * speed)`.
-/// Speed 0 is a freeze frame; negative speed plays in reverse.
+/// Maps clip-local time to source time: `source = source_in + floor(phase + local ×
+/// speed)`. Speed 0 is a freeze frame; negative speed plays in reverse.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimeMap {
     pub source_in: Time,
     pub speed: Rational,
+    /// The part of a flick (in seconds, under one flick) the source position had past
+    /// `source_in` where this clip was cut from a longer one at a non-integer speed —
+    /// carried so the back half of a split continues on exactly the frames the whole
+    /// clip showed there, instead of one flick early.
+    #[serde(default = "no_phase", skip_serializing_if = "is_no_phase")]
+    pub phase: Rational,
+}
+
+/// How far a clip's word times move when its timing changes from `old` to `new`: by as
+/// much clip time as the in point moved in the source (a head trim), nothing when only the
+/// clip moved. Freezes and a change of speed leave them alone.
+pub fn word_shift(old: &TimeMap, new: &TimeMap) -> Time {
+    if old.speed != new.speed || old.speed.is_zero() {
+        return Time::ZERO;
+    }
+    let moved = new.source_in - old.source_in;
+    -Time::from_rational_floor(moved.as_rational() * old.speed.recip())
+}
+
+fn no_phase() -> Rational {
+    Rational::ZERO
+}
+
+fn is_no_phase(r: &Rational) -> bool {
+    r.is_zero()
 }
 
 impl Default for TimeMap {
     fn default() -> Self {
-        TimeMap { source_in: Time::ZERO, speed: Rational::ONE }
+        TimeMap { source_in: Time::ZERO, speed: Rational::ONE, phase: Rational::ZERO }
     }
 }
 
 impl TimeMap {
+    /// Plays from `source_in` at `speed`.
+    pub fn new(source_in: Time, speed: Rational) -> Self {
+        TimeMap { source_in, speed, phase: Rational::ZERO }
+    }
+
     pub fn source_time(&self, local: Time) -> Time {
-        self.source_in + Time::from_rational_floor(local.as_rational() * self.speed)
+        self.source_in + Time::from_rational_floor(self.phase + local.as_rational() * self.speed)
+    }
+
+    /// The map for the part of the clip from `delta` on: the same source times, exactly.
+    pub fn from(&self, delta: Time) -> TimeMap {
+        let exact = self.phase + delta.as_rational() * self.speed;
+        let whole = Time::from_rational_floor(exact);
+        TimeMap { source_in: self.source_in + whole, speed: self.speed, phase: exact + Rational::new(-whole.0, oa_time::FLICKS_PER_SECOND) }
     }
 }
 
@@ -406,6 +443,15 @@ impl Item {
         Some(((k * words as f64) as usize).min(words - 1))
     }
 
+    /// Moves every word time `by` later on the clip's clock (earlier when negative).
+    pub fn shift_word_times(&mut self, by: Time) {
+        if by != Time::ZERO {
+            for w in &mut self.word_times {
+                w.start += by;
+            }
+        }
+    }
+
     /// Both keyframe clocks for timeline time `t`.
     pub fn eval_context(&self, t: Time) -> EvalContext {
         let local = t - self.range.start;
@@ -420,10 +466,7 @@ impl Item {
             return None;
         }
         let delta = new_start - self.range.start;
-        let map = TimeMap {
-            source_in: self.time_map.source_time(delta),
-            speed: self.time_map.speed,
-        };
+        let map = self.time_map.from(delta);
         Some((TimeRange::new(new_start, end - new_start), map))
     }
 }

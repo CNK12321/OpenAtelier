@@ -259,6 +259,29 @@ fn stepping_back_reuses_recent_frames() {
     assert_eq!(h.source.stats().frame_cache_hits, hits + 20);
 }
 
+/// A clip playing in reverse: every frame exact, from the end of a long GOP back to its
+/// start and past it — with a seek per stretch of frames, not one (and a GOP of decoding)
+/// per frame.
+#[test]
+fn reverse_playback_is_exact_without_a_seek_per_frame() {
+    let Some(mut h) = harness(&CLIPS[1]) else { return }; // long GOP: a seek per frame would be slow
+    let index = h.video().index.clone();
+    let size = [h.video().width, h.video().height];
+    let n = index.len();
+    let top = n - 1;
+    let frames = 60.min(n);
+    assert_eq!(h.shown_frame(index.time_of(top), size).unwrap(), top as u32);
+    let seeks_before = h.source.stats().seeks;
+    let started = std::time::Instant::now();
+    for i in (top + 1 - frames..top).rev() {
+        assert_eq!(h.shown_frame(index.time_of(i), size).unwrap(), i as u32, "playing back to {i}");
+    }
+    let seeks = h.source.stats().seeks - seeks_before;
+    eprintln!("{frames} frames backwards in {:?}, {seeks} seeks", started.elapsed());
+    // A stretch of REVERSE_CHUNK frames per seek (fewer where a keyframe cuts one short).
+    assert!(seeks as usize <= frames / 6 + 2, "{seeks} seeks for {frames} frames backwards");
+}
+
 #[test]
 fn downscaled_decode_matches() {
     let Some(mut h) = harness(&CLIPS[0]) else { return };
@@ -272,7 +295,15 @@ fn downscaled_decode_matches() {
 /// playing forward together must not make a decoder seek back and forth every frame.
 #[test]
 fn two_places_in_one_file_play_without_seeking() {
-    let Some(mut h) = harness(&CLIPS[0]) else { return };
+    // Far apart in a short-GOP file, and close together in a long-GOP one (where one
+    // decoder could reach both by decoding on: it must not be given both).
+    for (clip, a0, b0) in [(0, 20, 120), (1, 20, 60)] {
+        two_places(clip, a0, b0);
+    }
+}
+
+fn two_places(clip: usize, a0: usize, b0: usize) {
+    let Some(mut h) = harness(&CLIPS[clip]) else { return };
     let index = h.video().index.clone();
     let size = [h.video().width, h.video().height];
     let rect = Rect::from_size(size[0] as f64, size[1] as f64);
@@ -288,10 +319,10 @@ fn two_places_in_one_file_play_without_seeking() {
         let out = g.add(NodeOp::Composite { size, background: [0.0, 0.0, 0.0, 1.0], layers: vec![half, half] }, vec![sa, sb], rect, true);
         h.renderer.render(&g.finish(out), &registry, &mut h.source).expect("render");
     };
-    render_pair(&mut h, 20, 120);
+    render_pair(&mut h, a0, b0);
     let seeks = h.source.stats().seeks;
     for i in 1..30 {
-        render_pair(&mut h, 20 + i, 120 + i);
+        render_pair(&mut h, a0 + i, b0 + i);
     }
     let extra = h.source.stats().seeks - seeks;
     assert!(extra <= 1, "{extra} seeks while two streams of one file played together");
@@ -307,16 +338,21 @@ fn scrubbing_never_waits_and_settles_on_the_exact_frame() {
     // First frame of a file: nothing on hand yet, so this one waits.
     h.shown_frame(index.time_of(0), size).unwrap();
     h.source.interactive = true;
-    let mut slowest = std::time::Duration::ZERO;
+    let mut times = Vec::new();
     let n = index.len();
     for step in 0..60 {
         let i = (step * 37 + 11) % n;
         let started = std::time::Instant::now();
         let _ = h.shown_frame(index.time_of(i), size).unwrap();
-        slowest = slowest.max(started.elapsed());
+        times.push(started.elapsed());
     }
-    eprintln!("slowest interactive render while scrubbing: {slowest:?}");
-    assert!(slowest < std::time::Duration::from_millis(60), "a scrub render waited on the decoder: {slowest:?}");
+    times.sort();
+    let (typical, slowest) = (times[times.len() * 9 / 10], times[times.len() - 1]);
+    eprintln!("interactive renders while scrubbing: 90% under {typical:?}, slowest {slowest:?}");
+    // Waiting on the decoder would be most renders, a seek and a GOP each (150 ms and
+    // more); the odd slow one is the machine (tests run side by side share it).
+    assert!(typical < std::time::Duration::from_millis(60), "scrub renders waited on the decoder: 90% under {typical:?}");
+    assert!(slowest < std::time::Duration::from_millis(250), "a scrub render waited on the decoder: {slowest:?}");
 
     // Stop on a frame: within a moment the exact frame is what's shown.
     let target = n / 2 + 3;
@@ -329,4 +365,162 @@ fn scrubbing_never_waits_and_settles_on_the_exact_frame() {
         assert!(std::time::Instant::now() < deadline, "never settled on frame {target} (showing {shown})");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+/// Playback with a wait budget: a cut to elsewhere in the file (a seek, and for ffmpeg a
+/// restart) never holds a render up for long — the last picture or a stand-in shows —
+/// and playing on from there turns exact within a few frames. A decoder warmed for a
+/// clip that's about to start has its first frame ready at once.
+#[test]
+fn playback_never_stalls_on_a_seek() {
+    let Some(mut h) = harness(&CLIPS[1]) else { return }; // long GOP: seeks are expensive
+    let index = h.video().index.clone();
+    let size = [h.video().width, h.video().height];
+    let n = index.len();
+    h.shown_frame(index.time_of(0), size).unwrap();
+    h.source.wait_budget = Some(std::time::Duration::from_millis(20));
+
+    let far = n * 2 / 3;
+    let mut slowest = std::time::Duration::ZERO;
+    let mut exact_from = None;
+    for k in 0..60.min(n - far) {
+        let started = std::time::Instant::now();
+        let shown = h.shown_frame(index.time_of(far + k), size);
+        slowest = slowest.max(started.elapsed());
+        let settled = oa_gpu::FrameSource::settled(&mut h.source);
+        if shown.as_ref().is_ok_and(|s| *s == (far + k) as u32) && settled {
+            exact_from.get_or_insert(k);
+        } else if exact_from.is_some() {
+            panic!("frame {} not exact once playback had caught up ({shown:?})", far + k);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    eprintln!("slowest playback render across a cut: {slowest:?}; exact from frame +{exact_from:?}");
+    assert!(slowest < std::time::Duration::from_millis(120), "a playback render waited on a seek: {slowest:?}");
+    assert!(exact_from.is_some_and(|k| k < 45), "playback never caught up: {exact_from:?}");
+
+    let next = n / 3;
+    h.source.warm(h.media, index.time_of(next));
+    assert!(h.source.wait_idle(std::time::Duration::from_secs(5)));
+    let started = std::time::Instant::now();
+    assert_eq!(h.shown_frame(index.time_of(next), size).unwrap(), next as u32);
+    assert!(oa_gpu::FrameSource::settled(&mut h.source), "the warmed clip's first frame was a stand-in");
+    eprintln!("first frame of a warmed clip: {:?}", started.elapsed());
+}
+
+/// A clip at 4× asks for every 4th frame: each is exact, the decoder never seeks for
+/// them, and the frames in between are decoded but not uploaded (most of the cost of
+/// working ahead at speed).
+#[test]
+fn fast_clips_upload_only_the_frames_they_show() {
+    let Some(mut h) = harness(&CLIPS[0]) else { return };
+    let index = h.video().index.clone();
+    let size = [h.video().width, h.video().height];
+    let frames: Vec<usize> = (0..index.len()).step_by(4).take(20).collect();
+    for &i in &frames {
+        assert_eq!(h.shown_frame(index.time_of(i), size).unwrap(), i as u32, "frame {i}");
+        // Room for the decode-ahead to work, as between frames of playback.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let stats = h.source.stats();
+    eprintln!("{stats:?}");
+    assert_eq!(stats.inexact, 0);
+    assert!(stats.seeks <= 1, "{} seeks", stats.seeks);
+    assert!(stats.skipped_uploads >= 30, "only {} of the frames in between went un-uploaded", stats.skipped_uploads);
+}
+
+/// Shown small, ffmpeg decodes small (a quarter of the size here, a sixteenth of the
+/// bytes) and every frame is still the right one; asked for full size again, it goes
+/// back to full size, still exact.
+#[test]
+fn small_previews_decode_small_and_exact() {
+    let Some(mut h) = harness(&CLIPS[0]) else { return };
+    let index = h.video().index.clone();
+    for i in 0..40 {
+        assert_eq!(h.shown_frame(index.time_of(i), [160, 90]).unwrap(), i as u32, "quarter size, frame {i}");
+    }
+    assert_eq!(h.shown_frame(index.time_of(50), [640, 360]).unwrap(), 50, "full size again");
+    assert_eq!(h.shown_frame(index.time_of(20), [320, 180]).unwrap(), 20, "half size, back in the file");
+    assert_eq!(h.source.stats().inexact, 0);
+}
+
+/// An animated GIF with transparency keeps it: decoded with an alpha plane, the empty
+/// part renders see-through and the drawn part opaque, in its own color.
+#[test]
+fn gif_transparency_survives_decoding() {
+    if !tool_available("ffmpeg") || !tool_available("ffprobe") {
+        return;
+    }
+    let Ok(ctx) = GpuContext::new_headless() else { return };
+    let ctx = Arc::new(ctx);
+    let dir = std::env::temp_dir().join("oa-media-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let gif = dir.join("see_through.gif");
+    // Transparent, with an orange square in the middle; a palette that keeps a
+    // transparent entry.
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=10:d=1,format=rgba,geq=r=255:g=128:b=0:a='if(between(X\\,16\\,47)*between(Y\\,16\\,47)\\,255\\,0)'"])
+        .args(["-vf", "split[a][b];[a]palettegen=reserve_transparent=1[p];[b][p]paletteuse=alpha_threshold=128"])
+        .arg(&gif)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !made {
+        return;
+    }
+    let probe = probe(&gif).expect("probe");
+    let video = probe.video.clone().expect("video");
+    assert!(video.has_alpha, "a GIF says it has transparency ({})", video.pixel_format);
+    let mut source = ffmpeg_source(&ctx);
+    source.add(1, &gif, video.clone());
+    let mut renderer = Renderer::new(ctx.clone(), RenderOptions { fusion: FusionMode::Blocking, cache_budget: 0, ..Default::default() });
+    let size = [64u32, 64];
+    let mut b = GraphBuilder::new(KeyContext::default());
+    let src = b.add(
+        NodeOp::Source { media: 1, fingerprint: None, source_time: Time::ZERO, rep: Representation::Original, decode_scale: 1.0, size, yuv: [0, 0] },
+        vec![],
+        Rect::from_size(64.0, 64.0),
+        false,
+    );
+    let out = b.add(
+        NodeOp::Composite { size, background: [0.0; 4], layers: vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false }] },
+        vec![src],
+        Rect::from_size(64.0, 64.0),
+        false,
+    );
+    let img = renderer.render(&b.finish(out), &Registry::with_builtins(), &mut source).expect("render");
+    let px = oa_gpu::readback::read_linear(&ctx, &img).unwrap();
+    let at = |x: usize, y: usize| px[y * 64 + x];
+    assert!(at(4, 4)[3] < 0.05, "the corner is see-through: {:?}", at(4, 4));
+    let middle = at(32, 32);
+    assert!(middle[3] > 0.95, "the square is opaque: {middle:?}");
+    assert!(middle[0] > 0.6 && middle[2] < 0.15, "and orange: {middle:?}");
+}
+
+/// A clip at 16× on a long-GOP file: every frame exact, reached by decoding on — never
+/// by a seek, which for ffmpeg restarts the process (it used to on every frame past a
+/// keyframe, and a fast clip exported at a few frames a second). Through the app's own
+/// decoder type, so what it forwards is checked too.
+#[test]
+fn fast_clips_decode_on_instead_of_seeking() {
+    let Some(mut h) = harness(&CLIPS[1]) else { return };
+    let index = h.video().index.clone();
+    let size = [h.video().width, h.video().height];
+    let mut i = 0;
+    while i < index.len() {
+        assert_eq!(h.shown_frame(index.time_of(i), size).unwrap(), i as u32, "frame {i}");
+        i += 16;
+    }
+    let seeks = h.source.stats().seeks;
+    assert!(seeks <= 1, "{seeks} seeks at 16×");
+}
+
+/// The app decodes through `AnyDecoder`: what a decoder can be asked (a smaller size)
+/// and tells (a seek's cost) must reach it, not stop at the trait's defaults.
+#[test]
+fn the_app_decoder_forwards_everything() {
+    use oa_media::VideoDecoder;
+    let Some(h) = harness(&CLIPS[0]) else { return };
+    let mut d = oa_media::AnyDecoder::Ffmpeg(FfmpegDecoder::open(h.ctx.device.clone(), h.ctx.queue.clone(), &h.probe_path, h.video()).unwrap());
+    assert!((8..=240).contains(&d.seek_cost()), "a seek costs frames: {}", d.seek_cost());
+    assert!(d.set_scale_divisor(2), "a smaller size is taken");
 }

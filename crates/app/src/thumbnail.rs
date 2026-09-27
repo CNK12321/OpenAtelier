@@ -5,11 +5,11 @@
 //! those instead of a wall of identical file icons — a project is much easier to
 //! recognize by what it looks like than by what it's called.
 //!
-//! It's a nicety, never a failure: anything that goes wrong (no frame yet, a GPU busy
-//! with something else, a read-only folder) just means no picture this time.
+//! It's rendered, read back and encoded on the preview thread (`preview_worker`), so
+//! saving never stalls the editor. It's a nicety, never a failure: anything that goes
+//! wrong (no frame, a read-only folder) just means no picture this time.
 
 use crate::App;
-use oa_plan::{plan_frame, PlanOptions};
 use oa_time::Time;
 use std::path::{Path, PathBuf};
 
@@ -23,8 +23,8 @@ pub fn path_for(project: &Path) -> PathBuf {
 }
 
 impl App {
-    /// Renders a frame of the project and writes it beside the file. Returns where it
-    /// put it, or `None` if there was nothing to draw.
+    /// Asks for a frame of the project to be written beside the file (in the
+    /// background). Returns where it goes, or `None` if there's nothing to draw.
     pub(crate) fn write_thumbnail(&mut self, project_path: &Path) -> Option<PathBuf> {
         let duration = self.editor.duration();
         if duration <= Time::ZERO {
@@ -38,23 +38,21 @@ impl App {
             Time::from_seconds_f64(duration.as_seconds_f64() * 0.2)
         };
         let canvas = self.editor.sequence().canvas();
-        let scale = WIDTH as f64 / canvas.width.max(1) as f64;
-        let opts = PlanOptions { variant: Some(self.variant_id()), render_scale: scale.min(1.0), ..Default::default() };
-        let planned = plan_frame(self.editor.doc.project(), self.editor.seq, at, &opts, &self.registry).ok()?;
-        let graph = oa_graph::optimize(&planned.graph, oa_graph::OptLevel::Full, oa_graph::KeyContext::default());
-        // Wait for shaders here: this runs once, on save, not every frame.
-        let was_waiting = std::mem::replace(&mut self.renderer.options.wait, true);
-        let rendered = self.renderer.render(&graph, &self.registry, &mut self.sources);
-        self.renderer.options.wait = was_waiting;
-        let image = rendered.ok()?;
-        let pixels = oa_gpu::readback::read_srgb8(self.renderer.context(), self.renderer.pipelines(), &image).ok()?;
-
+        let scale = (WIDTH as f64 / canvas.width.max(1) as f64).min(1.0);
         let out = path_for(project_path);
-        let file = std::fs::File::create(&out).ok()?;
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), image.size[0], image.size[1]);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.write_header().ok()?.write_image_data(&pixels).ok()?;
+        self.preview_worker.request(crate::preview_worker::Request {
+            slot: crate::preview_worker::PROJECT_PICTURE,
+            tag: 0,
+            // The project as saved: edits made meanwhile don't leak into the picture.
+            project: self.editor.doc.snapshot(),
+            registry: self.registry.clone(),
+            seq: self.editor.seq,
+            variant: self.variant_id(),
+            at,
+            scale,
+            wanted: None,
+            png: Some(out.clone()),
+        });
         Some(out)
     }
 }

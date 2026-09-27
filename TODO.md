@@ -5,7 +5,7 @@ Where things stand and what's next. Architecture and rationale live in
 
 ## State
 
-16 crates, ~46k lines of Rust, **340 tests passing, clippy clean** (as of this note):
+16 crates, ~46k lines of Rust, **374 tests passing, clippy clean** (as of this note):
 
 | Crate | What works |
 |---|---|
@@ -20,7 +20,7 @@ Where things stand and what's next. Architecture and rationale live in
 | `oa-text` | **New.** System font index (mmap'd name tables), fallback chain + bundled font, harfrust shaping, line layout (`TextSpec` → `Layout`, cached), glyph signed distance fields |
 | `oa-media` | Probe, import/conform, stills, relink, MF hardware decode **on per-file decode threads with 4-frame lookahead**, leased shared textures |
 | `oa-audio` | Ring, ffmpeg decoder, cpal engine (built for the device's format), clock; **mixer**: overlapping clips, per-clip decoders, keyframable gain, live `MixHandle` updates; **`fx`**: sound effects with latency-primed chains, roles (intro/outro) and plugin **sound shaders** (`shader.rs`) |
-| `oa-export` | Stepwise exporter; **Media Foundation sink** (NVIDIA HW H.264/HEVC + AAC mux, default) or ffmpeg; `audio_clips()` shared with playback |
+| `oa-export` | Stepwise exporter; **Media Foundation sink** (NVIDIA HW H.264/HEVC + AAC mux, default) or ffmpeg; `audio_clips()` shared with playback; sound mixed on its own thread beside the frames (`mixdown.rs`) |
 | `oa-cli` | `oa presets/probe/demo/plan/render/bench/export` (binary is `oa`) |
 | `oa-app` | Viewer with direct manipulation, timeline editing, inspector with keyframes, shortcuts, `--script` input driver, **autosave + crash recovery**, atomic saves |
 
@@ -42,10 +42,11 @@ so test runs don't leave recovery banners in your real autosave folder.
 0. **Plugins & the start page** (✅ 2026-09-20, DESIGN §8 and §11b): `oa_graph::plugin`
    (manifest + WGSL, Atelier Core holds every built-in), `Registry::from_plugins`, the
    app's `plugins.rs`/`settings.rs`/`home.rs`, `plugins/example-looks`,
-   `plugins/README.md`. Left: plugin-provided sound effects (DSP needs a host API),
-   motion effects (they are Rust fns), installing a plugin from a zip, a per-plugin
-   effects list on the Plugins page, and versioned migration when a plugin changes its
-   parameters.
+   `plugins/README.md`. Plugins also bring sound effects (`.oasound` scripts), motion
+   effects (`.oamotion`), text effects (`glyph`/`glyph_pixel` shaders), overlays and
+   actions (OA scripts, behind a security confirmation); the Plugins page opens each
+   plugin's effect list with hover previews (2026-09-27). Left: installing a plugin from
+   a zip, and versioned migration when a plugin changes its parameters.
 
    Also done: a **Depth** effect (`oa.depth.slab`: the clip as a sheet with
    thickness, turned in 3D, optionally shaped by a depth map), a searchable/filterable effect picker (`picker.rs`), a font menu with
@@ -77,12 +78,13 @@ so test runs don't leave recovery banners in your real autosave folder.
    effect rows with a value summary and drag-to-reorder;
    **(4)** a left dock with Media / Effects / Plugins tabs, so the effect browser is a
    panel you drag from (Premiere) rather than a menu;
-   **(5)** viewer overlay toolbar (zoom, guides, quality, fullscreen) and moving the
-   remaining view controls off the top bar;
+   **(5)** ✅ viewer toolbar (fit/zoom, thirds, center, safe areas, vertical layout) and
+   fullscreen playback (F, 2026-09-27);
    **(6)** empty states, focus rings, full keyboard navigation, reduced motion;
    **(7)** workspaces (Edit/Color/Audio/Export, Resolve's pages) with saved panel sizes;
-   plus: route the new menu/command strings through `t()`, per-property reset buttons in
-   the inspector (Resolve), a shortcut editor (Premiere), and export presets (CapCut).
+   plus: route the rest of the menu/command strings through `t()` (35 files use it so
+   far), a shortcut editor (Premiere), and export presets (CapCut). (Per-property reset is
+   there: right-click a value → Reset to default.)
 
    Also done 2026-09-20: 14 more core effects (pixelate, scanlines, vignette with colour,
    film grain, halftone, sharpen, edges, fisheye, swirl, mirror, zoom blur, chromatic
@@ -111,14 +113,15 @@ so test runs don't leave recovery banners in your real autosave folder.
    effect/value copy-paste, compound clips "As media"/"Nest", crop, media bin cards with
    sort/search, drag from bin to timeline, transform copy/paste, sequence background
    (solid/gradient, blurred content, texture); also chroma key, smear blur, wobble, formats moved into the top dropdown,
-   loading skeletons instead of stalls everywhere). **Not yet verified by hand in the
-   UI.** Left: open a compound clip as its own timeline, solo, dragging a transition
-   band's edges, media-level crop (crop is per
-   clip now), rendered thumbnails for compounds (they show their first file's frame).
-5. **Text, next steps** (text layers ✅ 2026-09-18, DESIGN §17): on-canvas editing
-   (double-click a title in the viewer), wrapping to a box width, rich text (per-range
-   style), color emoji, font weight picker beyond bold (faces have weights), text
-   effects as shader plugins, atlas eviction. ✅ Done this session: text layers with
+   loading skeletons instead of stalls everywhere); compound clips open as their own
+   timeline (breadcrumbs, `compound.rs`), bulk Arrange and a Length property
+   (2026-09-26); compound clips' own pictures in the bin and filmstrips on the timeline,
+   imports that wait in the bin, reverse playback with sound (2026-09-27). Left: solo,
+   dragging a transition band's edges, media-level crop (crop is per clip now).
+5. **Text, next steps** (text layers ✅ 2026-09-18, DESIGN §17; on-canvas editing ✅,
+   its double-click made dependable 2026-09-26): wrapping to a box width, rich text (per-range
+   style), color emoji, font weight picker beyond bold (faces have weights), glyph atlas
+   eviction. (Text effects as shader plugins: done — `glyph`/`glyph_pixel`.) ✅ Done this session: text layers with
    the three-level shader controller (per pixel `GlyphPixel`: Shimmer, Glow; per letter
    `Glyph`: Letter Wiggle, Wave, Rainbow Letters, Typewriter, Letters Rise/Pop/Scatter,
    Letter Fade; whole object: transform/motion), "+ Text"/Ctrl+T, Text inspector
@@ -126,13 +129,15 @@ so test runs don't leave recovery banners in your real autosave folder.
    render from a frozen frame (no decoder waits) within a 12 ms/frame budget and are
    framed on the clip; smooth scrubbing (stand-ins), Auto preview resolution, viewer
    zoom/pan and guides. Earlier: effect categories/roles, motion effects, media inputs. Also this session: `Unit::Direction` + pinwheel dial (Fly any angle, wipes, push, shimmer), `Value::Gradient` directional gradients (tint, text fill/outline, glow) with a stop editor, Shimmer for any clip. Old projects: Fly/Push saved with the old left/right/up/down choice fall back to the default direction. Later: simple/advanced Color (right-click → gradient) and Scale (right-click → X/Y), smaller dial snapping to right angles, outro "Reverse" (`Item::active_effects`, `EffectRole::Reversed`), script `rclick`.
-6. **Audio**: ✅ sound effects (Bass Boost, Pitch Shift, Echo, Reverb, Threshold, Bit Crush, Denoise; DESIGN §12). ✅ Speed with keep-pitch. ✅ Effect tracks (picture and sound buses), tails, EQ/compressor/limiter/de-esser with live meters, formants, reverb rooms, properties following the sound (2026-09-24). Left: reverse/freeze clips are silent; per-track gain/pan;
+6. **Audio**: ✅ sound effects (Bass Boost, Pitch Shift, Echo, Reverb, Threshold, Bit Crush, Denoise; DESIGN §12). ✅ Speed with keep-pitch. ✅ Effect tracks (picture and sound buses), tails, EQ/compressor/limiter/de-esser with live meters, formants, reverb rooms, properties following the sound (2026-09-24). ✅ Reversed clips play their sound backwards (2026-09-27). Left: freeze frames and reversed compound clips are silent; per-track gain/pan;
    replace the ffmpeg audio process with a platform decoder.
-7. **Stateful effects** (`oa.time.feedback-trail`) render as passthrough and are reported.
+7. **Stateful effects**: the engine reserves `Statefulness::Stateful` (preroll, no cache
+   key) but no effect uses it any more and the executor doesn't run them — needed for
+   trails, echoes of the picture, temporal denoise.
 8. **Color management** ✅ 2026-09-20 (DESIGN §9, `oa_doc::color`, `app/color.rs`): input
    transforms per file (curve incl. PQ/HLG and six log formats, gamut, levels, matrix,
    exposure; automatic from tags), display-space wrapping, output tone map + exposure.
-   Left: **10-bit/P010 decode** (HDR/log band at 8 bits today), HDR export, LUTs/OCIO.
+   ✅ The Color tab (2026-09-27): scopes, lift/gamma/gain/offset wheels, tone and white balance, curves, HSL mixer. Left: **10-bit/P010 decode** (HDR/log band at 8 bits today), HDR export, LUTs/OCIO, qualifiers and power windows (secondary grades on part of the picture).
 9. ✅ **Batch export of all format variants** (Export window, 2026-09-20). Left: cancel-with-partial-output semantics in the UI.
 10. **Editing UI** ✅ 2026-09-20 (DESIGN §5, §11b): curve editor window (`curves.rs`),
     editing inside compound clips with breadcrumbs (`compound.rs`), on-canvas title
@@ -147,9 +152,14 @@ whatever front-end work is under way. Take
 the next unticked item, land it with tests, update DESIGN.md, tick it here. Skip only
 when the turn's requested work is already very large (and say so).
 
-- Threading: [ ] coordinator thread · [ ] single GPU submit thread · [ ] request priorities
-  (current frame → lookahead → scrub → background) · [ ] pipelining (plan N+1 while N
-  renders) · [ ] progressive refinement when idle.
+- Threading: [x] coordinator thread (the viewer renders on `viewer_render`, 2026-09-26) ·
+  [~] single GPU submit thread — decided against: wgpu's queue already is one serialized
+  submission point, and routing submits through another thread would reorder them
+  against each thread's own uploads (DESIGN "Threading") · [x] request priorities
+  (the viewer's frame first: background previews wait while it plays; decoders answer
+  frames before scrub wants, 2026-09-26) · [x] pipelining (the next playback frame is
+  planned on `plan_ahead` while this one renders) · [x] progressive refinement when idle
+  (2× supersampled, smooth text).
 - Parameters: [x] LFO driver (`Modulator::Lfo`: sine/triangle/square/saw, phase, decay; wave editor `app/waves.rs`) · [ ] linking params · [x] audio-reactive drivers (`Modulator::Follow`, `oa_audio::envelope`; connection editor `app/connections.rs`) · [ ] spatial bezier motion paths · [ ] squash & stretch from velocity ·
   [ ] motion blur (sub-frame transform samples) · [ ] speed curves.
 - GPU: [ ] rebuild a lost device in place · [ ] zero-copy hardware decode · [ ] plugin
@@ -160,42 +170,43 @@ when the turn's requested work is already very large (and say so).
   decode fallback (`oa_media::ffmpeg`, any platform, 2026-09-24) · [x] Linux · [ ] macOS (VideoToolbox) ·
   [ ] VA-API zero-copy.
 - Audio: [x] sound effects on the effect system: `EffectKind::Sound`, roles/clocks, plugin
-  sound shaders (2026-09-21) · [ ] sound effects on compound clips (needs a bus) ·
-  [ ] per-track gain/pan · [x] buses and track effects (effect tracks) · [ ] time-stretch ·
-  [ ] gain/mute after the ring · [ ] export frame-count clock · [ ] Bluetooth sync offset
+  sound shaders (2026-09-21) · [x] sound effects on compound clips (a group bus,
+  2026-09-26) · [ ] per-track gain/pan · [x] buses and track effects (effect tracks) ·
+  [x] time-stretch (WSOLA for "keep pitch") · [x] gain/mute after the ring (ramped) ·
+  [x] export frame-count clock · [x] Bluetooth sync offset (Settings → Audio)
   · [x] effect tails past the clip end · [ ] native decoder instead of ffmpeg.
 - Render graph / export: [x] exports wait for shaders/glyphs the preview skips
-  (2026-09-21) · [ ] on-disk pipeline cache · [ ] UV-warp fusion · [ ] ROI
-  propagation · [ ] graph reuse between frames · [ ] zero-copy encode · [ ] image
-  sequences and audio-only export · [ ] resume a canceled export.
+  (2026-09-21) · [x] the sound mixed on its own thread while the frames render
+  (2026-09-26) · [x] export queue: jobs keep their project as queued; reorder, remove,
+  skip (2026-09-26) · [x] PNG image sequences and audio-only export (WAV/M4A/MP3/FLAC/
+  Opus, 2026-09-26) · [ ] on-disk pipeline cache · [x] UV-warp fusion · [x] ROI
+  propagation · [x] reuse between frames (uniforms and bind groups kept, 6.8 → 2.2 ms on
+  60 layers, 2026-09-26) · [ ] zero-copy encode · [ ] resume a canceled export.
+- Color: [ ] OCIO configs (a pure-Rust config reader, transforms evaluated on the CPU and
+  baked into 3D LUTs; per-file color space, project display/view) · [ ] .cube LUTs ·
+  [ ] 10-bit/P010 decode · [ ] HDR export.
 
 ## Known issues / gaps
 
-- Conforming a GIF to H.264 loses its transparency.
 - Audio decode is an ffmpeg process per clip (restart on seek, ~50 ms); fine for now.
-- Split with non-integer speed can be off by one flick in the back half (floor rounding).
-- Anchor moves write position at the playhead only — with keyframed position, other
-  times shift (documented in `transform.rs`).
-- Hit testing uses the layer rectangle, not alpha (nor a Surface's warped shape).
+- Hit testing: titles by their letters and Surfaces by their mesh (2026-09-26), other
+  layers still by their rectangle — a PNG's transparent parts still catch clicks.
 - Captions: the engine setup (uv → Python → faster-whisper → model) is built and its
   steps are unit-tested, but the real download and a real transcription haven't been run
   yet. First run: watch the Details log in the Captions window. CPU only; no speaker
   detection (color captions per speaker by hand).
-- Word times (`Item::word_times`) don't follow a head trim or a split of a caption clip
-  yet; retyping a caption with a different number of words shifts the highlight.
+- Retyping a caption with a different number of words shifts the highlight (word times
+  now follow trims, splits and moves).
 - "Highlight when spoken" covers a title's color and outline and text effects' params;
   whole-layer effects (blur…) and the text size can't change per word.
-- Sound effects on a compound clip aren't heard (its inner clips' own effects are).
 - Background effects are picture effects only (passive); no motion or text effects there.
 - Dragging an effect onto another clip failed twice in manual testing with no cause found in
   headless egui tests (they pass); the drop is now decided by the inspector itself. If it
   still fails, check first whether reordering by the same grip works (does the drag even
   start?).
-- Inside a compound clip the preview shows it on the compound's own background (black),
-  not the see-through look it has where it's used.
-- GPU test binary once hung with ≥3 parallel tests (unresolved, not reproduced since);
-  `crates/gpu/examples/stress.rs` exists to chase it. Use `--test-threads=4`.
-- Rotated layers have no edge anti-aliasing.
+- GPU test binary once hung with ≥3 parallel tests. Not reproduced since (five runs of
+  the render tests at 16 threads, 2026-09-26); `crates/gpu/examples/stress.rs` exists to
+  chase it. CI uses `--test-threads=4`.
 
 ## House style
 

@@ -49,6 +49,24 @@ impl VideoDecoder for AnyDecoder {
         })
     }
 
+    // Everything a decoder can say or be asked goes through to it: a default here would
+    // silently switch the feature off for the app, which always decodes through this.
+    fn seek_cost(&self) -> usize {
+        match self {
+            #[cfg(windows)]
+            AnyDecoder::Mf(d) => d.seek_cost(),
+            AnyDecoder::Ffmpeg(d) => d.seek_cost(),
+        }
+    }
+
+    fn set_scale_divisor(&mut self, divisor: u32) -> bool {
+        match self {
+            #[cfg(windows)]
+            AnyDecoder::Mf(d) => d.set_scale_divisor(divisor),
+            AnyDecoder::Ffmpeg(d) => d.set_scale_divisor(divisor),
+        }
+    }
+
     fn publish(&mut self, frame: &AnyFrame) -> Result<Surface, MediaError> {
         match (self, frame) {
             #[cfg(windows)]
@@ -90,7 +108,8 @@ pub fn frame_source(ctx: &oa_gpu::GpuContext, choice: DecoderChoice) -> MediaFra
     let (device, queue) = (ctx.device.clone(), ctx.queue.clone());
     MediaFrameSource::new(move |path, video| {
         #[cfg(windows)]
-        if let Some(bridge) = choice.bridge.clone().filter(|_| !choice.force_ffmpeg)
+        // Transparency goes to ffmpeg: Media Foundation hands over opaque NV12 only.
+        if let Some(bridge) = choice.bridge.clone().filter(|_| !choice.force_ffmpeg && !video.has_alpha)
             && let Ok(d) = crate::windows::MfDecoder::open(bridge, path, video)
         {
             return Ok(AnyDecoder::Mf(d));

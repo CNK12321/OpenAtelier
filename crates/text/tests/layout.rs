@@ -84,3 +84,27 @@ fn font_samples_draw_something() {
     assert_eq!(px.len(), (w * h) as usize);
     assert!(oa_text::fonts::sample_image(&family, "", 18.0).is_none());
 }
+
+/// Cursor positions for editing where the text is drawn: one before every character
+/// and one after each line, left to right, on the right line; a click finds the nearest.
+#[test]
+fn carets_follow_the_characters() {
+    let l = layout(&spec("Hi you\nok"));
+    assert_eq!(l.carets.len(), 2);
+    let (a, b) = (&l.carets[0], &l.carets[1]);
+    assert_eq!((a.first_char, a.xs.len()), (0, 7), "6 characters, 7 places to be");
+    assert_eq!((b.first_char, b.xs.len()), (7, 3), "the line break counts as a character");
+    assert!(a.xs.windows(2).all(|w| w[1] > w[0]), "{:?}", a.xs);
+    assert!(b.top > a.top && b.bottom > b.top);
+    // "H" starts where its glyph is drawn.
+    assert!((a.xs[0] - l.glyphs[0].origin[0]).abs() < 1.0);
+    // Before the space, and after it ("y" is the third drawn glyph).
+    assert!((a.xs[3] - l.glyphs[2].origin[0]).abs() < 1.0);
+    let (line, x) = l.caret(8).unwrap();
+    assert_eq!(line.first_char, 7);
+    assert_eq!(x, b.xs[1]);
+    // Clicks: the nearest place on the line clicked.
+    assert_eq!(l.index_at([a.xs[3] + 1.0, (a.top + a.bottom) / 2.0]), 3);
+    assert_eq!(l.index_at([b.xs[2] + 500.0, (b.top + b.bottom) / 2.0]), 9);
+    assert_eq!(l.index_at([-500.0, a.top]), 0);
+}

@@ -1,0 +1,8 @@
+// Rule-of-thirds lines and a title-safe frame, over the viewer. An overlay only draws:
+// it sees the canvas size, the playhead and the selected clip's box, nothing else.
+color(1, 1, 1, 0.35);
+grid(0, 0, canvas_w, canvas_h, 3, 3, 1);
+let inset_x = canvas_w * (1 - safe) / 2;
+let inset_y = canvas_h * (1 - safe) / 2;
+color(1, 0.8, 0.2, 0.6);
+rect(inset_x, inset_y, canvas_w - inset_x, canvas_h - inset_y, 1.5);

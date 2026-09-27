@@ -97,6 +97,25 @@ pub fn trim(p: &Project, seq: SeqId, item: ItemId, edge: Edge, to: Time) -> R<Ve
     Ok(vec![Op::SetItemTiming { seq, item, range, time_map }])
 }
 
+/// The clip's timing played the other way (`reverse`: backwards) — the same part of its
+/// file at the same speed, last frame first — or `None` if it already plays that way (or
+/// is a freeze frame). The clip keeps its place and length.
+///
+/// Forwards, local time 0 shows the part's first instant, `in`; the part ends at
+/// `in + span`. Backwards, 0 shows its last instant (a flick short of the end, so the
+/// frame there is the part's last one, not the one after it) and plays down towards `in`.
+pub fn reversed(item: &Item, reverse: bool) -> Option<(TimeRange, oa_doc::TimeMap)> {
+    let map = item.time_map;
+    let speed = map.speed;
+    if speed.is_zero() || (speed.num() < 0) == reverse {
+        return None;
+    }
+    // Where the clip's end falls in the file, a flick in: the new starting point.
+    let far = map.source_time(item.range.duration);
+    let nudge = if reverse { Time(-1) } else { Time(1) };
+    Some((item.range, oa_doc::TimeMap::new(far + nudge, oa_time::Rational::new(-speed.num(), speed.den()))))
+}
+
 /// Slides the footage inside a clip without moving the clip (a slip edit): the source
 /// in-point moves by `delta`, clamped to the media.
 pub fn slip(p: &Project, seq: SeqId, item: ItemId, delta: Time) -> R<Vec<Op>> {
@@ -137,6 +156,8 @@ pub fn split(p: &Project, seq: SeqId, item: ItemId, at: Time, alloc: &mut dyn Fn
     let mut back = it.clone();
     back.id = ItemId(alloc());
     back.range = tail_range;
+    // Its words stay on their moments (the back half's clock starts at the cut).
+    back.shift_word_times(oa_doc::word_shift(&it.time_map, &tail_map));
     back.time_map = tail_map;
     for src in back.params.0.values_mut() {
         src.shift_clip_clock(delta);
@@ -349,6 +370,77 @@ pub fn move_items(p: &Project, seq: SeqId, items: &[ItemId], delta: Time, track_
     }
     removes.extend(inserts);
     Ok(removes)
+}
+
+/// Where [`arrange`] puts the selected clips (each stays on its own track).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Arrange {
+    /// Close the gaps between them: on each track, the first stays put and each next one
+    /// starts where the one before ends.
+    Together,
+    /// Every one starts where the earliest does.
+    LineUpStarts,
+    /// The earliest starts at this time, the rest keep their spacing from it.
+    StartAt(Time),
+    /// The first and last (in time, across tracks) stay; the others are spread so the
+    /// gaps between each start and the next are equal.
+    SpaceEvenly,
+}
+
+/// Moves several clips at once (see [`Arrange`]), each on its own track, as one edit.
+/// Fails — changing nothing — if any would land on a clip that isn't moving, on another
+/// moved clip, or before zero.
+pub fn arrange(p: &Project, seq: SeqId, items: &[ItemId], how: Arrange) -> R<Vec<Op>> {
+    let s = sequence(p, seq)?;
+    let mut clips: Vec<(TrackId, &Item)> = Vec::new();
+    for &id in items {
+        let (ti, ii) = s.find_item(id).ok_or(EditError::NotFound("item", id.0))?;
+        clips.push((s.tracks[ti].id, &s.tracks[ti].items[ii]));
+    }
+    clips.sort_by_key(|(_, it)| (it.range.start, it.id.0));
+    let Some(earliest) = clips.first().map(|(_, it)| it.range.start) else { return Ok(Vec::new()) };
+    let starts: Vec<Time> = match how {
+        Arrange::Together => {
+            let mut last_end: std::collections::HashMap<TrackId, Time> = Default::default();
+            clips
+                .iter()
+                .map(|(track, it)| {
+                    let start = last_end.get(track).copied().unwrap_or(it.range.start);
+                    last_end.insert(*track, start + it.range.duration);
+                    start
+                })
+                .collect()
+        }
+        Arrange::LineUpStarts => clips.iter().map(|_| earliest).collect(),
+        Arrange::StartAt(at) => clips.iter().map(|(_, it)| it.range.start - earliest + at).collect(),
+        Arrange::SpaceEvenly => {
+            let n = clips.len();
+            let last = clips[n - 1].1.range.start;
+            clips
+                .iter()
+                .enumerate()
+                .map(|(i, (_, it))| if n < 3 { it.range.start } else { earliest + Time::from_rational_floor((last - earliest).as_rational() * oa_time::Rational::new(i as i64, (n - 1) as i64)) })
+                .collect()
+        }
+    };
+    let snapped: Vec<Time> = starts.iter().map(|t| snap_to_frame(s, *t)).collect();
+    let moved: Vec<(TrackId, &Item, TimeRange)> = clips.iter().zip(&snapped).map(|((track, it), start)| (*track, *it, TimeRange::new(*start, it.range.duration))).collect();
+    for (i, (track, it, range)) in moved.iter().enumerate() {
+        if range.start < Time::ZERO {
+            return Err(EditError::InvalidRange);
+        }
+        let staying = s.track(*track).into_iter().flat_map(|t| t.items.iter()).filter(|o| !items.contains(&o.id));
+        let hits_staying = staying.into_iter().any(|o| o.range.overlaps(*range));
+        let hits_moved = moved.iter().enumerate().any(|(j, (t, other, r))| j != i && t == track && other.id != it.id && r.overlaps(*range));
+        if hits_staying || hits_moved {
+            return Err(EditError::Overlap);
+        }
+    }
+    Ok(moved
+        .into_iter()
+        .filter(|(_, it, range)| *range != it.range)
+        .map(|(_, it, range)| Op::SetItemTiming { seq, item: it.id, range, time_map: it.time_map })
+        .collect())
 }
 
 /// Pastes copies of `clips` (each with the track it came from) so the earliest starts at

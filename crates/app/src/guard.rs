@@ -61,7 +61,7 @@ impl App {
         self.rendered = None;
         if self.failed_frames >= MAX_FAILED_FRAMES {
             self.failed_frames = 0;
-            self.screen = crate::home::Screen::Home;
+            self.go_home();
             self.report_error(format!("The editor kept failing ({why}). Your work was autosaved — reopen the project to continue."));
         } else {
             self.report_error(format!("Something went wrong ({why}). Your work was autosaved and the editor recovered."));

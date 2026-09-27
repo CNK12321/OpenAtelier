@@ -20,7 +20,7 @@
 //! rather than failing the load.
 
 use crate::registry::{EffectDescriptor, EffectKind, EffectShader, EffectUsage, SecondInput, WorkingSpace, PLUGIN_API_VERSION};
-use crate::script::{BoundsScript, MotionScript, PassScript};
+use crate::script::{ActionScript, BoundsScript, MotionScript, OverlayScript, PassScript};
 use std::sync::Arc;
 use oa_params::{Gradient, ParamId, ParamSchema, Unit, Value};
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,27 @@ pub struct Plugin {
     pub effects: Vec<EffectDescriptor>,
     /// What was wrong with it (skipped effects, unreadable shaders…).
     pub issues: Vec<String>,
+    /// Its overlays and actions.
+    pub scripts: Vec<Arc<PluginScript>>,
+    /// A fingerprint of every OA script it carries — sound shaders, motion, bounds, pass
+    /// and tail scripts, overlays, actions — or `None` if it has none. Scripts run on the
+    /// computer (not sandboxed on the GPU as WGSL shaders are), so a plugin's scripts run
+    /// only once the user has allowed this exact set (the host keeps the fingerprints).
+    pub script_digest: Option<u64>,
+}
+
+impl Plugin {
+    /// Whether it carries scripts that need the user's go-ahead.
+    pub fn has_scripts(&self) -> bool {
+        self.script_digest.is_some()
+    }
+
+    /// Itself without anything that runs a script (its WGSL-only effects stay): what's
+    /// loaded until its scripts are allowed.
+    pub fn without_scripts(&self) -> Plugin {
+        let scripted = |d: &EffectDescriptor| d.kind == EffectKind::Sound || d.motion.is_some() || d.bounds.is_some() || d.pass_count.is_some() || d.pass_divisor.is_some() || d.tail.is_some();
+        Plugin { effects: self.effects.iter().filter(|d| !scripted(d)).cloned().collect(), scripts: Vec::new(), ..self.clone() }
+    }
 }
 
 impl Plugin {
@@ -110,6 +131,65 @@ struct Manifest {
     api_version: u32,
     #[serde(default)]
     effects: Vec<EffectDef>,
+    /// Overlays and actions (OA scripts of their own, not effects).
+    #[serde(default)]
+    scripts: Vec<ScriptDef>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ScriptDef {
+    id: String,
+    name: String,
+    /// overlay · action
+    kind: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    params: Vec<ParamDef>,
+    script: Source,
+}
+
+/// A plugin's overlay or action (see [`OverlayScript`], [`ActionScript`]).
+#[derive(Debug)]
+pub struct PluginScript {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub params: Vec<ParamSchema>,
+    pub kind: ScriptKind,
+}
+
+#[derive(Debug)]
+pub enum ScriptKind {
+    Overlay(OverlayScript),
+    Action(ActionScript),
+}
+
+impl ScriptDef {
+    fn into_script(self, read: &dyn Fn(&str) -> Result<String, String>) -> Result<PluginScript, String> {
+        let where_ = format!("script \"{}\"", self.id);
+        let params = self.params.into_iter().map(ParamDef::into_schema).collect::<Result<Vec<_>, _>>().map_err(|e| format!("{where_}: {e}"))?;
+        let source = self.script.text(read).map_err(|e| format!("{where_}: {e}"))?;
+        let kind = match self.kind.as_str() {
+            "overlay" => ScriptKind::Overlay(OverlayScript::compile(&source, &params).map_err(|e| format!("{where_}: {e}"))?),
+            "action" => ScriptKind::Action(ActionScript::compile(&source, &params).map_err(|e| format!("{where_}: {e}"))?),
+            other => return Err(format!("{where_}: kind \"{other}\" — an overlay or an action")),
+        };
+        Ok(PluginScript { id: self.id, name: self.name, description: self.description, params, kind })
+    }
+}
+
+/// A stable fingerprint of script text (FNV-1a): what the user allowed to run. Any
+/// change to any of a plugin's scripts changes it, and the plugin asks again.
+fn digest(texts: &[String]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for t in texts {
+        for b in t.as_bytes().iter().chain(&[0xFF]) {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
 }
 
 fn unknown_version() -> String {
@@ -156,7 +236,7 @@ struct EffectDef {
     /// Settings for its preview in the picker, by parameter id.
     #[serde(default)]
     preview: serde_json::Map<String, serde_json::Value>,
-    /// A host editor: "surface" or "equalizer".
+    /// A host editor: "surface", "equalizer" or "color".
     #[serde(default)]
     editor: Option<String>,
     /// Sound: "reduction" or "correlation".
@@ -385,7 +465,7 @@ impl EffectDef {
             preview.push((ParamId::new(&id), def.into_schema().map_err(|e| format!("{where_}: preview: {e}"))?.default));
         }
         if let Some(e) = &self.editor
-            && ![crate::registry::EDITOR_SURFACE, crate::registry::EDITOR_EQUALIZER].contains(&e.as_str())
+            && ![crate::registry::EDITOR_SURFACE, crate::registry::EDITOR_EQUALIZER, crate::registry::EDITOR_COLOR].contains(&e.as_str())
         {
             return Err(format!("{where_}: unknown editor \"{e}\""));
         }
@@ -478,6 +558,23 @@ fn from_manifest(text: &str, read: &dyn Fn(&str) -> Result<String, String>, buil
     if (manifest.id == CORE_ID) != builtin {
         return Err(format!("\"{CORE_ID}\" is the built-in plugin's id"));
     }
+    // Every script it carries, as written: what the user is asked to allow.
+    let mut texts = Vec::new();
+    for e in &manifest.effects {
+        for s in [&e.tail, &e.motion, &e.bounds, &e.pass_count, &e.pass_divisor].into_iter().flatten() {
+            texts.push(s.text(read).unwrap_or_default());
+        }
+        if e.kind == "sound"
+            && let Some(sh) = &e.shader
+        {
+            texts.push(sh.source.clone().or_else(|| sh.file.as_deref().and_then(|f| read(f).ok())).unwrap_or_default());
+        }
+    }
+    for s in &manifest.scripts {
+        texts.push(s.script.text(read).unwrap_or_default());
+    }
+    let script_digest = (!texts.is_empty()).then(|| digest(&texts));
+
     let (mut effects, mut issues) = (Vec::new(), Vec::new());
     for e in manifest.effects {
         match e.into_descriptor(read, builtin) {
@@ -485,7 +582,26 @@ fn from_manifest(text: &str, read: &dyn Fn(&str) -> Result<String, String>, buil
             Err(e) => issues.push(e),
         }
     }
-    Ok(Plugin { id: manifest.id, name: manifest.name, version: manifest.version, description: manifest.description, author: manifest.author, builtin, path: None, effects, issues })
+    let mut scripts = Vec::new();
+    for s in manifest.scripts {
+        match s.into_script(read) {
+            Ok(s) => scripts.push(Arc::new(s)),
+            Err(e) => issues.push(e),
+        }
+    }
+    Ok(Plugin {
+        id: manifest.id,
+        name: manifest.name,
+        version: manifest.version,
+        description: manifest.description,
+        author: manifest.author,
+        builtin,
+        path: None,
+        effects,
+        issues,
+        scripts,
+        script_digest,
+    })
 }
 
 /// Reads one plugin folder (or a lone `plugin.json`). Bad effects are skipped and
@@ -657,5 +773,44 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert!(errors[0].contains("plugin API version 99"), "{errors:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Overlays and actions load and run; a plugin with scripts carries a fingerprint of
+    /// them all (sound shaders included) that changes with any of them; held back to
+    /// "without scripts", only its GPU effects stay.
+    #[test]
+    fn scripts_are_fingerprinted_and_can_be_held_back() {
+        let manifest = |overlay: &str| {
+            format!(
+                r#"{{"id": "com.example.guides", "name": "Guides",
+                    "effects": [
+                        {{"id": "com.example.tint", "name": "Tint", "kind": "point", "shader": {{"entry": "tint", "source": "fn tint(c: vec4f, p: EffectParams) -> vec4f {{ return c; }}"}}}},
+                        {{"id": "com.example.hush", "name": "Hush", "kind": "sound", "shader": {{"source": "out = in * 0.5;"}}}}
+                    ],
+                    "scripts": [
+                        {{"id": "thirds", "name": "Thirds", "kind": "overlay", "script": "{overlay}"}},
+                        {{"id": "tilt", "name": "Tilt", "kind": "action", "params": [{{"id": "by", "type": "float", "default": 5}}], "script": "rotation = rotation + by * index;"}}
+                    ]}}"#
+            )
+        };
+        let read = |_: &str| Err::<String, String>("no files".into());
+        let a = from_manifest(&manifest("grid(0, 0, canvas_w, canvas_h, 3, 3, 1);"), &read, false).unwrap();
+        assert!(a.issues.is_empty(), "{:?}", a.issues);
+        assert!(a.has_scripts());
+        let b = from_manifest(&manifest("grid(0, 0, canvas_w, canvas_h, 4, 4, 1);"), &read, false).unwrap();
+        assert_ne!(a.script_digest, b.script_digest, "a changed script asks again");
+
+        let ScriptKind::Overlay(overlay) = &a.scripts[0].kind else { panic!("an overlay") };
+        let shapes = overlay.draw(&oa_params::Evaluated(Vec::new()), &crate::script::OverlayInput { canvas: [300.0, 200.0], ..Default::default() });
+        assert_eq!(shapes.len(), 4, "a 3×3 grid is four lines");
+        let ScriptKind::Action(action) = &a.scripts[1].kind else { panic!("an action") };
+        let values = oa_params::Evaluated(vec![(ParamId::new("by"), Value::Float(5.0))]);
+        let clip = crate::script::ActionClip { scale: 1.0, opacity: 1.0, ..Default::default() };
+        assert_eq!(action.apply(&values, clip, 2, 3, 0.0, [1920.0, 1080.0]).rotation, 10.0);
+
+        let held = a.without_scripts();
+        assert!(held.scripts.is_empty());
+        assert_eq!(held.effects.iter().map(|d| &*d.type_id).collect::<Vec<_>>(), ["com.example.tint"], "the sound shader is a script too");
+        assert!(core().script_digest.is_some(), "Atelier Core has scripts, but it's built in and trusted");
     }
 }

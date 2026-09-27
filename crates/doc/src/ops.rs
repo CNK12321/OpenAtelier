@@ -296,6 +296,12 @@ impl Op {
                 let new_index = track.insertion_index(range, Some(item)).ok_or(EditError::Overlap)?;
                 let mut it = track.items.remove(ii);
                 let old = Op::SetItemTiming { seq, item, range: it.range, time_map: it.time_map };
+                // Word times follow what's said: a head trim (the in point moves) keeps
+                // each word on its moment; a move (the in point stays) takes them along.
+                // Undo shifts them back exactly (none are dropped: the title still shows
+                // every word).
+                let shift = crate::model::word_shift(&it.time_map, &time_map);
+                it.shift_word_times(shift);
                 it.range = range;
                 it.time_map = time_map;
                 let at = if new_index > ii { new_index - 1 } else { new_index };

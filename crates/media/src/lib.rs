@@ -20,6 +20,7 @@ pub mod import;
 mod probe;
 mod source;
 mod still;
+pub mod svg;
 #[cfg(windows)]
 pub mod windows;
 

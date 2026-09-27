@@ -180,6 +180,24 @@ impl App {
         self.selection = None;
     }
 
+    /// Moves the selected clips at once (right-click → Arrange): together, lined up, to
+    /// the playhead, or evenly spaced. Refused whole if something is in the way.
+    pub(crate) fn arrange_selection(&mut self, how: oa_edit::timeline::Arrange, label: &str) {
+        let clips = self.selected_clips();
+        let seq = self.editor.seq;
+        let result = oa_edit::timeline::arrange(self.editor.doc.project(), seq, &clips, how);
+        match result {
+            Ok(ops) if ops.is_empty() => {}
+            Ok(ops) => {
+                if let Err(e) = self.editor.apply(label, ops) {
+                    self.error = Some(e.to_string());
+                }
+            }
+            Err(oa_doc::EditError::Overlap) => self.notify(format!("{label}: another clip is in the way — nothing moved.")),
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
     pub(crate) fn group_selection(&mut self) {
         let clips = self.selected_clips();
         if clips.len() < 2 {

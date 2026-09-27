@@ -4,29 +4,26 @@
 //! effects sweep from off to full strength.
 //!
 //! Each preview is a real render — the same planner and GPU path as the viewer — of a
-//! scratch copy of the project with the effect added to the clip. The clip's picture is
-//! frozen on the playhead's frame in that copy, so every preview (and every frame of a
-//! hover animation) reuses one decoded frame from the render cache: nothing waits on
-//! the decoder. Still previews are cached until the document, playhead, format or clip
-//! changes (not while playing: they stay on the moment playback started from), and
-//! rendered within a small time budget per frame so opening a picker never stalls the
-//! UI; a preview being redone shows the one before until it's ready, never a blank.
+//! scratch copy of the project with the effect added to the clip, made on the preview
+//! thread (`preview_worker`) so the UI never waits on one. The clip's picture is frozen
+//! on the playhead's frame in that copy, so every preview (and every frame of a hover
+//! animation) reuses one decoded frame from that thread's render cache. Still previews
+//! are cached until the document, playhead, format or clip changes (not while playing:
+//! they stay on the moment playback started from); requests for a moment that has since
+//! changed are skipped on the thread, and a preview being redone shows the one before
+//! until it's ready, never a blank.
 
 use crate::App;
 use eframe::egui;
 use oa_doc::{EffectId, EffectInstance, EffectRole, ItemId, Project};
-use oa_graph::{optimize, KeyContext, OptLevel};
 use oa_params::{ParamSource, Value};
-use oa_plan::{plan_frame, PlanOptions};
 use oa_time::{Rational, Time};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// Previews render ~200 px wide.
 const THUMB_WIDTH: f64 = 200.0;
-/// Rendering time allowed per UI frame for still previews.
-const BUDGET: Duration = Duration::from_millis(12);
 /// How long a previewed intro/outro lasts.
 const IN_OUT_PREVIEW: Time = Time::from_seconds(1);
 /// Pause after an intro/outro plays before it loops.
@@ -61,10 +58,14 @@ pub struct Thumbs {
     images: HashMap<(ThumbKind, String), (egui::TextureId, wgpu::Texture)>,
     /// Previews of the moment before, shown until each is rendered for this one.
     stale: HashMap<(ThumbKind, String), (egui::TextureId, wgpu::Texture)>,
-    spent: Duration,
+    /// Which moment the previews are for, bumped when it changes: requests for an older
+    /// one are skipped on the preview thread, and their results dropped here.
+    generation: Arc<AtomicU64>,
+    /// Still previews asked for in this generation (so each is asked for once).
+    requested: HashSet<(ThumbKind, String)>,
     hover: Option<Hover>,
-    /// The one texture hover animations draw into, reused frame to frame.
-    live: Option<(egui::TextureId, wgpu::Texture)>,
+    /// The hover animation's latest frame: its egui id, texture, and which cell it's of.
+    live: Option<(egui::TextureId, wgpu::Texture, u64)>,
     /// The part of the canvas previews show (0..1): the clip and room around it, so a
     /// small title fills the preview instead of sitting in a corner of it.
     framing: Option<egui::Rect>,
@@ -105,7 +106,6 @@ impl App {
     /// throw them away as fast as they render); and when the moment does change, the
     /// old previews stay up until their replacements are ready.
     pub(crate) fn thumbs_frame_start(&mut self) {
-        self.thumbs.spent = Duration::ZERO;
         if let Some(h) = &mut self.thumbs.hover
             && !std::mem::replace(&mut h.seen, false)
         {
@@ -138,13 +138,20 @@ impl App {
     /// stand-in is only replaced by a newer preview (the moment can change many times
     /// before anything re-renders — dragging a slider changes it every frame).
     fn age_thumbs(&mut self) {
-        self.thumbs.framing = None;
+        self.next_thumb_generation();
         let fresh = std::mem::take(&mut self.thumbs.images);
         let mut replaced = Vec::new();
         for (key, image) in fresh {
             replaced.extend(self.thumbs.stale.insert(key, image));
         }
         self.free_textures(replaced.into_iter());
+    }
+
+    /// The moment changed: previews asked for before are no longer wanted.
+    fn next_thumb_generation(&mut self) {
+        self.thumbs.framing = None;
+        self.thumbs.generation.fetch_add(1, Ordering::AcqRel);
+        self.thumbs.requested.clear();
     }
 
     fn free_textures(&self, textures: impl Iterator<Item = (egui::TextureId, wgpu::Texture)>) {
@@ -158,7 +165,7 @@ impl App {
 
     /// Drops every cached preview (the moment changed, or the effects did).
     pub(crate) fn forget_thumbs(&mut self) {
-        self.thumbs.framing = None;
+        self.next_thumb_generation();
         let images = std::mem::take(&mut self.thumbs.images);
         let stale = std::mem::take(&mut self.thumbs.stale);
         self.free_textures(images.into_values().chain(stale.into_values()));
@@ -212,57 +219,64 @@ impl App {
         response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
     }
 
-    /// The still preview of `type_id` for `item`, rendering it now if this frame's
-    /// budget allows. `None` while it's still waiting.
+    /// The still preview of `type_id` for `item`: asked of the preview thread the first
+    /// time, picked up when it's done. Until then the one from the moment before (or
+    /// `None`: a placeholder).
     fn effect_thumb(&mut self, item: ItemId, kind: ThumbKind, type_id: &str) -> Option<egui::TextureId> {
         let key = (kind, type_id.to_string());
         if let Some((id, _)) = self.thumbs.images.get(&key) {
             return Some(*id);
         }
+        let generation = self.thumbs.generation.load(Ordering::Acquire);
+        let slot = thumb_slot(&key);
+        if let Some(done) = self.preview_worker.take(slot).filter(|d| d.tag == generation)
+            && let Some(rs) = self.render_state.as_ref()
+        {
+            let view = oa_gpu::readback::display_view(&done.texture);
+            let id = rs.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear);
+            if let Some(old) = self.thumbs.stale.remove(&key) {
+                self.free_textures(std::iter::once(old));
+            }
+            self.thumbs.images.insert(key, (id, done.texture));
+            return Some(id);
+        }
+        if !self.thumbs.requested.contains(&key)
+            && let Some((project, t)) = self.preview_scene(item, kind, type_id, None)
+        {
+            let wanted = Some((self.thumbs.generation.clone(), generation));
+            let scale = self.thumb_scale();
+            self.request_preview(slot, generation, project, t, scale, wanted);
+            self.thumbs.requested.insert(key.clone());
+        }
         // Until it's ready: the one from the moment before, if there is one.
-        let stand_in = self.thumbs.stale.get(&key).map(|(id, _)| *id);
-        if self.thumbs.spent >= BUDGET {
-            return stand_in;
-        }
-        let started = Instant::now();
-        let Some((project, t)) = self.preview_scene(item, kind, type_id, None) else { return stand_in };
-        let rendered = self.render_preview(&project, t, None);
-        self.thumbs.spent += started.elapsed();
-        // Built on a stand-in frame: don't keep it; the exact frame comes shortly.
-        let Some(texture) = rendered.filter(|(_, exact)| *exact).map(|(t, _)| t) else { return stand_in };
-        let Some(rs) = self.render_state.as_ref() else { return stand_in };
-        let view = oa_gpu::readback::display_view(&texture);
-        let id = rs.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear);
-        if let Some(old) = self.thumbs.stale.remove(&key) {
-            self.free_textures(std::iter::once(old));
-        }
-        self.thumbs.images.insert(key, (id, texture));
-        Some(id)
+        self.thumbs.stale.get(&key).map(|(id, _)| *id)
     }
 
-    /// One frame of the hover animation, `phase` seconds in.
+    /// The hover animation, `phase` seconds in: this frame is asked for, and the latest
+    /// one done for this cell is shown (a frame or two behind — never a wait). `None`
+    /// until the first is in.
     fn animated_thumb(&mut self, item: ItemId, kind: ThumbKind, type_id: &str, phase: f64) -> Option<egui::TextureId> {
-        let (project, t) = self.preview_scene(item, kind, type_id, Some(phase))?;
-        let old = self.thumbs.live.take();
-        let Some((texture, _)) = self.render_preview(&project, t, old.as_ref().map(|(_, tex)| tex.clone())) else {
-            self.thumbs.live = old;
-            return None;
-        };
-        let rs = self.render_state.as_ref()?;
-        let id = match old {
-            Some((id, tex)) if tex == texture => id,
-            Some((id, _)) => {
-                let view = oa_gpu::readback::display_view(&texture);
-                rs.renderer.write().update_egui_texture_from_wgpu_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear, id);
-                id
-            }
-            None => {
-                let view = oa_gpu::readback::display_view(&texture);
-                rs.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear)
-            }
-        };
-        self.thumbs.live = Some((id, texture));
-        Some(id)
+        let cell = thumb_slot(&(kind, type_id.to_string()));
+        if let Some((project, t)) = self.preview_scene(item, kind, type_id, Some(phase)) {
+            let scale = self.thumb_scale();
+            self.request_preview(crate::preview_worker::LIVE, cell, project, t, scale, None);
+        }
+        if let Some(done) = self.preview_worker.take(crate::preview_worker::LIVE)
+            && done.tag == cell
+            && let Some(rs) = self.render_state.as_ref()
+        {
+            // A new texture each time: point the animation's id at it (the old one drops).
+            let view = oa_gpu::readback::display_view(&done.texture);
+            let id = match self.thumbs.live.take() {
+                Some((id, ..)) => {
+                    rs.renderer.write().update_egui_texture_from_wgpu_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear, id);
+                    id
+                }
+                None => rs.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear),
+            };
+            self.thumbs.live = Some((id, done.texture, cell));
+        }
+        self.thumbs.live.as_ref().filter(|(.., of)| *of == cell).map(|(id, ..)| *id)
     }
 
     /// The scratch project a preview renders and the moment to show: `phase` is `None`
@@ -324,7 +338,7 @@ impl App {
         }
         let (ti, ii) = seq.find_item(item)?;
         let clip = &mut Arc::make_mut(&mut seq.tracks[ti]).items[ii];
-        clip.time_map = oa_doc::TimeMap { source_in: clip.time_map.source_time(here - clip.range.start), speed: Rational::ZERO };
+        clip.time_map = oa_doc::TimeMap::new(clip.time_map.source_time(here - clip.range.start), Rational::ZERO);
         if kind != ThumbKind::Passive {
             clip.effects.retain(|e| e.role == EffectRole::Passive);
         }
@@ -349,37 +363,36 @@ impl App {
         f
     }
 
-    /// Renders a preview frame to a display texture (into `reuse` when it fits).
-    /// Never waits: while the decoder, a shader or glyphs aren't ready this gives `None`
-    /// (or a frame built on a stand-in, flagged by `exact == false`), and the cell shows a
-    /// loading skeleton instead of stalling the editor.
-    fn render_preview(&mut self, project: &Project, t: Time, reuse: Option<wgpu::Texture>) -> Option<(wgpu::Texture, bool)> {
+    /// How big previews render: sharp over the framed part of the canvas, never above
+    /// full resolution.
+    fn thumb_scale(&mut self) -> f64 {
         let canvas = self.editor.sequence().variants[self.variant.min(self.editor.sequence().variants.len() - 1)].size;
-        // Sharp over the framed part of the canvas, never above full resolution.
         let shown = canvas.width as f64 * self.thumb_framing().width() as f64;
-        self.render_scaled(project, t, (THUMB_WIDTH / shown.max(1.0)).min(1.0), reuse)
+        (THUMB_WIDTH / shown.max(1.0)).min(1.0)
     }
 
-    /// Renders `project`'s open timeline at `t`, `scale` × the canvas, to a display
-    /// texture (the same no-waiting rules as effect previews).
-    pub(crate) fn render_scaled(&mut self, project: &Project, t: Time, scale: f64, reuse: Option<wgpu::Texture>) -> Option<(wgpu::Texture, bool)> {
-        let seq = self.editor.seq;
-        let opts = PlanOptions { variant: Some(self.variant_id()), render_scale: scale.clamp(0.05, 1.0), ..Default::default() };
-        let plan = plan_frame(project, seq, t, &opts, &self.registry).ok()?;
-        let graph = optimize(&plan.graph, OptLevel::Full, KeyContext::default());
-        self.sources.set_interactive(true);
-        let image = self.renderer.render(&graph, &self.registry, &mut self.sources);
-        self.sources.set_interactive(false);
-        let exact = oa_gpu::FrameSource::settled(&mut self.sources);
-        let image = match image {
-            Ok(image) => image,
-            Err(oa_gpu::RenderError::NotReady) => return None,
-            Err(e) => {
-                eprintln!("preview: {e}");
-                return None;
-            }
-        };
-        let texture = oa_gpu::readback::display_texture_into(&self.gpu, self.renderer.pipelines(), &image, reuse).map_err(|e| eprintln!("preview: {e}")).ok()?;
-        Some((texture, exact))
+    /// Asks the preview thread for `project`'s open timeline at `t`, `scale` × the canvas
+    /// (see `preview_worker::Request`).
+    pub(crate) fn request_preview(&self, slot: u64, tag: u64, project: Project, at: Time, scale: f64, wanted: Option<(Arc<AtomicU64>, u64)>) {
+        self.preview_worker.request(crate::preview_worker::Request {
+            slot,
+            tag,
+            project: Arc::new(project),
+            registry: self.registry.clone(),
+            seq: self.editor.seq,
+            variant: self.variant_id(),
+            at,
+            scale,
+            wanted,
+            png: None,
+        });
     }
+}
+
+/// The preview thread's slot for one picker cell (clear of its fixed slots).
+fn thumb_slot(key: &(ThumbKind, String)) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish() | 1 << 63
 }

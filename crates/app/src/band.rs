@@ -55,14 +55,19 @@ impl App {
     }
 
     /// Where the line and its keys are drawn over `rect` (a clip from `start` to
-    /// `end`), sampling every few px.
-    pub(crate) fn band_shape(&self, item: ItemId, band: &Band, rect: egui::Rect, x_of: &dyn Fn(Time) -> f32, time_at: &dyn Fn(f32) -> Time) -> Option<BandShape> {
+    /// `end`), sampling every few px — only across `shown` (the visible lane): a long
+    /// clip zoomed in is millions of px wide, and each sample evaluates the property.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn band_shape(&self, item: ItemId, band: &Band, rect: egui::Rect, shown: egui::Rect, x_of: &dyn Fn(Time) -> f32, time_at: &dyn Fn(f32) -> Time) -> Option<BandShape> {
         let it = self.editor.item(item)?;
         let value = |t: Time| self.editor.param_value(item, &band.target, &band.param, t).and_then(|v| v.as_float());
         let default = || if band.param == schema::OPACITY { 1.0 } else { 0.0 };
         let mut line = Vec::new();
-        let mut x = rect.left();
-        while x <= rect.right() {
+        // On the clip's own 3 px grid, so the line doesn't shimmer as it scrolls.
+        let from = rect.left() + ((shown.left() - 3.0 - rect.left()).max(0.0) / 3.0).floor() * 3.0;
+        let to = rect.right().min(shown.right() + 3.0);
+        let mut x = from;
+        while x <= to {
             let t = time_at(x).max(it.range.start).min(it.range.end() - Time(1));
             line.push(egui::pos2(x, y_of(rect, band, value(t).unwrap_or_else(default))));
             x += 3.0;
@@ -76,6 +81,7 @@ impl App {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, k)| Some((i, egui::pos2(x_of(it.range.start + k.t), y_of(rect, band, k.value.as_float()?)))))
+                    .filter(|(_, p)| p.x >= shown.left() - 8.0 && p.x <= shown.right() + 8.0)
                     .collect()
             })
             .unwrap_or_default();

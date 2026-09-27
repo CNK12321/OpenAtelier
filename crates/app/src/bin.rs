@@ -564,7 +564,24 @@ impl App {
 
         // The picture: skims with the pointer over a video.
         let mut drawn = false;
-        if let Some((media, path, size, duration, rest)) = &card.picture {
+        // A compound clip: its own frames, rendered from the timeline inside it.
+        if let Entry::Compound(seq) = card.entry {
+            let duration = card.length.as_seconds_f64();
+            if let Some(strip) = self.compound_strip(&ctx, seq) {
+                let at = match response.hover_pos() {
+                    Some(p) => ((p.x - thumb.left()) / thumb.width()).clamp(0.0, 1.0) as f64 * duration,
+                    None => duration * 0.1,
+                };
+                let h = thumb.height().min(thumb.width() / strip.aspect.max(0.01));
+                let dest = egui::Rect::from_center_size(thumb.center(), egui::vec2(h * strip.aspect, h));
+                painter.image(strip.texture.id(), dest, strip.uv(at), egui::Color32::WHITE);
+                drawn = true;
+            } else if self.clip_previews.compound_pending(seq) {
+                crate::widgets::skeleton(ui, &painter, thumb);
+                drawn = true;
+            }
+        }
+        if let Some((media, path, size, duration, rest)) = card.picture.as_ref().filter(|_| !drawn) {
             let at = match response.hover_pos() {
                 Some(p) if *duration > 0.0 => ((p.x - thumb.left()) / thumb.width()).clamp(0.0, 1.0) as f64 * duration,
                 _ => *rest,
@@ -982,8 +999,9 @@ impl App {
         });
     }
 
-    /// Imports an asset into the project, the same way dropping the file in would.
+    /// Uses an asset (its ＋, or a double-click): imported into the project and put on the
+    /// timeline — asked for by name, unlike a plain import.
     fn use_asset(&mut self, asset: &crate::assets::Asset) {
-        self.open_paths(std::slice::from_ref(&asset.path));
+        self.import_paths(std::slice::from_ref(&asset.path), true, "");
     }
 }

@@ -23,6 +23,7 @@ use oa_params::Value;
 use oa_time::Time;
 use std::fmt;
 
+#[derive(Clone, Debug)]
 pub struct PlanOptions {
     /// `None` = the sequence's active variant.
     pub variant: Option<VariantId>,
@@ -30,11 +31,19 @@ pub struct PlanOptions {
     pub render_scale: f64,
     pub use_proxies: bool,
     pub key_context: KeyContext,
+    /// Text anti-aliasing: titles are drawn this many times larger each way (with their
+    /// per-letter and per-pixel effects) and averaged back down before any of the clip's
+    /// other effects see them — smooth edges on thin strokes and on hard-edged text
+    /// effects. 1 = off (the preview); export uses 2 unless turned off.
+    pub text_supersample: u32,
+    /// Leave out the sequence's background: see-through where it has nothing, as it is
+    /// where it's used as a compound clip (the preview while editing inside one).
+    pub see_through: bool,
 }
 
 impl Default for PlanOptions {
     fn default() -> Self {
-        PlanOptions { variant: None, render_scale: 1.0, use_proxies: false, key_context: KeyContext::default() }
+        PlanOptions { variant: None, render_scale: 1.0, use_proxies: false, key_context: KeyContext::default(), text_supersample: 1, see_through: false }
     }
 }
 
@@ -186,7 +195,7 @@ impl Planner<'_> {
         ];
         // The top sequence sits on its background (black by default); a nested one (a
         // compound clip, a group used as media) is see-through where it has nothing.
-        let top = depth == 0;
+        let top = depth == 0 && !self.opts.see_through;
         let (background, under) = if top { self.background(s, t, size, depth) } else { ([0.0; 4], None) };
         // The background's own effects run on what it drew — or on a canvas of its color.
         // Not for blurred content: that background is the finished frame blurred, built
@@ -857,7 +866,16 @@ impl Planner<'_> {
             }
             ItemKind::Nested { sequence } => self.sequence(*sequence, None, ctx.source_time, raster, depth + 1),
             ItemKind::Text => {
-                let (node, grown, spec) = self.text(item, variant, &ctx, raster, bounds);
+                // Anti-aliased: drawn k× larger, then shrunk back to the layer's raster —
+                // its own pass, before the crop and the clip's effects.
+                let k = self.opts.text_supersample.clamp(1, 4) as f64;
+                let up = Affine2::scale(k, k);
+                let (mut node, mut grown, spec) = self.text(item, variant, &ctx, raster * k, up.map_rect(bounds));
+                if k > 1.0 {
+                    let down = Affine2::scale(1.0 / k, 1.0 / k);
+                    grown = down.map_rect(grown);
+                    node = self.b.add(NodeOp::Transform { matrix: down }, vec![node], grown, false);
+                }
                 text_layout = Some((spec, raster));
                 bounds = grown;
                 node

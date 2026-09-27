@@ -209,7 +209,7 @@ struct Slot {
 }
 
 /// Enough for the lookahead queue, the frame on screen and a few in flight on the GPU.
-const MAX_SLOTS: usize = crate::source::LOOKAHEAD + 6;
+const MAX_SLOTS: usize = crate::source::LOOKAHEAD + 6 + crate::source::REVERSE_CHUNK;
 
 pub struct MfDecoder {
     bridge: Arc<D3D11Bridge>,
@@ -328,6 +328,7 @@ impl VideoDecoder for MfDecoder {
         Ok(Surface {
             texture: slot.wgpu.clone(),
             chroma: None,
+            alpha: None,
             coded_size: coded,
             visible_size: self.visible,
             rotation_quarter_turns: self.rotation,

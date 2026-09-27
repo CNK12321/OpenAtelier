@@ -18,7 +18,6 @@ use oa_doc::EffectRole;
 use oa_graph::registry::{EffectDescriptor, EffectKind, EffectUsage};
 use oa_params::{Evaluated, ParamSchema, ParamSet, Value};
 use oa_script::{Env, Frame, NoHost, Section};
-use std::f32::consts::PI;
 use std::sync::{Arc, OnceLock, RwLock};
 
 /// Where a sound effect is offered, like a picture effect's usage: over the whole clip,
@@ -222,72 +221,6 @@ pub(crate) fn processor(type_id: &str, channels: usize, rate: f32) -> Option<Box
     Some(Box::new(ShaderProcessor::new(program, channels, rate)))
 }
 
-// ---- keeping a sped-up clip's pitch ----
-
-/// Two crossfaded taps sweeping through a delay line: reading slower or faster than
-/// it's written changes the pitch. (Pitch Shift does the same in its sound shader; this
-/// one is the mixer's own, for a clip whose speed changed but whose pitch shouldn't.)
-struct PitchShift {
-    ch: usize,
-    line: Vec<f32>,
-    len: usize,
-    write: usize,
-    /// Delay of the first tap, in frames (the second is half a window behind).
-    delay: f32,
-    window: f32,
-}
-
-impl PitchShift {
-    fn new(ch: usize, rate: f32) -> Self {
-        let window = (rate * 0.06).round();
-        let len = (window as usize) * 2 + 4;
-        PitchShift { ch, line: vec![0.0; len * ch], len, write: 0, delay: 0.0, window }
-    }
-
-    fn tap(&self, c: usize, delay: f32) -> f32 {
-        let pos = self.write as f32 - 1.0 - delay;
-        let pos = pos.rem_euclid(self.len as f32);
-        let i = pos.floor() as usize % self.len;
-        let j = (i + 1) % self.len;
-        let f = pos - pos.floor();
-        self.line[i * self.ch + c] * (1.0 - f) + self.line[j * self.ch + c] * f
-    }
-}
-
-impl Processor for PitchShift {
-    fn process(&mut self, buf: &mut [f32], v: &Evaluated, _clock: &ClockSpan) {
-        let ratio = 2f32.powf(v.float("semitones") as f32 / 12.0);
-        let mix = v.float("mix").clamp(0.0, 1.0) as f32;
-        let w = self.window;
-        for frame in buf.chunks_exact_mut(self.ch) {
-            for (c, x) in frame.iter().enumerate() {
-                self.line[self.write * self.ch + c] = *x;
-            }
-            self.write = (self.write + 1) % self.len;
-            // The taps jump back a window when they run out, each faded out as it does.
-            self.delay = (self.delay + 1.0 - ratio).rem_euclid(w);
-            let d2 = (self.delay + w / 2.0).rem_euclid(w);
-            let g1 = (PI * self.delay / w).sin().powi(2);
-            let g2 = (PI * d2 / w).sin().powi(2);
-            for (c, x) in frame.iter_mut().enumerate() {
-                let wet = self.tap(c, self.delay) * g1 + self.tap(c, d2) * g2;
-                *x = *x * (1.0 - mix) + wet * mix;
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        self.line.fill(0.0);
-        self.delay = 0.0;
-    }
-}
-
-/// The plain pitch shifter: for keeping a sped-up clip's pitch, which runs outside any
-/// effect chain.
-pub(crate) fn plain_pitch(ch: usize, rate: f32) -> Box<dyn Processor> {
-    Box::new(PitchShift::new(ch.max(1), rate))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,7 +246,7 @@ mod tests {
     }
 
     fn sine(freq: f32, secs: f32, amp: f32) -> Vec<f32> {
-        (0..(RATE * secs) as usize).map(|i| amp * (2.0 * PI * freq * i as f32 / RATE).sin()).collect()
+        (0..(RATE * secs) as usize).map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / RATE).sin()).collect()
     }
 
     fn rms(x: &[f32]) -> f32 {

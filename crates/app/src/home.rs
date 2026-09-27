@@ -63,6 +63,8 @@ struct Card {
     /// The folder it came from (empty for the built-in one).
     where_: String,
     enabled: bool,
+    /// It carries scripts (not built in): whether they're allowed.
+    scripts: Option<bool>,
 }
 
 /// "3 min ago" for a file's last change.
@@ -298,19 +300,30 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
         .on_hover_text(t("home.language_hint"));
     }
 
-    /// The picture saved beside a project, loaded once and kept.
+    /// The picture saved beside a project, loaded once and kept. It's read and decoded on
+    /// a thread of its own (a start page of big PNGs would otherwise hitch as it opens);
+    /// `None` until it's in, or if there's none.
     fn project_thumb(&mut self, ctx: &egui::Context, r: &crate::settings::RecentProject) -> Option<egui::TextureHandle> {
         let path = r.thumb.clone().unwrap_or_else(|| crate::thumbnail::path_for(&r.path));
         let key = path.to_string_lossy().to_string();
-        if let Some(found) = self.project_thumbs.get(&key) {
-            return found.clone();
-        }
-        let loaded = load_png(&path).map(|(size, pixels)| {
-            let image = egui::ColorImage { size, pixels, source_size: egui::vec2(size[0] as f32, size[1] as f32) };
-            ctx.load_texture(format!("project-{key}"), image, egui::TextureOptions::LINEAR)
+        let slot = self.project_thumbs.entry(key.clone()).or_insert_with(|| {
+            let slot = std::sync::Arc::new(std::sync::OnceLock::new());
+            let (fill, ctx) = (slot.clone(), ctx.clone());
+            let spawned = std::thread::Builder::new().name("oa-project-picture".into()).spawn(move || {
+                // egui takes textures from any thread; it uploads them with the next frame.
+                let loaded = load_png(&path).map(|(size, pixels)| {
+                    let image = egui::ColorImage { size, pixels, source_size: egui::vec2(size[0] as f32, size[1] as f32) };
+                    ctx.load_texture(format!("project-{key}"), image, egui::TextureOptions::LINEAR)
+                });
+                let _ = fill.set(loaded);
+                ctx.request_repaint();
+            });
+            if spawned.is_err() {
+                let _ = slot.set(None);
+            }
+            slot
         });
-        self.project_thumbs.insert(key, loaded.clone());
-        loaded
+        slot.get().cloned().flatten()
     }
 
     /// Work an earlier session autosaved but never saved, with what can be done with it.
@@ -457,6 +470,7 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
                 builtin: p.builtin,
                 where_: p.path.as_ref().and_then(|p| p.parent()).map(|p| p.display().to_string()).unwrap_or_default(),
                 enabled: self.plugins.is_enabled(&p.id),
+                scripts: (!p.builtin && p.has_scripts()).then(|| crate::plugins::Plugins::scripts_allowed(p, &self.settings.trusted_scripts)),
             })
             .collect();
         for card in cards {
@@ -476,7 +490,9 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
                         let text_width = ui.available_width() - 52.0;
                         ui.allocate_ui_with_layout(egui::vec2(text_width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(egui::RichText::new(&card.name).size(crate::style::TEXT_L).strong());
+                                if ui.add(egui::Button::new(egui::RichText::new(&card.name).size(crate::style::TEXT_L).strong()).frame(false)).on_hover_text("Open it: its effects, with previews").clicked() {
+                                    self.plugin_previews.open = Some(card.id.clone());
+                                }
                                 crate::widgets::pill(ui, &format!("v{}", card.version), ui.visuals().weak_text_color());
                                 if card.builtin {
                                     crate::widgets::pill(ui, t("plugins.builtin"), crate::style::ACCENT);
@@ -496,7 +512,10 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
                             ui.horizontal_wrapped(|ui| {
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                                 crate::icons::paint(ui.painter(), r, crate::icons::EFFECTS, ui.visuals().weak_text_color());
-                                ui.label(egui::RichText::new(&card.summary).small().weak());
+                                // Opens the plugin's window: what it is, and its effects with previews.
+                                if ui.add(egui::Button::new(egui::RichText::new(format!("{} ▸", card.summary)).small()).frame(false)).on_hover_text("Open it: its effects, with previews").clicked() {
+                                    self.plugin_previews.open = Some(card.id.clone());
+                                }
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                                 crate::icons::paint(ui.painter(), r, crate::icons::FOLDER, ui.visuals().weak_text_color());
                                 let source = if card.builtin { t("plugins.built_in_source").to_string() } else { card.where_.clone() };
@@ -504,6 +523,26 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
                             });
                             if !card.enabled {
                                 ui.label(egui::RichText::new(t("plugins.off_note")).small().weak());
+                            }
+                            // Scripts: nothing of them runs until allowed (plugin_scripts.rs).
+                            match card.scripts {
+                                Some(false) => {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new("⚠ Carries scripts — none run until you allow them").small().color(crate::style::WARNING));
+                                        if ui.small_button("Review and allow…").clicked() {
+                                            self.ask_script_consent(&card.id);
+                                        }
+                                    });
+                                }
+                                Some(true) => {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new("Scripts allowed").small().weak());
+                                        if ui.small_button("Stop allowing").on_hover_text("Its scripts stop at once; it asks again next time").clicked() {
+                                            self.revoke_scripts(&card.id);
+                                        }
+                                    });
+                                }
+                                None => {}
                             }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -516,6 +555,9 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
                 });
             ui.add_space(crate::style::GAP);
         }
+        // A plugin opened: its window over the page.
+        let ctx = ui.ctx().clone();
+        self.plugin_window(&ctx);
     }
 }
 

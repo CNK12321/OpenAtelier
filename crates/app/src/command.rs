@@ -87,10 +87,8 @@ impl App {
                     a.open_paths(&files);
                 }
             }),
-            cmd("project.export", "Export…", Group::Project, "", Some(icons::EXPORT), self.export.is_none(), false, |a| a.start_export()),
-            cmd("project.home", "Home: projects and plugins", Group::Project, "", Some(icons::HOME), true, false, |a| {
-                a.screen = crate::home::Screen::Home;
-            }),
+            cmd("project.export", "Export…", Group::Project, "", Some(icons::EXPORT), true, false, |a| a.start_export()),
+            cmd("project.home", "Home: projects and plugins", Group::Project, "", Some(icons::HOME), true, false, |a| a.go_home()),
             // ---- edit ----
             cmd("edit.undo", "Undo", Group::Edit, "Ctrl+Z", Some(icons::UNDO), self.editor.doc.undo_label().is_some(), false, |a| a.undo()),
             cmd("edit.redo", "Redo", Group::Edit, "Ctrl+Shift+Z", Some(icons::REDO), self.editor.doc.redo_label().is_some(), false, |a| a.redo()),

@@ -90,6 +90,11 @@ fn sample_input_clamped(pos: vec2f) -> vec4f {
     return textureSampleLevel(input_tex, input_samp, uv, 0.0);
 }
 
+// For UV warps: a position kept on the input (so edges repeat outward), and one that
+// reads as transparent.
+fn clamp_to_input(pos: vec2f) -> vec2f { return clamp(pos, in_origin(), in_origin() + in_size()); }
+fn outside_input() -> vec2f { return vec2f(-1e9); }
+
 fn srgb_encode(c: vec3f) -> vec3f {
     let lo = c * 12.92;
     let hi = 1.055 * pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.4)) - 0.055;
@@ -123,11 +128,29 @@ fn fs_main() -> @location(0) vec4f {{
 /// The layer shader. `over_white` makes it hand the blend its premultiplied color laid
 /// over white (for Darken, a minimum, where transparent must mean "no change" rather than
 /// black).
+///
+/// Edges are anti-aliased: the quad is drawn one output pixel larger all round, and each
+/// pixel is weighted by how much of it the image covers (its distance inside the
+/// image's edge, in output pixels, + ½) — so a rotated or sub-pixel-placed layer has
+/// smooth edges instead of the rasterizer's stair steps. An unrotated layer on whole
+/// pixels comes out exactly as before (inside pixels are ≥ ½ px in: fully covered).
 pub fn layer(over_white: bool) -> String {
-    let out = if over_white { "let c = textureSampleLevel(input_tex, input_samp, v.uv, 0.0) * u(14u);\n    return vec4f(c.rgb + vec3f(1.0 - c.a), c.a);" } else { "return textureSampleLevel(input_tex, input_samp, v.uv, 0.0) * u(14u);" };
+    layer_reading(over_white, "textureSampleLevel(input_tex, input_samp, uv, 0.0)", "")
+}
+
+/// The layer shader reading its picture with `read` (an expression of `uv`, 0..1 across
+/// the image), with `extra` WGSL functions alongside.
+fn layer_reading(over_white: bool, read: &str, extra: &str) -> String {
+    let out = if over_white { format!("let c = {read} * (u(14u) * cover);\n    return vec4f(c.rgb + vec3f(1.0 - c.a), c.a);") } else { format!("return {read} * (u(14u) * cover);") };
     format!(
         "{PRELUDE}
+{extra}
 struct VOut {{ @builtin(position) pos: vec4f, @location(0) uv: vec2f }}
+
+// Output px per input px along the image's x and y (the affine's columns).
+fn layer_scale() -> vec2f {{
+    return vec2f(length(vec2f(u(8u), u(9u))), length(vec2f(u(10u), u(11u))));
+}}
 
 @vertex
 fn vs_layer(@builtin(vertex_index) i: u32) -> VOut {{
@@ -136,15 +159,21 @@ fn vs_layer(@builtin(vertex_index) i: u32) -> VOut {{
         vec2f(1.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0),
     );
     let c = corners[i];
-    let p = in_origin() + c * in_size();
+    // One output pixel of room outside the image for the edge's fade.
+    let pad = 1.0 / max(layer_scale(), vec2f(1e-4));
+    let p = in_origin() + c * in_size() + (c * 2.0 - 1.0) * pad;
     let x = u(8u) * p.x + u(10u) * p.y + u(12u);
     let y = u(9u) * p.x + u(11u) * p.y + u(13u);
     let ndc = vec2f(x / out_size().x * 2.0 - 1.0, 1.0 - y / out_size().y * 2.0);
-    return VOut(vec4f(ndc, 0.0, 1.0), c);
+    return VOut(vec4f(ndc, 0.0, 1.0), (p - in_origin()) / in_size());
 }}
 
 @fragment
 fn fs_layer(v: VOut) -> @location(0) vec4f {{
+    // How far inside the nearest edge this pixel's center is, in output pixels.
+    let inside = min(v.uv, vec2f(1.0) - v.uv) * in_size() * layer_scale();
+    let cover = clamp(min(inside.x, inside.y) + 0.5, 0.0, 1.0);
+    let uv = clamp(v.uv, vec2f(0.0), vec2f(1.0));
     {out}
 }}"
     )
@@ -275,6 +304,57 @@ fn fs_main(@builtin(position) fc: vec4f) -> @location(0) vec4f {
     }
     s.push_str("    return vec4f(c.rgb * c.a, c.a);\n}\n");
     s
+}
+
+/// The warp functions of `chain` (innermost first, each with its number of uniform
+/// floats, params from `PARAM_BASE` on) and a function carrying a position back through
+/// all of them, outermost first: `oa_warp_back(pos) -> vec2f`, the input position that
+/// ends up at `pos`.
+fn warp_back(chain: &[(&EffectShader, usize)]) -> String {
+    let mut s = String::new();
+    let mut seen = Vec::new();
+    for (shader, _) in chain {
+        if !seen.contains(&shader.entry.as_str()) {
+            seen.push(&shader.entry);
+            s.push_str(&shader.source);
+            s.push('\n');
+        }
+    }
+    let mut bases = Vec::with_capacity(chain.len());
+    let mut base = PARAM_BASE;
+    for (_, len) in chain {
+        bases.push(base);
+        base += len;
+    }
+    s.push_str("fn oa_warp_back(pos: vec2f) -> vec2f {\n    var p = pos;\n");
+    for ((shader, len), base) in chain.iter().zip(&bases).rev() {
+        let clock = base + len.saturating_sub(CLOCK_SLOTS);
+        let _ = writeln!(s, "    oa_set_clock({clock}u);\n    p = {}(p, {base}u);", shader.entry);
+    }
+    s.push_str("    return p;\n}\n");
+    s
+}
+
+/// A pass of UV warps (one, or several fused): each output pixel reads the input once,
+/// where the warps carry it back to.
+pub fn uv_warp_chain(chain: &[(&EffectShader, usize)]) -> String {
+    format!(
+        "{PRELUDE}
+{}
+@fragment
+fn fs_main(@builtin(position) fc: vec4f) -> @location(0) vec4f {{
+    oa_pos = out_origin() + fc.xy;
+    return sample_input(oa_warp_back(oa_pos));
+}}",
+        warp_back(chain)
+    )
+}
+
+/// The layer shader ([`layer`]) with UV warps drawn in: the layer's pixel is carried back
+/// through `chain` before the (unwarped) picture is read — the warp and the placement
+/// in one resample.
+pub fn layer_warped(chain: &[(&EffectShader, usize)], over_white: bool) -> String {
+    layer_reading(over_white, "sample_input(oa_warp_back(in_origin() + uv * in_size()))", &warp_back(chain))
 }
 
 /// A neighborhood effect pass (spatial or UV warp) with `len` uniform floats. With

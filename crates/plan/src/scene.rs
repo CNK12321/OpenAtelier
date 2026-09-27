@@ -188,9 +188,59 @@ pub fn layers_at(project: &Project, seq: SeqId, variant: &FormatVariant, t: Time
 /// The topmost visible layer under canvas point `p` at `t`: what a click in the viewer
 /// selects. Fully transparent layers are skipped so they don't block what's beneath.
 pub fn hit_test(project: &Project, seq: SeqId, variant: &FormatVariant, t: Time, p: [f64; 2]) -> Option<ItemId> {
-    layers_at(project, seq, variant, t)
-        .into_iter()
-        .rev()
-        .find(|l| l.opacity > 0.0 && l.contains(p))
-        .map(|l| l.item)
+    hits(project, seq, variant, t, p).into_iter().next()
+}
+
+/// Every visible layer whose picture is under canvas point `p` at `t`, topmost first. A
+/// title counts only on its letters (with a little room around each), not its whole box
+/// — the gaps between words and the empty ends of short lines fall through to what's
+/// beneath; other layers by their (cropped) rectangle.
+pub fn hits(project: &Project, seq: SeqId, variant: &FormatVariant, t: Time, p: [f64; 2]) -> Vec<ItemId> {
+    let Some(s) = project.sequence(seq) else { return Vec::new() };
+    let mut under: Vec<ItemId> = s
+        .tracks
+        .iter()
+        .filter(|tr| tr.enabled && tr.kind == TrackKind::Video)
+        .filter_map(|tr| {
+            let item = tr.item_at(t).filter(|i| i.enabled)?;
+            let l = placement(project, tr.id, item, variant, t).ok()?;
+            (l.opacity > 0.0 && l.contains(p) && on_letters(item, &l, variant, t, p)).then_some(item.id)
+        })
+        .collect();
+    under.reverse();
+    under
+}
+
+/// The title a double-click at `p` opens for typing: the topmost title whose box `p` is
+/// in — the gaps between its letters and words count here, unlike [`hits`] — unless a
+/// layer above it is under `p` first.
+pub fn title_at(project: &Project, seq: SeqId, variant: &FormatVariant, t: Time, p: [f64; 2]) -> Option<ItemId> {
+    let s = project.sequence(seq)?;
+    for tr in s.tracks.iter().rev().filter(|tr| tr.enabled && tr.kind == TrackKind::Video) {
+        let Some(item) = tr.item_at(t).filter(|i| i.enabled) else { continue };
+        let Ok(l) = placement(project, tr.id, item, variant, t) else { continue };
+        if l.opacity <= 0.0 || !l.contains(p) {
+            continue;
+        }
+        return (item.kind == ItemKind::Text).then_some(item.id);
+    }
+    None
+}
+
+/// For a title: is `p` on (or within a fifth of an em of) one of its letters? Other
+/// layers, and a title with no letters yet, always.
+fn on_letters(item: &Item, l: &Placement, variant: &FormatVariant, t: Time, p: [f64; 2]) -> bool {
+    if item.kind != ItemKind::Text {
+        return true;
+    }
+    let values = item.params.eval(schema::text(), variant.overrides.get(&item.id), &item.eval_context(t));
+    let layout = oa_text::layout(&text_spec(&values));
+    let Some([x, y]) = l.to_layer(p) else { return false };
+    let room = layout.em * 0.2;
+    // (A glyph's ink box can come with its y edges either way round.)
+    let near = |g: &oa_text::PlacedGlyph| {
+        let (y0, y1) = (g.ink[1].min(g.ink[3]), g.ink[1].max(g.ink[3]));
+        x >= g.ink[0] - room && x <= g.ink[2] + room && y >= y0 - room && y <= y1 + room
+    };
+    layout.glyphs.is_empty() || layout.glyphs.iter().any(near)
 }

@@ -12,6 +12,7 @@ mod engine;
 mod ffmpeg;
 mod recorder;
 mod ring;
+mod stretch;
 mod timeline;
 
 pub use engine::AudioEngine;

@@ -30,6 +30,26 @@ impl Surface {
         p.to_canvas.apply([u * p.native[0], v * p.native[1]])
     }
 
+    /// Is `q` (fractions of the layer) on the warped picture — inside one of the mesh's
+    /// cells (each split into two triangles)?
+    pub fn covers(&self, q: [f64; 2]) -> bool {
+        let n = self.n;
+        let at = |r: usize, c: usize| self.points[r * n + c];
+        let in_triangle = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+            let side = |p: [f64; 2], q2: [f64; 2], r: [f64; 2]| (q2[0] - p[0]) * (r[1] - p[1]) - (q2[1] - p[1]) * (r[0] - p[0]);
+            let (d1, d2, d3) = (side(a, b, q), side(b, c, q), side(c, a, q));
+            let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+            let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+            !(neg && pos)
+        };
+        (0..n.saturating_sub(1)).any(|r| {
+            (0..n - 1).any(|c| {
+                let (a, b, d, e) = (at(r, c), at(r, c + 1), at(r + 1, c + 1), at(r + 1, c));
+                in_triangle(a, b, d) || in_triangle(a, d, e)
+            })
+        })
+    }
+
     /// The point nearest `pointer` (screen), if one is within reach.
     pub fn point_near(&self, p: &Placement, to_screen: &dyn Fn([f64; 2]) -> egui::Pos2, pointer: egui::Pos2) -> Option<usize> {
         (0..self.points.len())
@@ -101,5 +121,24 @@ impl App {
             let big = hovered == Some(i) || dragged == Some(i);
             painter.circle(at(i), if big { 6.5 } else { 5.0 }, egui::Color32::WHITE, egui::Stroke::new(1.5, accent));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Surface;
+    use oa_doc::EffectId;
+
+    /// A 2×2 surface pulled into a narrow diamond: inside it is hit, the corners of the
+    /// layer it no longer covers aren't.
+    #[test]
+    fn a_warped_surface_is_hit_where_the_picture_is() {
+        let s = Surface { effect: EffectId(1), n: 2, points: vec![[0.5, 0.0], [1.0, 0.5], [0.0, 0.5], [0.5, 1.0]] };
+        assert!(s.covers([0.5, 0.5]));
+        assert!(s.covers([0.6, 0.3]));
+        assert!(!s.covers([0.05, 0.05]), "the layer's corner, outside the diamond");
+        assert!(!s.covers([0.95, 0.95]));
+        let rest = Surface { effect: EffectId(1), n: 3, points: (0..9).map(|i| [(i % 3) as f64 / 2.0, (i / 3) as f64 / 2.0]).collect() };
+        assert!(rest.covers([0.01, 0.99]) && !rest.covers([1.2, 0.5]));
     }
 }

@@ -212,6 +212,185 @@ impl PassScript {
     }
 }
 
+// ---- overlays ----
+
+const OVERLAY_READS: [&str; 10] = ["canvas_w", "canvas_h", "seconds", "duration", "playing", "selected", "sel_x0", "sel_y0", "sel_x1", "sel_y1"];
+const COLOR: u16 = 0;
+const LINE: u16 = 1;
+const RECT: u16 = 2;
+const FILL: u16 = 3;
+const CIRCLE: u16 = 4;
+const GRID: u16 = 5;
+const DOT: u16 = 6;
+const V: Arg = Arg::Value;
+const OVERLAY_FUNCTIONS: &[Function] = &[
+    Function { name: "color", args: &[V, V, V, V], id: COLOR, pure: false, statement: true, intrinsic: Intrinsic::Call },
+    Function { name: "line", args: &[V, V, V, V, V], id: LINE, pure: false, statement: true, intrinsic: Intrinsic::Call },
+    Function { name: "rect", args: &[V, V, V, V, V], id: RECT, pure: false, statement: true, intrinsic: Intrinsic::Call },
+    Function { name: "fill", args: &[V, V, V, V], id: FILL, pure: false, statement: true, intrinsic: Intrinsic::Call },
+    Function { name: "circle", args: &[V, V, V, V], id: CIRCLE, pure: false, statement: true, intrinsic: Intrinsic::Call },
+    Function { name: "grid", args: &[V, V, V, V, V, V, V], id: GRID, pure: false, statement: true, intrinsic: Intrinsic::Call },
+    Function { name: "dot", args: &[V, V, V], id: DOT, pure: false, statement: true, intrinsic: Intrinsic::Call },
+];
+
+/// Most shapes one overlay may draw in a frame (a `grid` counts its lines).
+pub const OVERLAY_MAX_SHAPES: usize = 512;
+
+/// A shape an overlay draws over the viewer, in canvas px, straight RGBA color.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OverlayShape {
+    Line { from: [f32; 2], to: [f32; 2], width: f32, color: [f32; 4] },
+    /// Outlined (`width` > 0) or filled (`width` = 0).
+    Rect { min: [f32; 2], max: [f32; 2], width: f32, color: [f32; 4] },
+    /// Outlined (`width` > 0) or filled (`width` = 0).
+    Circle { center: [f32; 2], radius: f32, width: f32, color: [f32; 4] },
+}
+
+/// What an overlay sees of the editor this frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OverlayInput {
+    pub canvas: [f64; 2],
+    pub seconds: f64,
+    pub duration: f64,
+    pub playing: bool,
+    /// The selected clip's box on the canvas (x0, y0, x1, y1), if one is showing.
+    pub selected: Option<[f64; 4]>,
+}
+
+struct OverlayHost {
+    color: [f32; 4],
+    shapes: Vec<OverlayShape>,
+}
+
+impl OverlayHost {
+    fn push(&mut self, shape: OverlayShape) {
+        if self.shapes.len() < OVERLAY_MAX_SHAPES {
+            self.shapes.push(shape);
+        }
+    }
+}
+
+impl Host for OverlayHost {
+    fn call(&mut self, id: u16, _site: u32, a: &[f32]) -> f32 {
+        if a.iter().any(|x| !x.is_finite()) {
+            return 0.0;
+        }
+        let color = self.color;
+        match id {
+            COLOR => self.color = [a[0], a[1], a[2], a[3]].map(|c| c.clamp(0.0, 1.0)),
+            LINE => self.push(OverlayShape::Line { from: [a[0], a[1]], to: [a[2], a[3]], width: a[4].clamp(0.0, 64.0), color }),
+            RECT => self.push(OverlayShape::Rect { min: [a[0].min(a[2]), a[1].min(a[3])], max: [a[0].max(a[2]), a[1].max(a[3])], width: a[4].clamp(0.0, 64.0).max(0.5), color }),
+            FILL => self.push(OverlayShape::Rect { min: [a[0].min(a[2]), a[1].min(a[3])], max: [a[0].max(a[2]), a[1].max(a[3])], width: 0.0, color }),
+            CIRCLE => self.push(OverlayShape::Circle { center: [a[0], a[1]], radius: a[2].abs(), width: a[3].clamp(0.0, 64.0), color }),
+            DOT => self.push(OverlayShape::Circle { center: [a[0], a[1]], radius: a[2].abs(), width: 0.0, color }),
+            // grid(x0, y0, x1, y1, columns, rows, width): the lines between cells.
+            GRID => {
+                let (x0, y0, x1, y1) = (a[0], a[1], a[2], a[3]);
+                let (cols, rows) = (a[4].clamp(1.0, 64.0) as u32, a[5].clamp(1.0, 64.0) as u32);
+                let width = a[6].clamp(0.0, 64.0);
+                for i in 1..cols {
+                    let x = x0 + (x1 - x0) * i as f32 / cols as f32;
+                    self.push(OverlayShape::Line { from: [x, y0], to: [x, y1], width, color });
+                }
+                for j in 1..rows {
+                    let y = y0 + (y1 - y0) * j as f32 / rows as f32;
+                    self.push(OverlayShape::Line { from: [x0, y], to: [x1, y], width, color });
+                }
+            }
+            _ => {}
+        }
+        0.0
+    }
+}
+
+/// A plugin's overlay: drawn over the viewer each frame (guides, grids, safe areas, a
+/// frame counter's marks…). Reads `canvas_w`/`canvas_h` (px), `seconds` (the playhead),
+/// `duration`, `playing`, and the selected clip's box (`selected` 0/1, `sel_x0`…`sel_y1`
+/// in canvas px); draws with `color(r, g, b, a)`, then `line(x0, y0, x1, y1, width)`,
+/// `rect(x0, y0, x1, y1, width)`, `fill(x0, y0, x1, y1)`, `circle(x, y, radius, width)`,
+/// `dot(x, y, radius)` and `grid(x0, y0, x1, y1, columns, rows, width)`. It can only
+/// draw: it never sees or changes the project's contents.
+#[derive(Debug)]
+pub struct OverlayScript(Script);
+
+impl OverlayScript {
+    pub fn compile(source: &str, params: &[ParamSchema]) -> Result<Self, String> {
+        let env = Env { reads: &OVERLAY_READS, writes: &[], params, functions: OVERLAY_FUNCTIONS, ..Env::default() };
+        Script::compile(source, env).map(OverlayScript)
+    }
+
+    pub fn draw(&self, values: &Evaluated, i: &OverlayInput) -> Vec<OverlayShape> {
+        let s = &self.0;
+        let mut regs = vec![0.0; s.frame.registers];
+        let sel = i.selected.unwrap_or_default();
+        let reads = [i.canvas[0], i.canvas[1], i.seconds, i.duration, i.playing as u8 as f64, i.selected.is_some() as u8 as f64, sel[0], sel[1], sel[2], sel[3]];
+        for (r, v) in regs.iter_mut().zip(reads) {
+            *r = v as f32;
+        }
+        s.frame.load_params(&mut regs, &s.params, values);
+        let mut host = OverlayHost { color: [1.0, 1.0, 1.0, 1.0], shapes: Vec::new() };
+        s.run(&mut regs, &mut host);
+        host.shapes
+    }
+}
+
+// ---- actions ----
+
+const ACTION_READS: [&str; 5] = ["index", "count", "playhead", "canvas_w", "canvas_h"];
+/// What an action may change on each clip (and reads first: it starts as the clip's own).
+pub const ACTION_WRITES: [&str; 8] = ["start", "duration", "position_x", "position_y", "scale", "rotation", "opacity", "volume_db"];
+
+/// One clip as an action sees it (and what it hands back, changed or not).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ActionClip {
+    pub start: f64,
+    pub duration: f64,
+    pub position: [f64; 2],
+    pub scale: f64,
+    pub rotation: f64,
+    pub opacity: f64,
+    pub volume_db: f64,
+}
+
+/// A plugin's action: run on demand over the selected clips, each in turn (`index` of
+/// `count`, in timeline order), with `playhead` and `canvas_w`/`canvas_h`. It reads and
+/// may set `start`, `duration` (seconds), `position_x`/`position_y` (canvas share),
+/// `scale`, `rotation` (degrees), `opacity` and `volume_db`; what it changes is one edit,
+/// undone in one step. `noise(x, stream)` / `jitter(x, stream)` give it randomness.
+#[derive(Debug)]
+pub struct ActionScript(Script);
+
+impl ActionScript {
+    pub fn compile(source: &str, params: &[ParamSchema]) -> Result<Self, String> {
+        let env = Env { reads: &ACTION_READS, writes: &ACTION_WRITES, params, functions: MOTION_FUNCTIONS, ..Env::default() };
+        Script::compile(source, env).map(ActionScript)
+    }
+
+    /// Clip `index` of `count`, changed (non-finite results keep the clip's own value).
+    pub fn apply(&self, values: &Evaluated, clip: ActionClip, index: usize, count: usize, playhead: f64, canvas: [f64; 2]) -> ActionClip {
+        let s = &self.0;
+        let mut regs = vec![0.0; s.frame.registers];
+        let reads = [index as f64, count as f64, playhead, canvas[0], canvas[1]];
+        let own = [clip.start, clip.duration, clip.position[0], clip.position[1], clip.scale, clip.rotation, clip.opacity, clip.volume_db];
+        for (r, v) in regs.iter_mut().zip(reads.iter().chain(&own)) {
+            *r = *v as f32;
+        }
+        s.frame.load_params(&mut regs, &s.params, values);
+        s.run(&mut regs, &mut MotionHost { seed: 0x0A7_1015 });
+        let n = ACTION_READS.len();
+        let get = |k: usize| if regs[n + k].is_finite() { regs[n + k] as f64 } else { own[k] };
+        ActionClip {
+            start: get(0).max(0.0),
+            duration: get(1).max(1e-3),
+            position: [get(2), get(3)],
+            scale: get(4),
+            rotation: get(5),
+            opacity: get(6).clamp(0.0, 1.0),
+            volume_db: get(7).clamp(-60.0, 24.0),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

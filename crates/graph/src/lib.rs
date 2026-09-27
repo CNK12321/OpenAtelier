@@ -12,10 +12,11 @@ mod geom;
 mod optimize;
 pub mod plugin;
 pub mod registry;
+pub mod roi;
 pub mod script;
 
 pub use geom::{Affine2, Rect};
-pub use optimize::{optimize, OptLevel};
+pub use optimize::{optimize, same_area, OptLevel};
 pub use registry::{EffectKind, EffectShader, Statefulness, WorkingSpace};
 
 use oa_time::Time;
@@ -28,6 +29,19 @@ pub struct NodeId(pub u32);
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey(pub u128);
+
+impl CacheKey {
+    /// The key of just `region` of this node's output (see [`roi`]): a different image
+    /// from the whole, so a different key.
+    pub fn within(self, region: Rect) -> CacheKey {
+        let mut h = Xxh3::new();
+        h.update(&self.0.to_le_bytes());
+        for v in [region.x0, region.y0, region.x1, region.y1] {
+            h.update(&v.to_bits().to_le_bytes());
+        }
+        CacheKey(h.digest128())
+    }
+}
 
 impl std::fmt::Debug for CacheKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,6 +126,10 @@ pub enum NodeOp {
     },
     /// Created by the optimizer: several point ops in one shader pass.
     FusedPointOps { space: WorkingSpace, chain: Vec<(Arc<str>, u32, Vec<f32>)>, nearest: bool },
+    /// Created by the optimizer: several UV warps (innermost first) in one pass — each
+    /// output pixel's position is carried back through every warp and the input is read
+    /// once, one resample instead of one per warp.
+    FusedUvWarps { chain: Vec<(Arc<str>, u32, Vec<f32>)>, nearest: bool },
     Transform { matrix: Affine2 },
     /// Inputs are layers, bottom to top, one [`LayerInfo`] each.
     Composite { size: [u32; 2], background: [f32; 4], layers: Vec<LayerInfo> },
@@ -221,6 +239,10 @@ impl Graph {
             NodeOp::FusedPointOps { chain, space, .. } => {
                 let names: Vec<_> = chain.iter().map(|c| &*c.0).collect();
                 format!("FusedPointOps({space:?}) {}", names.join(" → "))
+            }
+            NodeOp::FusedUvWarps { chain, .. } => {
+                let names: Vec<_> = chain.iter().map(|c| &*c.0).collect();
+                format!("FusedUvWarps {}", names.join(" → "))
             }
             NodeOp::Transform { matrix } => {
                 let m = matrix.m.map(|x| (x * 1000.0).round() / 1000.0);
@@ -332,6 +354,15 @@ impl GraphBuilder {
             }
             NodeOp::FusedPointOps { space, chain, nearest } => {
                 h.update(&[3, *space as u8, *nearest as u8]);
+                for (id, version, u) in chain {
+                    text(&mut h, id);
+                    h.update(&version.to_le_bytes());
+                    h.update(&(u.len() as u64).to_le_bytes());
+                    f32s(&mut h, u);
+                }
+            }
+            NodeOp::FusedUvWarps { chain, nearest } => {
+                h.update(&[9, *nearest as u8]);
                 for (id, version, u) in chain {
                     text(&mut h, id);
                     h.update(&version.to_le_bytes());

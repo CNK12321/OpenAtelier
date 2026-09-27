@@ -215,6 +215,51 @@ fn media_foundation_export_matches_too() {
     }
 }
 
+/// An export stopped part way keeps what it wrote, the sound (mixed on its own thread,
+/// possibly further along) cut to the picture, and leaves no temporary files behind.
+#[test]
+fn stopped_export_keeps_its_sound_cut_to_the_picture() {
+    let Some(source_path) = numbered_clip() else { return };
+    let Ok(ctx) = GpuContext::new_headless() else { return };
+    let ctx = Arc::new(ctx);
+    if hardware_source(&ctx).is_err() {
+        return;
+    }
+    let Some(tone) = tone() else { return };
+    let probe = oa_media::probe(&source_path).expect("probe");
+    let (project, seq, _) = project(&source_path, &probe);
+    for (encoder, name) in [(Encoder::Ffmpeg, "stopped_early.mp4"), (Encoder::MediaFoundation, "stopped_early_mf.mp4")] {
+        let dir = std::env::temp_dir().join("oa-media-tests");
+        let out = dir.join(name);
+        let _ = std::fs::remove_file(&out);
+        let mut renderer = Renderer::new(ctx.clone(), RenderOptions { fusion: FusionMode::Blocking, ..Default::default() });
+        let registry = Registry::with_builtins();
+        let mut sources = hardware_source(&ctx).expect("decoder");
+        sources.add(3, &source_path, probe.video.clone().expect("video"));
+        let audio = vec![oa_audio::AudioClip::new(99, 98, tone.clone(), TimeRange::new(Time::ZERO, Time::from_seconds(3)), Time::ZERO)];
+        let options = ExportOptions { codec: VideoCodec::H264, encoder, audio, ..Default::default() };
+        let summary = export(&project, seq, &out, &options, &ctx, &mut renderer, &registry, &mut sources, |frame, _| frame < 30).expect("export");
+        assert_eq!(summary.frames, 30, "{name}");
+        let exported = oa_media::probe(&out).expect("probe export");
+        assert_eq!(exported.video.as_ref().expect("video").index.len(), 30, "{name}");
+        let sound = exported.audio.as_ref().expect("the sound was muxed in");
+        assert_eq!(sound.sample_rate, 48_000);
+        // Media Foundation keeps the sound mixed so far (up to where the mix was stopped);
+        // ffmpeg cuts it to the picture.
+        if encoder == Encoder::Ffmpeg {
+            assert!((exported.duration.as_seconds_f64() - 1.0).abs() < 0.1, "{name}: {:?}", exported.duration);
+        }
+        let stem = out.file_stem().unwrap().to_string_lossy().to_string();
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(&format!("{stem}.export-")))
+            .collect();
+        assert!(leftovers.is_empty(), "{name}: {leftovers:?}");
+    }
+}
+
 /// A part of the timeline, as a GIF: only that part's frames are rendered (starting on
 /// the frame it asks for), and ffmpeg writes a looping GIF at the GIF's own rate.
 #[test]
@@ -306,6 +351,59 @@ fn transparency_survives_export() {
         assert_eq!(alpha(4, 4), 0, "{name}: the corner is see-through");
         assert_eq!(alpha(SIZE[0] / 2, SIZE[1] / 2), 255, "{name}: the clip is opaque");
     }
+
+    // An image sequence: one PNG per frame, numbered from 0, transparency kept.
+    let dir = std::env::temp_dir().join("oa-media-tests").join("png-sequence");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("shot.png");
+    let mut renderer = Renderer::new(ctx.clone(), RenderOptions { fusion: FusionMode::Blocking, ..Default::default() });
+    let registry = Registry::with_builtins();
+    let mut sources = hardware_source(&ctx).expect("decoder");
+    sources.add(3, &source_path, probe.video.clone().expect("video"));
+    let range = Some(TimeRange::new(Time::ZERO, Time::from_seconds_f64(0.5)));
+    let options = ExportOptions { codec: VideoCodec::PngSequence, encoder: Encoder::Ffmpeg, range, ..Default::default() };
+    let summary = export(&project, seq, &out, &options, &ctx, &mut renderer, &registry, &mut sources, |_, _| true).expect("export");
+    let mut files: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    files.sort();
+    assert_eq!(files.len() as u64, summary.frames, "{files:?}");
+    assert_eq!(files.first().map(String::as_str), Some("shot_00000.png"));
+    let rgba = first_rgba(&dir.join("shot_00000.png"));
+    let alpha = |x: u32, y: u32| rgba[((y * SIZE[0] + x) * 4 + 3) as usize];
+    assert_eq!(alpha(4, 4), 0, "the corner is see-through");
+    assert_eq!(alpha(SIZE[0] / 2, SIZE[1] / 2), 255, "the clip is opaque");
+}
+
+/// The sound alone: a WAV written as it's mixed, or encoded by the file's extension —
+/// as long as the timeline, with no picture.
+#[test]
+fn sound_alone_exports() {
+    let Some(source_path) = numbered_clip() else { return };
+    let Some(tone) = tone() else { return };
+    let probe = oa_media::probe(&source_path).expect("probe");
+    let (project, seq, _) = project(&source_path, &probe);
+    let Ok(ctx) = GpuContext::new_headless() else { return };
+    let ctx = Arc::new(ctx);
+    for name in ["sound.wav", "sound.m4a", "sound.flac"] {
+        let out = std::env::temp_dir().join("oa-media-tests").join(name);
+        let _ = std::fs::remove_file(&out);
+        let audio = vec![oa_audio::AudioClip::new(99, 98, tone.clone(), TimeRange::new(Time::ZERO, Time::from_seconds(3)), Time::ZERO)];
+        let options = ExportOptions { codec: VideoCodec::Audio, audio, ..Default::default() };
+        let mut renderer = Renderer::new(ctx.clone(), RenderOptions::default());
+        let mut sources = oa_gpu::TestPatternSource { frames_generated: 0 };
+        let summary = export(&project, seq, &out, &options, &ctx, &mut renderer, &Registry::with_builtins(), &mut sources, |_, _| true).expect(name);
+        assert_eq!(summary.frames, FRAMES as u64, "{name}: progress counts the timeline's frames");
+        assert!((summary.audio_seconds - 3.0).abs() < 0.01, "{name}");
+        let exported = oa_media::probe(&out).expect("probe");
+        assert!(exported.video.is_none(), "{name}: no picture");
+        assert_eq!(exported.audio.as_ref().expect("sound").sample_rate, 48_000, "{name}");
+        assert!((exported.duration.as_seconds_f64() - 3.0).abs() < 0.1, "{name}: {:?}", exported.duration);
+        let leftovers = std::fs::read_dir(out.parent().unwrap()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("sound.export-")).count();
+        assert_eq!(leftovers, 0, "{name}: no temporary files");
+    }
+    // No sound to export is said so, not written as silence.
+    let options = ExportOptions { codec: VideoCodec::Audio, ..Default::default() };
+    assert!(oa_export::Exporter::start(&project, seq, &std::env::temp_dir().join("oa-media-tests").join("none.wav"), &options).is_err());
 }
 
 /// A compound clip as the background texture really draws: a red compound tiled behind

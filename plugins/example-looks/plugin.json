@@ -109,5 +109,27 @@
         "file": "drop.oamotion"
       }
     }
+  ],
+  "scripts": [
+    {
+      "id": "thirds",
+      "name": "Thirds and title-safe (example)",
+      "kind": "overlay",
+      "description": "Rule-of-thirds lines and the 90% title-safe frame, drawn over the viewer.",
+      "params": [
+        { "id": "safe", "type": "float", "default": 0.9, "min": 0.5, "max": 1.0 }
+      ],
+      "script": { "file": "thirds.oaoverlay" }
+    },
+    {
+      "id": "stagger",
+      "name": "Stagger from the playhead (example)",
+      "kind": "action",
+      "description": "Moves the selected clips so each starts a quarter second after the one before, from the playhead.",
+      "params": [
+        { "id": "gap", "type": "float", "default": 0.25, "min": 0.0, "max": 10.0 }
+      ],
+      "script": "start = playhead + index * gap;"
+    }
   ]
 }

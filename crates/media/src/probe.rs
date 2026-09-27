@@ -207,6 +207,9 @@ fn run(args: &[&str], path: &Path) -> Result<Probe, MediaError> {
 }
 
 pub fn probe(path: &Path) -> Result<MediaProbe, MediaError> {
+    if crate::svg::is_svg(path) {
+        return crate::svg::probe(path);
+    }
     let all = run(
         &[
             "-show_entries",

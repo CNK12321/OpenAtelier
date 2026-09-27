@@ -163,6 +163,34 @@ fn moving_the_anchor_leaves_the_picture_still() {
     assert!(close(after.pivot, to, 1e-6), "the pivot is where it was dropped");
 }
 
+/// On a layer that turns and grows over time (and moves), moving the anchor leaves the
+/// picture where it was at every key — not just at the playhead.
+#[test]
+fn moving_the_anchor_of_an_animated_layer_keeps_every_key_still() {
+    let mut doc = doc_with(&[(V1, 10, STILL, 0.0, 5.0, 0.0)]);
+    let keys = |a: Value, b: Value| ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, vec![Keyframe::linear(secs(0.5), a), Keyframe::linear(secs(4.0), b)]));
+    let set = |param: &str, source: ParamSource| Op::SetParam { seq: SEQ, item: ItemId(10), target: ParamTarget::Item, param: param.into(), source: Some(source) };
+    doc.edit(
+        "anim",
+        vec![
+            set(schema::ROTATION, keys(Value::Float(0.0), Value::Float(90.0))),
+            set(schema::SCALE, keys(Value::Vec2([1.0, 1.0]), Value::Vec2([2.0, 2.0]))),
+            set(schema::POSITION, keys(Value::Vec2([0.0, 0.0]), Value::Vec2([0.1, -0.05]))),
+        ],
+    )
+    .unwrap();
+    let times = [secs(0.5), secs(2.0), secs(4.0)];
+    let before: Vec<_> = times.iter().map(|t| placement(&doc, 10, WIDE, *t).corners()).collect();
+    let grab = placement(&doc, 10, WIDE, secs(2.0)).pivot;
+    drag(&mut doc, 10, WIDE, secs(2.0), Handle::Anchor, grab, [grab[0] + 60.0, grab[1] - 25.0], Modifiers { step: true, ..Default::default() }, Scope::AllFormats);
+    for (t, was) in times.iter().zip(&before) {
+        let now = placement(&doc, 10, WIDE, *t).corners();
+        for (a, b) in was.iter().zip(now) {
+            assert!(close(*a, b, 1e-6), "at {t:?}: {a:?} moved to {b:?}");
+        }
+    }
+}
+
 #[test]
 fn animated_properties_get_a_key_at_the_playhead() {
     let mut doc = doc_with(&[(V1, 10, STILL, 0.0, 5.0, 0.0)]);

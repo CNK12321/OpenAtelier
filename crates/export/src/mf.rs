@@ -9,6 +9,7 @@
 //! uses). Handing the encoder GPU textures through the DXGI device manager is the next
 //! step; it only changes how `push_nv12` builds its sample.
 
+use crate::mixdown::{AudioTarget, LiveAudio};
 use crate::{ExportError, VideoCodec, VideoSink};
 use oa_time::{FrameRate, Time};
 use std::io::{Read, Seek, SeekFrom};
@@ -38,15 +39,13 @@ fn pack(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-/// The sound to mux: a 16-bit PCM WAV written by the exporter.
+/// The sound to mux: a 16-bit PCM WAV the exporter's mixer is writing as this reads it.
 struct Audio {
+    live: LiveAudio,
     file: std::fs::File,
     stream: u32,
-    sample_rate: u32,
-    channels: u16,
     /// Sample frames written so far.
     written: u64,
-    total: u64,
 }
 
 pub struct MfSink {
@@ -58,7 +57,14 @@ pub struct MfSink {
     audio: Option<Audio>,
     /// Which encoder the sink writer chose, e.g. "hardware: NVIDIA H.264 Encoder MFT".
     pub encoder: String,
+    /// Whether to hold frames back while the encoder has a backlog (see
+    /// [`MfSink::keep_up_with_the_encoder`]); off once the writer turns out not to
+    /// report its progress.
+    paced: bool,
 }
+
+/// Frames the encoder may have waiting before the next one is held back.
+const MAX_QUEUED: u64 = 12;
 
 impl MfSink {
     /// `bits_per_pixel` sets the average bitrate (0.1 ≈ 12 Mbit/s for 1080p60).
@@ -68,7 +74,7 @@ impl MfSink {
         rate: FrameRate,
         codec: VideoCodec,
         bits_per_pixel: f64,
-        audio_wav: Option<&Path>,
+        audio: Option<&LiveAudio>,
     ) -> Result<Self, ExportError> {
         let subtype = match codec {
             VideoCodec::H264 => MFVideoFormat_H264,
@@ -114,25 +120,20 @@ impl MfSink {
                 .SetInputMediaType(video, &input, None)
                 .map_err(|e| ExportError::Encode(format!("no {codec:?} encoder accepts {}x{} NV12: {e}", size[0], size[1])))?;
 
-            let audio = match audio_wav {
-                Some(path) => Some(Self::add_audio(&writer, path)?),
+            let audio = match audio {
+                Some(live) => Some(Self::add_audio(&writer, live)?),
                 None => None,
             };
 
             writer.BeginWriting().map_err(err("BeginWriting"))?;
             let encoder = describe_encoder(&writer, video);
-            Ok(MfSink { writer, video, size, rate, frame: 0, audio, encoder })
+            Ok(MfSink { writer, video, size, rate, frame: 0, audio, encoder, paced: true })
         }
     }
 
-    unsafe fn add_audio(writer: &IMFSinkWriter, wav: &Path) -> Result<Audio, ExportError> {
-        let mut file = std::fs::File::open(wav).map_err(|e| ExportError::Io(format!("{}: {e}", wav.display())))?;
-        // Our own WAV: a fixed 44-byte header (see wav.rs).
-        let mut header = [0u8; 44];
-        file.read_exact(&mut header).map_err(|e| ExportError::Io(e.to_string()))?;
-        let channels = u16::from_le_bytes([header[22], header[23]]);
-        let sample_rate = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
-        let data = u32::from_le_bytes([header[40], header[41], header[42], header[43]]) as u64;
+    unsafe fn add_audio(writer: &IMFSinkWriter, live: &LiveAudio) -> Result<Audio, ExportError> {
+        let file = std::fs::File::open(&live.path).map_err(|e| ExportError::Io(format!("{}: {e}", live.path.display())))?;
+        let (sample_rate, channels) = (live.sample_rate, live.channels);
         let block = channels as u32 * 2;
         unsafe {
             let out = MFCreateMediaType().map_err(err("MFCreateMediaType"))?;
@@ -152,25 +153,33 @@ impl MfSink {
             input.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block).map_err(err("align"))?;
             input.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, sample_rate * block).map_err(err("bytes/s"))?;
             writer.SetInputMediaType(stream, &input, None).map_err(err("no AAC encoder for this audio"))?;
-            Ok(Audio { file, stream, sample_rate, channels, written: 0, total: data / block as u64 })
+            Ok(Audio { live: live.clone(), file, stream, written: 0 })
         }
     }
 
     /// Writes sound up to `until` (sample-exact), in chunks of about 100 ms, so audio and
-    /// video stay interleaved in the file.
+    /// video stay interleaved in the file. The mixer runs ahead (it's much faster than the
+    /// picture); this waits for it only if it ever isn't.
     fn write_audio_until(&mut self, until: Time) -> Result<(), ExportError> {
         let Some(a) = self.audio.as_mut() else { return Ok(()) };
-        let target = ((until.0 as i128 * a.sample_rate as i128 / oa_time::FLICKS_PER_SECOND as i128) as u64).min(a.total);
-        let chunk = (a.sample_rate / 10) as u64;
-        let block = a.channels as u64 * 2;
+        let sample_rate = a.live.sample_rate;
+        let target = ((until.0 as i128 * sample_rate as i128 / oa_time::FLICKS_PER_SECOND as i128) as u64).min(a.live.total_frames);
+        if a.written >= target {
+            return Ok(());
+        }
+        a.live.wait_for(target)?;
+        // Less than asked for only when the mix was stopped (an export stopped early).
+        let target = target.min(a.live.written());
+        let chunk = (sample_rate / 10) as u64;
+        let block = a.live.channels as u64 * 2;
         while a.written < target {
             let frames = chunk.min(target - a.written);
             let bytes = (frames * block) as usize;
             let mut data = vec![0u8; bytes];
-            a.file.seek(SeekFrom::Start(44 + a.written * block)).map_err(|e| ExportError::Io(e.to_string()))?;
+            a.file.seek(SeekFrom::Start(crate::wav::HEADER_BYTES + a.written * block)).map_err(|e| ExportError::Io(e.to_string()))?;
             a.file.read_exact(&mut data).map_err(|e| ExportError::Io(e.to_string()))?;
-            let start = a.written as i128 * 10_000_000 / a.sample_rate as i128;
-            let end = (a.written + frames) as i128 * 10_000_000 / a.sample_rate as i128;
+            let start = a.written as i128 * 10_000_000 / sample_rate as i128;
+            let end = (a.written + frames) as i128 * 10_000_000 / sample_rate as i128;
             unsafe { write_sample(&self.writer, a.stream, &data, start as i64, (end - start) as i64)? };
             a.written += frames;
         }
@@ -224,6 +233,40 @@ unsafe fn describe_encoder(writer: &IMFSinkWriter, stream: u32) -> String {
     }
 }
 
+impl MfSink {
+    /// Waits while the encoder is more than [`MAX_QUEUED`] frames behind. The writer
+    /// runs unthrottled (throttling stalls on the sound/picture interleave), so without
+    /// this frames could be handed over far faster than a slow encoder takes them: they
+    /// piled up in memory, the progress bar reached 100 % with minutes of encoding still
+    /// queued, and `Finalize` sat there silently draining it. Now progress is the
+    /// encoder's own, memory stays bounded, and finishing takes a moment. A writer that
+    /// doesn't report progress (the count never moves) is left alone from then on.
+    fn keep_up_with_the_encoder(&mut self) {
+        if !self.paced {
+            return;
+        }
+        let mut last = None;
+        let mut since = std::time::Instant::now();
+        loop {
+            let mut stats = MF_SINK_WRITER_STATISTICS { cb: std::mem::size_of::<MF_SINK_WRITER_STATISTICS>() as u32, ..Default::default() };
+            if unsafe { self.writer.GetStatistics(self.video, &mut stats) }.is_err() {
+                self.paced = false;
+                return;
+            }
+            if stats.qwNumSamplesReceived.saturating_sub(stats.qwNumSamplesEncoded) <= MAX_QUEUED {
+                return;
+            }
+            if last != Some(stats.qwNumSamplesEncoded) {
+                (last, since) = (Some(stats.qwNumSamplesEncoded), std::time::Instant::now());
+            } else if since.elapsed() > std::time::Duration::from_secs(3) {
+                self.paced = false;
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 impl VideoSink for MfSink {
     fn push_nv12(&mut self, luma: &[u8], chroma: &[u8]) -> Result<(), ExportError> {
         let expected = (self.size[0] * self.size[1]) as usize;
@@ -245,6 +288,7 @@ impl VideoSink for MfSink {
         };
         unsafe { write_sample(&self.writer, self.video, data, hns(t0), hns(t1) - hns(t0))? };
         self.frame += 1;
+        self.keep_up_with_the_encoder();
         Ok(())
     }
 
@@ -255,5 +299,9 @@ impl VideoSink for MfSink {
 
     fn describe(&self) -> String {
         format!("Media Foundation ({})", self.encoder)
+    }
+
+    fn audio_target(&self) -> Option<AudioTarget> {
+        self.audio.as_ref().map(|_| AudioTarget::LiveWav)
     }
 }

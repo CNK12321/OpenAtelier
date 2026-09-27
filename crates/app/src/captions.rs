@@ -116,6 +116,8 @@ pub struct CaptionsUi {
     /// The style preview: its texture, and what it was made from.
     preview: Option<(egui::TextureId, wgpu::Texture)>,
     preview_key: u64,
+    /// What the preview thread was last asked to render.
+    preview_asked: u64,
     /// The caption in focus was changed from the keyboard: scroll the list to it.
     reveal: bool,
     /// The preview is being scrubbed (dragged across).
@@ -160,6 +162,7 @@ impl CaptionsUi {
             usage: None,
             preview: None,
             preview_key: 0,
+            preview_asked: 0,
             reveal: false,
             scrubbing: false,
             text_focus: false,
@@ -573,8 +576,13 @@ impl App {
         let mut open = true;
         let mut close = false;
         let setting_up = !c.engine.is_installed() || c.job.as_ref().is_some_and(|(w, _)| *w == Work::Install);
-        let window = egui::Window::new("Captions").open(&mut open).collapsible(false).resizable(true);
-        let window = if setting_up { window.default_size([560.0, 480.0]) } else { window.default_size([1120.0, 720.0]).min_width(860.0) };
+        let window = crate::widgets::on_screen(egui::Window::new("Captions").open(&mut open).collapsible(false).resizable(true), ctx);
+        let window = if setting_up {
+            window.default_size(crate::widgets::fit_screen(ctx, [560.0, 480.0]))
+        } else {
+            let size = crate::widgets::fit_screen(ctx, [1120.0, 720.0]);
+            window.default_size(size).min_width(860.0f32.min(size[0]))
+        };
         window.show(ctx, |ui| {
             if setting_up {
                 self.captions_setup(ui, &mut c);
@@ -874,7 +882,8 @@ impl App {
             // 16 kHz mono: what Whisper listens at.
             let format = oa_audio::AudioFormat { sample_rate: 16_000, channels: 1 };
             let mut mix = oa_audio::TimelineAudio::new(clips, format, start, end);
-            let result = oa_export::write_wav(&path, &mut mix, end - start).map(|secs| (path, secs)).map_err(|e| format!("couldn't mix the sound down: {e}"));
+            let samples = ((end - start).as_seconds_f64() * format.sample_rate as f64).ceil() as u64;
+            let result = oa_export::write_wav(&path, &mut mix, samples).map(|secs| (path, secs)).map_err(|e| format!("couldn't mix the sound down: {e}"));
             let _ = tx.send(result);
         });
         c.render = Some(rx);
@@ -1532,7 +1541,10 @@ impl App {
             self.variant.hash(&mut h);
             h.finish()
         };
-        if key != c.preview_key || c.preview.is_none() {
+        // Rendered on the preview thread (`preview_worker`): asked for once per look, shown
+        // when it's done — the one before stays up meanwhile.
+        if (key != c.preview_key || c.preview.is_none()) && key != c.preview_asked {
+            c.preview_asked = key;
             // A scratch copy of the project with the caption on top; nothing is edited.
             let mut project = (*self.editor.doc.snapshot()).clone();
             if let Some(seq) = project.sequences.get_mut(&self.editor.seq) {
@@ -1547,29 +1559,22 @@ impl App {
                 seq.tracks.push(std::sync::Arc::new(track));
             }
             let scale = (width * ui.ctx().pixels_per_point()) as f64 / canvas.width.max(1) as f64;
-            let reuse = c.preview.as_ref().map(|(_, t)| t.clone());
-            match self.render_scaled(&project, at, scale, reuse) {
-                Some((texture, exact)) => {
-                    if let Some(rs) = &self.render_state {
-                        let view = oa_gpu::readback::display_view(&texture);
-                        let id = match c.preview.take() {
-                            Some((id, old)) if old == texture => id,
-                            Some((id, _)) => {
-                                rs.renderer.write().update_egui_texture_from_wgpu_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear, id);
-                                id
-                            }
-                            None => rs.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear),
-                        };
-                        c.preview = Some((id, texture));
-                    }
-                    if exact {
-                        c.preview_key = key;
-                    } else {
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
-                    }
+            self.request_preview(crate::preview_worker::CAPTION, key, project, at, scale, None);
+        }
+        if let Some(done) = self.preview_worker.take(crate::preview_worker::CAPTION)
+            && let Some(rs) = &self.render_state
+        {
+            // A new texture each time: point the preview's id at it (the old one drops).
+            let view = oa_gpu::readback::display_view(&done.texture);
+            let id = match c.preview.take() {
+                Some((id, _)) => {
+                    rs.renderer.write().update_egui_texture_from_wgpu_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear, id);
+                    id
                 }
-                None => ui.ctx().request_repaint_after(std::time::Duration::from_millis(30)),
-            }
+                None => rs.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear),
+            };
+            c.preview = Some((id, done.texture));
+            c.preview_key = done.tag;
         }
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 6.0, egui::Color32::from_gray(12));
