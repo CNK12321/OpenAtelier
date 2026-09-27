@@ -57,6 +57,11 @@ fn make_clip(clip: &Clip) -> Option<PathBuf> {
     if path.exists() {
         return Some(path);
     }
+    // Written under a name of its own, then moved into place in one step: tests (and the
+    // ffmpeg decode tests, which share these files) run at once, and one finding the file
+    // half written failed with "moov atom not found".
+    let (stem, ext) = clip.name.rsplit_once('.').unwrap_or((clip.name, "mp4"));
+    let part = dir.join(format!("v2_{stem}.part-{}-{:?}.{ext}", std::process::id(), std::thread::current().id()).replace(['(', ')'], ""));
     // 8 seconds of 640x360 numbered frames.
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("nullsrc=s=640x360:r={}:d=8,{NUMBERED}", clip.rate)]);
@@ -66,13 +71,18 @@ fn make_clip(clip: &Clip) -> Option<PathBuf> {
         args.remove(vf);
         cmd.args(["-vf", filter]);
     }
-    cmd.args(&args).args(["-pix_fmt", "yuv420p", "-crf", "12", "-preset", "veryfast"]).arg(&path);
+    cmd.args(&args).args(["-pix_fmt", "yuv420p", "-crf", "12", "-preset", "veryfast"]).arg(&part);
     let out = cmd.output().ok()?;
     if !out.status.success() {
         eprintln!("could not create {}: {}", clip.name, String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_file(&part);
         return None;
     }
-    Some(path)
+    // Another test may have put the same clip there meanwhile: either is whole.
+    if std::fs::rename(&part, &path).is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    path.exists().then_some(path)
 }
 
 struct Harness {

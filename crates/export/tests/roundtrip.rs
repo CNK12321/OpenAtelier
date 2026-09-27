@@ -41,15 +41,33 @@ fn numbered_clip() -> Option<PathBuf> {
         return Some(path);
     }
     let filter = "geq=lum='if(lt(X\\,W/2)\\,16+mod(N\\,16)*12\\,16+floor(N/16)*12)':cb=128:cr=128";
+    let part = part_path(&path);
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
         .arg(format!("nullsrc=s={}x{}:r=30:d=3,{filter}", SIZE[0], SIZE[1]))
         .args(["-c:v", "libx264", "-g", "15", "-bf", "2", "-pix_fmt", "yuv420p", "-crf", "12", "-preset", "veryfast"])
-        .arg(&path)
+        .arg(&part)
         .output()
         .ok()?;
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    Some(path)
+    move_into_place(&part, &path)
+}
+
+/// A name of this test's own beside `path` (same extension, so ffmpeg writes the same
+/// kind of file): generated files are written there, then moved into place in one step
+/// — tests run at once, and one reading a file another was still writing failed.
+fn part_path(path: &Path) -> PathBuf {
+    let ext = path.extension().map_or_else(String::new, |e| e.to_string_lossy().to_string());
+    let tag = format!("{}-{:?}", std::process::id(), std::thread::current().id()).replace(['(', ')'], "");
+    path.with_extension(format!("part-{tag}.{ext}"))
+}
+
+/// Moves a finished `part` to `path` (if another test got there first, either is whole).
+fn move_into_place(part: &Path, path: &Path) -> Option<PathBuf> {
+    if std::fs::rename(part, path).is_err() {
+        let _ = std::fs::remove_file(part);
+    }
+    path.exists().then(|| path.to_path_buf())
 }
 
 /// A one-clip project at the media's own size and rate.
@@ -136,15 +154,17 @@ fn read_numbers(ctx: &Arc<GpuContext>, path: &Path, times: &[usize]) -> Vec<u32>
 /// A 3 second tone to mux in.
 fn tone() -> Option<PathBuf> {
     let path = std::env::temp_dir().join("oa-media-tests").join("export_tone.wav");
-    if !path.exists() {
-        let out = Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=3:sample_rate=48000", "-ac", "2"])
-            .arg(&path)
-            .output()
-            .ok()?;
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    if path.exists() {
+        return Some(path);
     }
-    Some(path)
+    let part = part_path(&path);
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=3:sample_rate=48000", "-ac", "2"])
+        .arg(&part)
+        .output()
+        .ok()?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    move_into_place(&part, &path)
 }
 
 /// Exports the numbered clip with `encoder` and checks the file frame by frame.
