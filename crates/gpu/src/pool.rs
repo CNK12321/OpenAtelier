@@ -18,6 +18,23 @@ pub struct PooledTexture {
 }
 
 impl PooledTexture {
+    /// A working-format texture of its own, outside the pool (filled from the CPU, so no
+    /// pass earlier in the frame may still be using it).
+    pub(crate) fn standalone(device: &wgpu::Device, size: [u32; 2], label: &str) -> PooledTexture {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        PooledTexture { texture, view, size, last_used: AtomicU64::new(0) }
+    }
+
     pub fn bytes(&self) -> u64 {
         self.size[0] as u64 * self.size[1] as u64 * BYTES_PER_TEXEL
     }

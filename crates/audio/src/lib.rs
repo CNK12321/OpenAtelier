@@ -20,7 +20,7 @@ pub use ffmpeg::FfmpegAudioSource;
 pub use recorder::{Recorder, Take};
 pub use ring::Ring;
 pub use fx::AudioEffect;
-pub use timeline::{db_to_amplitude, AudioBus, AudioClip, MixHandle, MixState, Opener, TimelineAudio, SILENCE_DB};
+pub use timeline::{db_to_amplitude, AudioBus, AudioClip, MixHandle, OuterGain, MixState, Opener, TimelineAudio, SILENCE_DB};
 
 use oa_time::Time;
 use std::fmt;

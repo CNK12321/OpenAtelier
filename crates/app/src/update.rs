@@ -6,7 +6,8 @@
 //!
 //! * Versions are semantic (`0.1.0-beta.2`); the **Beta** channel also offers pre-releases,
 //!   **Stable** only full releases. Beta builds start on the Beta channel.
-//! * Checked at start at most once a day (Settings → Updates: on/off, channel, Check now).
+//! * Checked at every start and every few hours while open (Settings → Updates: on/off,
+//!   channel, Check now).
 //! * Installing replaces files in the app's own folder: a file in use (the running
 //!   program) is renamed aside (`*.old`) first — Windows allows that — and the leftovers
 //!   are cleared at the next start. A build run from a `target` folder (a developer's), or
@@ -26,6 +27,20 @@ use std::sync::mpsc::{channel, Receiver};
 pub const REPO: &str = "CNK12321/OpenAtelier";
 /// The version running.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A version as people see it (and as releases are tagged): a patch of 0 left off,
+/// `0.1.0-beta.5` → `0.1-beta.5`. Cargo needs all three parts; the tags don't.
+pub fn short_version(v: &str) -> String {
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (v, None),
+    };
+    let core = core.strip_suffix(".0").filter(|c| c.contains('.')).unwrap_or(core);
+    match pre {
+        Some(p) => format!("{core}-{p}"),
+        None => core.to_string(),
+    }
+}
 /// The checksum file every release carries.
 const SUMS: &str = "SHA256SUMS.txt";
 
@@ -363,18 +378,30 @@ fn fetch_releases() -> Result<Vec<Release>, String> {
     parse_releases(&body)
 }
 
+/// Starting again within this many seconds of a check doesn't check again.
+const START_CHECK_GAP: u64 = 10 * 60;
+/// While the app is open, it checks again this often (seconds).
+const RUNNING_CHECK_GAP: u64 = 6 * 3600;
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 impl App {
-    /// Starting up: clear what the last update left behind, and check (at most daily).
+    /// Starting up: clear what the last update left behind, and check — at every start
+    /// (the settings are shared by every copy, so a daily limit let one copy's check
+    /// hide a release from another), just not twice within a few minutes.
     pub(crate) fn start_updates(&mut self) {
         if let Some(dir) = install_dir() {
             clean_up(&dir);
         }
         let _ = std::fs::remove_dir_all(workdir());
-        if self.settings.check_updates && self.script.is_none() && now_secs().saturating_sub(self.settings.update_checked_at) > 20 * 3600 {
+        self.check_if_due(START_CHECK_GAP);
+    }
+
+    /// Checks again when the last check is older than `gap` seconds (and checking is on).
+    fn check_if_due(&mut self, gap: u64) {
+        if self.settings.check_updates && self.script.is_none() && self.updater.checking.is_none() && now_secs().saturating_sub(self.settings.update_checked_at) > gap {
             self.check_for_updates();
         }
     }
@@ -397,6 +424,10 @@ impl App {
 
     /// Every frame: answers from GitHub, and the install's progress.
     pub(crate) fn poll_updates(&mut self, ctx: &egui::Context) {
+        // Left open for hours, it looks again; once something is offered, there's no need.
+        if self.updater.available.is_none() {
+            self.check_if_due(RUNNING_CHECK_GAP);
+        }
         if let Some(rx) = &self.updater.checking {
             match rx.try_recv() {
                 Ok(result) => {
@@ -537,7 +568,7 @@ impl App {
                     }
                     None => {
                         let kind = if release.prerelease { "beta" } else { "version" };
-                        ui.label(format!("A new {kind} is out: {} — you have {VERSION}.", release.name));
+                        ui.label(format!("A new {kind} is out: {} — you have {}.", release.name, short_version(VERSION)));
                         let can = install_dir().is_some();
                         let tip = if can { "Download it, check it and install it; then restart" } else { "Opens the download page (this copy can't update itself: it's a developer build, or its folder isn't writable)" };
                         if ui.add(egui::Button::new(egui::RichText::new("Update").strong()).fill(crate::style::ACCENT.gamma_multiply(0.35))).on_hover_text(tip).clicked() {
@@ -558,7 +589,7 @@ impl App {
 
     /// Settings → Updates.
     pub(crate) fn update_settings(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new(format!("OpenAtelier {VERSION} · {}", platform())).small());
+        ui.label(egui::RichText::new(format!("OpenAtelier {} · {}", short_version(VERSION), platform())).small());
         let s = &mut self.settings;
         ui.horizontal(|ui| {
             ui.label("Channel");
@@ -569,7 +600,7 @@ impl App {
                 s.update_checked_at = 0;
             }
         });
-        ui.checkbox(&mut s.check_updates, "Check for updates at start").on_hover_text("At most once a day, from the project's GitHub releases");
+        ui.checkbox(&mut s.check_updates, "Check for updates").on_hover_text("At start and every few hours while open, from the project's GitHub releases");
         ui.horizontal(|ui| {
             let checking = self.updater.checking.is_some();
             if ui.add_enabled(!checking, egui::Button::new("Check now")).clicked() {
@@ -639,6 +670,14 @@ mod tests {
         assert_eq!(v("1.2.3+build.7"), v("1.2.3"));
         assert!(Version::parse("latest").is_none());
         assert!(Version::parse(VERSION).is_some(), "the running version parses");
+        // Tags leave a patch of 0 off, and still mean the same version.
+        assert_eq!(v("v0.1-beta.5"), v("0.1.0-beta.5"));
+        assert!(v("v0.1-beta.5") > v("v0.1.0-beta.4"));
+        assert_eq!(short_version("0.1.0-beta.5"), "0.1-beta.5");
+        assert_eq!(short_version("0.2.0"), "0.2");
+        assert_eq!(short_version("1.2.3-rc.1"), "1.2.3-rc.1");
+        assert_eq!(short_version("1.0"), "1.0");
+        assert_eq!(Version::parse(&short_version(VERSION)), Version::parse(VERSION));
     }
 
     fn release(tag: &str, pre: bool, platforms: &[&str]) -> Release {

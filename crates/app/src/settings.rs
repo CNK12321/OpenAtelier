@@ -61,6 +61,10 @@ pub struct Settings {
     /// Color management controls (source color, output tone mapping). Off: files are
     /// read by their tags and the controls stay out of the way.
     pub advanced_color: bool,
+    /// The Masks tab in the inspector: draw masks on clips, then limit properties and
+    /// effects to them.
+    #[serde(default)]
+    pub masking: bool,
     /// Squash and the crop sliders in Transform (crop by double-clicking a clip in the
     /// viewer works either way).
     pub advanced_transform: bool,
@@ -100,7 +104,7 @@ pub struct Settings {
     /// Updates: "stable" (full releases) or "beta" (pre-releases too).
     #[serde(default = "default_channel")]
     pub update_channel: String,
-    /// Look for a newer version at start (at most once a day).
+    /// Look for a newer version at start (and every few hours while open).
     #[serde(default = "yes")]
     pub check_updates: bool,
     /// When the last check was (Unix seconds).
@@ -144,7 +148,7 @@ pub struct ProjectView {
 
 impl Default for ProjectView {
     fn default() -> Self {
-        ProjectView { variant: None, layout: None, inspector: 320.0, media: 300.0, timeline: 280.0, viewer: 420.0 }
+        ProjectView { variant: None, layout: None, inspector: 420.0, media: 410.0, timeline: 335.0, viewer: 420.0 }
     }
 }
 
@@ -304,6 +308,7 @@ impl Default for Settings {
             overlays_on: Default::default(),
             save_as_you_go: true,
             advanced_color: false,
+            masking: false,
             advanced_transform: false,
             default_curve: DefaultCurve::default(),
             show_performance: false,

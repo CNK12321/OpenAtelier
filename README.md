@@ -92,7 +92,7 @@ Ready-to-run builds are on the [Releases page](https://github.com/CNK12321/OpenA
   `./install.sh --uninstall` removes it. Or just run `./openatelier` from the folder.
   Install `ffmpeg` from your package manager too (the app tells you if it can't find it).
 
-The app checks the releases once a day and offers newer versions in a bar at the top:
+The app checks the releases at start (and every few hours while open) and offers newer versions in a bar at the top:
 **Update** downloads the package, checks it against the release's `SHA256SUMS.txt`,
 installs it in place and restarts (installed from the `.deb`, it points to the download
 instead: apt owns `/opt/openatelier`). Settings → Updates picks the channel (Stable, or Beta
@@ -100,18 +100,20 @@ for pre-releases too), turns the check off, or checks now.
 
 ### Making a release
 
-The version lives in the workspace `Cargo.toml`. Tagging it publishes the release:
+The version lives in the workspace `Cargo.toml` (`0.1.0-beta.5`). Its tag leaves a patch
+of 0 off (`v0.1-beta.5`; the full form works too), and tagging publishes the release:
 
 ```bash
-git tag v0.1.0-beta.1
+git tag v0.1-beta.5
 ```
 
 ```bash
-git push origin v0.1.0-beta.1
+git push origin v0.1-beta.5
 ```
 
 `.github/workflows/release.yml` builds Windows and Linux packages, writes the checksums
-and publishes a GitHub Release (a pre-release when the version has a `-beta`/`-rc` part).
+and publishes a GitHub Release (a pre-release when the version has a `-beta`/`-rc` part),
+titled "Beta 5" for `v0.1-beta.5`.
 
 ## Getting started
 

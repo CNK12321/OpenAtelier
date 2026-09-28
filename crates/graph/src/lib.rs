@@ -149,6 +149,30 @@ pub enum NodeOp {
     /// effect it gets — `bounds` as in [`TextEffect::bounds`] — in every channel,
     /// straight across the node's bounds (the text laid out as in `Text`).
     TextMask { spec: Arc<oa_text::TextSpec>, scale: f64, bounds: [f32; 4] },
+    /// A mask's drawing as coverage (every channel = coverage, premultiplied white),
+    /// uploaded as is: `pixels.size` px with its corner at 0,0. Placed over the layer by
+    /// [`registry::MASK_SHAPE`].
+    MaskPixels { pixels: Arc<MaskPixels> },
+}
+
+/// Coverage bytes of a mask's drawing (see `oa_doc::mask`), made on the CPU once per
+/// edit. Compared and keyed by `hash` (the drawing and the size it was made at).
+pub struct MaskPixels {
+    pub hash: u64,
+    pub size: [u32; 2],
+    pub coverage: Vec<u8>,
+}
+
+impl PartialEq for MaskPixels {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.size == other.size
+    }
+}
+
+impl std::fmt::Debug for MaskPixels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MaskPixels({:016x} {}x{})", self.hash, self.size[0], self.size[1])
+    }
 }
 
 /// One text effect in a text pass: its packed params (and clock), and the ones it uses on
@@ -255,6 +279,7 @@ impl Graph {
                 format!("Text {:?} {}px×{scale} [{}]", spec.content, spec.size, names.join(" → "))
             }
             NodeOp::TextMask { spec, bounds, .. } => format!("TextMask {:?} {bounds:?}", spec.content),
+            NodeOp::MaskPixels { pixels } => format!("{pixels:?}"),
         };
         let b = n.bounds;
         let key = n.key.map_or("uncached".to_string(), |k| format!("{k:?}"));
@@ -426,6 +451,12 @@ impl GraphBuilder {
                 h.update(&[spec.bold as u8, spec.italic as u8, spec.align as u8]);
                 f64s(&mut h, &[spec.size, spec.tracking, spec.line_height, *scale]);
                 f32s(&mut h, bounds);
+            }
+            NodeOp::MaskPixels { pixels } => {
+                h.update(&[10]);
+                h.update(&pixels.hash.to_le_bytes());
+                h.update(&pixels.size[0].to_le_bytes());
+                h.update(&pixels.size[1].to_le_bytes());
             }
         }
         for i in inputs {

@@ -23,6 +23,9 @@ use std::sync::{Arc, OnceLock};
 /// Upload textures kept per file at most (frames in flight plus look-ahead).
 const MAX_SLOTS: usize = 24 + crate::source::REVERSE_CHUNK;
 
+/// Codecs GPUs decode in fixed-function hardware (what `-hwaccel` is for).
+const HARDWARE_CODECS: [&str; 7] = ["h264", "hevc", "vp9", "av1", "mpeg2video", "vc1", "vp8"];
+
 /// One reusable pair of upload textures.
 struct Slot {
     luma: Arc<wgpu::Texture>,
@@ -52,6 +55,10 @@ pub struct FfmpegDecoder {
     /// hands over YUV with an alpha plane (`yuva420p`, BT.709 video range, whatever the
     /// file was) instead of NV12, and the alpha plane is uploaded too.
     alpha: bool,
+    /// A decoder to ask for by name: VP8/VP9 keep their transparency in a layer of their
+    /// own that only libvpx decodes (ffmpeg's built-in decoder and hardware drop it,
+    /// and the picture flickers between transparent and not).
+    decoder: Option<&'static str>,
     hwaccel: bool,
     child: Option<Child>,
     stdout: Option<ChildStdout>,
@@ -87,7 +94,18 @@ impl FfmpegDecoder {
             // that's what the frames then are.
             color: if video.has_alpha { VideoColor { matrix: oa_gpu::YuvMatrix::Bt709, full_range: false, ..video.color } } else { video.color },
             alpha: video.has_alpha,
-            hwaccel: hwaccel_allowed(),
+            decoder: match (video.has_alpha, video.codec.as_str()) {
+                (true, "vp9") => Some("libvpx-vp9"),
+                (true, "vp8") => Some("libvpx"),
+                _ => None,
+            },
+            // The platform's hardware decoder only for what hardware decodes, and only for
+            // pictures without transparency (hardware drops it). For other codecs `auto`
+            // may pick ffmpeg's Vulkan compute decoders (FFV1, ProRes…), which share the
+            // GPU with the editor and corrupted frames now and then — or lost the device
+            // (a transparent Minecraft clip flickered black; a ProRes 4444 one showed the
+            // test pattern).
+            hwaccel: hwaccel_allowed() && !video.has_alpha && HARDWARE_CODECS.contains(&video.codec.as_str()),
             child: None,
             stdout: None,
             times: None,
@@ -122,6 +140,9 @@ impl FfmpegDecoder {
         if let Some(t) = from {
             // The file's own timestamps, landing on the keyframe at or before them.
             c.args(["-seek_timestamp", "1", "-noaccurate_seek", "-ss", &format!("{:.6}", t.as_seconds_f64().max(0.0))]);
+        }
+        if let Some(decoder) = self.decoder {
+            c.args(["-c:v", decoder]);
         }
         c.arg("-i").arg(&self.path);
         // Smaller when the picture is shown smaller (`set_scale_divisor`).

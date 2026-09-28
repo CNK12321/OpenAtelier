@@ -473,6 +473,7 @@ impl App {
                     scale: (320.0 / canvas.width.max(1) as f64).min(1.0),
                     wanted: None,
                     png: None,
+                    see_through: false,
                 },
                 tx,
             );

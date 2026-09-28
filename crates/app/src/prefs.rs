@@ -93,6 +93,11 @@ impl App {
         ui.checkbox(&mut s.advanced_color, "Advanced color")
             .on_hover_text("Source color (log and HDR curves, gamut, levels) and the Output tone map. Off: files are read by their own tags.");
         ui.add_space(6.0);
+        ui.strong("Masking");
+        ui.checkbox(&mut s.masking, "Masks tab").on_hover_text(
+            "A Masks tab in the inspector: draw masks on a clip (rectangle, ellipse, brush, magic select, fill, or a black-and-white picture), then give properties their own value inside them or run effects only there.",
+        );
+        ui.add_space(6.0);
         ui.label("Default curve for new keyframes");
         ui.horizontal(|ui| {
             let label = |c: CurveShape| match c {

@@ -501,3 +501,86 @@ fn export_waits_for_what_the_preview_would_skip() {
     exporter.finish().expect("finish");
     assert!(!renderer.options.wait, "the renderer is left as it was");
 }
+
+
+
+
+/// Transparent video — VP9 and FFV1 in MKV, PNG in MKV, ProRes 4444 in MOV — over a
+/// green solid on the track below, on its own and inside a compound clip: every frame
+/// keeps its colors and its transparency (a red disc, green around it). Never a black
+/// disc, a missing one, garbage (ffmpeg's Vulkan decoders did that now and then), nor
+/// the blue background showing (the video counted as covering the solid under it).
+#[test]
+fn transparent_video_keeps_its_colors_every_frame() {
+    if !tool("ffmpeg") {
+        return;
+    }
+    let Ok(ctx) = GpuContext::new_headless() else { return };
+    let ctx = Arc::new(ctx);
+    let dir = std::env::temp_dir().join("oa-media-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let disc = "color=c=red:s=320x180:r=30:d=2,format=rgba,geq=r='255':g='0':b='0':a='if(lt(hypot(X-160,Y-90),50),255,0)'";
+    let files: [(&str, &[&str]); 4] = [
+        ("alpha_ffv1.mkv", &["-c:v", "ffv1", "-pix_fmt", "yuva420p"]),
+        ("alpha_vp9.mkv", &["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]),
+        ("alpha_png.mkv", &["-c:v", "png"]),
+        ("alpha_prores.mov", &["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"]),
+    ];
+    for (name, codec) in files {
+        let path = dir.join(name);
+        if !path.exists() {
+            let part = part_path(&path);
+            let ok = Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", disc]).args(codec).arg(&part).status().is_ok_and(|s| s.success());
+            if !ok || move_into_place(&part, &path).is_none() {
+                continue;
+            }
+        }
+        let probe = oa_media::probe(&path).expect("probe");
+        assert!(probe.video.as_ref().is_some_and(|v| v.has_alpha), "{name}: seen as transparent");
+        for nested in [false, true] {
+            let (mut project, seq, media) = project(&path, &probe);
+            Arc::make_mut(project.media.get_mut(&media).unwrap()).info.as_mut().unwrap().alpha = true;
+            let s = Arc::make_mut(project.sequences.get_mut(&seq).unwrap());
+            s.params.set(schema::BG_COLOR, oa_params::ParamSource::Static(oa_params::Value::Gradient(oa_params::Gradient::solid([0.0, 0.0, 1.0, 1.0]))));
+            // A green solid under the video (the video's track moves up one).
+            let mut under = Track::new(TrackId(20), "V0", TrackKind::Video);
+            let mut green = Item::new(ItemId(21), "green", ItemKind::Solid, s.tracks[0].items[0].range);
+            green.params.set(schema::SOLID_COLOR, oa_params::ParamSource::Static(oa_params::Value::Color([0.0, 1.0, 0.0, 1.0])));
+            under.items.push(green);
+            if nested {
+                // The video inside a compound clip of the same size.
+                let inner = SeqId(30);
+                let mut compound = Sequence::new(inner, "Compound", s.rate, FormatVariant { id: VariantId(31), name: "Native".into(), size: s.canvas(), overrides: BTreeMap::new() });
+                compound.tracks.push(s.tracks[0].clone());
+                let range = s.tracks[0].items[0].range;
+                let track = Arc::make_mut(&mut s.tracks[0]);
+                track.items = vec![Item::new(ItemId(32), "compound", ItemKind::Nested { sequence: inner }, range)];
+                project.sequences.insert(inner, Arc::new(compound));
+            }
+            let s = Arc::make_mut(project.sequences.get_mut(&seq).unwrap());
+            s.tracks.insert(0, Arc::new(under));
+            let case = format!("{name}{}", if nested { " in a compound clip" } else { "" });
+            let out_dir = dir.join(format!("frames-{name}-{nested}"));
+            let _ = std::fs::remove_dir_all(&out_dir);
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let mut renderer = Renderer::new(ctx.clone(), RenderOptions { fusion: FusionMode::Blocking, ..Default::default() });
+            let registry = Registry::with_builtins();
+            // As the app opens files: Media Foundation, and ffmpeg for transparency.
+            let mut sources = oa_media::frame_source(&ctx, oa_media::DecoderChoice { bridge: oa_media::windows::D3D11Bridge::new(&ctx).ok(), force_ffmpeg: false });
+            sources.add(3, &path, probe.video.clone().expect("video"));
+            let options = ExportOptions { codec: VideoCodec::PngSequence, encoder: Encoder::Ffmpeg, range: Some(TimeRange::new(Time::ZERO, Time::from_seconds(2))), ..Default::default() };
+            let summary = export(&project, seq, &out_dir.join("f.png"), &options, &ctx, &mut renderer, &registry, &mut sources, |_, _| true).expect("export");
+            let mut bad = Vec::new();
+            for i in 0..summary.frames {
+                let rgba = first_rgba(&out_dir.join(format!("f_{i:05}.png")));
+                let px = |x: u32, y: u32| &rgba[((y * SIZE[0] + x) * 4) as usize..((y * SIZE[0] + x) * 4 + 3) as usize];
+                let (center, corner) = (px(160, 90), px(4, 4));
+                // The disc red; around it the green solid underneath.
+                if !(center[0] > 200 && center[1] < 60 && center[2] < 60 && corner[1] > 200 && corner[0] < 60 && corner[2] < 60) {
+                    bad.push((i, center.to_vec(), corner.to_vec()));
+                }
+            }
+            assert!(bad.is_empty(), "{case}: {} bad frames of {}: {bad:?}", bad.len(), summary.frames);
+        }
+    }
+}

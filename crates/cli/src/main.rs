@@ -197,7 +197,7 @@ fn demo(args: &[String]) -> Res {
             let path = std::fs::canonicalize(file)?;
             let p = oa_media::probe(&path)?;
             let v = p.video.clone().ok_or("file has no video track")?;
-            let info = MediaInfo { width: v.width, height: v.height, duration: p.duration, rate: v.avg_rate, has_video: true, has_audio: p.has_audio(), still: v.still, color: oa_doc::color::ColorTags { transfer: v.transfer_tag.clone(), primaries: v.primaries_tag.clone() } };
+            let info = MediaInfo { width: v.width, height: v.height, duration: p.duration, rate: v.avg_rate, has_video: true, has_audio: p.has_audio(), still: v.still, color: oa_doc::color::ColorTags { transfer: v.transfer_tag.clone(), primaries: v.primaries_tag.clone() }, alpha: v.has_alpha };
             let fingerprint = Some(oa_media::fingerprint(&path)?);
             let path = path.to_string_lossy().trim_start_matches(r"\\?\").to_string();
             (MediaRef { id: media, path, fingerprint, info: Some(info), scaling: Default::default(), folder: String::new(), color: Default::default() }, v.avg_rate.unwrap_or(FrameRate::FPS_29_97))

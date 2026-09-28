@@ -270,10 +270,16 @@ pub fn select_frame(pts: &[i64], timebase: Rational, t: Rational) -> Option<usiz
     if pts.is_empty() {
         return None;
     }
-    // pts * tb <= t  <=>  pts * tb.num * t.den <= t.num * tb.den
-    let rhs = t.num as i128 * timebase.den as i128;
+    // With a coarse time base (a tick of half a millisecond or more — Matroska's
+    // milliseconds), a frame counts from half a tick before its stamp: such files round
+    // a frame's true start to the nearest tick, so 2/30 s is stored as 0.067 s, and
+    // without the slack asking for 2/30 s would get the frame before — every third frame
+    // of 30 fps footage would repeat. Fine time bases stay exact.
+    // (pts − s/2) · tb <= t  <=>  (2·pts − s) · tb.num · t.den <= 2 · t.num · tb.den
+    let slack = i128::from(timebase.num as i128 * 2000 >= timebase.den as i128);
+    let rhs = 2 * t.num as i128 * timebase.den as i128;
     let k = timebase.num as i128 * t.den as i128;
-    let after = pts.partition_point(|&p| p as i128 * k <= rhs);
+    let after = pts.partition_point(|&p| (2 * p as i128 - slack) * k <= rhs);
     Some(after.saturating_sub(1))
 }
 
@@ -370,5 +376,22 @@ mod tests {
         assert!(!a.contains(Time::from_seconds(3)));
         assert!(!a.overlaps(TimeRange::new(Time::from_seconds(3), Time::from_seconds(1))));
         assert!(a.overlaps(TimeRange::new(Time::from_seconds(2), Time::from_seconds(5))));
+    }
+}
+
+#[cfg(test)]
+mod coarse_timebase_tests {
+    use super::*;
+
+    /// Matroska stores times in milliseconds: 30 fps frames at 0, 33, 67, 100 ms… Every
+    /// frame of a 30 fps timeline gets its own frame, none repeated.
+    #[test]
+    fn millisecond_stamps_select_every_frame() {
+        let tb = Rational::new(1, 1000);
+        let pts: Vec<i64> = (0..90).map(|i| ((i as f64) * 1000.0 / 30.0).round() as i64).collect();
+        for i in 0..90i64 {
+            let t = FrameRate::FPS_30.frame_start(i).as_rational();
+            assert_eq!(select_frame(&pts, tb, t), Some(i as usize), "frame {i}");
+        }
     }
 }

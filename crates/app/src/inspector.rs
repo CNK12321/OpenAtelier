@@ -156,6 +156,8 @@ pub enum Tab {
     Effects,
     /// Grading (with Advanced color on): scopes, wheels, curves, the HSL mixer.
     Color,
+    /// Masks drawn on the clip (with Masking on).
+    Masks,
     Sound,
 }
 
@@ -166,6 +168,7 @@ impl Tab {
             Tab::Transitions => "Transitions",
             Tab::Effects => "Effects",
             Tab::Color => "Color",
+            Tab::Masks => "Masks",
             Tab::Sound => "Sound",
         }
     }
@@ -236,12 +239,13 @@ impl App {
         let audible = self.is_audible(item);
 
         // The tabs: only the ones this clip has anything in.
-        let tabs: Vec<Tab> = [Tab::Properties, Tab::Transitions, Tab::Effects, Tab::Color, Tab::Sound]
+        let tabs: Vec<Tab> = [Tab::Properties, Tab::Transitions, Tab::Effects, Tab::Color, Tab::Masks, Tab::Sound]
             .into_iter()
             .filter(|tab| match tab {
                 Tab::Properties => true,
                 Tab::Transitions | Tab::Effects => visual,
                 Tab::Color => visual && self.settings.advanced_color,
+                Tab::Masks => visual && self.settings.masking && self.maskable(item),
                 Tab::Sound => audible,
             })
             .collect();
@@ -260,6 +264,7 @@ impl App {
                 self.effects_section(ui, item, t);
             }
             Tab::Color => self.color_tab(ui, item, t),
+            Tab::Masks => self.masks_tab(ui, item, t),
             Tab::Sound => self.sound_tab(ui, item, t),
         }
     }
@@ -338,6 +343,7 @@ impl App {
                         }
                     });
                     ui.end_row();
+                    self.on_mask_row(ui, item, schema::POSITION, t);
 
                     let scale = v.vec2(schema::SCALE);
                     let mut pct = [scale[0] * 100.0, scale[1] * 100.0];
@@ -380,6 +386,7 @@ impl App {
                         ui.data_mut(|d| d.insert_temp(key, advanced));
                     });
                     ui.end_row();
+                    self.on_mask_row(ui, item, schema::SCALE, t);
 
                     for (param, label, default, speed, suffix, factor) in [
                         (schema::ROTATION, "rotation", 0.0, 0.5, "°", 1.0),
@@ -414,6 +421,7 @@ impl App {
                         };
                         self.property_menu(&r, item, &ParamTarget::Item, param, &Value::Float(default), band, t);
                         ui.end_row();
+                        self.on_mask_row(ui, item, param, t);
                         if param == schema::OPACITY {
                             ui.label("");
                             ui.label("blend");
@@ -436,10 +444,11 @@ impl App {
 
     /// How the clip arrives and leaves.
     fn transitions_tab(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
-        section(ui, "Intro", "How the clip arrives: plays over its first seconds. Add several to combine them.");
-        self.in_out_section(ui, item, true, t);
-        section(ui, "Outro", "How the clip leaves: plays over its last seconds. Add several to combine them.");
-        self.in_out_section(ui, item, false, t);
+        // Where another clip touches an end, it can be a transition with that clip instead.
+        section(ui, "Start", "How the clip arrives: its own intro (effects over its first seconds, several combine) — or, when a clip ends right where it starts, a transition from that clip.");
+        self.transition_end(ui, item, true, t);
+        section(ui, "End", "How the clip leaves: its own outro (effects over its last seconds, several combine) — or, when a clip starts right where it ends, a transition into that clip.");
+        self.transition_end(ui, item, false, t);
     }
 
     /// Level and sound effects. The speed control is only here for sound on its own —
@@ -525,7 +534,7 @@ impl App {
     }
 
     /// The clip's intros (`intro`) or outros, in the same cards as its other effects.
-    fn in_out_section(&mut self, ui: &mut egui::Ui, item: ItemId, intro: bool, t: Time) {
+    pub(crate) fn in_out_section(&mut self, ui: &mut egui::Ui, item: ItemId, intro: bool, t: Time) {
         self.effect_list(ui, item, if intro { List::Intro } else { List::Outro }, t);
     }
 
@@ -598,9 +607,10 @@ impl App {
         let id = schema.id.as_str();
         let current = self.editor.param_value(item, target, id, t).filter(|v| v.ty() == schema.ty).unwrap_or_else(|| schema.default.clone());
         let pretty = |id: &str| id.rsplit('.').next().unwrap_or(id).replace(['_', '-'], " ");
-        let label = match id.strip_suffix(schema::SPOKEN_SUFFIX) {
-            Some(base) => format!("{} when spoken", pretty(base)),
-            None => pretty(id),
+        let label = match (id.strip_suffix(schema::SPOKEN_SUFFIX), id.strip_suffix(oa_doc::mask::ON_MASK_SUFFIX)) {
+            (Some(base), _) => format!("{} when spoken", pretty(base)),
+            (_, Some(base)) => format!("{} on mask", pretty(base)),
+            _ => pretty(id),
         };
         match &schema.default {
             Value::Float(_) if schema.unit == oa_params::Unit::Direction => {
@@ -1391,10 +1401,18 @@ impl App {
             ui.add_enabled(signed != 0.0, egui::Checkbox::new(&mut reverse, "Reverse"))
                 .on_hover_text("Plays the same part of the file backwards, last frame first — the sound too.");
             let r = ui
-                .add(egui::DragValue::new(&mut speed).speed(0.01).range(0.05..=20.0).max_decimals(3).suffix("×"))
-                .on_hover_text("Playback speed, picture and sound together (0.05× to 20×). The clip gets shorter or longer on the timeline.");
+                .add(egui::DragValue::new(&mut speed).speed(0.01).range(0.0..=20.0).max_decimals(3).suffix("×"))
+                .on_hover_text(
+                    "Playback speed, picture and sound together (0.05× to 20×). The clip gets shorter or longer on the timeline. \
+                     0× holds its first frame as a still, silent, at the length it has.",
+                );
             ui.label("speed");
-            for preset in [0.25, 0.5, 1.0, 2.0, 4.0] {
+            // Between 0× and 0.05× there's nothing useful (a clip hundreds of times its
+            // length): below it is a freeze, and up from a freeze starts at 0.05×.
+            if speed > 0.0 && speed < 0.05 {
+                speed = if old == 0.0 { 0.05 } else { 0.0 };
+            }
+            for preset in [0.0, 0.25, 0.5, 1.0, 2.0, 4.0] {
                 if ui.small_button(format!("{preset}×")).clicked() {
                     speed = preset;
                 }
@@ -1416,20 +1434,21 @@ impl App {
             }
             return;
         }
-        if (speed - old).abs() < 1e-9 || speed <= 0.0 || old <= 0.0 {
+        if (speed - old).abs() < 1e-9 || speed < 0.0 {
             return;
         }
         // Each selected clip: the same part of its file, played at the new speed (and the
-        // way it was going).
+        // way it was going). A freeze (0×) holds the clip's first frame for the length it
+        // has, and one set going again keeps that length too.
         let mut ops = Vec::new();
         for id in std::iter::once(item).chain(self.editor.linked.iter().copied().filter(|l| *l != item)) {
             let Some(it) = self.editor.item(id) else { continue };
             let was = it.time_map.speed.num() as f64 / it.time_map.speed.den().max(1) as f64;
-            if was == 0.0 {
-                continue;
-            }
-            let span = it.range.duration.as_seconds_f64() * was.abs();
-            let duration = Time::from_seconds_f64(span / speed).max(Time(1));
+            let duration = if was == 0.0 || speed == 0.0 {
+                it.range.duration
+            } else {
+                Time::from_seconds_f64(it.range.duration.as_seconds_f64() * was.abs() / speed).max(Time(1))
+            };
             let milli = (speed * 1000.0).round() as i64 * if was < 0.0 { -1 } else { 1 };
             let time_map = oa_doc::TimeMap::new(it.time_map.source_in, oa_time::Rational::new(milli, 1000));
             ops.push(oa_doc::Op::SetItemTiming { seq: self.editor.seq, item: id, range: oa_time::TimeRange::new(it.range.start, duration), time_map });
@@ -1467,7 +1486,7 @@ impl App {
         }
     }
 
-    fn apply_or_report(&mut self, label: &str, ops: Vec<oa_doc::Op>) {
+    pub(crate) fn apply_or_report(&mut self, label: &str, ops: Vec<oa_doc::Op>) {
         if let Err(e) = self.editor.apply(label, ops) {
             self.error = Some(e.to_string());
         }
@@ -1799,13 +1818,18 @@ impl App {
                     ui.close();
                 }
             }
-            if self.track_space(item, target, param).is_some() {
+            // A point (position, scale…): following a track, and each axis connected to
+            // the sound on its own.
+            let tracked = self.track_space(item, target, param).is_some();
+            let vector = matches!(default, Value::Vec2(_));
+            if tracked || vector {
                 ui.separator();
                 ui.menu_button("Animate", |ui| {
-                    if ui
-                        .button("Edit track…")
-                        .on_hover_text("Make it follow something in the picture: have the AI follow a point, click it in by hand, or record it with the mouse")
-                        .clicked()
+                    if tracked
+                        && ui
+                            .button("Edit track…")
+                            .on_hover_text("Make it follow something in the picture: have the AI follow a point, click it in by hand, or record it with the mouse")
+                            .clicked()
                     {
                         self.edit_track(item, target.clone(), param, crate::tracks::Purpose::Track);
                         ui.close();
@@ -1819,9 +1843,26 @@ impl App {
                         self.edit_track(item, target.clone(), param, crate::tracks::Purpose::Stabilize);
                         ui.close();
                     }
+                    if vector {
+                        // The range an axis is drawn over in the connection's graph.
+                        let (lo, hi) = match param {
+                            p if p == schema::POSITION => (-0.5, 0.5),
+                            p if p == schema::SCALE => (0.0, 2.0),
+                            _ => (-1.0, 1.0),
+                        };
+                        for (axis, name) in [(0u8, "X"), (1u8, "Y")] {
+                            let tip = format!("Connect its {name} to the sound: offset by how loud the mix or a chosen clip is (or its bass, mids or treble) — {name} alone");
+                            if ui.button(format!("Edit {name} connection offset…")).on_hover_text(tip).clicked() {
+                                let band = crate::band::Band { target: target.clone(), param: param.to_string(), lo, hi };
+                                self.edit_connection_on(item, band, Some(axis));
+                                ui.close();
+                            }
+                        }
+                    }
                 });
             }
             self.spoken_entry(ui, item, target, param, default, t);
+            self.mask_entry(ui, item, target, param, default, t);
         }
     }
 

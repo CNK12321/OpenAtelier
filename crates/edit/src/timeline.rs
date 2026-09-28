@@ -162,6 +162,10 @@ pub fn split(p: &Project, seq: SeqId, item: ItemId, at: Time, alloc: &mut dyn Fn
     for src in back.params.0.values_mut() {
         src.shift_clip_clock(delta);
     }
+    // Keyframed mask paths too.
+    for m in &mut back.masks {
+        m.shift_clip_clock(delta);
+    }
     for fx in &mut back.effects {
         fx.id = oa_doc::EffectId(alloc());
         for src in fx.params.0.values_mut() {

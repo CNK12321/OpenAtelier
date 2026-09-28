@@ -40,6 +40,9 @@ pub enum Space {
     Position,
     /// A point on the clip, as a fraction of its own size.
     OnClip,
+    /// A mask's center: an offset from the middle of its clip, as a fraction of the
+    /// clip (`oa_doc::mask::CENTER`).
+    MaskCenter,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -181,6 +184,12 @@ impl App {
     /// Whether `param` is a position the track editor can drive, and how.
     pub(crate) fn track_space(&self, item: ItemId, target: &ParamTarget, param: &str) -> Option<Space> {
         let it = self.editor.item(item)?;
+        // A mask's center follows a point on its clip.
+        if *target == ParamTarget::Item
+            && let Some(m) = oa_doc::mask::mask_of_param(param)
+        {
+            return (param == oa_doc::mask::param_id(m, oa_doc::mask::CENTER) && it.masks.iter().any(|x| x.id == m)).then_some(Space::MaskCenter);
+        }
         let schema = match target {
             ParamTarget::Item => oa_doc::schema::visual().iter().find(|s| s.id.as_str() == param)?.clone(),
             ParamTarget::Effect(id) => {
@@ -279,6 +288,7 @@ impl App {
                 Some([now[0] + (c[0] - p.pivot[0]) / size[0], now[1] + (c[1] - p.pivot[1]) / size[1]])
             }
             Space::OnClip => p.to_layer_fraction(c),
+            Space::MaskCenter => p.to_layer_fraction(c).map(|f| [f[0] - 0.5, f[1] - 0.5]),
         }
     }
 
@@ -287,8 +297,9 @@ impl App {
         let p = self.placement_at(ed.item, t)?;
         match ed.space {
             Space::Position => Some(p.pivot),
-            Space::OnClip => {
+            Space::OnClip | Space::MaskCenter => {
                 let v = self.editor.param_value(ed.item, &ed.target, &ed.param, t).and_then(|v| v.as_vec2())?;
+                let v = if ed.space == Space::MaskCenter { [v[0] + 0.5, v[1] + 0.5] } else { v };
                 Some(p.to_canvas.apply([v[0] * p.native[0], v[1] * p.native[1]]))
             }
         }
@@ -322,7 +333,8 @@ impl App {
                 let sets = std::iter::once((ParamTarget::Item, &it.params)).chain(it.effects.iter().map(|e| (ParamTarget::Effect(e.id), &e.params)));
                 for (target, set) in sets {
                     for (param, source) in &set.0 {
-                        if source.find_track().is_some_and(|(t, _)| t.id == track.id) {
+                        let paired = source.track_pair().is_some_and(|(a, b)| a.id == track.id || b.id == track.id);
+                        if paired || source.find_track().is_some_and(|(t, _)| t.id == track.id) {
                             ops.push(Op::SetParam { seq: *seq, item: it.id, target: target.clone(), param: param.clone(), source: Some(source.clone().retracked(&track)) });
                         }
                     }
@@ -362,7 +374,7 @@ impl App {
                 }
             }
             Space::Position => {}
-            Space::OnClip => {
+            Space::OnClip | Space::MaskCenter => {
                 // Keyed where the track has points inside the clip.
                 let keys: Vec<(Time, [f64; 2])> = track
                     .points
@@ -580,7 +592,7 @@ impl App {
                 return;
             }
             Some(item)
-        } else if space == Space::OnClip && is_video(self, item) {
+        } else if matches!(space, Space::OnClip | Space::MaskCenter) && is_video(self, item) {
             Some(item)
         } else {
             let project = self.editor.doc.snapshot();

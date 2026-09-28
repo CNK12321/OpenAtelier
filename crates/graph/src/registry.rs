@@ -432,6 +432,19 @@ pub const BLUR: &str = "oa.internal.blur";
 pub const MASK_KEEP: &str = "oa.internal.mask_keep";
 pub const MASK_DROP: &str = "oa.internal.mask_drop";
 pub const ADD: &str = "oa.internal.add";
+/// A clip mask placed over its layer (`oa_doc::mask`): the input is the drawing's
+/// coverage ([`crate::NodeOp::MaskPixels`]); uniforms are the layer's raster size (2),
+/// the mask's center offset (2, layer fractions), scale, rotation (radians), harshness,
+/// invert (0/1) and the area it's made for (4, which only keys it). Out: coverage in
+/// every channel over the node's bounds.
+pub const MASK_SHAPE: &str = "oa.internal.mask_shape";
+/// Two masks joined (the second input is `b`), by the uniform: 0 add (`a + b − ab`),
+/// 1 subtract (`a(1 − b)`), 2 intersect (`ab`), 3 difference (`a + b − 2ab`) — as
+/// `oa_doc::mask::MaskMode` numbers them.
+pub const MASK_COMBINE: &str = "oa.internal.mask_combine";
+/// The picture × its opacity outside the mask (uniform 0) and inside it (uniform 1); the
+/// second input is the mask.
+pub const MASK_ALPHA: &str = "oa.internal.mask_alpha";
 
 /// Effects the host uses itself, never offered in the effects lists.
 pub fn is_internal_effect(type_id: &str) -> bool {
@@ -808,6 +821,60 @@ pub(crate) fn host_effects() -> Vec<EffectDescriptor> {
         EffectDescriptor {
             shader: wgsl("oa_internal_add", 1, "fn oa_internal_add(pos: vec2f, base: u32) -> vec4f { return sample_input(pos) + sample_media(pos); }"),
             ..descriptor(ADD, "Add", EffectKind::Spatial { expand: None }, vec![])
+        },
+        // Clip masks (`MASK_SHAPE`…).
+        EffectDescriptor {
+            shader: wgsl(
+                "oa_internal_mask_shape",
+                1,
+                "fn oa_internal_mask_shape(pos: vec2f, base: u32) -> vec4f {
+                    let ls = max(vec2f(u(base), u(base + 1u)), vec2f(1.0));
+                    let center = vec2f(u(base + 2u), u(base + 3u));
+                    let s = max(u(base + 4u), 0.001);
+                    let a = u(base + 5u);
+                    // Back through the mask's own move, turn and scale (in pixels, so a
+                    // turn keeps its shape on a layer that isn't square).
+                    let q = pos - (vec2f(0.5) + center) * ls;
+                    let r = vec2f(q.x * cos(a) + q.y * sin(a), -q.x * sin(a) + q.y * cos(a)) / s;
+                    let uv = r / ls + vec2f(0.5);
+                    var c = 0.0;
+                    if (all(uv >= vec2f(0.0)) && all(uv <= vec2f(1.0))) {
+                        c = textureSampleLevel(input_tex, input_samp, uv, 0.0).a;
+                    }
+                    if (u(base + 7u) > 0.5) { c = 1.0 - c; }
+                    c = c * clamp(u(base + 6u), 0.0, 1.0);
+                    return vec4f(c);
+                }",
+            ),
+            preserves_opacity: false,
+            ..descriptor(MASK_SHAPE, "Mask Shape", EffectKind::Spatial { expand: None }, vec![])
+        },
+        EffectDescriptor {
+            shader: wgsl(
+                "oa_internal_mask_combine",
+                1,
+                "fn oa_internal_mask_combine(pos: vec2f, base: u32) -> vec4f {
+                    let a = sample_input(pos).a;
+                    let b = sample_media(pos).a;
+                    let mode = u32(u(base) + 0.5);
+                    var c = a + b - a * b;
+                    if (mode == 1u) { c = a * (1.0 - b); }
+                    else if (mode == 2u) { c = a * b; }
+                    else if (mode == 3u) { c = a + b - 2.0 * a * b; }
+                    return vec4f(c);
+                }",
+            ),
+            ..descriptor(MASK_COMBINE, "Mask Combine", EffectKind::Spatial { expand: None }, vec![])
+        },
+        EffectDescriptor {
+            shader: wgsl(
+                "oa_internal_mask_alpha",
+                1,
+                "fn oa_internal_mask_alpha(pos: vec2f, base: u32) -> vec4f {
+                    return sample_input(pos) * mix(u(base), u(base + 1u), sample_media(pos).a);
+                }",
+            ),
+            ..descriptor(MASK_ALPHA, "Mask Opacity", EffectKind::Spatial { expand: None }, vec![])
         },
         // The blurred-picture background (a copy of Atelier Core's Blur, which may be off).
         EffectDescriptor {

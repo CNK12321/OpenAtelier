@@ -385,6 +385,7 @@ impl App {
             scale,
             wanted,
             png: None,
+            see_through: false,
         });
     }
 }

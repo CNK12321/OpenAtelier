@@ -1431,8 +1431,9 @@ fn glow_takes_the_nearest_edge_color_and_fades_out() {
     let blue = b.add(NodeOp::Transform { matrix: m }, vec![blue], m.map_rect(b.node(blue).bounds), true);
     let infos = vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false }; 2];
     let picture = b.add(NodeOp::Composite { size: [32, 32], background: [0.0; 4], layers: infos }, vec![red, blue], Rect::from_size(32.0, 32.0), true);
-    // radius 16, strength 1, white tint, behind; the second input is the picture itself.
-    let mut uniforms = vec![16.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0];
+    // radius 16, strength 1, white tint, behind, not softened, the picture's colors; the
+    // second input is the picture itself.
+    let mut uniforms = vec![16.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
     uniforms.extend(oa_graph::registry::STILL_CLOCK);
     let op = NodeOp::Effect { type_id: d.type_id.clone(), version: d.version, kind: d.kind.clone(), space: d.space, fusible: d.fusible, stateful: false, uniforms, nearest: false };
     let glow = b.add(op, vec![picture, picture], b.node(picture).bounds.expand(16.0), false);
@@ -1474,7 +1475,7 @@ fn a_wide_glow_on_a_coarse_grid_still_follows_the_edges() {
     let blue = b.add(NodeOp::Transform { matrix: m }, vec![blue], m.map_rect(b.node(blue).bounds), true);
     let infos = vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false }; 2];
     let picture = b.add(NodeOp::Composite { size: [32, 32], background: [0.0; 4], layers: infos }, vec![red, blue], Rect::from_size(32.0, 32.0), true);
-    let mut uniforms = vec![64.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0];
+    let mut uniforms = vec![64.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
     uniforms.extend(oa_graph::registry::STILL_CLOCK);
     let op = NodeOp::Effect { type_id: d.type_id.clone(), version: d.version, kind: d.kind.clone(), space: d.space, fusible: d.fusible, stateful: false, uniforms, nearest: false };
     let glow = b.add(op, vec![picture, picture], b.node(picture).bounds.expand(64.0), false);
@@ -1491,6 +1492,54 @@ fn a_wide_glow_on_a_coarse_grid_still_follows_the_edges() {
     let fade: Vec<f32> = [114, 124, 134, 144, 154, 164].iter().map(|&x| at(x, 106)[0]).collect();
     assert!(fade.windows(2).all(|w| w[0] > w[1]), "fades outwards: {fade:?}");
     assert!(at(180, 106)[0] < 1e-3, "and stops at the radius: {:?}", at(180, 106));
+}
+
+/// Glow's softness blends the colors where the nearest edge changes color (a hard seam,
+/// unsoftened), and a solid glow is the color chosen, whatever the picture's edges are.
+#[test]
+fn glow_softness_blends_its_seams_and_solid_is_one_color() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let d = registry.effect(oa_graph::registry::GLOW).unwrap();
+    // The picture of the glow tests above (red, its top-right quarter blue) at 32,32;
+    // radius 16, strength 1, behind.
+    let mut run = |tint: [f32; 4], softness: f32, one_color: bool| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let red = solid(&mut b, [1.0, 0.0, 0.0, 1.0], 32.0);
+        let blue = solid(&mut b, [0.0, 0.0, 1.0, 1.0], 16.0);
+        let m = Affine2::translate(16.0, 0.0);
+        let blue = b.add(NodeOp::Transform { matrix: m }, vec![blue], m.map_rect(b.node(blue).bounds), true);
+        let infos = vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false }; 2];
+        let picture = b.add(NodeOp::Composite { size: [32, 32], background: [0.0; 4], layers: infos }, vec![red, blue], Rect::from_size(32.0, 32.0), true);
+        let mut uniforms = vec![16.0, 1.0, tint[0], tint[1], tint[2], tint[3], 0.0, softness, one_color as u8 as f32];
+        uniforms.extend(oa_graph::registry::STILL_CLOCK);
+        let op = NodeOp::Effect { type_id: d.type_id.clone(), version: d.version, kind: d.kind.clone(), space: d.space, fusible: d.fusible, stateful: false, uniforms, nearest: false };
+        let glow = b.add(op, vec![picture, picture], b.node(picture).bounds.expand(16.0), false);
+        let m = Affine2::translate(32.0, 32.0);
+        let placed = b.add(NodeOp::Transform { matrix: m }, vec![glow], m.map_rect(b.node(glow).bounds), false);
+        let out = composite(&mut b, 96, [0.0, 0.0, 0.0, 1.0], &[(placed, BlendMode::Normal)]);
+        render_one(&mut r, &b.finish(out))
+    };
+    let at = |px: &[[f32; 4]], x: usize, y: usize| px[y * 96 + x];
+    // Right of the picture, where blue (above y 48) meets red (below).
+    // The steepest change of color from one row to the next, down that column.
+    let steepest = |px: &[[f32; 4]]| (40..56).map(|y| (at(px, 70, y + 1)[2] - at(px, 70, y)[2]).abs()).fold(0.0f32, f32::max);
+    let hard = run([1.0; 4], 0.0, false);
+    let soft = run([1.0; 4], 1.0, false);
+    let (hard_step, soft_step) = (steepest(&hard), steepest(&soft));
+    assert!(hard_step > 0.15, "unsoftened, the color jumps at the seam: {hard_step}");
+    assert!(soft_step < hard_step * 0.5, "softened, it changes gradually: {soft_step} vs {hard_step}");
+    // Far from the seam it keeps its edge's color.
+    let p = at(&soft, 66, 58);
+    assert!(p[0] > 0.3 && p[2] < 0.05, "red beside red: {p:?}");
+    // Solid green: green by the blue part and the red part alike.
+    let green = run([0.0, 1.0, 0.0, 1.0], 0.5, true);
+    for y in [40, 56] {
+        let p = at(&green, 66, y);
+        assert!(p[1] > 0.3 && p[0] < 0.01 && p[2] < 0.01, "solid green (y {y}): {p:?}");
+    }
+    assert!(close(at(&green, 40, 56), [1.0, 0.0, 0.0, 1.0], 1e-3), "the picture itself untouched");
 }
 
 /// Drop Shadow puts the silhouette, offset and softened, behind the picture; Stroke
@@ -1845,4 +1894,158 @@ fn a_tinted_background_renders() {
     p.sequences.insert(SeqId(1), Arc::new(seq));
     let blurred = render_project(&mut r, &p, Time::from_seconds(1));
     assert!(blurred[5][0] > blurred[5][2], "tinted orange: {:?}", blurred[5]);
+}
+
+/// A white solid over the whole 640×360 frame (on black) with a mask over its left half.
+fn masked_solid(configure: impl FnOnce(&mut Item)) -> Project {
+    let (mut p, seq_id) = text_project(|_| {});
+    let seq = Arc::make_mut(p.sequences.get_mut(&seq_id).unwrap());
+    let track = Arc::make_mut(&mut seq.tracks[0]);
+    let mut clip = Item::new(ItemId(6), "solid", ItemKind::Solid, TimeRange::new(Time::ZERO, Time::from_seconds(10)));
+    clip.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color([1.0; 4])));
+    clip.masks.push(Mask { id: 9, name: "Mask 1".into(), enabled: true, invert: false, mode: mask::MaskMode::Add, shapes: vec![MaskShape::Rect { center: [0.25, 0.5], size: [0.5, 1.0], expand: 0.0, feather: 0.0, erase: false }], frame: [1.0, 1.0] });
+    configure(&mut clip);
+    track.items = vec![clip];
+    p
+}
+
+/// "Opacity on mask": the clip's opacity inside its mask is its own; outside, the
+/// clip's. Harshness scales how much the mask applies.
+#[test]
+fn opacity_on_a_mask() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let p = masked_solid(|c| { c.params.set(&mask::on_mask(schema::OPACITY), ParamSource::Static(Value::Float(0.0))); });
+    let px = render_project(&mut r, &p, Time::from_seconds(1));
+    let at = |x: usize| px[180 * 640 + x][0];
+    assert!(at(100) < 0.02, "inside the mask: see-through → black, got {}", at(100));
+    assert!(at(540) > 0.98, "outside: the clip, got {}", at(540));
+    let p = masked_solid(|c| {
+        c.params.set(&mask::on_mask(schema::OPACITY), ParamSource::Static(Value::Float(0.0)));
+        c.params.set(&mask::param_id(9, mask::HARSHNESS), ParamSource::Static(Value::Float(0.5)));
+    });
+    let px = render_project(&mut r, &p, Time::from_seconds(1));
+    let v = px[180 * 640 + 100][0];
+    assert!((v - 0.5).abs() < 0.03, "half applied: {v}");
+}
+
+/// An effect with a mask changes only what's inside it (or, inverted, outside); the
+/// mask's softness makes a ramp at its edge.
+#[test]
+fn effects_inside_a_mask() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let red = |invert: bool, soft: f64| {
+        masked_solid(move |c| {
+            let mut fx = EffectInstance::new(EffectId(40), "oa.color.color-to");
+            fx.params.set("from", ParamSource::Static(Value::Color([1.0, 1.0, 1.0, 1.0])));
+            fx.params.set("to", ParamSource::Static(Value::Color([1.0, 0.0, 0.0, 1.0])));
+            fx.params.set("offset_from_original", ParamSource::Static(Value::Bool(false)));
+            fx.params.set(mask::EFFECT_USE, ParamSource::Static(Value::Float(9.0)));
+            fx.params.set(mask::EFFECT_INVERT, ParamSource::Static(Value::Bool(invert)));
+            c.effects.push(fx);
+            c.params.set(&mask::param_id(9, mask::SOFTNESS), ParamSource::Static(Value::Float(soft)));
+        })
+    };
+    let px = render_project(&mut r, &red(false, 0.0), Time::from_seconds(1));
+    let (left, right) = (px[180 * 640 + 100], px[180 * 640 + 540]);
+    assert!(left[0] > 0.95 && left[1] < 0.05, "red inside: {left:?}");
+    assert!(right[1] > 0.95, "white outside: {right:?}");
+    let px = render_project(&mut r, &red(true, 0.0), Time::from_seconds(1));
+    assert!(px[180 * 640 + 100][1] > 0.95 && px[180 * 640 + 540][1] < 0.05, "inverted");
+    let px = render_project(&mut r, &red(false, 40.0), Time::from_seconds(1));
+    let edge = px[180 * 640 + 320][1];
+    assert!(edge > 0.2 && edge < 0.8, "a soft edge: {edge}");
+}
+
+/// "Position on mask": the part inside the mask moves on its own.
+#[test]
+fn position_on_a_mask() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let p = masked_solid(|c| { c.params.set(&mask::on_mask(schema::POSITION), ParamSource::Static(Value::Vec2([0.25, 0.0]))); });
+    let px = render_project(&mut r, &p, Time::from_seconds(1));
+    let at = |x: usize| px[180 * 640 + x][0];
+    assert!(at(60) < 0.02, "the left part moved away: {}", at(60));
+    assert!(at(250) > 0.98 && at(600) > 0.98, "it's to the right now, over the rest");
+}
+
+/// Several masks join by their modes: a second mask over the middle half subtracts from
+/// the first (the left half), intersects with it, or makes their difference.
+#[test]
+fn masks_join_by_mode() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    // Opacity 0 inside the masks: black where they are, white elsewhere.
+    let with = |mode: mask::MaskMode| {
+        masked_solid(move |c| {
+            c.masks.push(Mask { id: 10, name: "Mask 2".into(), enabled: true, invert: false, mode, shapes: vec![MaskShape::Rect { center: [0.5, 0.5], size: [0.5, 1.0], expand: 0.0, feather: 0.0, erase: false }], frame: [1.0, 1.0] });
+            c.params.set(&mask::on_mask(schema::OPACITY), ParamSource::Static(Value::Float(0.0)));
+        })
+    };
+    // Columns: 0–25 % only the first mask, 25–50 % both, 50–75 % only the second.
+    let masked = |px: &[[f32; 4]]| [80, 240, 400, 560].map(|x| px[180 * 640 + x][0] < 0.5);
+    let cases = [
+        (mask::MaskMode::Add, [true, true, true, false]),
+        (mask::MaskMode::Subtract, [true, false, false, false]),
+        (mask::MaskMode::Intersect, [false, true, false, false]),
+        (mask::MaskMode::Difference, [true, false, true, false]),
+    ];
+    for (mode, want) in cases {
+        let px = render_project(&mut r, &with(mode), Time::from_seconds(1));
+        assert_eq!(masked(&px), want, "{mode:?}");
+    }
+}
+
+/// A red solid inside compound clips nested `levels` deep, the outermost scaled by
+/// `scale`, on a canvas `width` wide (16:9).
+fn nested_red(levels: u64, scale: f64, width: u32) -> Project {
+    let size = CanvasSize { width, height: width * 9 / 16 };
+    let mut p = Project::new("nest");
+    let variant = |id: u64| FormatVariant { id: VariantId(id), name: "16:9".into(), size, overrides: BTreeMap::new() };
+    for level in 0..=levels {
+        let seq = SeqId(100 + level);
+        let mut s = Sequence::new(seq, "S", FrameRate::FPS_30, variant(200 + level));
+        let mut track = Track::new(TrackId(300 + level), "V1", TrackKind::Video);
+        let ten = TimeRange::new(Time::ZERO, Time::from_seconds(10));
+        let mut item = if level == levels {
+            let mut solid = Item::new(ItemId(400 + level), "red", ItemKind::Solid, ten);
+            solid.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color([1.0, 0.0, 0.0, 1.0])));
+            solid
+        } else {
+            Item::new(ItemId(400 + level), "nest", ItemKind::Nested { sequence: SeqId(101 + level) }, ten)
+        };
+        if level == 0 {
+            item.params.set(schema::SCALE, ParamSource::Static(Value::Vec2([scale, scale])));
+        }
+        track.items.push(item);
+        s.tracks.push(Arc::new(track));
+        p.sequences.insert(seq, Arc::new(s));
+    }
+    p
+}
+
+/// Compound clips inside compound clips draw what's inside them — however deep, and
+/// however far the outer one is scaled up (without asking for a texture bigger than a
+/// GPU has).
+#[test]
+fn nested_compounds_render() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let registry = Registry::with_builtins();
+    for (levels, scale, width) in [(1, 1.0, 640), (3, 1.0, 640), (3, 3.0, 640), (2, 3.0, 3840), (4, 6.0, 3840)] {
+        let p = nested_red(levels, scale, width);
+        let opts = PlanOptions { render_scale: 640.0 / width as f64, ..Default::default() };
+        let plan = plan_frame(&p, SeqId(100), Time::from_seconds(1), &opts, &registry).unwrap();
+        let g = optimize(&plan.graph, OptLevel::Full, KeyContext::default());
+        let img = r.render(&g, &registry, &mut TestPatternSource::default()).unwrap_or_else(|e| panic!("{levels} deep × {scale} at {width}: {e}"));
+        let px = read_linear(r.context(), &img).unwrap();
+        let mid = px[(img.size[1] as usize / 2) * img.size[0] as usize + img.size[0] as usize / 2];
+        assert!(mid[0] > 0.95 && mid[1] < 0.05, "{levels} deep × {scale} at {width}: {mid:?}");
+    }
+    // Exported at full size, scaled up inside a 4K frame.
+    let p = nested_red(2, 3.0, 3840);
+    let plan = plan_frame(&p, SeqId(100), Time::from_seconds(1), &PlanOptions::default(), &registry).unwrap();
+    let g = optimize(&plan.graph, OptLevel::Full, KeyContext::default());
+    r.render(&g, &registry, &mut TestPatternSource::default()).expect("a 4K export with a compound scaled up");
 }

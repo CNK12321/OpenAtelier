@@ -1,5 +1,6 @@
 use crate::model::Project;
 use crate::ops::{EditError, Op};
+use oa_time::Time;
 use std::sync::Arc;
 
 struct Transaction {
@@ -146,6 +147,30 @@ fn run(project: &Arc<Project>, ops: Vec<Op>) -> Result<(Arc<Project>, Vec<Op>), 
     if next.sequences.is_empty() && !project.sequences.is_empty() {
         return Err(EditError::LastSequence);
     }
+    // Compound clips follow what's inside them: a timeline that got shorter or longer
+    // takes the clips playing it along (real edits, so undo puts them back), and a
+    // compound clip inside another passes its change on up.
+    let mut before: std::collections::BTreeMap<crate::SeqId, Time> = project.sequences.iter().map(|(id, s)| (*id, s.duration())).collect();
+    for _ in 0..16 {
+        let changed: Vec<(crate::SeqId, Time, Time)> = next
+            .sequences
+            .iter()
+            .filter_map(|(id, s)| before.get(id).map(|old| (*id, *old, s.duration())).filter(|(_, old, new)| old != new))
+            .collect();
+        if changed.is_empty() {
+            break;
+        }
+        before = next.sequences.iter().map(|(id, s)| (*id, s.duration())).collect();
+        let fits = fit_compound_clips(&next, &changed);
+        if fits.is_empty() {
+            break;
+        }
+        for op in fits {
+            let mut inv = op.apply(&mut next)?;
+            inv.append(&mut undo);
+            undo = inv;
+        }
+    }
     // Backgrounds follow their timeline's length (derived: undo lands on the same length).
     for s in next.sequences.values_mut() {
         if !s.background_in_sync() {
@@ -153,6 +178,53 @@ fn run(project: &Arc<Project>, ops: Vec<Op>) -> Result<(Arc<Project>, Vec<Op>), 
         }
     }
     Ok((Arc::new(next), undo))
+}
+
+/// Timing edits for the compound clips playing sequences whose length changed (`changed`:
+/// the sequence, its old length, its new): a clip that now runs past the end is cut to
+/// it; a clip that showed everything up to the old end grows to the new one, as far as
+/// the next clip on its track allows. Reversed and frozen clips are left alone.
+fn fit_compound_clips(p: &Project, changed: &[(crate::SeqId, Time, Time)]) -> Vec<Op> {
+    use crate::ItemKind;
+    let mut ops = Vec::new();
+    for (seq_id, s) in &p.sequences {
+        let rate = s.rate;
+        for track in &s.tracks {
+            for (i, it) in track.items.iter().enumerate() {
+                let ItemKind::Nested { sequence } = it.kind else { continue };
+                let Some(&(_, old, new)) = changed.iter().find(|(id, ..)| *id == sequence) else { continue };
+                let speed = it.time_map.speed;
+                if speed.num() <= 0 || speed.den() <= 0 {
+                    continue;
+                }
+                // How much of the inside the clip shows now, and where that ends.
+                let inner_time = |d: Time| Time::from_rational_floor(d.as_rational() * speed);
+                let outer_time = |d: Time| Time::from_rational_floor(d.as_rational() * speed.recip());
+                let shown_end = it.time_map.source_in + inner_time(it.range.duration);
+                // Past the new end (it shrank), or showing up to the old end (it grew).
+                if !(shown_end > new || (new > old && shown_end >= old)) {
+                    continue;
+                }
+                let target_end = new;
+                if target_end <= it.time_map.source_in {
+                    continue; // it would show nothing: leave it for the user to see
+                }
+                let mut end = it.range.start + outer_time(target_end - it.time_map.source_in);
+                // Growing stops at the next clip.
+                if let Some(next) = track.items.get(i + 1) {
+                    end = end.min(next.range.start);
+                }
+                // On a frame, at least one frame long.
+                let frame = rate.frame_start(1);
+                let end = rate.frame_start(rate.frame_at(end)).max(it.range.start + frame);
+                if end == it.range.end() {
+                    continue;
+                }
+                ops.push(Op::SetItemTiming { seq: *seq_id, item: it.id, range: oa_time::TimeRange::new(it.range.start, end - it.range.start), time_map: it.time_map });
+            }
+        }
+    }
+    ops
 }
 
 #[cfg(test)]
@@ -210,5 +282,65 @@ mod validation_tests {
         assert_eq!(Time::from_seconds_f64(f64::NAN), Time::ZERO);
         let huge = Time::from_seconds_f64(f64::INFINITY);
         assert!(huge.0.checked_add(huge.0).is_some());
+    }
+}
+
+#[cfg(test)]
+mod compound_fit_tests {
+    use super::*;
+    use crate::*;
+    use oa_time::{FrameRate, TimeRange};
+
+    fn secs(s: i64) -> Time {
+        Time::from_seconds(s)
+    }
+
+    /// Main plays compound B (0–10 s, all of it) then a clip at 12 s; B plays compound C
+    /// (all of it); C is a 10 s solid.
+    fn project() -> Document {
+        let mut doc = Document::new(Project::new("t"));
+        let v = |id| FormatVariant { id: VariantId(id), name: "w".into(), size: CanvasSize::new(16, 9), overrides: Default::default() };
+        let seq = |id, name, vid| Sequence::new(SeqId(id), name, FrameRate::FPS_30, v(vid));
+        let track = |id| Track::new(TrackId(id), "V1", TrackKind::Video);
+        let item = |id, kind, start, len| Item::new(ItemId(id), "x", kind, TimeRange::new(secs(start), secs(len)));
+        let ops = vec![
+            Op::AddSequence(Arc::new(seq(1, "Main", 2))),
+            Op::AddSequence(Arc::new(seq(3, "B", 4))),
+            Op::AddSequence(Arc::new(seq(5, "C", 6))),
+            Op::InsertTrack { seq: SeqId(1), index: 0, track: Arc::new(track(10)) },
+            Op::InsertTrack { seq: SeqId(3), index: 0, track: Arc::new(track(11)) },
+            Op::InsertTrack { seq: SeqId(5), index: 0, track: Arc::new(track(12)) },
+            Op::InsertItem { seq: SeqId(5), track: TrackId(12), item: item(20, ItemKind::Solid, 0, 10) },
+            Op::InsertItem { seq: SeqId(3), track: TrackId(11), item: item(21, ItemKind::Nested { sequence: SeqId(5) }, 0, 10) },
+            Op::InsertItem { seq: SeqId(1), track: TrackId(10), item: item(22, ItemKind::Nested { sequence: SeqId(3) }, 0, 10) },
+            Op::InsertItem { seq: SeqId(1), track: TrackId(10), item: item(23, ItemKind::Solid, 12, 3) },
+        ];
+        doc.edit("setup", ops).unwrap();
+        doc
+    }
+
+    fn length(doc: &Document, seq: u64, item: u64) -> Time {
+        doc.project().sequence(SeqId(seq)).unwrap().item(ItemId(item)).unwrap().range.duration
+    }
+
+    #[test]
+    fn compound_clips_follow_what_is_inside() {
+        let mut doc = project();
+        let set = |len| Op::SetItemTiming { seq: SeqId(5), item: ItemId(20), range: TimeRange::new(Time::ZERO, secs(len)), time_map: TimeMap::default() };
+        // C shrinks to 6 s: B's clip of it, then Main's clip of B, follow.
+        doc.edit("shrink", vec![set(6)]).unwrap();
+        assert_eq!((length(&doc, 3, 21), length(&doc, 1, 22)), (secs(6), secs(6)));
+        // One undo puts it all back.
+        doc.undo().unwrap();
+        assert_eq!((length(&doc, 5, 20), length(&doc, 3, 21), length(&doc, 1, 22)), (secs(10), secs(10), secs(10)));
+        // C grows to 15 s: B's clip grows with it; Main's only to the clip at 12 s.
+        doc.edit("grow", vec![set(15)]).unwrap();
+        assert_eq!((length(&doc, 3, 21), length(&doc, 1, 22)), (secs(15), secs(12)));
+        // A clip showing only part of the inside isn't stretched when it grows.
+        let mut doc = project();
+        let part = TimeRange::new(Time::ZERO, secs(4));
+        doc.edit("trim", vec![Op::SetItemTiming { seq: SeqId(1), item: ItemId(22), range: part, time_map: TimeMap::default() }]).unwrap();
+        doc.edit("grow", vec![set(15)]).unwrap();
+        assert_eq!(length(&doc, 1, 22), secs(4));
     }
 }

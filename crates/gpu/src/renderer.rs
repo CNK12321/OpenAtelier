@@ -170,6 +170,32 @@ impl GpuServices<'_> {
         self.wait
     }
 
+    /// A mask's coverage as an image (premultiplied white: every channel = coverage),
+    /// its corner at 0,0.
+    pub fn upload_mask(&mut self, pixels: &oa_graph::MaskPixels) -> Result<GpuImage, RenderError> {
+        let size = [pixels.size[0].max(1), pixels.size[1].max(1)];
+        let max = self.ctx.max_texture_size();
+        if size[0] > max || size[1] > max || pixels.coverage.len() < size[0] as usize * size[1] as usize {
+            return Err(RenderError::TooLarge(size));
+        }
+        let lut: Vec<u16> = (0..=255u32).map(|v| f16_bits(v as f32 / 255.0)).collect();
+        let mut texels = Vec::with_capacity(pixels.coverage.len() * 8);
+        for c in &pixels.coverage[..size[0] as usize * size[1] as usize] {
+            let h = lut[*c as usize].to_le_bytes();
+            for _ in 0..4 {
+                texels.extend_from_slice(&h);
+            }
+        }
+        let tex = PooledTexture::standalone(&self.ctx.device, size, "oa-mask");
+        self.ctx.queue.write_texture(
+            tex.texture.as_image_copy(),
+            &texels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size[0] * 8), rows_per_image: None },
+            wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+        );
+        Ok(GpuImage { tex: Arc::new(tex), origin: [0.0; 2], size })
+    }
+
     pub fn target(&self, size: [u32; 2]) -> Result<Arc<PooledTexture>, RenderError> {
         let max = self.ctx.max_texture_size();
         if size[0] == 0 || size[1] == 0 || size[0] > max || size[1] > max {
@@ -768,6 +794,24 @@ fn working_spec(label: &str, source: String) -> PipelineSpec {
     }
 }
 
+/// A value in 0..=1 as half-float bits (round to nearest).
+fn f16_bits(x: f32) -> u16 {
+    if x <= 0.0 {
+        return 0;
+    }
+    let b = x.to_bits();
+    let mut exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    if exp <= 0 {
+        return 0;
+    }
+    let mut mant = ((b & 0x7f_ffff) + 0x1000) >> 13;
+    if mant == 0x400 {
+        mant = 0;
+        exp += 1;
+    }
+    ((exp as u16) << 10) | mant as u16
+}
+
 fn spatial_key(entry: &str, len: usize, media: bool) -> String {
     format!("spatial{}:{entry}/{len}", if media { "+media" } else { "" })
 }
@@ -1027,6 +1071,7 @@ impl Exec<'_> {
                 let size = [(b.x1 - b.x0).round().max(1.0) as u32, (b.y1 - b.y0).round().max(1.0) as u32];
                 self.gpu.text_mask_pass(self.text, spec, *scale, *bounds, [b.x0, b.y0], size)
             }
+            NodeOp::MaskPixels { pixels } => self.gpu.upload_mask(pixels),
             NodeOp::Transition { type_id, uniforms, progress, .. } => {
                 let from = self.node(node.inputs[0])?;
                 let to = self.node(node.inputs[1])?;

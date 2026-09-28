@@ -530,7 +530,7 @@ fn fast_clips_decode_on_instead_of_seeking() {
 fn the_app_decoder_forwards_everything() {
     use oa_media::VideoDecoder;
     let Some(h) = harness(&CLIPS[0]) else { return };
-    let mut d = oa_media::AnyDecoder::Ffmpeg(FfmpegDecoder::open(h.ctx.device.clone(), h.ctx.queue.clone(), &h.probe_path, h.video()).unwrap());
+    let mut d = oa_media::AnyDecoder::Ffmpeg(Box::new(FfmpegDecoder::open(h.ctx.device.clone(), h.ctx.queue.clone(), &h.probe_path, h.video()).unwrap()));
     assert!((8..=240).contains(&d.seek_cost()), "a seek costs frames: {}", d.seek_cost());
     assert!(d.set_scale_divisor(2), "a smaller size is taken");
 }

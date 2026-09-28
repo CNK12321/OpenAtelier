@@ -30,11 +30,14 @@ pub struct ViewerView {
     /// The last press on the canvas: when, where, and the title under it (for our own
     /// double-press, see [`title_double_press`]).
     pub last_press: Option<(f64, egui::Pos2, Option<oa_doc::ItemId>)>,
+    /// Where the last click that selected a clip landed: clicking there again selects
+    /// the next clip down (what's under a transparent overlay).
+    pub last_click: Option<egui::Pos2>,
 }
 
 impl Default for ViewerView {
     fn default() -> Self {
-        ViewerView { zoom: None, pan: egui::Vec2::ZERO, thirds: false, safe_areas: false, center: false, last_press: None }
+        ViewerView { zoom: None, pan: egui::Vec2::ZERO, thirds: false, safe_areas: false, center: false, last_press: None, last_click: None }
     }
 }
 
@@ -258,11 +261,19 @@ impl App {
         let rect = egui::Rect::from_center_size(available.center() + pan, size);
         let clip = ui.painter_at(available);
         // Inside a compound clip the picture is see-through where it has nothing: a
-        // checkerboard shows where.
-        if !self.compound_trail.is_empty() {
+        // checkerboard shows where. One made of sound alone has no picture at all: it
+        // says so, rather than showing an empty checkerboard.
+        let sound_only = !self.compound_trail.is_empty() && !self.editor.sequence_has_picture(self.editor.seq);
+        if sound_only {
+            clip.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
+            let message = "♪  This compound clip is sound only — nothing to show here.\nIts sound plays; its clips are on the sound tracks below.";
+            clip.text(rect.center(), egui::Align2::CENTER_CENTER, message, egui::FontId::proportional(13.0), egui::Color32::from_gray(150));
+        } else if !self.compound_trail.is_empty() {
             crate::widgets::checkerboard(&clip, rect);
         }
-        clip.image(preview_id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+        if !sound_only {
+            clip.image(preview_id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+        }
         self.draw_guides(&clip, rect);
 
         self.display_scale = rect.width() / canvas[0] as f32 * ui.ctx().pixels_per_point();
@@ -295,6 +306,12 @@ impl App {
             self.track_overlay(ui, &response, &to_canvas, &to_screen, available);
             return;
         }
+        // The Masks tab shows the mask being drawn; with a drawing tool, it takes the
+        // pointer over.
+        if self.mask_viewer(ui, &response, rect, zoom, available) {
+            self.viewer_canvas = Some((available, rect));
+            return;
+        }
 
         // Selection geometry at this instant — only if the selected clip is on screen now.
         let project = self.editor.doc.snapshot();
@@ -321,12 +338,15 @@ impl App {
             .as_ref()
             .map(|v| scene::layers_at(&project, seq, v, t).into_iter().filter_map(|l| Some((l.item, self.surface_of(l.item, t)?, l))).map(|(id, s, l)| (id, l, s)).collect())
             .unwrap_or_default();
-        let hit = |pointer: [f64; 2]| {
-            let v = variant.as_ref()?;
+        // Every layer under the pointer, topmost first (the first is what a click takes).
+        let hits_at = |pointer: [f64; 2]| -> Vec<oa_doc::ItemId> {
+            let Some(v) = variant.as_ref() else { return Vec::new() };
             scene::hits(&project, seq, v, t, pointer)
                 .into_iter()
-                .find(|id| meshes.iter().find(|(m, ..)| m == id).is_none_or(|(_, l, s)| l.to_layer_fraction(pointer).is_some_and(|q| s.covers(q))))
+                .filter(|id| meshes.iter().find(|(m, ..)| m == id).is_none_or(|(_, l, s)| l.to_layer_fraction(pointer).is_some_and(|q| s.covers(q))))
+                .collect()
         };
+        let hit = |pointer: [f64; 2]| hits_at(pointer).into_iter().next();
 
         // Pointer feedback.
         let mut hovered_layer = None;
@@ -614,7 +634,16 @@ impl App {
         {
             let c = to_canvas(pos);
             if pick(c).is_none() && surface_point(pos).is_none() && effect_point(pos).is_none() {
-                self.selection = hit(c);
+                // Clicking again where the last click was takes the next clip down —
+                // what's under a video with transparency, which covers its whole box.
+                let under = hits_at(c);
+                let again = self.view.last_click.is_some_and(|p| p.distance(pos) <= 4.0);
+                let next = match self.selection.and_then(|s| under.iter().position(|i| *i == s)) {
+                    Some(i) if again && under.len() > 1 => Some(under[(i + 1) % under.len()]),
+                    _ => under.first().copied(),
+                };
+                self.selection = next;
+                self.view.last_click = Some(pos);
             }
         }
         // Double-click a title to type into it right where it is; any other clip, to

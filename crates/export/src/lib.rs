@@ -135,15 +135,20 @@ fn collect_audio(
                 // A compound clip: its sound, moved to where the clip sits and cut to it,
                 // at its own track's layer.
                 if depth < 16 && item.audio_enabled() {
-                    let before = clips.len();
-                    nested_audio(project, sequence, item, audio_path, depth, clips, skipped);
+                    let (before, buses_before) = (clips.len(), buses.len());
+                    // Its fades: the transitions at its ends, as a plain clip's.
+                    let fades = [ClipEnd::Head, ClipEnd::Tail].map(|end| oa_plan::transitions::window(track, i, end).map_or(Time::ZERO, |w| w.duration));
+                    nested_audio(project, sequence, item, fades, audio_path, depth, clips, buses, skipped);
                     clips[before..].iter_mut().for_each(|c| c.layer = layer);
-                    // Its own sound effects: over its clips alone, mixed apart (a group),
-                    // then added in at its layer. (A compound clip inside another keeps
-                    // its clips' effects; its own aren't heard yet.)
+                    buses[buses_before..].iter_mut().for_each(|b| b.layer = layer);
+                    // Its own sound effects: over its sound alone, mixed apart (a group),
+                    // then added in at its layer. The groups of compound clips inside it
+                    // are members of it, and their clips go with them.
                     let effects = sound_effects(item);
                     if !effects.is_empty() && clips.len() > before {
-                        let members = clips[before..].iter().map(|c| c.id).collect();
+                        let inner = &buses[buses_before..];
+                        let in_group = |id: u64| inner.iter().any(|b| b.members.as_ref().is_some_and(|m| m.contains(&id)));
+                        let members = clips[before..].iter().map(|c| c.id).chain(inner.iter().map(|b| b.id)).filter(|id| !in_group(*id)).collect();
                         buses.push(oa_audio::AudioBus { id: item.id.0 ^ 0x5EED_B055, range: item.range, effects, layer, members: Some(members) });
                     }
                 }
@@ -209,14 +214,19 @@ fn collect_audio(
     }
 }
 
-/// The sound inside compound clip `item` (playing `sequence`), in the outer timeline.
+/// The sound inside compound clip `item` (playing `sequence`), in the outer timeline:
+/// its clips (under the compound clip's own volume and `fades` too) and the groups of
+/// compound clips inside it that have sound effects of their own.
+#[allow(clippy::too_many_arguments)]
 fn nested_audio(
     project: &Project,
     sequence: SeqId,
     item: &oa_doc::Item,
+    fades: [Time; 2],
     audio_path: &dyn Fn(oa_doc::MediaId) -> Option<std::path::PathBuf>,
     depth: usize,
     clips: &mut Vec<oa_audio::AudioClip>,
+    buses: &mut Vec<oa_audio::AudioBus>,
     skipped: &mut Vec<oa_doc::ItemId>,
 ) {
     // A retimed compound clip plays its timeline `k` times as fast: inner time τ is heard
@@ -235,8 +245,33 @@ fn nested_audio(
     let outer = |tau: Time| item.range.start + Time::from_seconds_f64((tau - item.time_map.source_in).as_seconds_f64() / k);
     let squeeze = |d: Time| Time::from_seconds_f64(d.as_seconds_f64() / k);
     let mut inner = Vec::new();
-    collect_audio(project, sequence, audio_path, depth + 1, &mut inner, &mut Vec::new(), skipped);
+    let mut inner_buses = Vec::new();
+    collect_audio(project, sequence, audio_path, depth + 1, &mut inner, &mut inner_buses, skipped);
     let (lo, hi) = (item.range.start, item.range.end());
+    // The same sequence can be used more than once: keep the mixer's ids apart.
+    let rekey = |id: u64| id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ item.id.0;
+    // The compound clip's own volume and fades, over everything inside it.
+    let own = oa_audio::OuterGain {
+        gain_db: item.params.get(oa_doc::schema::AUDIO_GAIN).cloned().unwrap_or(oa_params::ParamSource::Static(oa_params::Value::Float(0.0))),
+        clock_start: item.range.start,
+        clock_rate: 1.0,
+        range: item.range,
+        fade_in: fades[0],
+        fade_out: fades[1],
+    };
+    let has_own = item.params.get(oa_doc::schema::AUDIO_GAIN).is_some() || fades != [Time::ZERO; 2];
+    for mut b in inner_buses {
+        let (start, end) = (outer(b.range.start).max(lo), outer(b.range.end()).min(hi));
+        if end <= start {
+            continue;
+        }
+        b.range = oa_time::TimeRange::new(start, end - start);
+        b.id = rekey(b.id);
+        if let Some(m) = &mut b.members {
+            m.iter_mut().for_each(|id| *id = rekey(*id));
+        }
+        buses.push(b);
+    }
     for mut c in inner {
         let mut start = outer(c.range.start);
         let mut end = outer(c.range.end());
@@ -246,8 +281,21 @@ fn nested_audio(
             c.fade_in = squeeze(c.fade_in);
             c.fade_out = squeeze(c.fade_out);
             c.length = squeeze(c.length);
+            c.clock_rate *= k;
         }
         c.clock_start = outer(c.clock_start);
+        // The compound clips it was already inside move along with it.
+        for o in &mut c.outer {
+            let (s, e) = (outer(o.range.start), outer(o.range.end()));
+            o.range = oa_time::TimeRange::new(s, e - s);
+            o.clock_start = outer(o.clock_start);
+            o.clock_rate *= k;
+            o.fade_in = squeeze(o.fade_in);
+            o.fade_out = squeeze(o.fade_out);
+        }
+        if has_own {
+            c.outer.push(own.clone());
+        }
         if start < lo {
             c.source_in += Time::from_seconds_f64((lo - start).as_seconds_f64() * c.speed);
             c.fade_in = Time::ZERO;
@@ -261,8 +309,7 @@ fn nested_audio(
             continue;
         }
         c.range = oa_time::TimeRange::new(start, end - start);
-        // The same sequence can be used more than once: keep the mixer's ids apart.
-        c.id = c.id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ item.id.0;
+        c.id = rekey(c.id);
         clips.push(c);
     }
 }
@@ -891,6 +938,70 @@ mod tests {
         assert_eq!(buses.len(), 1);
         assert_eq!(buses[0].members.as_deref(), Some(&[clips[0].id][..]), "over its own clip");
         assert_eq!(buses[0].range, TimeRange::new(secs(10.0), secs(1.0)));
+    }
+
+    /// A compound clip's volume (keyframes too) and fades reach the sound inside it, and
+    /// a compound clip inside another keeps its own sound effects: its group sits inside
+    /// the outer one's, each clip in exactly one group.
+    #[test]
+    fn compound_clips_inside_compound_clips() {
+        let p = AspectPreset::by_id("landscape-16x9").unwrap();
+        let variant = |id| FormatVariant { id: VariantId(id), name: "wide".into(), size: p.size(1080), overrides: Default::default() };
+        let mut project = Project::new("t");
+        let media = MediaId(1);
+        let info = MediaInfo { width: 0, height: 0, duration: secs(60.0), rate: None, has_video: false, has_audio: true, still: false, ..Default::default() };
+        project.media.insert(media, Arc::new(MediaRef { id: media, path: "a.wav".into(), fingerprint: None, info: Some(info), scaling: Default::default(), folder: String::new(), color: Default::default() }));
+        // Innermost: a sound 0–10 s. Middle: that compound, with an echo, at 0 s, and a
+        // sound of its own. Main: the middle compound at 5 s on an audio track, −6 dB,
+        // with a reverb and a fade in.
+        let mut inner = Sequence::new(SeqId(2), "Inner", FrameRate::FPS_30, variant(3));
+        let mut a = Track::new(TrackId(4), "A1", TrackKind::Audio);
+        a.items.push(Item::new(ItemId(5), "sound", ItemKind::Media { media }, TimeRange::new(secs(0.0), secs(10.0))));
+        inner.tracks.push(Arc::new(a));
+        project.sequences.insert(SeqId(2), Arc::new(inner));
+        let mut middle = Sequence::new(SeqId(10), "Middle", FrameRate::FPS_30, variant(11));
+        let mut m1 = Track::new(TrackId(12), "A1", TrackKind::Audio);
+        let mut nest = Item::new(ItemId(13), "inner", ItemKind::Nested { sequence: SeqId(2) }, TimeRange::new(secs(0.0), secs(10.0)));
+        nest.effects.push(oa_doc::EffectInstance::new(oa_doc::EffectId(14), "oa.audio.echo"));
+        m1.items.push(nest);
+        let mut m2 = Track::new(TrackId(15), "A2", TrackKind::Audio);
+        m2.items.push(Item::new(ItemId(16), "voice", ItemKind::Media { media }, TimeRange::new(secs(0.0), secs(10.0))));
+        middle.tracks.push(Arc::new(m1));
+        middle.tracks.push(Arc::new(m2));
+        project.sequences.insert(SeqId(10), Arc::new(middle));
+        let mut main = Sequence::new(SeqId(20), "Main", FrameRate::FPS_30, variant(21));
+        let mut t = Track::new(TrackId(22), "A1", TrackKind::Audio);
+        let mut outer = Item::new(ItemId(23), "middle", ItemKind::Nested { sequence: SeqId(10) }, TimeRange::new(secs(5.0), secs(10.0)));
+        outer.params.set(oa_doc::schema::AUDIO_GAIN, oa_params::ParamSource::Static(oa_params::Value::Float(-6.0)));
+        outer.effects.push(oa_doc::EffectInstance::new(oa_doc::EffectId(24), "oa.audio.reverb"));
+        outer.transition_in = Some(oa_doc::Transition::new("oa.transition.dissolve", secs(1.0)));
+        t.items.push(outer);
+        main.tracks.push(Arc::new(t));
+        project.sequences.insert(SeqId(20), Arc::new(main));
+
+        let (clips, buses, skipped) = audio_mix(&project, SeqId(20), |_| Some("a.wav".into()));
+        assert!(skipped.is_empty());
+        assert_eq!(clips.len(), 2);
+        // Both clips hear the outer clip's volume and fade in, placed at 5 s.
+        for c in &clips {
+            assert_eq!(c.range, TimeRange::new(secs(5.0), secs(10.0)));
+            assert_eq!(c.outer.len(), 1, "{c:?}");
+            let o = &c.outer[0];
+            assert_eq!((o.range, o.clock_start), (TimeRange::new(secs(5.0), secs(10.0)), secs(5.0)));
+            assert!(o.fade_in > Time::ZERO);
+            assert_eq!(o.gain_db, oa_params::ParamSource::Static(oa_params::Value::Float(-6.0)));
+        }
+        // Two groups: the echo over the innermost sound, inside the reverb over it all.
+        assert_eq!(buses.len(), 2, "{buses:?}");
+        let echo = buses.iter().find(|b| b.effects[0].type_id == "oa.audio.echo").unwrap();
+        let reverb = buses.iter().find(|b| b.effects[0].type_id == "oa.audio.reverb").unwrap();
+        let echo_members = echo.members.clone().unwrap();
+        let reverb_members = reverb.members.clone().unwrap();
+        assert_eq!(echo_members.len(), 1);
+        assert!(reverb_members.contains(&echo.id), "the inner group mixes inside the outer one");
+        assert!(!reverb_members.contains(&echo_members[0]), "its clip isn't mixed twice");
+        assert_eq!(reverb_members.len(), 2, "the voice and the inner group");
+        assert_eq!(echo.range, TimeRange::new(secs(5.0), secs(10.0)));
     }
 
     /// An audio effect track becomes a bus above the audio tracks drawn below it (and the

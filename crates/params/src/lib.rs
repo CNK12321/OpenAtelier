@@ -223,6 +223,12 @@ impl ParamSource {
     /// Adds an offset that follows the sound: `amount` at full level, nothing below
     /// `floor_db`.
     pub fn follow(self, source: SoundSource, band: SoundBand, amount: f64, floor_db: f64) -> ParamSource {
+        self.follow_on(None, source, band, amount, floor_db)
+    }
+
+    /// [`ParamSource::follow`] for one component of a vector (`axis`: 0 = x, 1 = y), or
+    /// all of it (`None`).
+    pub fn follow_on(self, axis: Option<u8>, source: SoundSource, band: SoundBand, amount: f64, floor_db: f64) -> ParamSource {
         ParamSource::Modulated {
             base: Box::new(self),
             modulator: Modulator::Follow {
@@ -230,7 +236,34 @@ impl ParamSource {
                 band,
                 amount: Box::new(ParamSource::Static(Value::Float(amount))),
                 floor_db: Box::new(ParamSource::Static(Value::Float(floor_db))),
+                axis,
             },
+        }
+    }
+
+    /// The sound connection offsetting component `axis` (`None`: the whole value), and
+    /// what it rides on.
+    pub fn find_follow_on(&self, axis: Option<u8>) -> Option<(&ParamSource, &Modulator)> {
+        match self {
+            ParamSource::Modulated { base, modulator: m @ Modulator::Follow { axis: a, .. } } if *a == axis => Some((base, m)),
+            ParamSource::Modulated { base, .. } => base.find_follow_on(axis),
+            _ => None,
+        }
+    }
+
+    /// Mutable [`ParamSource::find_follow_on`].
+    pub fn find_follow_on_mut(&mut self, axis: Option<u8>) -> Option<(&mut ParamSource, &mut Modulator)> {
+        let here = matches!(self, ParamSource::Modulated { modulator: Modulator::Follow { axis: a, .. }, .. } if *a == axis);
+        let ParamSource::Modulated { base, modulator } = self else { return None };
+        if here { Some((&mut **base, modulator)) } else { base.find_follow_on_mut(axis) }
+    }
+
+    /// This source without the sound connection on component `axis`.
+    pub fn remove_follow_on(self, axis: Option<u8>) -> ParamSource {
+        match self {
+            ParamSource::Modulated { base, modulator: Modulator::Follow { axis: a, .. } } if a == axis => *base,
+            ParamSource::Modulated { base, modulator } => ParamSource::Modulated { base: Box::new(base.remove_follow_on(axis)), modulator },
+            other => other,
         }
     }
 
@@ -337,12 +370,41 @@ impl ParamSource {
         }
     }
 
+    /// Scales or turns with two tracks (`pair`, a [`Modulator::TrackPair`]) — replacing
+    /// a pair it already follows; its own value (keyframes too) stays underneath.
+    pub fn with_track_pair(self, pair: Modulator) -> ParamSource {
+        ParamSource::Modulated { base: Box::new(self.without_track_pair()), modulator: pair }
+    }
+
+    /// Stops scaling or turning with two tracks (its own value is left).
+    pub fn without_track_pair(self) -> ParamSource {
+        match self {
+            ParamSource::Modulated { base, modulator: Modulator::TrackPair { .. } } => base.without_track_pair(),
+            ParamSource::Modulated { base, modulator } => ParamSource::Modulated { base: Box::new(base.without_track_pair()), modulator },
+            other => other,
+        }
+    }
+
+    /// The two tracks it scales or turns with, if any.
+    pub fn track_pair(&self) -> Option<(&Arc<PointTrack>, &Arc<PointTrack>)> {
+        match self {
+            ParamSource::Modulated { modulator: Modulator::TrackPair { a, b, .. }, .. } => Some((a, b)),
+            ParamSource::Modulated { base, .. } => base.track_pair(),
+            _ => None,
+        }
+    }
+
     /// The same, following `track`'s new points (when that track has been edited); a
     /// stabilization is worked out again for them.
     pub fn retracked(self, track: &Arc<PointTrack>) -> ParamSource {
         match self {
             ParamSource::Modulated { base, modulator: Modulator::Track { track: old, clock, mode } } if old.id == track.id => {
                 ParamSource::Modulated { base, modulator: Modulator::Track { track: track.clone(), clock, mode: mode.rebuilt(track) } }
+            }
+            ParamSource::Modulated { base, modulator: Modulator::TrackPair { a, b, clock, measure, aspect, reference } } if a.id == track.id || b.id == track.id => {
+                let pick = |old: Arc<PointTrack>| if old.id == track.id { track.clone() } else { old };
+                let modulator = Modulator::TrackPair { a: pick(a), b: pick(b), clock, measure, aspect, reference };
+                ParamSource::Modulated { base: Box::new(base.retracked(track)), modulator }
             }
             ParamSource::Modulated { base, modulator } => ParamSource::Modulated { base: Box::new(base.retracked(track)), modulator },
             other => other,
@@ -483,6 +545,21 @@ impl ParamSource {
                             *track = Arc::new(t);
                         }
                     }
+                    Modulator::TrackPair { a, b, aspect, reference, .. } => {
+                        for track in [a, b] {
+                            if !track.is_clean() {
+                                let mut t = (**track).clone();
+                                t.sanitize();
+                                *track = Arc::new(t);
+                            }
+                        }
+                        if !(aspect.is_finite() && *aspect > 0.0) {
+                            *aspect = 1.0;
+                        }
+                        if !reference.is_finite() {
+                            *reference = 1.0;
+                        }
+                    }
                 }
                 for s in modulator.rates_mut() {
                     if !s.sanitize() {
@@ -559,6 +636,10 @@ pub enum Modulator {
         amount: Box<ParamSource>,
         /// dBFS below which the sound counts as silence (float source).
         floor_db: Box<ParamSource>,
+        /// Only one component of a vector (0 = x, 1 = y, 2 = z) — a position that sways
+        /// sideways with the beat; `None` offsets every component (and plain numbers).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        axis: Option<u8>,
     },
     /// Follows a [`PointTrack`]: its position is added, so the property's own value is
     /// an **offset** from the track. The track is carried along (shared, not copied) so
@@ -573,6 +654,55 @@ pub enum Modulator {
         #[serde(default)]
         mode: TrackUse,
     },
+    /// Follows two [`PointTrack`]s at once: how far apart they are (a scale, multiplied
+    /// in) or which way the line between them points (a rotation in degrees, added),
+    /// each compared with when it was linked — something tracked at two points grows,
+    /// shrinks and turns, and the property does too.
+    TrackPair {
+        a: Arc<PointTrack>,
+        b: Arc<PointTrack>,
+        /// Timeline time = clip time + `clock`, as for [`Modulator::Track`].
+        clock: Time,
+        measure: PairMeasure,
+        /// Width ÷ height of what the tracks' positions are fractions of, so distances
+        /// and angles are measured true on a picture that isn't square.
+        aspect: f64,
+        /// The distance (scale) or the angle in degrees (rotation) when it was linked.
+        reference: f64,
+    },
+}
+
+/// What a [`Modulator::TrackPair`] reads from its two tracks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairMeasure {
+    Scale,
+    Rotation,
+}
+
+impl PairMeasure {
+    /// The distance between `a` and `b` (Scale) or the angle of the line from `a` to `b`
+    /// in degrees (Rotation), on a picture `aspect` wide per unit of height.
+    pub fn of(self, a: [f64; 2], b: [f64; 2], aspect: f64) -> f64 {
+        let d = [(b[0] - a[0]) * aspect, b[1] - a[1]];
+        match self {
+            PairMeasure::Scale => (d[0] * d[0] + d[1] * d[1]).sqrt(),
+            PairMeasure::Rotation => d[1].atan2(d[0]).to_degrees(),
+        }
+    }
+}
+
+impl Modulator {
+    /// A [`Modulator::TrackPair`] linked at timeline time `now` (its reference is the
+    /// tracks' distance or angle there); `None` if a track has no points there or the
+    /// two points coincide.
+    pub fn track_pair(a: Arc<PointTrack>, b: Arc<PointTrack>, clock: Time, measure: PairMeasure, aspect: f64, now: Time) -> Option<Modulator> {
+        let (pa, pb) = (a.at(now)?, b.at(now)?);
+        let reference = measure.of(pa, pb, aspect);
+        if measure == PairMeasure::Scale && reference < 1e-9 {
+            return None;
+        }
+        Some(Modulator::TrackPair { a, b, clock, measure, aspect, reference })
+    }
 }
 
 /// What a position does with its track.
@@ -755,7 +885,7 @@ impl Modulator {
         match self {
             Modulator::Wiggle { amplitude, frequency, .. } | Modulator::Lfo { amplitude, frequency, .. } => vec![amplitude, frequency],
             Modulator::Follow { amount, floor_db, .. } => vec![amount, floor_db],
-            Modulator::Track { .. } => Vec::new(),
+            Modulator::Track { .. } | Modulator::TrackPair { .. } => Vec::new(),
         }
     }
 
@@ -763,7 +893,7 @@ impl Modulator {
         match self {
             Modulator::Wiggle { amplitude, frequency, .. } | Modulator::Lfo { amplitude, frequency, .. } => vec![amplitude, frequency],
             Modulator::Follow { amount, floor_db, .. } => vec![amount, floor_db],
-            Modulator::Track { .. } => Vec::new(),
+            Modulator::Track { .. } | Modulator::TrackPair { .. } => Vec::new(),
         }
     }
 
@@ -780,7 +910,7 @@ impl Modulator {
             // It listens at the timeline instant, which a clip-clock shift doesn't move.
             Modulator::Follow { .. } => {}
             // Same instants, same place on the track.
-            Modulator::Track { clock, .. } => *clock += delta,
+            Modulator::Track { clock, .. } | Modulator::TrackPair { clock, .. } => *clock += delta,
         }
     }
 
@@ -790,7 +920,18 @@ impl Modulator {
                 (Value::Vec2([a, b]), Some([x, y])) => Value::Vec2([a + x, b + y]),
                 (v, _) => v,
             },
-            Modulator::Follow { source, band, amount, floor_db } => {
+            Modulator::TrackPair { a, b, clock, measure, aspect, reference } => {
+                let t = ctx.clip_time + *clock;
+                let (Some(pa), Some(pb), Value::Float(v)) = (a.at(t), b.at(t), &value) else { return value };
+                let now = measure.of(pa, pb, *aspect);
+                match measure {
+                    PairMeasure::Scale if *reference > 1e-9 => Value::Float(v * now / reference),
+                    // The turn since linking, the short way round.
+                    PairMeasure::Rotation => Value::Float(v + (now - reference + 180.0).rem_euclid(360.0) - 180.0),
+                    _ => value,
+                }
+            }
+            Modulator::Follow { source, band, amount, floor_db, axis } => {
                 let amount = amount.eval(ctx).as_float().unwrap_or(0.0);
                 if amount == 0.0 {
                     return value;
@@ -800,8 +941,23 @@ impl Modulator {
                 match value {
                     Value::Float(v) => Value::Float(v + d),
                     Value::Int(v) => Value::Int(v + d.round() as i64),
-                    Value::Vec2([a, b]) => Value::Vec2([a + d, b + d]),
-                    Value::Vec3([a, b, c]) => Value::Vec3([a + d, b + d, c + d]),
+                    // One component only, when it says so.
+                    Value::Vec2(mut v) => {
+                        for (k, c) in v.iter_mut().enumerate() {
+                            if axis.is_none_or(|a| a as usize == k) {
+                                *c += d;
+                            }
+                        }
+                        Value::Vec2(v)
+                    }
+                    Value::Vec3(mut v) => {
+                        for (k, c) in v.iter_mut().enumerate() {
+                            if axis.is_none_or(|a| a as usize == k) {
+                                *c += d;
+                            }
+                        }
+                        Value::Vec3(v)
+                    }
                     Value::Color([r, g, b, a]) => Value::Color([r + d, g + d, b + d, a]),
                     other => other,
                 }
@@ -1176,5 +1332,39 @@ mod lfo_decay_tests {
         let plain = src.clone().remove_lfo();
         assert!(plain.find_lfo().is_none());
         assert_eq!(plain.eval(&EvalContext::at(Time::ZERO, Time::ZERO)).as_float(), Some(0.0));
+    }
+}
+
+#[cfg(test)]
+mod track_pair_tests {
+    use super::*;
+
+    fn track(id: u64, points: &[(i64, [f64; 2])]) -> Arc<PointTrack> {
+        Arc::new(PointTrack { id, name: format!("t{id}"), points: points.iter().map(|(s, p)| (Time::from_seconds(*s), *p)).collect() })
+    }
+
+    /// Two tracked points drifting apart and turning: a linked scale grows with their
+    /// distance, a linked rotation turns with the line between them — both from the
+    /// value they had when linked, which stays keyframable underneath.
+    #[test]
+    fn two_tracks_scale_and_turn() {
+        let a = track(1, &[(0, [0.25, 0.5]), (2, [0.25, 0.5])]);
+        let b = track(2, &[(0, [0.75, 0.5]), (2, [0.25, 0.0])]);
+        let at = |s: i64| EvalContext::at(Time::from_seconds(s), Time::from_seconds(s));
+        let pair = |m| Modulator::track_pair(a.clone(), b.clone(), Time::ZERO, m, 2.0, Time::ZERO).unwrap();
+        // On a 2:1 picture: 1.0 across at the start, 0.5 straight up at the end.
+        let scale = ParamSource::Static(Value::Float(1.5)).with_track_pair(pair(PairMeasure::Scale));
+        assert_eq!(scale.eval(&at(0)).as_float(), Some(1.5));
+        assert!((scale.eval(&at(2)).as_float().unwrap() - 0.75).abs() < 1e-9);
+        let turn = ParamSource::Static(Value::Float(10.0)).with_track_pair(pair(PairMeasure::Rotation));
+        assert!((turn.eval(&at(2)).as_float().unwrap() - (10.0 - 90.0)).abs() < 1e-9);
+        assert!(turn.track_pair().is_some());
+        // Unlinked: its own value again; a moved track is picked up.
+        assert_eq!(turn.clone().without_track_pair().eval(&at(2)).as_float(), Some(10.0));
+        let moved = track(2, &[(0, [0.75, 0.5]), (2, [0.5, 1.0])]);
+        assert!((turn.retracked(&moved).eval(&at(2)).as_float().unwrap() - (10.0 + 45.0)).abs() < 1e-9);
+        // Saved and loaded.
+        let json = serde_json::to_string(&scale).unwrap();
+        assert_eq!(serde_json::from_str::<ParamSource>(&json).unwrap(), scale);
     }
 }

@@ -108,6 +108,14 @@ so test runs don't leave recovery banners in your real autosave folder.
    `MF_SINK_WRITER_D3D_MANAGER` so frames never leave the GPU (needs rendering the two
    NV12 planes into a shared D3D11 NV12 texture). Export is pipelined already: 305 fps
    1080p60 via MF/NVIDIA.
+   Measured 2026-09-27 (`bench_export`, 10 s): 1080p is **encoder-bound** (~275 fps; the
+   NVIDIA MFT paces the writer; planning is 0.13 ms a frame, masks cost clips without
+   them nothing; a Blur of 80 px adds ~5 %). 4K footage is **decode-bound** (~157 fps,
+   with or without effects; MF's hardware decode — ffmpeg's d3d11va is no faster, its
+   software decoder is 2.5× faster on the CPU but our ffmpeg pipe path is slower still).
+   A separate encoder thread was tried and was slower (MF and ffmpeg already encode
+   beside the render loop): don't redo it. Next lever for 4K: a second decoder working
+   ahead on the next GOP during export.
 4. **Timeline UX** (overhaul ✅ 2026-09-19, DESIGN §11b: multi-select, groups, clipboard,
    menus, track rename/reorder/delete, filmstrip/waveform, keyframe line, extract audio,
    effect/value copy-paste, compound clips "As media"/"Nest", crop, media bin cards with
@@ -129,7 +137,7 @@ so test runs don't leave recovery banners in your real autosave folder.
    render from a frozen frame (no decoder waits) within a 12 ms/frame budget and are
    framed on the clip; smooth scrubbing (stand-ins), Auto preview resolution, viewer
    zoom/pan and guides. Earlier: effect categories/roles, motion effects, media inputs. Also this session: `Unit::Direction` + pinwheel dial (Fly any angle, wipes, push, shimmer), `Value::Gradient` directional gradients (tint, text fill/outline, glow) with a stop editor, Shimmer for any clip. Old projects: Fly/Push saved with the old left/right/up/down choice fall back to the default direction. Later: simple/advanced Color (right-click → gradient) and Scale (right-click → X/Y), smaller dial snapping to right angles, outro "Reverse" (`Item::active_effects`, `EffectRole::Reversed`), script `rclick`.
-6. **Audio**: ✅ sound effects (Bass Boost, Pitch Shift, Echo, Reverb, Threshold, Bit Crush, Denoise; DESIGN §12). ✅ Speed with keep-pitch. ✅ Effect tracks (picture and sound buses), tails, EQ/compressor/limiter/de-esser with live meters, formants, reverb rooms, properties following the sound (2026-09-24). ✅ Reversed clips play their sound backwards (2026-09-27). Left: freeze frames and reversed compound clips are silent; per-track gain/pan;
+6. **Audio**: ✅ sound effects (Bass Boost, Pitch Shift, Echo, Reverb, Threshold, Bit Crush, Denoise; DESIGN §12). ✅ Speed with keep-pitch. ✅ Effect tracks (picture and sound buses), tails, EQ/compressor/limiter/de-esser with live meters, formants, reverb rooms, properties following the sound (2026-09-24). ✅ Reversed clips play their sound backwards (2026-09-27). ✅ Compound clips: their volume (keyframes too) and fades reach the sound inside, compound clips inside compound clips keep their sound effects (groups nest in the mixer), keyframes inside retimed compounds run at the right rate, sound-only compounds go on sound tracks and draw as waveforms (timeline, bin; the viewer says so inside one) (2026-09-27). Left: freeze frames and reversed compound clips are silent; per-track gain/pan;
    replace the ffmpeg audio process with a platform decoder.
 7. **Stateful effects**: the engine reserves `Statefulness::Stateful` (preroll, no cache
    key) but no effect uses it any more and the executor doesn't run them — needed for
@@ -144,6 +152,19 @@ so test runs don't leave recovery banners in your real autosave folder.
     typing (double-click in the viewer), the format picker (`formats.rs`) with platform
     safe zones. Left: curve editor for vector properties and several curves at once;
     selecting several keys on the timeline.
+11. **Masks** ✅ 2026-09-27 (DESIGN §17b, `oa_doc::mask`, `app/masks.rs`; Settings →
+    Masking): several masks per clip drawn with rectangle, ellipse, brush/eraser, fill
+    and magic select, or imported from a black-and-white or see-through picture;
+    keyframable center/scale/rotation/softness/harshness; "… on mask" values for
+    opacity, position, scale, rotation, squash; "Use with mask" (or outside) for effects;
+    copy/paste between clips with fit or crop. ✅ Second pass (same day): bezier paths
+    (Pen) with per-point keyframes, an Edit tool with handles for rectangles, ellipses
+    and path points, per-shape expand/contract and feather, add/subtract/intersect/
+    difference between masks, the center on a point track and scale/rotation on two
+    (`Modulator::TrackPair`), pixel masks at full resolution. Left: **automatic
+    rotoscoping** (a path that follows its outline by itself, e.g. tracking each point),
+    inserting a point on a path segment, a timeline view of path keys, and building
+    masks from the Color tab (qualifiers).
 
 ## Background backend track
 
@@ -185,6 +206,7 @@ when the turn's requested work is already very large (and say so).
 - Color: [ ] OCIO configs (a pure-Rust config reader, transforms evaluated on the CPU and
   baked into 3D LUTs; per-file color space, project display/view) · [ ] .cube LUTs ·
   [ ] 10-bit/P010 decode · [ ] HDR export.
+- Media: [x] transparent video fixed (2026-09-27): ffmpeg's `-hwaccel auto` picked its Vulkan compute decoders for FFV1/ProRes, which corrupted frames now and then (black flicker, test pattern) — hardware decoding is now only for H.264/HEVC/VP9/AV1/MPEG-2/VC-1/VP8 without alpha; VP8/VP9 alpha decoded with libvpx and detected from `alpha_mode`; transparent media no longer counts as covering the layers under it (`MediaInfo::alpha`); Matroska millisecond stamps no longer repeat every third frame (half-tick slack in `select_frame` for coarse time bases); clicking the same spot again selects the next clip down.
 
 ## Known issues / gaps
 

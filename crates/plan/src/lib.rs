@@ -169,6 +169,43 @@ fn spoken(params: &oa_params::ParamSet, schema: &[oa_params::ParamSchema], value
     any.then_some(out)
 }
 
+/// The longest side a mask's drawing is rasterized at: the layer's full resolution up
+/// to the largest texture every GPU takes.
+const MAX_MASK_SIDE: f64 = 8192.0;
+/// How many bytes of rasterized drawings are kept for later frames.
+const MASK_CACHE_BYTES: usize = 256 << 20;
+
+/// A mask's drawing as coverage at `size` px at clip time `t`: rasterized once per
+/// drawing and size (and, for keyframed paths, per instant), then reused frame after
+/// frame (the planner runs every frame; drawings change rarely). The most recently used
+/// are kept, up to [`MASK_CACHE_BYTES`].
+fn mask_pixels(mask: &oa_doc::Mask, size: [u32; 2], t: Time) -> std::sync::Arc<oa_graph::MaskPixels> {
+    use std::sync::{Arc, Mutex};
+    static CACHE: Mutex<Vec<Arc<oa_graph::MaskPixels>>> = Mutex::new(Vec::new());
+    let hash = mask.content_hash(t);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = cache.iter().position(|p| p.hash == hash && p.size == size) {
+        let hit = cache.remove(i);
+        cache.insert(0, hit.clone());
+        return hit;
+    }
+    let made = Arc::new(oa_graph::MaskPixels { hash, size, coverage: mask.rasterize(size, t) });
+    cache.insert(0, made.clone());
+    let mut bytes = 0;
+    cache.retain(|p| {
+        bytes += p.coverage.len();
+        bytes <= MASK_CACHE_BYTES
+    });
+    made
+}
+
+/// The masks a choice means on `item` ([`oa_doc::mask::PROPS_USE`], `EFFECT_USE`),
+/// read from `params` (an effect's or the clip's): `None` when it's off.
+fn mask_choice(params: &oa_params::ParamSet, id: &str, ctx: &oa_params::EvalContext) -> Option<f64> {
+    let v = params.get(id)?.eval(ctx).as_float()?;
+    (v == oa_doc::mask::ALL || v > 0.0).then_some(v)
+}
+
 /// Snap a scale up to the next power of two (…, 1/4, 1/2, 1, 2, …) within limits.
 fn quantize_scale(k: f64, max: f64) -> f64 {
     let k = k.clamp(1.0 / 64.0, max);
@@ -579,9 +616,77 @@ impl Planner<'_> {
                     node = mixed;
                     bounds = area;
                 }
+            } else if let Some(choice) = mask_choice(&fx.params, oa_doc::mask::EFFECT_USE, ctx) {
+                // With a mask (a bounded effect can't have one): the result inside it,
+                // the picture as it was outside — or the other way round.
+                let area = bounds.union(&before_bounds);
+                if let Some(mask) = self.mask_node(item, choice, ctx, raster, raster_size, area) {
+                    let invert = matches!(fx.params.get(oa_doc::mask::EFFECT_INVERT).map(|s| s.eval(ctx)), Some(Value::Bool(true)));
+                    let (inside, outside) = if invert { (before, node) } else { (node, before) };
+                    let keep = self.two_input(oa_graph::registry::MASK_KEEP, vec![], inside, mask, area);
+                    let drop = self.two_input(oa_graph::registry::MASK_DROP, vec![], outside, mask, area);
+                    if let (Some(keep), Some(drop)) = (keep, drop)
+                        && let Some(mixed) = self.two_input(oa_graph::registry::ADD, vec![], keep, drop, area)
+                    {
+                        node = mixed;
+                        bounds = area;
+                    }
+                }
             }
         }
         (node, bounds)
+    }
+
+    /// One of the host's two-input effects (`b` is its second input) over `area`.
+    fn two_input(&mut self, type_id: &str, uniforms: Vec<f32>, a: NodeId, b: NodeId, area: Rect) -> Option<NodeId> {
+        let op = self.internal_op(type_id, uniforms)?;
+        Some(self.b.add(op, vec![a, b], area, false))
+    }
+
+    /// `item`'s masks named by `choice` (`oa_doc::mask::ALL` or a mask's id), placed over
+    /// its layer at this instant — the layer at `raster` × native size (`raster_size`
+    /// px) — as coverage over `area` (layer raster px), joined in order by their modes
+    /// (add, subtract, intersect, difference). `None` when no such mask is on.
+    fn mask_node(&mut self, item: &Item, choice: f64, ctx: &oa_params::EvalContext, raster: f64, raster_size: [f64; 2], area: Rect) -> Option<NodeId> {
+        use oa_doc::mask::MaskMode;
+        let mut out: Option<NodeId> = None;
+        for m in oa_doc::mask::chosen(&item.masks, choice) {
+            let v = oa_doc::mask::MaskValues::eval(item, m.id, ctx);
+            // The drawing at the layer's raster size (within limits); the GPU places it.
+            let k = (MAX_MASK_SIDE / raster_size[0].max(raster_size[1]).max(1.0)).min(1.0);
+            let size = [(raster_size[0] * k).round().max(1.0) as u32, (raster_size[1] * k).round().max(1.0) as u32];
+            let pixels = mask_pixels(m, size, ctx.clip_time);
+            // Subtracting with nothing above it takes it out of the whole clip.
+            let invert = m.invert ^ (out.is_none() && m.mode == MaskMode::Subtract);
+            let src = self.b.add(NodeOp::MaskPixels { pixels }, vec![], Rect::from_size(size[0] as f64, size[1] as f64), false);
+            let uniforms = vec![
+                raster_size[0] as f32,
+                raster_size[1] as f32,
+                v.center[0] as f32,
+                v.center[1] as f32,
+                v.scale as f32,
+                v.rotation.to_radians() as f32,
+                v.harshness as f32,
+                invert as u8 as f32,
+                area.x0 as f32,
+                area.y0 as f32,
+                area.x1 as f32,
+                area.y1 as f32,
+            ];
+            let Some(mut node) = self.internal(oa_graph::registry::MASK_SHAPE, uniforms, src, area) else { continue };
+            // Softness: the edge blurred by that many of the layer's own pixels.
+            let soft = v.softness * raster;
+            if soft >= 0.5
+                && let Some(blurred) = self.internal(oa_graph::registry::BLUR, vec![soft as f32, 1.0], node, area)
+            {
+                node = blurred;
+            }
+            out = Some(match out {
+                Some(prev) => self.two_input(oa_graph::registry::MASK_COMBINE, vec![m.mode.index() as f32], prev, node, area).unwrap_or(prev),
+                None => node,
+            });
+        }
+        out
     }
 
     /// A pool media file as an effect input: decoded at `size`, at `t` into the file
@@ -773,7 +878,25 @@ impl Planner<'_> {
         let vis = item.params.eval(schema::visual(), overrides, &ctx);
         let motion = self.motion(item, variant, &ctx);
         let opacity = (vis.float(schema::OPACITY) * motion.opacity).clamp(0.0, 1.0);
-        if opacity <= 0.0 {
+        // Properties with their own value inside the clip's masks ("… on mask"): the
+        // values there, when a mask they use is on.
+        let props_mask = mask_choice(&item.params, oa_doc::mask::PROPS_USE, &ctx).unwrap_or(oa_doc::mask::ALL);
+        let vis_in = (!oa_doc::mask::chosen(&item.masks, props_mask).is_empty())
+            .then(|| {
+                let mut v = vis.clone();
+                let mut any = false;
+                for p in oa_doc::mask::MASKABLE {
+                    let Some(value) = item.params.get(&oa_doc::mask::on_mask(p)).map(|s| s.eval(&ctx)) else { continue };
+                    if let Some(slot) = v.0.iter_mut().find(|(id, old)| id.as_str() == p && old.ty() == value.ty()) {
+                        slot.1 = value;
+                        any = true;
+                    }
+                }
+                any.then_some(v)
+            })
+            .flatten();
+        let opacity_in = vis_in.as_ref().map(|v| (v.float(schema::OPACITY) * motion.opacity).clamp(0.0, 1.0));
+        if opacity <= 0.0 && opacity_in.is_none_or(|o| o <= 0.0) {
             return None;
         }
 
@@ -790,21 +913,28 @@ impl Planner<'_> {
             }
         };
 
-        let base = scene::reframe(item, &vis, native, variant);
-        let to_canvas = scene::user_transform(&vis, native, &base, variant);
-        // Motion effects move the whole layer around its anchor, after its own transform.
-        let to_canvas = if motion == Motion::NONE {
-            to_canvas
-        } else {
-            let anchor = vis.vec2(schema::ANCHOR);
-            let p = to_canvas.apply([anchor[0] * native[0], anchor[1] * native[1]]);
-            to_canvas
-                .then(&Affine2::translate(-p[0], -p[1]))
-                .then(&Affine2::scale(motion.scale, motion.scale))
-                .then(&Affine2::rotate_degrees(motion.rotation))
-                .then(&Affine2::translate(p[0] + motion.offset[0], p[1] + motion.offset[1]))
+        // Layer px → output px for these visual values.
+        let placed = |vis: &oa_params::Evaluated| {
+            let base = scene::reframe(item, vis, native, variant);
+            let to_canvas = scene::user_transform(vis, native, &base, variant);
+            // Motion effects move the whole layer around its anchor, after its own transform.
+            let to_canvas = if motion == Motion::NONE {
+                to_canvas
+            } else {
+                let anchor = vis.vec2(schema::ANCHOR);
+                let p = to_canvas.apply([anchor[0] * native[0], anchor[1] * native[1]]);
+                to_canvas
+                    .then(&Affine2::translate(-p[0], -p[1]))
+                    .then(&Affine2::scale(motion.scale, motion.scale))
+                    .then(&Affine2::rotate_degrees(motion.rotation))
+                    .then(&Affine2::translate(p[0] + motion.offset[0], p[1] + motion.offset[1]))
+            };
+            to_canvas.then(&Affine2::scale(out_scale, out_scale))
         };
-        let full = to_canvas.then(&Affine2::scale(out_scale, out_scale));
+        let full = placed(&vis);
+        // Inside the mask it may sit elsewhere (only when something there moves it).
+        let full_in = vis_in.as_ref().map(&placed).filter(|m| m.m != full.m);
+        let shown_scale = full.max_axis_scale().max(full_in.map_or(0.0, |m| m.max_axis_scale()));
 
         let pixelated = match item.kind {
             ItemKind::Media { media } => self.project.media(media).is_some_and(|m| m.pixelated()),
@@ -817,11 +947,11 @@ impl Planner<'_> {
         let raster = if pixelated {
             // The exact scale (in quarter steps, so a slow zoom doesn't resize the
             // texture every frame), never below 1:1 and never past a sane texture size.
-            let want = (full.max_axis_scale() * 4.0).round().max(4.0) / 4.0;
+            let want = (shown_scale * 4.0).round().max(4.0) / 4.0;
             let room = (MAX_PIXEL_ART_SIDE / native[0].max(native[1]).max(1.0)).max(1.0);
             want.min(room)
         } else {
-            quantize_scale(full.max_axis_scale(), max_raster)
+            quantize_scale(shown_scale, max_raster)
         };
         let raster_size = [native[0] * raster, native[1] * raster];
         let mut bounds = Rect::from_size(raster_size[0], raster_size[1]);
@@ -845,16 +975,18 @@ impl Planner<'_> {
                     size: [size[0].round() as u32, size[1].round() as u32],
                     yuv: yuv_override(m),
                 };
-                let src = self.b.add(op, vec![], Rect::from_size(size[0], size[1]), true);
+                // Opaque (hiding what's under it) unless the file has transparency.
+                let solid = !m.info.as_ref().is_some_and(|i| i.alpha);
+                let src = self.b.add(op, vec![], Rect::from_size(size[0], size[1]), solid);
                 let src = self.input_color(m, src);
                 if !pixelated || raster <= 1.0 {
                     src
                 } else {
                     let out = [raster_size[0].round().max(1.0) as u32, raster_size[1].round().max(1.0) as u32];
                     let matrix = Affine2::scale(out[0] as f64 / native[0], out[1] as f64 / native[1]);
-                    let placed = self.b.add(NodeOp::Transform { matrix }, vec![src], matrix.map_rect(Rect::from_size(native[0], native[1])), true);
+                    let placed = self.b.add(NodeOp::Transform { matrix }, vec![src], matrix.map_rect(Rect::from_size(native[0], native[1])), solid);
                     let layers = vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: true }];
-                    self.b.add(NodeOp::Composite { size: out, background: [0.0; 4], layers }, vec![placed], bounds, true)
+                    self.b.add(NodeOp::Composite { size: out, background: [0.0; 4], layers }, vec![placed], bounds, solid)
                 }
             }
             ItemKind::Solid => {
@@ -896,6 +1028,33 @@ impl Planner<'_> {
         }
 
         let (node, bounds) = self.effect_chain(item, &ctx, node, bounds, raster, raster_size, pixelated, depth, text_layout);
+
+        // Other values inside the mask: its opacity there (one pass over the picture) —
+        // and, when it also moves, scales or turns there, the part inside is placed on
+        // its own, as a second layer over the part outside.
+        if let Some(opacity_in) = opacity_in
+            && let Some(mask) = self.mask_node(item, props_mask, &ctx, raster, raster_size, bounds)
+        {
+            let to_layer = Affine2::scale(1.0 / raster, 1.0 / raster);
+            let Some(full_in) = full_in else {
+                let node = self.two_input(oa_graph::registry::MASK_ALPHA, vec![opacity as f32, opacity_in as f32], node, mask, bounds)?;
+                let matrix = to_layer.then(&full);
+                let node = self.b.add(NodeOp::Transform { matrix }, vec![node], matrix.map_rect(bounds), false);
+                return Some((node, LayerInfo { opacity: 1.0, blend: blend_of(&vis), pixelated }));
+            };
+            let outside = self.two_input(oa_graph::registry::MASK_ALPHA, vec![opacity as f32, 0.0], node, mask, bounds)?;
+            let inside = self.two_input(oa_graph::registry::MASK_ALPHA, vec![0.0, opacity_in as f32], node, mask, bounds)?;
+            let size = [((variant.size.width as f64 * out_scale).round() as u32).max(1), ((variant.size.height as f64 * out_scale).round() as u32).max(1)];
+            let canvas = Rect::from_size(size[0] as f64, size[1] as f64);
+            let (mut inputs, mut layers) = (Vec::new(), Vec::new());
+            for (part, place) in [(outside, full), (inside, full_in)] {
+                let matrix = to_layer.then(&place);
+                inputs.push(self.b.add(NodeOp::Transform { matrix }, vec![part], matrix.map_rect(bounds), false));
+                layers.push(LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated });
+            }
+            let both = self.b.add(NodeOp::Composite { size, background: [0.0; 4], layers }, inputs, canvas, false);
+            return Some((both, LayerInfo { opacity: 1.0, blend: blend_of(&vis), pixelated: false }));
+        }
 
         let matrix = Affine2::scale(1.0 / raster, 1.0 / raster).then(&full);
         let opaque = self.b.node(node).opaque && matrix.is_axis_aligned();

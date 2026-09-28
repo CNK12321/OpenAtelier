@@ -23,6 +23,7 @@ use eframe::egui;
 use oa_doc::{ItemId, TrackId, TrackKind};
 use oa_edit::timeline::{self as cmd, Edge, Snapper};
 use oa_time::Time;
+use std::sync::Arc;
 
 /// Track heights the user can pick between (the ⇕ button in the timeline's tools).
 pub const ROW_HEIGHTS: [f32; 4] = [22.0, 30.0, 46.0, 72.0];
@@ -898,20 +899,33 @@ impl App {
             if let Some((media, source_in, speed)) = b.media {
                 self.paint_clip_preview(ui.ctx(), &clip_painter.with_clip_rect(b.rect.shrink(1.0).intersect(lane)), b, media, source_in, speed, &time_at);
             }
-            // A compound clip: its own filmstrip, rendered from the timeline inside.
-            if let Some((seq, source_in, speed)) = b.compound
-                && let Some(strip) = self.compound_strip(ui.ctx(), seq)
-            {
+            // A compound clip: its own filmstrip, rendered from the timeline inside, over
+            // its sound — or, made of sound alone, just its sound.
+            if let Some((seq, source_in, speed)) = b.compound {
+                let (picture, sound) = self.compound_look(seq);
                 let painter = clip_painter.with_clip_rect(b.rect.shrink(1.0).intersect(lane));
                 let r = b.rect;
-                let tile = (r.height() * strip.aspect).max(8.0);
-                let visible = painter.clip_rect();
-                for x in shown_tiles([r.left(), r.right()], tile, [visible.left(), visible.right()]) {
-                    let at = source_in + (time_at(x).as_seconds_f64() - b.start) * speed;
-                    let dest = egui::Rect::from_min_size(egui::pos2(x, r.top()), egui::vec2(tile, r.height()));
-                    painter.image(strip.texture.id(), dest, strip.uv(at), egui::Color32::from_gray(190));
+                let audible = !sound.is_empty() && self.editor.item(b.id).is_some_and(|i| i.audio_enabled());
+                let wave_h = match (picture, audible) {
+                    (true, true) => r.height() * 0.4,
+                    (false, _) => r.height(),
+                    (true, false) => 0.0,
+                };
+                if picture && let Some(strip) = self.compound_strip(ui.ctx(), seq) {
+                    let pic = egui::Rect::from_min_max(r.min, egui::pos2(r.right(), r.bottom() - wave_h));
+                    let tile = (pic.height() * strip.aspect).max(8.0);
+                    let visible = painter.clip_rect();
+                    for x in shown_tiles([r.left(), r.right()], tile, [visible.left(), visible.right()]) {
+                        let at = source_in + (time_at(x).as_seconds_f64() - b.start) * speed;
+                        let dest = egui::Rect::from_min_size(egui::pos2(x, pic.top()), egui::vec2(tile, pic.height()));
+                        painter.image(strip.texture.id(), dest, strip.uv(at), egui::Color32::from_gray(190));
+                    }
+                    painter.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 14.0)), 0.0, egui::Color32::from_black_alpha(90));
                 }
-                painter.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 14.0)), 0.0, egui::Color32::from_black_alpha(90));
+                if audible {
+                    let band = egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - wave_h), r.max);
+                    self.paint_compound_sound(ui.ctx(), &painter, &sound, band, |x| source_in + (time_at(x).as_seconds_f64() - b.start) * speed);
+                }
             }
             // Intro and outro ramps: the clip rising from / falling to its edges.
             let ramp = egui::Color32::from_white_alpha(40);
@@ -1122,6 +1136,52 @@ fn item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> bool {
 }
 
 impl App {
+    /// Whether compound `seq` shows a picture, and its sound: the clips heard inside it,
+    /// in its own time (compound clips inside it included). Worked out once per edit.
+    pub(crate) fn compound_look(&mut self, seq: oa_doc::SeqId) -> (bool, Arc<Vec<oa_audio::AudioClip>>) {
+        let version = Arc::as_ptr(&self.editor.doc.snapshot()) as usize;
+        if let Some((v, picture, sound)) = self.compound_looks.get(&seq)
+            && *v == version
+        {
+            return (*picture, sound.clone());
+        }
+        let picture = self.editor.sequence_has_picture(seq);
+        let sound = Arc::new(self.audio_clips_of(seq));
+        self.compound_looks.retain(|_, (v, ..)| *v == version);
+        self.compound_looks.insert(seq, (version, picture, sound.clone()));
+        (picture, sound)
+    }
+
+    /// A compound clip's sound in `band`: at each x, the loudest of the clips inside it
+    /// playing then (`inside(x)`: the compound's own time at screen x, in seconds), from
+    /// each file's waveform.
+    pub(crate) fn paint_compound_sound(&mut self, ctx: &egui::Context, painter: &egui::Painter, sound: &[oa_audio::AudioClip], band: egui::Rect, inside: impl Fn(f32) -> f64) {
+        let peaks: Vec<Option<crate::previews::Peaks>> = sound.iter().map(|c| self.clip_previews.peaks(ctx, oa_doc::MediaId(c.media), &c.path)).collect();
+        let visible = painter.clip_rect();
+        let mid = band.center().y;
+        let color = egui::Color32::from_rgba_unmultiplied(220, 255, 230, 170);
+        let from = band.left().max(visible.left()).floor() as i32;
+        let to = band.right().min(visible.right()).ceil() as i32;
+        for px in (from..to).step_by(2) {
+            let t = Time::from_seconds_f64(inside(px as f32));
+            let mut level = 0f32;
+            for (c, peaks) in sound.iter().zip(&peaks) {
+                let Some(peaks) = peaks.as_ref().filter(|_| c.range.contains(t)) else { continue };
+                // Where in the file (a reversed clip reads down from its pivot).
+                let into = c.source_in.as_seconds_f64() + (t - c.range.start).as_seconds_f64() * c.speed;
+                let at = match c.reverse {
+                    Some(pivot) => pivot.as_seconds_f64() - into,
+                    None => into,
+                };
+                if let Some(&(lo, hi)) = peaks.get((at.max(0.0) * crate::previews::PEAKS_PER_SECOND) as usize) {
+                    level = level.max(lo.abs().max(hi.abs()));
+                }
+            }
+            let a = level.min(1.0) * band.height() * 0.5;
+            painter.line_segment([egui::pos2(px as f32, mid - a), egui::pos2(px as f32, mid + a.max(0.5))], egui::Stroke::new(1.0, color));
+        }
+    }
+
     /// A compound clip's filmstrip — rendered from what's in it, on the preview thread,
     /// and made again after it's edited (the last one stays up meanwhile).
     pub(crate) fn compound_strip(&mut self, ctx: &egui::Context, seq: oa_doc::SeqId) -> Option<crate::previews::Strip> {

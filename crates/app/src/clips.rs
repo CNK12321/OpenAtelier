@@ -706,13 +706,18 @@ impl App {
         // A per-letter or per-pixel effect on a title can be limited to some of its letters.
         if self.can_bound(item, &effect.type_id) {
             ui.separator();
-            let mut on = matches!(effect.params.get(schema::BOUNDED).map(|s| s.eval(&oa_params::EvalContext::at(Time::ZERO, Time::ZERO))), Some(oa_params::Value::Bool(true)));
+            let at = oa_params::EvalContext::at(Time::ZERO, Time::ZERO);
+            let mut on = matches!(effect.params.get(schema::BOUNDED).map(|s| s.eval(&at)), Some(oa_params::Value::Bool(true)));
+            // A masked effect can't be bounded too (nor a bounded one masked).
+            let masked = effect.params.get(oa_doc::mask::EFFECT_USE).and_then(|s| s.eval(&at).as_float()).is_some_and(|v| v != 0.0);
             let tip = "Only some of the letters: from a start to an end, in letters or percent of the text, with a blend at the edges";
-            if ui.checkbox(&mut on, "Bounded").on_hover_text(tip).clicked() {
+            let r = ui.add_enabled(!masked || on, eframe::egui::Checkbox::new(&mut on, "Bounded")).on_hover_text(tip).on_disabled_hover_text("It uses a mask: a masked effect can't be bounded too");
+            if r.clicked() {
                 self.editor.set_param(item, ParamTarget::Effect(effect.id), schema::BOUNDED, ParamSource::Static(oa_params::Value::Bool(on)), "bounded");
                 ui.close();
             }
         }
+        self.effect_mask_menu(ui, item, effect);
         ui.separator();
         if ui.button("Copy all effects").clicked() {
             self.copy_effects(item, None);

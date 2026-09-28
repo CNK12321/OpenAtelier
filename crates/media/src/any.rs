@@ -10,7 +10,7 @@ use oa_time::Time;
 pub enum AnyDecoder {
     #[cfg(windows)]
     Mf(crate::windows::MfDecoder),
-    Ffmpeg(FfmpegDecoder),
+    Ffmpeg(Box<FfmpegDecoder>),
 }
 
 pub enum AnyFrame {
@@ -115,6 +115,6 @@ pub fn frame_source(ctx: &oa_gpu::GpuContext, choice: DecoderChoice) -> MediaFra
             return Ok(AnyDecoder::Mf(d));
         }
         let _ = &choice;
-        FfmpegDecoder::open(device.clone(), queue.clone(), path, video).map(AnyDecoder::Ffmpeg)
+        FfmpegDecoder::open(device.clone(), queue.clone(), path, video).map(|d| AnyDecoder::Ffmpeg(Box::new(d)))
     })
 }

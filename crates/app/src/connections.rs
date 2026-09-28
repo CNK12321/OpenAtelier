@@ -22,11 +22,19 @@ use std::sync::Arc;
 pub struct ConnectionEditor {
     pub item: ItemId,
     pub band: Band,
+    /// One component of a vector property (0 = X, 1 = Y), or the whole value.
+    pub axis: Option<u8>,
 }
 
 impl App {
     pub(crate) fn edit_connection(&mut self, item: ItemId, band: Band) {
-        self.connection_editor = Some(ConnectionEditor { item, band });
+        self.edit_connection_on(item, band, None);
+    }
+
+    /// The connection of one component of a vector property (`axis`: 0 = X, 1 = Y) — a
+    /// position that moves sideways, or up and down, with the sound.
+    pub(crate) fn edit_connection_on(&mut self, item: ItemId, band: Band, axis: Option<u8>) {
+        self.connection_editor = Some(ConnectionEditor { item, band, axis });
     }
 
     /// Keeps [`App::follower`] in step with the document and the envelopes analyzed so
@@ -62,8 +70,14 @@ impl App {
     }
 
     /// `param`'s value at `t` with the sound playing (connections included).
-    fn value_with_sound(&self, item: ItemId, band: &Band, t: Time) -> Option<f64> {
-        let read = || self.editor.param_value(item, &band.target, &band.param, t).and_then(|v| v.as_float());
+    fn value_with_sound(&self, item: ItemId, band: &Band, axis: Option<u8>, t: Time) -> Option<f64> {
+        let read = || {
+            self.editor.param_value(item, &band.target, &band.param, t).and_then(|v| match (v, axis) {
+                (Value::Vec2(p), Some(a)) => p.get(a as usize).copied(),
+                (Value::Vec3(p), Some(a)) => p.get(a as usize).copied(),
+                (v, _) => v.as_float(),
+            })
+        };
         match &self.follower {
             Some(f) => oa_params::signal::with(f.at(t), read),
             None => read(),
@@ -72,34 +86,40 @@ impl App {
 
     pub(crate) fn connection_window(&mut self, ctx: &egui::Context) {
         let Some(ed) = self.connection_editor.as_ref() else { return };
-        let (item, band) = (ed.item, ed.band.clone());
+        let (item, band, axis) = (ed.item, ed.band.clone(), ed.axis);
         let Some(it) = self.editor.item(item).cloned() else {
             self.connection_editor = None;
             return;
         };
         let mut open = true;
-        let title = format!("Connection — {} · {}", it.name, band.param.rsplit('.').next().unwrap_or(&band.param));
+        let which = match axis {
+            Some(0) => " X",
+            Some(1) => " Y",
+            Some(_) => " Z",
+            None => "",
+        };
+        let title = format!("Connection — {} · {}{which}", it.name, band.param.rsplit('.').next().unwrap_or(&band.param));
         crate::widgets::on_screen(egui::Window::new(title), ctx)
             .id(egui::Id::new("connection-editor"))
             .open(&mut open)
             .default_width(460.0)
             .resizable(true)
-            .show(ctx, |ui| self.connection_body(ui, item, &band, &it));
+            .show(ctx, |ui| self.connection_body(ui, item, &band, axis, &it));
         if !open {
             self.connection_editor = None;
             self.editor.doc.seal();
         }
     }
 
-    fn connection_body(&mut self, ui: &mut egui::Ui, item: ItemId, band: &Band, it: &oa_doc::Item) {
+    fn connection_body(&mut self, ui: &mut egui::Ui, item: ItemId, band: &Band, axis: Option<u8>, it: &oa_doc::Item) {
         let start = it.eval_context(it.range.start);
         let current = self.editor.param_value(item, &band.target, &band.param, it.range.start).unwrap_or(Value::Float(band.lo.max(0.0)));
         let source = self.editor.param_source(item, &band.target, &band.param).unwrap_or(ParamSource::Static(current));
-        let Some((_, Modulator::Follow { source: from, band: which, amount, floor_db })) = source.find_follow().map(|(b, m)| (b.clone(), m.clone())) else {
+        let Some((_, Modulator::Follow { source: from, band: which, amount, floor_db, .. })) = source.find_follow_on(axis).map(|(b, m)| (b.clone(), m.clone())) else {
             ui.label("Connects this value to the sound: it's offset by how loud things are at each moment — all of it, or just the bass, mids or treble.");
             if ui.button("Connect to the sound").clicked() {
                 let reach = ((band.hi - band.lo) * 0.25).abs().max(1e-3);
-                let src = source.follow(SoundSource::Mix, SoundBand::Loudness, reach, -48.0);
+                let src = source.follow_on(axis, SoundSource::Mix, SoundBand::Loudness, reach, -48.0);
                 self.editor.set_param(item, band.target.clone(), &band.param, src, "connection-editor");
                 self.editor.doc.seal();
             }
@@ -189,7 +209,7 @@ impl App {
         let samples: Vec<f64> = (0..=STEPS)
             .map(|i| {
                 let t = it.range.start + Time::from_seconds_f64(duration.as_seconds_f64() * i as f64 / STEPS as f64).min(duration - Time(1));
-                self.value_with_sound(item, band, t).unwrap_or(0.0)
+                self.value_with_sound(item, band, axis, t).unwrap_or(0.0)
             })
             .collect();
         let (vmin, vmax) = samples.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(*v), b.max(*v)));
@@ -211,7 +231,7 @@ impl App {
 
         ui.horizontal(|ui| {
             if ui.button("Disconnect").clicked() {
-                let src = source.clone().remove_follow();
+                let src = source.clone().remove_follow_on(axis);
                 self.editor.set_param(item, band.target.clone(), &band.param, src, "connection-editor");
                 self.editor.doc.seal();
             }
@@ -220,7 +240,7 @@ impl App {
 
         if changed {
             let mut src = source.clone();
-            if let Some((_, Modulator::Follow { source, band: b, amount, floor_db })) = src.find_follow_mut() {
+            if let Some((_, Modulator::Follow { source, band: b, amount, floor_db, .. })) = src.find_follow_on_mut(axis) {
                 *source = from;
                 *b = which;
                 **amount = ParamSource::Static(Value::Float(if amt.is_finite() { amt } else { 0.0 }));

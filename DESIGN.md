@@ -2073,6 +2073,71 @@ atlas eviction beyond "start over when full".
   the GPU (rounded corners; the highlight following word times; the box behind only the
   spoken word).
 
+## 17b. Masks ✅ (2026-09-27; `oa_doc::mask`, `app/masks.rs`)
+
+Settings → Editing → **Masking** turns on a **Masks** tab for clips with a picture.
+
+* **Model.** `Item::masks: Vec<Mask>`; each has an id (from `alloc_id`), a name,
+  on/off, invert, and what was drawn — `MaskShape`s applied in order, each adding (union,
+  `a + b − ab`) or erasing (`a × (1 − b)`): `Rect`, `Ellipse`, `Stroke` (points, radius as
+  a share of the layer's height, edge softness) and `Bitmap` (coverage bytes, run-length
+  encoded in base64; magic selections, fills and imported pictures). Coordinates are
+  fractions of the layer, so a mask moves, scales and turns with its clip. `frame`
+  stretches the drawing about the middle: a mask pasted onto a clip of another shape
+  asks **fit** (all of it shows) or **crop** (it covers the clip) and keeps its shapes'
+  proportions that way (`Mask::refit`). `Op::SetMasks` replaces a clip's masks.
+* **Animated values** are ordinary clip params, `mask.<id>.center|scale|rotation|softness|harshness`
+  (`mask::params`), so keyframes, curves and waves work as everywhere. Center is an
+  offset in layer fractions; softness is a blur of the edge in layer px; harshness
+  scales the coverage (1 = fully applied, 0 = no masking).
+* **Uses.** A Transform property (opacity, position, scale, rotation, squash) can take
+  a second value inside the masks — right-click → **With mask**, stored as
+  `<param>#mask` and shown under the property; `mask.props` picks which mask (default:
+  all). An effect can run only inside a mask (or outside) — right-click its name → **Use
+  with mask** (`mask.use`: a mask id, −1 for all, 0 off; `mask.invert`). Bounded text
+  effects, per-letter text effects, motion and sound effects can't be masked.
+* **Paths, edges, modes** (2026-09-27, second pass). `Path` shapes are bezier outlines
+  (`PathPoint`s, each with its own keys — `PathKey`: time, point, in and out handles —
+  eased key to key: points key one by one, the ground rotoscoping stands on; flattened
+  24 pieces a curve, filled nonzero with four sample rows a pixel; only closed paths
+  fill; a split shifts their keys like the other clip clocks). Every shape has an
+  **expand** (grow, or shrink below zero) and a **feather**, as shares of the layer's
+  height: exact from the signed distance for rectangles, ellipses and strokes, from an
+  exact Euclidean distance transform (Felzenszwalb) of the coverage for paths and
+  pixels. Each mask has a **mode** — add, subtract, intersect, difference — for how it
+  joins the masks above it where several are used together (`MASK_COMBINE`); a first
+  mask that subtracts takes itself out of the whole clip.
+* **Tracking.** A mask's center follows a point track through the ordinary track
+  editor (`tracks::Space::MaskCenter`: the value is the point minus the clip's middle).
+  Scale and rotation follow **two** tracks through a new modulator,
+  `Modulator::TrackPair` (`oa-params`): the distance between the points, multiplied in,
+  or the angle of the line between them, added — each against its value when linked,
+  measured true for the clip's aspect; editing a track updates it (`retracked`).
+* **Rendering.** The drawing is rasterized on the CPU once per drawing, size and — for
+  keyframed paths — instant (the planner keeps the most recent, up to 256 MB, keyed by
+  `Mask::content_hash(t)`) at the layer's raster size, its full resolution up to 8192 px,
+  uploaded as `NodeOp::MaskPixels` (keyed by that hash), placed over the
+  layer by `MASK_SHAPE` (center, scale, rotation, harshness, invert), blurred by the
+  softness (`BLUR`), and several masks joined by their modes (`MASK_COMBINE`). A masked effect is put
+  together like a bounded one (`MASK_KEEP` + `MASK_DROP` + `ADD`). Opacity on a mask is
+  one pass (`MASK_ALPHA`: × mix(outside, inside, mask)); when position, scale, rotation or
+  squash differ inside, the part inside is its own layer, placed with those values, over
+  the part outside (both `MASK_ALPHA` splits of the same picture). Export plans the same.
+* **Drawing** (`app/masks.rs`, `app/mask_draw.rs`): with a tool picked, the viewer's
+  pointer belongs to the mask; the mask is shown tinted over its clip (a small CPU raster
+  as an egui mesh following the layer and the mask's own move). Rectangle and ellipse
+  drag; **Pen** clicks path points (drag for curve handles; the first point or Enter
+  closes it); **Edit** moves shapes and drags rectangle/ellipse corners and path points
+  and handles (Alt breaks a smooth point) — with *Keyframe points* on, a moved point is
+  keyed at the playhead; brush and eraser paint strokes (Alt or the Erase switch takes
+  away); **Fill** floods the empty area bounded by what's drawn; **Magic select**
+  renders the clip alone in its own pixels (a canvas its size, the clip stretched over
+  it, unmoved, the preview thread, see-through) and floods similar colors from the
+  click (tolerance, contiguous or everywhere); **Import picture** renders a bin picture
+  stretched to the clip and takes its brightness or its opacity. Pixel masks are made at
+  the clip's full resolution (≤ 8192 px); strokes stay vectors, drawn at whatever
+  resolution renders them. Automatic rotoscoping is shown as coming soon.
+
 ## 18. Releases and updates ✅ (2026-09-24; the first release not yet made)
 
 **Releases** (`.github/workflows/release.yml`): pushing a tag `v<version>` (it must match
@@ -2097,7 +2162,7 @@ ignored test). At start the app checks it can run ffmpeg and ffprobe (`app/deps.
 says how to get them if not, instead of imports failing with a puzzling error.
 
 **Updates** (`app/update.rs`): the app reads the repository's releases (GitHub API via
-`curl`, once a day at start, or Settings → Updates → Check now) and compares by semantic
+`curl`, at every start and every few hours while open, or Settings → Updates → Check now) and compares by semantic
 versioning (`0.1.0-beta.2` > `beta.1`; a release above its pre-releases). The **Beta**
 channel (the default for beta builds) also offers pre-releases; **Stable** only full
 releases; only releases with a package for this platform count. A bar at the top offers

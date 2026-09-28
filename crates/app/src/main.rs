@@ -18,7 +18,10 @@ mod color;
 mod color_tab;
 mod compound;
 mod crop;
+mod cut_transitions;
 mod logo;
+mod mask_draw;
+mod masks;
 mod points;
 mod surface;
 mod sound_cards;
@@ -359,6 +362,9 @@ struct App {
     project_view: settings::ProjectView,
     view_epoch: u64,
     view_key: Option<(PathBuf, String)>,
+    /// The room the panels were last fitted to: when the window changes size, they are
+    /// fitted again from `project_view` (the sizes wanted, not the ones squeezed in).
+    fitted_room: egui::Vec2,
     /// A new window size waiting to hold still before it's saved, and since when.
     window_pending: Option<(settings::WindowState, f64)>,
     /// Frames since start while the window is being fitted to the screen (`None`: done).
@@ -415,6 +421,12 @@ struct App {
     plugin_previews: plugin_previews::PluginPreviews,
     /// The Color tab's scopes, curve and mixer choices, and a copied grade.
     color_tab: color_tab::ColorTab,
+    /// The Masks tab: the mask being drawn, the tool, and a copied mask.
+    masks: masks::Masks,
+    /// Each compound clip's sound (its clips, in its own time) and whether it shows a
+    /// picture, for drawing it on the timeline — worked out again after each edit (the
+    /// project snapshot it was made from).
+    compound_looks: std::collections::HashMap<oa_doc::SeqId, (usize, bool, Arc<Vec<AudioClip>>)>,
     /// The security confirmation for a plugin's scripts, while it's asked.
     script_consent: Option<plugin_scripts::ScriptConsent>,
     /// The timelines stepped out of to edit inside compound clips, outermost first.
@@ -594,6 +606,7 @@ impl App {
             // stand in for the ones restored from the project.
             view_epoch: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64),
             view_key: None,
+            fitted_room: egui::Vec2::ZERO,
             window_pending: None,
             window_fitting: Some(0),
             timeline_view: timeline::TimelineView::default(),
@@ -610,6 +623,8 @@ impl App {
             fullscreen: Default::default(),
             plugin_previews: Default::default(),
             color_tab: Default::default(),
+            masks: Default::default(),
+            compound_looks: Default::default(),
             script_consent: None,
             compound_trail: Vec::new(),
             curve_editor: None,
@@ -875,7 +890,13 @@ impl App {
         }
         // Into the folder the bin is showing, so they appear where you're looking.
         let folder = if self.bin.tab == bin::BinTab::Project { self.bin.folder.clone() } else { String::new() };
-        self.import_paths(paths, false, &folder);
+        // A folder brings its media in as a bin folder of the same name, and the folders
+        // inside it as folders inside that one.
+        let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) = paths.iter().cloned().partition(|p| p.is_dir());
+        self.import_paths(&files, false, &folder);
+        for (bin_folder, files) in dirs.iter().flat_map(|d| bin::media_in_folder(d, &folder)) {
+            self.import_paths(&files, false, &bin_folder);
+        }
     }
 
     /// Imports media files; with `to_timeline` they're also added to the end of the
@@ -2218,6 +2239,7 @@ impl App {
             return;
         }
         self.curve_window(ctx);
+        self.mask_paste_modal(ctx);
         self.wave_window(ctx);
         self.connection_window(ctx);
         self.track_panel(ctx);
@@ -2251,14 +2273,20 @@ impl App {
         // The tall right-hand column holds the properties, or — in the vertical layout —
         // the viewer, and the middle holds the other.
         let vertical = self.vertical_layout();
-        let epoch = self.view_epoch;
         // The project's panel sizes, fitted to this window (they only apply when a
-        // project opens or the layout changes: `epoch`).
+        // project opens, the layout changes or the window is resized: `epoch`). The
+        // window opens small and is maximized a few frames later, so fitting only once
+        // left the panels squeezed to that first size.
         let room = root.available_rect_before_wrap().size();
+        if (room - self.fitted_room).length() > 1.0 {
+            self.fitted_room = room;
+            self.view_epoch += 1;
+        }
+        let epoch = self.view_epoch;
         let (fit_right, fit_media, fit_timeline) = layout::fit_panels(&self.project_view, vertical, [room.x, room.y]);
         let right_range = if vertical { 220.0..=1600.0 } else { 260.0..=560.0 };
         let right_width = fit_right;
-        let right = egui::Panel::right(egui::Id::new(("right-column", epoch, vertical))).default_size(right_width).size_range(right_range).show(root, |ui| {
+        let right = egui::Panel::right(egui::Id::new(("right-column", epoch, vertical))).default_size(right_width).size_range(right_range.clone()).show(root, |ui| {
             if vertical {
                 self.viewer_area(ui, frame);
             } else {
@@ -2381,7 +2409,13 @@ impl App {
                 self.viewer_area(ui, frame);
             }
         });
-        self.note_panel_sizes(right_width, media.response.rect.width(), controls.response.rect.height());
+        // (What each panel was fit to, as egui holds it: within its size range.)
+        let fit = [
+            fit_right.clamp(*right_range.start(), *right_range.end()),
+            fit_media.clamp(220.0, 520.0),
+            fit_timeline.clamp(150.0, 760.0),
+        ];
+        self.note_panel_sizes(ctx, [right_width, media.response.rect.width(), controls.response.rect.height()], fit);
         self.remember_view(ctx);
         self.fit_window(ctx);
         self.remember_window(ctx);

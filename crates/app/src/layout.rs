@@ -54,17 +54,29 @@ impl App {
     }
 
     /// Records panel sizes as drawn this frame (`right` is the right-hand column: the
-    /// properties, or the viewer in the vertical layout).
-    pub(crate) fn note_panel_sizes(&mut self, right: f32, media: f32, timeline: f32) {
+    /// properties, or the viewer in the vertical layout) — only a panel that is being
+    /// dragged away from the size it was `fit` to: one squeezed to fit a small window
+    /// keeps the size it wants for when the window grows again.
+    pub(crate) fn note_panel_sizes(&mut self, ctx: &egui::Context, drawn: [f32; 3], fit: [f32; 3]) {
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            return;
+        }
+        let moved = |i: usize| (drawn[i] - fit[i]).abs() > 0.5;
         let vertical = self.vertical_layout();
         let v = &mut self.project_view;
-        if vertical {
-            v.viewer = right;
-        } else {
-            v.inspector = right;
+        if moved(0) {
+            if vertical {
+                v.viewer = drawn[0];
+            } else {
+                v.inspector = drawn[0];
+            }
         }
-        v.media = media;
-        v.timeline = timeline;
+        if moved(1) {
+            v.media = drawn[1];
+        }
+        if moved(2) {
+            v.timeline = drawn[2];
+        }
     }
 
     /// Saves the open project's view when it has changed, once the pointer is up (not

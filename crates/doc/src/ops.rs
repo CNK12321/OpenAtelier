@@ -62,6 +62,8 @@ pub enum Op {
     SetEffectRole { seq: SeqId, item: ItemId, effect: EffectId, role: EffectRole },
     /// Adds, replaces or (with `None`) removes the transition on one end of a clip.
     SetTransition { seq: SeqId, item: ItemId, end: ClipEnd, transition: Option<Transition> },
+    /// Replaces a clip's masks (what was drawn; their animated values are params).
+    SetMasks { seq: SeqId, item: ItemId, masks: Vec<crate::mask::Mask> },
     InsertVariant { seq: SeqId, index: usize, variant: FormatVariant, make_active: bool },
     RemoveVariant { seq: SeqId, variant: VariantId },
     SetVariantSize { seq: SeqId, variant: VariantId, size: CanvasSize },
@@ -375,6 +377,29 @@ impl Op {
                 let it = item_mut(p, seq, item)?;
                 let old = std::mem::replace(it.transition_mut(end), transition);
                 vec![Op::SetTransition { seq, item, end, transition: old }]
+            }
+            Op::SetMasks { seq, item, masks } => {
+                let bad = |v: f64| !v.is_finite();
+                let invalid = masks.iter().any(|m| {
+                    m.frame.iter().any(|f| bad(*f) || *f <= 0.0)
+                        || m.shapes.iter().any(|s| match s {
+                            crate::mask::MaskShape::Rect { center, size, .. } | crate::mask::MaskShape::Ellipse { center, size, .. } => center.iter().chain(size).any(|v| bad(*v)),
+                            crate::mask::MaskShape::Stroke { points, radius, softness, .. } => bad(*radius) || bad(*softness) || points.iter().flatten().any(|v| !v.is_finite()),
+                            crate::mask::MaskShape::Bitmap { bitmap, .. } => bitmap.size[0] == 0 || bitmap.size[1] == 0,
+                            crate::mask::MaskShape::Path { points, .. } => {
+                                points.iter().any(|p| p.keys.is_empty() || p.keys.iter().any(|k| k.at.iter().chain(&k.handle_in).chain(&k.handle_out).any(|v| bad(*v))))
+                            }
+                        } || {
+                            let (expand, feather) = s.edge();
+                            bad(expand) || bad(feather)
+                        })
+                });
+                if invalid {
+                    return Err(EditError::InvalidValue);
+                }
+                let it = item_mut(p, seq, item)?;
+                let old = std::mem::replace(&mut it.masks, masks);
+                vec![Op::SetMasks { seq, item, masks: old }]
             }
             Op::RemoveEffect { seq, item, effect } => {
                 let it = item_mut(p, seq, item)?;

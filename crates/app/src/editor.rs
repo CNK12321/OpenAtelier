@@ -161,6 +161,7 @@ impl Editor {
                 transfer: video.and_then(|v| v.transfer_tag.clone()),
                 primaries: video.and_then(|v| v.primaries_tag.clone()),
             },
+            alpha: video.is_some_and(|v| v.has_alpha),
         };
         let media = MediaRef {
             id,
@@ -337,13 +338,41 @@ impl Editor {
         Ok((id, clip))
     }
 
-    /// Adds a clip playing compound `seq` at the end of the video track.
+    /// Whether compound `seq` shows anything: a clip on one of its picture tracks (a
+    /// compound clip there counting only if it shows something itself). One made of
+    /// sound alone doesn't — it goes on a sound track and draws as sound.
+    pub fn sequence_has_picture(&self, seq: SeqId) -> bool {
+        fn shows(p: &oa_doc::Project, seq: SeqId, depth: usize) -> bool {
+            let Some(s) = p.sequence(seq).filter(|_| depth < 16) else { return false };
+            s.tracks.iter().filter(|t| t.enabled && t.kind == TrackKind::Video && !t.effects).flat_map(|t| &t.items).any(|i| match i.kind {
+                ItemKind::Nested { sequence } => shows(p, sequence, depth + 1),
+                _ => i.enabled,
+            })
+        }
+        shows(self.doc.project(), seq, 0)
+    }
+
+    /// The kind of track a clip of `kind` belongs on: sound files and compound clips of
+    /// sound alone on a sound track, everything else on a picture track.
+    pub fn track_kind_for(&self, kind: &ItemKind) -> TrackKind {
+        match kind {
+            ItemKind::Media { media } if self.pool_item(*media).is_some_and(|p| p.kind == MediaKind::Audio) => TrackKind::Audio,
+            ItemKind::Nested { sequence } if !self.sequence_has_picture(*sequence) => TrackKind::Audio,
+            _ => TrackKind::Video,
+        }
+    }
+
+    /// Adds a clip playing compound `seq` at the end of the video track (the sound track,
+    /// for a compound of sound alone).
     pub fn append_compound(&mut self, seq: SeqId) -> Result<ItemId, EditError> {
         let inner = self.doc.project().sequence(seq).ok_or(EditError::NotFound("sequence", seq.0))?;
         let (name, duration) = (inner.name.clone(), inner.duration());
-        let track = match self.sequence().track(self.video_track).map(|t| t.id).or_else(|| self.sequence().tracks.iter().find(|t| t.kind == TrackKind::Video && !t.effects).map(|t| t.id)) {
+        let kind = self.track_kind_for(&ItemKind::Nested { sequence: seq });
+        let preferred = if kind == TrackKind::Video { self.video_track } else { self.audio_track };
+        let found = self.sequence().track(preferred).filter(|t| t.kind == kind).map(|t| t.id).or_else(|| self.sequence().tracks.iter().find(|t| t.kind == kind && !t.effects).map(|t| t.id));
+        let track = match found {
             Some(t) => t,
-            None => self.add_track(TrackKind::Video)?,
+            None => self.add_track(kind)?,
         };
         let start = self.sequence().track(track).map_or(Time::ZERO, |t| t.items.last().map_or(Time::ZERO, |i| i.range.end()));
         let id = ItemId(self.doc.alloc_id());
@@ -356,10 +385,7 @@ impl Editor {
     /// right kind of track and free there, else the first free track of the kind, else a
     /// new track. One undo step.
     pub fn place_clip(&mut self, name: &str, kind: ItemKind, duration: Time, at: Time, preferred: Option<TrackId>) -> Result<ItemId, EditError> {
-        let track_kind = match &kind {
-            ItemKind::Media { media } if self.pool_item(*media).is_some_and(|p| p.kind == MediaKind::Audio) => TrackKind::Audio,
-            _ => TrackKind::Video,
-        };
+        let track_kind = self.track_kind_for(&kind);
         let rate = self.sequence().rate;
         let at = rate.frame_start(rate.frame_at(at.max(Time::ZERO)));
         let range = TimeRange::new(at, duration.max(Time::from_seconds(1)));
@@ -537,6 +563,8 @@ impl Editor {
                     let fits = match param.split('.').next() {
                         Some("text") => other.kind == ItemKind::Text,
                         Some("solid") => other.kind == ItemKind::Solid,
+                        // One mask's values belong to that mask alone.
+                        Some("mask") => oa_doc::mask::mask_of_param(param).is_none_or(|m| other.masks.iter().any(|x| x.id == m)),
                         _ => true,
                     };
                     fits.then_some(ParamTarget::Item)
@@ -831,6 +859,13 @@ impl Editor {
                 && let Some(info) = Arc::make_mut(m).info.as_mut()
             {
                 info.color = tags;
+            }
+            // Likewise transparency, which older projects didn't keep (and VP9's was missed).
+            if let Some(m) = project.media.get_mut(&item.id)
+                && m.info.as_ref().is_some_and(|i| i.alpha != v.has_alpha)
+                && let Some(info) = Arc::make_mut(m).info.as_mut()
+            {
+                info.alpha = v.has_alpha;
             }
         }
         let mut doc = Document::new(project);

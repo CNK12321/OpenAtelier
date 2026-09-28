@@ -57,6 +57,41 @@ pub struct AudioClip {
     /// (the file read through [`Reversed`]), so everything else — speed, keep pitch,
     /// effects, transition handles — works on it as on any clip.
     pub reverse: Option<Time>,
+    /// How fast its own clock runs against the timeline's: a clip inside a compound clip
+    /// played at 2× reaches its keyframes twice as soon.
+    pub clock_rate: f64,
+    /// The compound clips it's inside (innermost first): their volume and fades apply
+    /// to it too.
+    pub outer: Vec<OuterGain>,
+}
+
+/// A compound clip's say over the sound inside it: its volume (keyframable, on its own
+/// clock) and the fades at its ends.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OuterGain {
+    pub gain_db: ParamSource,
+    /// Where its clock starts on the timeline, and how fast it runs.
+    pub clock_start: Time,
+    pub clock_rate: f64,
+    /// Where it plays on the timeline, and its fades there.
+    pub range: TimeRange,
+    pub fade_in: Time,
+    pub fade_out: Time,
+}
+
+impl OuterGain {
+    /// Its gain (dB) and fade at timeline time `t`.
+    fn at(&self, t: Time) -> (f64, f64) {
+        let clock = Time::from_seconds_f64((t - self.clock_start).as_seconds_f64() * self.clock_rate);
+        let db = self.gain_db.eval(&EvalContext::at(clock, clock)).as_float().unwrap_or(0.0);
+        (db, fade(t, self.range, self.fade_in, self.fade_out))
+    }
+}
+
+/// A linear ramp up over `fade_in` from `range`'s start and down over `fade_out` to its end.
+fn fade(t: Time, range: TimeRange, fade_in: Time, fade_out: Time) -> f64 {
+    let ramp = |into: Time, len: Time| if len > Time::ZERO { (into.0 as f64 / len.0 as f64).clamp(0.0, 1.0) } else { 1.0 };
+    ramp(t - range.start, fade_in) * ramp(range.end() - t, fade_out)
 }
 
 /// A file played backwards from `pivot`: reversed time `r` is the file at `pivot − r`.
@@ -163,18 +198,30 @@ impl AudioClip {
             keep_pitch: false,
             layer: 0,
             reverse: None,
+            clock_rate: 1.0,
+            outer: Vec::new(),
             range,
         }
     }
 
-    /// Linear amplitude at timeline time `t`.
+    /// Where its own clock is at timeline time `t`.
+    fn clip_time(&self, t: Time) -> Time {
+        let d = t - self.clock_start;
+        if self.clock_rate == 1.0 { d } else { Time::from_seconds_f64(d.as_seconds_f64() * self.clock_rate) }
+    }
+
+    /// Linear amplitude at timeline time `t`: its own volume and fades, and those of the
+    /// compound clips it's inside.
     pub(crate) fn amplitude(&self, t: Time) -> f32 {
-        let clip_time = t - self.clock_start;
         let source_time = self.source_at(t);
-        let db = self.gain_db.eval(&EvalContext::at(clip_time, source_time)).as_float().unwrap_or(0.0);
-        let ramp = |into: Time, len: Time| if len > Time::ZERO { (into.0 as f64 / len.0 as f64).clamp(0.0, 1.0) } else { 1.0 };
-        let fade = ramp(t - self.range.start, self.fade_in) * ramp(self.range.end() - t, self.fade_out);
-        db_to_amplitude(db) * fade as f32
+        let mut db = self.gain_db.eval(&EvalContext::at(self.clip_time(t), source_time)).as_float().unwrap_or(0.0);
+        let mut level = fade(t, self.range, self.fade_in, self.fade_out);
+        for o in &self.outer {
+            let (d, f) = o.at(t);
+            db += d;
+            level *= f;
+        }
+        db_to_amplitude(db) * level as f32
     }
 
     /// Where in the file timeline time `t` falls.
@@ -184,7 +231,7 @@ impl AudioClip {
 
     /// The clip's clocks at timeline time `t` (for keyframed effect params).
     fn context(&self, t: Time) -> EvalContext {
-        EvalContext::at(t - self.clock_start, self.source_at(t))
+        EvalContext::at(self.clip_time(t), self.source_at(t))
     }
 }
 
@@ -455,12 +502,15 @@ impl Decoder {
 }
 
 /// One thing the mixer adds in: a clip, or a compound clip's group (a bus with members:
-/// its clips, then its effects over them).
+/// its clips — and the groups of compound clips inside it — then its effects over them).
 #[derive(Clone, Debug)]
 enum Unit {
     Clip(usize),
-    Group(usize, Vec<usize>),
+    Group(usize, Vec<Unit>),
 }
+
+/// How deep compound clips' groups nest (a guard: a project can't nest itself).
+const MAX_GROUP_DEPTH: usize = 16;
 
 pub struct TimelineAudio {
     handle: MixHandle,
@@ -478,8 +528,9 @@ pub struct TimelineAudio {
     /// the effect tracks' buses between them (indices into the state's lists).
     order: Vec<Unit>,
     bus_order: Vec<usize>,
-    /// A compound clip's group, mixed apart before its effects run over it.
-    group: Vec<f32>,
+    /// Compound clips' groups, mixed apart before their effects run over them: a buffer
+    /// per level of nesting.
+    groups: Vec<Vec<f32>>,
     /// Each bus's running effects, and the frame it last stopped at.
     buses: HashMap<u64, (Chain, Option<i64>)>,
 }
@@ -505,7 +556,7 @@ impl TimelineAudio {
             tails: HashMap::new(),
             order: Vec::new(),
             bus_order: Vec::new(),
-            group: Vec::new(),
+            groups: Vec::new(),
             buses: HashMap::new(),
         };
         mixer.refresh();
@@ -561,15 +612,32 @@ impl TimelineAudio {
                 .map(|c| (c.id, (tail_of(&c.effects, &c.context(c.range.end())).as_seconds_f64() * rate).round() as i64))
                 .filter(|(_, t)| *t > 0)
                 .collect();
-            // Clips in a compound clip's group mix with it, not on their own.
+            // Clips in a compound clip's group mix with it, not on their own; a group
+            // inside another (a compound clip in a compound clip) mixes with that one.
             let index: HashMap<u64, usize> = state.clips.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+            let groups: HashMap<u64, usize> = state.buses.iter().enumerate().filter(|(_, b)| b.members.is_some()).map(|(i, b)| (b.id, i)).collect();
+            let inner: std::collections::HashSet<usize> =
+                state.buses.iter().filter_map(|b| b.members.as_ref()).flatten().filter_map(|id| groups.get(id).copied()).collect();
             let mut grouped = std::collections::HashSet::new();
+            fn build(state: &MixState, b: usize, index: &HashMap<u64, usize>, groups: &HashMap<u64, usize>, grouped: &mut std::collections::HashSet<usize>, depth: usize) -> Unit {
+                let members = state.buses[b].members.as_deref().unwrap_or_default();
+                let units = members
+                    .iter()
+                    .filter_map(|id| match (index.get(id), groups.get(id)) {
+                        (Some(&i), _) => {
+                            grouped.insert(i);
+                            Some(Unit::Clip(i))
+                        }
+                        (None, Some(&g)) if depth < MAX_GROUP_DEPTH && g != b => Some(build(state, g, index, groups, grouped, depth + 1)),
+                        _ => None,
+                    })
+                    .collect();
+                Unit::Group(b, units)
+            }
             let mut order: Vec<(u32, Unit)> = Vec::new();
             for (b, bus) in state.buses.iter().enumerate() {
-                if let Some(members) = &bus.members {
-                    let clips: Vec<usize> = members.iter().filter_map(|id| index.get(id).copied()).collect();
-                    grouped.extend(clips.iter().copied());
-                    order.push((bus.layer, Unit::Group(b, clips)));
+                if bus.members.is_some() && !inner.contains(&b) {
+                    order.push((bus.layer, build(&state, b, &index, &groups, &mut grouped, 0)));
                 }
             }
             order.extend((0..state.clips.len()).filter(|i| !grouped.contains(i)).map(|i| (state.clips[i].layer, Unit::Clip(i))));
@@ -688,20 +756,29 @@ impl TimelineAudio {
     /// Adds one unit to `out`: a clip, or a compound clip's group — its clips mixed apart,
     /// its own effects run over them, then added in.
     fn mix_unit(&mut self, state: &MixState, unit: &Unit, out: &mut [f32], start: i64, stop: i64) {
+        self.mix_unit_at(state, unit, out, start, stop, 0);
+    }
+
+    /// [`TimelineAudio::mix_unit`] for a group `depth` groups deep (each level mixes into
+    /// a buffer of its own).
+    fn mix_unit_at(&mut self, state: &MixState, unit: &Unit, out: &mut [f32], start: i64, stop: i64, depth: usize) {
         match unit {
             Unit::Clip(i) => self.mix_clip(&state.clips[*i], out, start, stop),
             Unit::Group(b, members) => {
-                let mut group = std::mem::take(&mut self.group);
+                if self.groups.len() <= depth {
+                    self.groups.resize_with(depth + 1, Vec::new);
+                }
+                let mut group = std::mem::take(&mut self.groups[depth]);
                 group.clear();
                 group.resize(out.len(), 0.0);
-                for &i in members {
-                    self.mix_clip(&state.clips[i], &mut group, start, stop);
+                for member in members {
+                    self.mix_unit_at(state, member, &mut group, start, stop, depth + 1);
                 }
                 self.run_bus(&state.buses[*b], &mut group, start, stop);
                 for (o, g) in out.iter_mut().zip(&group) {
                     *o += g;
                 }
-                self.group = group;
+                self.groups[depth] = group;
             }
         }
     }
@@ -995,6 +1072,34 @@ mod tests {
         let s = drain(&mut m);
         // Only the clip beside it: level 4 (plus its tiny timecode ramp).
         assert!((s[500] - (4.0 + 0.005)).abs() < 0.01, "the group's clips are silenced, the other plays: {}", s[500]);
+    }
+
+    /// A compound clip inside another: its group mixes inside the outer group, each clip
+    /// heard once — and the outer compound clip's volume and fade reach the clips.
+    #[test]
+    fn groups_inside_groups() {
+        let (inner_clip, outer_clip) = (clip(30, 1, 0.0, 2.0, 0.0), clip(31, 2, 0.0, 2.0, 0.0));
+        // No effects to speak of (a plain echo at no mix): the groups just pass sound on.
+        let pass = |id| effect_with(id, "oa.audio.echo", &[("mix", Value::Float(0.0))]);
+        let inner = AudioBus { id: 80, range: TimeRange::new(secs(0.0), secs(2.0)), effects: vec![pass(92)], layer: 0, members: Some(vec![30]) };
+        let outer = AudioBus { id: 81, range: TimeRange::new(secs(0.0), secs(2.0)), effects: vec![pass(93)], layer: 0, members: Some(vec![80, 31]) };
+        let mix = |clips: Vec<AudioClip>| {
+            let state = MixState { clips, buses: vec![inner.clone(), outer.clone()], end: secs(2.0) };
+            let mut m = TimelineAudio::with_handle(MixHandle::new(state), FORMAT, Time::ZERO)
+                .with_opener(Box::new(|c, format| Ok(Box::new(Probe { level: c.media as f32, format, frame: 0, seeks: Default::default() }) as Box<dyn AudioSource>)));
+            drain(&mut m)
+        };
+        let s = mix(vec![inner_clip.clone(), outer_clip.clone()]);
+        assert!((s[500] - (3.0 + 0.005)).abs() < 0.02, "each clip once: {}", s[500]);
+        // The compound clip's −6 dB with a 1 s fade in, on both.
+        let under = OuterGain { gain_db: ParamSource::Static(Value::Float(-6.0206)), clock_start: Time::ZERO, clock_rate: 1.0, range: TimeRange::new(secs(0.0), secs(2.0)), fade_in: secs(1.0), fade_out: Time::ZERO };
+        let quieter: Vec<AudioClip> = [inner_clip, outer_clip].into_iter().map(|mut c| {
+            c.outer.push(under.clone());
+            c
+        }).collect();
+        let s = mix(quieter);
+        assert!((s[1500] - 1.5).abs() < 0.02, "half as loud once faded in: {}", s[1500]);
+        assert!((s[250] - 0.375).abs() < 0.03, "a quarter of the way into the fade: {}", s[250]);
     }
 
     #[test]

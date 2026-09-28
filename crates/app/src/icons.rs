@@ -131,15 +131,18 @@ icons! {
     INFO = "info", '\u{e88e}', Info;
 }
 
-/// Whether the Material font was found and installed.
+/// The subset font, built into the program: reading it from `assets/fonts` only worked
+/// when started from the source tree, so installed copies fell back to drawn shapes.
+static BUILT_IN: &[u8] = include_bytes!("../../../assets/fonts/MaterialSymbolsRounded.ttf");
+
+/// Whether the Material font is installed (always: it's built in).
 pub fn material_font() -> bool {
-    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FOUND.get_or_init(|| font_path().is_some())
+    true
 }
 
-/// Where a Material Symbols font may be dropped, in the order they're looked for.
+/// Where a full Material Symbols font may be dropped to replace the built-in subset.
 pub fn font_dirs() -> Vec<std::path::PathBuf> {
-    vec![std::path::PathBuf::from("assets/fonts"), crate::settings::config_dir().join("fonts")]
+    vec![crate::settings::config_dir().join("fonts")]
 }
 
 fn font_path() -> Option<std::path::PathBuf> {
@@ -156,12 +159,15 @@ fn font_path() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Adds the Material font to egui's families, if it's there. Called once at startup,
-/// before the style is installed.
+/// Adds the Material font to egui's families: a copy in `<config>/fonts/` if there is
+/// one, the built-in subset otherwise. Called once at startup, before the style is
+/// installed.
 pub fn install(fonts: &mut egui::FontDefinitions) {
-    let Some(path) = font_path() else { return };
-    let Ok(bytes) = std::fs::read(&path) else { return };
-    fonts.font_data.insert("material".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+    let data = match font_path().and_then(|p| std::fs::read(p).ok()) {
+        Some(bytes) => egui::FontData::from_owned(bytes),
+        None => egui::FontData::from_static(BUILT_IN),
+    };
+    fonts.font_data.insert("material".into(), std::sync::Arc::new(data));
     fonts.families.insert(egui::FontFamily::Name("material".into()), vec!["material".into()]);
 }
 

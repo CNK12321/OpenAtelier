@@ -2,9 +2,10 @@ name: Release
 
 # Pushing a version tag builds the packages and publishes a GitHub Release:
 #
-#   git tag v0.1.0-beta.1 && git push origin v0.1.0-beta.1
+#   git tag v0.1-beta.5 && git push origin v0.1-beta.5
 #
-# The tag must match the version in Cargo.toml. A tag with a pre-release part
+# The tag must match the version in Cargo.toml, with a patch of 0 left off or not
+# (0.1.0-beta.5: v0.1-beta.5 or v0.1.0-beta.5). A tag with a pre-release part
 # (`-beta.1`, `-rc.2`) makes a pre-release, which only the app's Beta update channel
 # offers. Each release carries one package per platform —
 # `OpenAtelier-<version>-<platform>.zip|.tar.gz` — and `SHA256SUMS.txt`, which the app's
@@ -42,9 +43,18 @@ jobs:
         shell: bash
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
-            echo "::error::The tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml (v$VERSION)"
-            exit 1
+          # Tags and package names leave a patch of 0 off: Cargo's 0.1.0-beta.5 is
+          # v0.1-beta.5 (`update::short_version`). Either form of the tag is accepted.
+          CORE=${VERSION%%-*}
+          SHORT=${CORE%.0}${VERSION#"$CORE"}
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "$GITHUB_REF_NAME" != "v$VERSION" ] && [ "$GITHUB_REF_NAME" != "v$SHORT" ]; then
+              echo "::error::The tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml (v$SHORT or v$VERSION)"
+              exit 1
+            fi
+            VERSION=${GITHUB_REF_NAME#v}
+          else
+            VERSION=$SHORT
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "PACKAGE=OpenAtelier-$VERSION-${{ matrix.platform }}" >> "$GITHUB_ENV"
@@ -198,19 +208,19 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      # The title people see: "OpenAtelier Beta 4" for v0.1.0-beta.4, "OpenAtelier 0.2.0"
-      # for v0.2.0. The tag keeps the full version: the app's update check reads it.
+      # The title people see: "Beta 5" for v0.1-beta.5, "OpenAtelier 0.2" for v0.2. The
+      # tag keeps the version: the app's update check reads it.
       - name: Title
         id: title
         run: |
           tag="${{ github.ref_name }}"
           case "$tag" in
             *-beta.*) title="Beta ${tag##*-beta.}" ;;
-            *-*) pre="${tag#*-}"; title="${pre^}" ;;
-            *) title="${tag#v}" ;;
+            *-*) pre="${tag#*-}"; title="OpenAtelier ${pre^}" ;;
+            *) title="OpenAtelier ${tag#v}" ;;
           esac
-          echo "title=OpenAtelier $title" >> "$GITHUB_OUTPUT"
-          echo "OpenAtelier $title"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "$title"
 
       - uses: softprops/action-gh-release@v2
         with:

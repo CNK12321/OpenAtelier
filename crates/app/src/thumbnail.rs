@@ -52,6 +52,7 @@ impl App {
             scale,
             wanted: None,
             png: Some(out.clone()),
+            see_through: false,
         });
         Some(out)
     }

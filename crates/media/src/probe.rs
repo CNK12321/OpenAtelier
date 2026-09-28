@@ -165,6 +165,10 @@ struct Stream {
     channels: Option<u16>,
     #[serde(default)]
     side_data_list: Vec<SideData>,
+    /// Matroska/WebM mark VP8/VP9 with a transparency layer `alpha_mode=1` (ffprobe
+    /// still says `yuv420p`: its own decoder leaves the layer out).
+    #[serde(default)]
+    tags: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -213,7 +217,7 @@ pub fn probe(path: &Path) -> Result<MediaProbe, MediaError> {
     let all = run(
         &[
             "-show_entries",
-            "stream=codec_type,codec_name,pix_fmt,width,height,time_base,avg_frame_rate,color_range,color_space,color_transfer,color_primaries,sample_rate,channels:stream_side_data=rotation:format=duration,format_name",
+            "stream=codec_type,codec_name,pix_fmt,width,height,time_base,avg_frame_rate,color_range,color_space,color_transfer,color_primaries,sample_rate,channels:stream_tags=alpha_mode:stream_side_data=rotation:format=duration,format_name",
         ],
         path,
     )?;
@@ -293,7 +297,7 @@ fn video_track(path: &Path, s: Stream) -> Result<VideoTrack, MediaError> {
 
     Ok(VideoTrack {
         codec,
-        has_alpha: pixel_format.contains('a') && !pixel_format.starts_with("ya") || pixel_format.contains("rgba") || pixel_format.contains("bgra"),
+        has_alpha: pixel_format.contains('a') && !pixel_format.starts_with("ya") || pixel_format.contains("rgba") || pixel_format.contains("bgra") || s.tags.get("alpha_mode").or(s.tags.get("ALPHA_MODE")).is_some_and(|v| v == "1"),
         pixel_format,
         width,
         height,

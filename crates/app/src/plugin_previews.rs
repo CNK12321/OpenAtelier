@@ -428,6 +428,7 @@ impl App {
             scale: (CELL as f64 * 1.5 / CANVAS[0] as f64).min(1.0),
             wanted: None,
             png: None,
+            see_through: false,
         });
     }
 
@@ -487,7 +488,7 @@ mod tests {
         let d = registry.effect("oa.color.saturation").unwrap().clone();
         let (project, at) = sample_scene(&d, None, Some(size));
         let (tx, rx) = std::sync::mpsc::channel();
-        worker.pixels(crate::preview_worker::Request { slot: 0, tag: 0, project: Arc::new(project), registry, seq: OUTER, variant: VARIANT, at, scale: 0.25, wanted: None, png: None }, tx);
+        worker.pixels(crate::preview_worker::Request { slot: 0, tag: 0, project: Arc::new(project), registry, seq: OUTER, variant: VARIANT, at, scale: 0.25, wanted: None, png: None, see_through: false }, tx);
         let frame = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("answered").expect("rendered");
         let [w, h] = frame.size;
         assert_eq!([w, h], [90, 120]);

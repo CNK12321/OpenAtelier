@@ -366,6 +366,10 @@ pub struct Item {
     /// Drives "highlight when spoken" (`schema::spoken`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub word_times: Vec<TimeRange>,
+    /// Areas drawn on the clip (the Masks tab) that its properties and effects can be
+    /// limited to (see [`crate::mask`]). Their animated values are in `params`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub masks: Vec<crate::mask::Mask>,
 }
 
 impl Item {
@@ -384,6 +388,7 @@ impl Item {
             outro_reverses_intro: false,
             group: None,
             word_times: Vec::new(),
+            masks: Vec::new(),
         }
     }
 
@@ -657,6 +662,10 @@ pub struct MediaInfo {
     /// The file's color tags, for automatic input transforms.
     #[serde(default, skip_serializing_if = "ColorTags::is_empty")]
     pub color: ColorTags,
+    /// The picture has transparency (PNG, ProRes 4444, VP9 or FFV1 with alpha…): it
+    /// never counts as covering what's under it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alpha: bool,
 }
 
 impl MediaInfo {

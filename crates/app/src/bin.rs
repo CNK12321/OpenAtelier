@@ -41,6 +41,8 @@ pub enum BinTab {
     /// What this project has imported.
     #[default]
     Project,
+    /// The project's compound clips.
+    Compounds,
     /// The things kept on this computer, for every project (see `assets.rs`).
     Assets,
 }
@@ -174,9 +176,12 @@ impl App {
                 folder: String::new(),
             });
         }
+        // Media and compound clips each have their own tab.
+        let compounds = self.bin.tab == BinTab::Compounds;
+        cards.retain(|c| c.compound == compounds);
         // Searching looks everywhere; otherwise you see the folder you're in.
         let needle = self.bin.search.trim().to_lowercase();
-        if needle.is_empty() {
+        if needle.is_empty() && !compounds {
             let here = self.bin.folder.clone();
             cards.retain(|c| c.folder == here);
         } else {
@@ -370,7 +375,7 @@ impl App {
         self.bin.naming = Some(name.clone());
         if enter {
             let made = match self.bin.tab {
-                BinTab::Project => self.new_folder(&name),
+                BinTab::Project | BinTab::Compounds => self.new_folder(&name),
                 BinTab::Assets => {
                     let parent = self.bin.asset_folder.clone();
                     match self.assets.new_folder(&parent, &name) {
@@ -439,16 +444,30 @@ impl App {
         // to fit it and the viewer loses the room.
         ui.set_max_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.bin.tab, BinTab::Project, "Media");
-            ui.selectable_value(&mut self.bin.tab, BinTab::Assets, "Assets")
-                .on_hover_text("Files kept on this computer, for every project");
+            let compounds = self.editor.compounds().len();
+            let tabs = [
+                (BinTab::Project, "Media".to_string(), "What this project has imported"),
+                (BinTab::Compounds, format!("Compounds ({compounds})"), "This project's compound clips"),
+                (BinTab::Assets, "Assets".to_string(), "Files kept on this computer, for every project"),
+            ];
+            for (tab, label, tip) in tabs {
+                if bin_tab(ui, self.bin.tab == tab, &label).on_hover_text(tip).clicked() {
+                    self.bin.tab = tab;
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if crate::icons::button(ui, crate::icons::NEW_FOLDER, "New folder", "", true).clicked() {
+                if self.bin.tab != BinTab::Compounds && crate::icons::button(ui, crate::icons::NEW_FOLDER, "New folder", "", true).clicked() {
                     self.bin.naming = Some(String::new());
                     self.bin.naming_fresh = true;
                 }
                 match self.bin.tab {
+                    BinTab::Compounds => {}
                     BinTab::Project => {
+                        if crate::icons::button(ui, crate::icons::FOLDER_OPEN, "Import a folder (its folders come in as bin folders)…", "", true).clicked()
+                            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                        {
+                            self.open_paths(&[dir]);
+                        }
                         if crate::icons::button(ui, crate::icons::SAMPLES, "Import everything in ./samples", "", true).clicked() {
                             let mut files: Vec<PathBuf> = std::fs::read_dir("samples")
                                 .into_iter()
@@ -510,18 +529,29 @@ impl App {
             self.assets_panel(ui);
             return;
         }
-        self.bin_folder_row(ui);
+        // Compound clips have a tab of their own, without folders.
+        let compounds = self.bin.tab == BinTab::Compounds;
+        if !compounds {
+            self.bin_folder_row(ui);
+        }
 
         // Work still running on worker threads: a loading card each.
-        let loading: Vec<String> = self
-            .opening
-            .iter()
-            .map(|(p, _)| format!("Opening {}…", p.file_name().map_or_else(String::new, |n| n.to_string_lossy().to_string())))
-            .chain(self.imports.iter().map(|j| format!("Importing {}…", j.name)))
-            .collect();
+        let loading: Vec<String> = if compounds {
+            Vec::new()
+        } else {
+            self.opening
+                .iter()
+                .map(|(p, _)| format!("Opening {}…", p.file_name().map_or_else(String::new, |n| n.to_string_lossy().to_string())))
+                .chain(self.imports.iter().map(|j| format!("Importing {}…", j.name)))
+                .collect()
+        };
         let cards = self.bin_cards();
         if cards.is_empty() && loading.is_empty() {
-            let text = if self.bin.search.trim().is_empty() { "Nothing imported yet — drop files here, or use Import." } else { "Nothing matches." };
+            let text = match (self.bin.search.trim().is_empty(), compounds) {
+                (false, _) => "Nothing matches.",
+                (true, true) => "No compound clips yet — select clips on the timeline and group them into one.",
+                (true, false) => "Nothing imported yet — drop files or folders here, or use Import.",
+            };
             ui.label(egui::RichText::new(text).weak());
         }
         // The bin fills its panel, top to bottom.
@@ -536,10 +566,10 @@ impl App {
                     painter.text(egui::pos2(rect.left() + 2.0, thumb.bottom() + 4.0), egui::Align2::LEFT_TOP, text, egui::FontId::proportional(11.0), ui.visuals().weak_text_color());
                 }
                 // Folders first, then what is in this one.
-                if self.bin.naming.is_some() {
+                if self.bin.naming.is_some() && !compounds {
                     self.naming_card(ui);
                 }
-                if self.bin.search.trim().is_empty() {
+                if self.bin.search.trim().is_empty() && !compounds {
                     for (path, count) in self.child_folders(&self.bin.folder.clone()) {
                         self.folder_card(ui, &path, count);
                     }
@@ -567,7 +597,14 @@ impl App {
         // A compound clip: its own frames, rendered from the timeline inside it.
         if let Entry::Compound(seq) = card.entry {
             let duration = card.length.as_seconds_f64();
-            if let Some(strip) = self.compound_strip(&ctx, seq) {
+            let (picture, sound) = self.compound_look(seq);
+            if !picture {
+                // Sound alone: its waveform across the card, and a note.
+                let band = thumb.shrink2(egui::vec2(6.0, 14.0));
+                self.paint_compound_sound(&ctx, &painter, &sound, band, |x| ((x - band.left()) / band.width().max(1.0)) as f64 * duration);
+                painter.text(thumb.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, "♪ sound only", egui::FontId::proportional(10.0), visuals.weak_text_color());
+                drawn = true;
+            } else if let Some(strip) = self.compound_strip(&ctx, seq) {
                 let at = match response.hover_pos() {
                     Some(p) => ((p.x - thumb.left()) / thumb.width()).clamp(0.0, 1.0) as f64 * duration,
                     None => duration * 0.1,
@@ -1003,5 +1040,88 @@ impl App {
     /// timeline — asked for by name, unlike a plain import.
     fn use_asset(&mut self, asset: &crate::assets::Asset) {
         self.import_paths(std::slice::from_ref(&asset.path), true, "");
+    }
+}
+
+/// One of the bin's tabs: a label on a tab with rounded top corners, raised and
+/// underlined in the accent color when it's the one showing.
+fn bin_tab(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
+    let font = egui::FontId::proportional(crate::style::TEXT);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER);
+    let size = egui::vec2(galley.size().x + 2.0 * crate::style::GAP_L, crate::style::ICON + 2.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let r = crate::style::ROUNDING as u8;
+        let corners = egui::CornerRadius { nw: r, ne: r, sw: 0, se: 0 };
+        let fill = if selected {
+            visuals.widgets.active.weak_bg_fill
+        } else if response.hovered() {
+            visuals.widgets.hovered.weak_bg_fill
+        } else {
+            visuals.widgets.inactive.weak_bg_fill.gamma_multiply(0.5)
+        };
+        ui.painter().rect_filled(rect, corners, fill);
+        if selected {
+            let line = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 2.0), rect.right_bottom());
+            ui.painter().rect_filled(line, 0.0, crate::style::ACCENT);
+        }
+        let color = if selected { visuals.strong_text_color() } else { visuals.weak_text_color() };
+        ui.painter().galley(rect.center() - galley.size() * 0.5, galley, color);
+    }
+    response
+}
+
+/// The media in `dir` and the folders inside it, to import into the bin folder
+/// `parent`: (bin folder, its files), the folder named after `dir` first. Hidden files
+/// and folders are skipped, and it goes no more than eight folders deep.
+pub(crate) fn media_in_folder(dir: &std::path::Path, parent: &str) -> Vec<(String, Vec<PathBuf>)> {
+    fn walk(dir: &std::path::Path, folder: String, depth: usize, out: &mut Vec<(String, Vec<PathBuf>)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'))).collect();
+        paths.sort();
+        let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| p.is_dir());
+        let files: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| crate::MEDIA_EXTENSIONS.iter().any(|m| e.eq_ignore_ascii_case(m))))
+            .collect();
+        if !files.is_empty() {
+            out.push((folder.clone(), files));
+        }
+        if depth < 8 {
+            for d in dirs {
+                let name = d.file_name().map_or_else(String::new, |n| n.to_string_lossy().replace('/', "-"));
+                walk(&d, format!("{folder}/{name}"), depth + 1, out);
+            }
+        }
+    }
+    let name = dir.file_name().map_or_else(|| "Imported".to_string(), |n| n.to_string_lossy().replace('/', "-"));
+    let folder = if parent.is_empty() { name } else { format!("{parent}/{name}") };
+    let mut out = Vec::new();
+    walk(dir, folder, 0, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    /// A folder comes in as a bin folder of its name, its folders inside it; only media
+    /// is taken, and hidden things are left alone.
+    #[test]
+    fn folders_import_as_bin_folders() {
+        let root = std::env::temp_dir().join(format!("oa-bin-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shots = root.join("Shots");
+        std::fs::create_dir_all(shots.join("Day 1")).unwrap();
+        std::fs::create_dir_all(shots.join(".cache")).unwrap();
+        for f in ["a.mp4", "notes.txt", "Day 1/b.PNG", ".cache/c.mp4"] {
+            std::fs::write(shots.join(f), b"x").unwrap();
+        }
+        let found = super::media_in_folder(&shots, "Project");
+        let _ = std::fs::remove_dir_all(&root);
+        let names: Vec<(String, Vec<String>)> = found
+            .into_iter()
+            .map(|(folder, files)| (folder, files.iter().map(|f| f.file_name().unwrap().to_string_lossy().to_string()).collect()))
+            .collect();
+        assert_eq!(names, vec![("Project/Shots".to_string(), vec!["a.mp4".to_string()]), ("Project/Shots/Day 1".to_string(), vec!["b.PNG".to_string()])]);
     }
 }

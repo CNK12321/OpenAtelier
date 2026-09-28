@@ -62,6 +62,9 @@ pub struct Request {
     pub wanted: Option<(Arc<AtomicU64>, u64)>,
     /// Write it as a PNG here instead of handing back a texture.
     pub png: Option<PathBuf>,
+    /// Leave the sequence's background out: transparent where nothing is drawn (a
+    /// picture read back for its transparency).
+    pub see_through: bool,
 }
 
 /// A finished preview: display-ready (sRGB RGBA8), already submitted on the GPU.
@@ -294,7 +297,7 @@ fn render_strip(renderer: &mut Renderer, sources: &mut Sources, s: &StripRequest
     let rows = frames.div_ceil(s.cols);
     for i in 0..frames {
         let at = Time::from_seconds_f64(if frames == 1 { 0.0 } else { (i as f64 + 0.5) * duration / frames as f64 });
-        let r = Request { slot: 0, tag: 0, project: s.project.clone(), registry: s.registry.clone(), seq: s.seq, variant: variant.id, at, scale, wanted: None, png: None };
+        let r = Request { slot: 0, tag: 0, project: s.project.clone(), registry: s.registry.clone(), seq: s.seq, variant: variant.id, at, scale, wanted: None, png: None, see_through: false };
         let pixels = render(renderer, sources, &r).ok().and_then(|image| {
             let px = oa_gpu::readback::read_srgb8(renderer.context(), renderer.pipelines(), &image).ok()?;
             Some((px, [image.size[0] as usize, image.size[1] as usize]))
@@ -330,7 +333,7 @@ fn render_strip(renderer: &mut Renderer, sources: &mut Sources, s: &StripRequest
 }
 
 fn render(renderer: &mut Renderer, sources: &mut Sources, r: &Request) -> Result<oa_gpu::GpuImage, String> {
-    let opts = PlanOptions { variant: Some(r.variant), render_scale: r.scale.clamp(0.02, 1.0), ..Default::default() };
+    let opts = PlanOptions { variant: Some(r.variant), render_scale: r.scale.clamp(0.02, 1.0), see_through: r.see_through, ..Default::default() };
     let plan = plan_frame(&r.project, r.seq, r.at, &opts, &r.registry).map_err(|e| e.to_string())?;
     let graph = optimize(&plan.graph, OptLevel::Full, KeyContext::default());
     renderer.render(&graph, &r.registry, sources).map_err(|e| e.to_string())
@@ -405,6 +408,7 @@ mod tests {
             scale: 0.5,
             wanted,
             png,
+            see_through: false,
         }
     }
 

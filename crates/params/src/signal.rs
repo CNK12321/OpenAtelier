@@ -128,6 +128,28 @@ mod follow_tests {
         assert_eq!(src.clone().remove_follow(), ParamSource::Static(Value::Float(1.0)));
         assert!(src.is_valid());
     }
+
+    /// A position's X and Y connect to the sound apart: the bass moves it sideways, the
+    /// treble up — each found, changed and removed on its own.
+    #[test]
+    fn each_axis_follows_on_its_own() {
+        let src = ParamSource::Static(Value::Vec2([0.1, 0.2]))
+            .follow_on(Some(0), SoundSource::Mix, SoundBand::Bass, 0.5, -48.0)
+            .follow_on(Some(1), SoundSource::Mix, SoundBand::Treble, -0.25, -48.0);
+        let ctx = EvalContext::at(Time::ZERO, Time::ZERO);
+        let bass_only = with(Rc::new(|_, b| if b == SoundBand::Bass { 1.0 } else { 0.0 }), || src.eval(&ctx));
+        assert_eq!(bass_only, Value::Vec2([0.6, 0.2]), "the bass moves X alone");
+        let both = with(Rc::new(|_, _| 1.0), || src.eval(&ctx));
+        let near = |v: Value, w: [f64; 2]| matches!(v, Value::Vec2([a, b]) if (a - w[0]).abs() < 1e-9 && (b - w[1]).abs() < 1e-9);
+        assert!(near(both, [0.6, -0.05]));
+        assert!(matches!(src.find_follow_on(Some(0)), Some((_, crate::Modulator::Follow { band: SoundBand::Bass, .. }))));
+        assert!(matches!(src.find_follow_on(Some(1)), Some((_, crate::Modulator::Follow { band: SoundBand::Treble, .. }))));
+        assert!(src.find_follow_on(None).is_none());
+        let x_gone = src.clone().remove_follow_on(Some(0));
+        assert!(near(with(Rc::new(|_, _| 1.0), || x_gone.eval(&ctx)), [0.1, -0.05]));
+        let json = serde_json::to_string(&src).unwrap();
+        assert_eq!(serde_json::from_str::<ParamSource>(&json).unwrap(), src);
+    }
 }
 
 #[cfg(test)]
