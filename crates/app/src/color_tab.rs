@@ -9,6 +9,7 @@
 //! Effects tab has their numbers, with keyframe buttons). With several clips selected,
 //! a change grades each of them.
 
+use crate::i18n::{tr, trf};
 use crate::scopes::Scope;
 use crate::App;
 use eframe::egui;
@@ -40,11 +41,11 @@ impl CurveChannel {
 
     fn name(self) -> &'static str {
         match self {
-            CurveChannel::Master => "Master",
-            CurveChannel::Red => "Red",
-            CurveChannel::Green => "Green",
-            CurveChannel::Blue => "Blue",
-            CurveChannel::HueSat => "Hue vs Sat",
+            CurveChannel::Master => tr("Master"),
+            CurveChannel::Red => tr("Red"),
+            CurveChannel::Green => tr("Green"),
+            CurveChannel::Blue => tr("Blue"),
+            CurveChannel::HueSat => tr("Hue vs Sat"),
         }
     }
 
@@ -164,7 +165,7 @@ impl App {
         self.scopes_panel(ui);
         ui.add_space(crate::style::GAP_S);
         self.grade_actions(ui, item);
-        crate::inspector::section(ui, "Wheels", "Lift moves the shadows, gamma the midtones, gain the highlights, offset everything. Drag the dot (Shift: finely); the slider under each is its brightness. Double-click a wheel to reset it.");
+        crate::inspector::section(ui, tr("Wheels"), tr("Lift moves the shadows, gamma the midtones, gain the highlights, offset everything. Drag the dot (Shift: finely); the slider under each is its brightness. Double-click a wheel to reset it."));
         let width = ui.available_width();
         let size = ((width - 16.0) / 2.0).clamp(90.0, 150.0);
         let mut released = false;
@@ -178,7 +179,7 @@ impl App {
                 }
             });
         }
-        crate::inspector::section(ui, "Light and color", "In order: exposure and white balance in light, then the wheels, contrast around its pivot, tone, saturation and hue.");
+        crate::inspector::section(ui, tr("Light and color"), tr("In order: exposure and white balance in light, then the wheels, contrast around its pivot, tone, saturation and hue."));
         let sliders: [(&str, &str, f64, f64); 12] = [
             ("exposure", "Exposure (stops)", -5.0, 5.0),
             ("temperature", "Temperature", -1.0, 1.0),
@@ -195,7 +196,7 @@ impl App {
         ];
         for (param, label, lo, hi) in sliders {
             let mut v = self.grade_value(item, GRADE, param, t);
-            let r = ui.add(egui::Slider::new(&mut v, lo..=hi).text(label).fixed_decimals(if hi > 10.0 { 1 } else { 3 }));
+            let r = ui.add(egui::Slider::new(&mut v, lo..=hi).text(tr(label)).fixed_decimals(if hi > 10.0 { 1 } else { 3 }));
             if r.changed() {
                 self.set_grade(item, GRADE, param, v, t);
             }
@@ -206,9 +207,9 @@ impl App {
             }
             released |= r.drag_stopped() || r.lost_focus();
         }
-        crate::inspector::section(ui, "Curves", "Drag a point up or down; double-click it to put it back. Master first, then each channel; Hue vs Sat raises or lowers saturation by color.");
+        crate::inspector::section(ui, tr("Curves"), tr("Drag a point up or down; double-click it to put it back. Master first, then each channel; Hue vs Sat raises or lowers saturation by color."));
         released |= self.curves_editor(ui, item, t);
-        crate::inspector::section(ui, "HSL mixer", "Each color band's hue, saturation or luminance on its own.");
+        crate::inspector::section(ui, tr("HSL mixer"), tr("Each color band's hue, saturation or luminance on its own."));
         released |= self.hsl_mixer(ui, item, t);
         if released {
             self.editor.doc.seal();
@@ -228,17 +229,17 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             let on = graded.iter().any(|g| g.2);
             let mut want = on;
-            if ui.add_enabled(!graded.is_empty(), egui::Checkbox::new(&mut want, "Grade on")).on_hover_text("Off shows the clip as it was, to compare").changed() {
+            if ui.add_enabled(!graded.is_empty(), egui::Checkbox::new(&mut want, tr("Grade on"))).on_hover_text(tr("Off shows the clip as it was, to compare")).changed() {
                 let ops = graded.iter().map(|(item, effect, _)| Op::SetEffectEnabled { seq, item: *item, effect: *effect, enabled: want }).collect();
                 if let Err(e) = self.editor.apply(if want { "Grade on" } else { "Grade off" }, ops) {
                     self.error = Some(e.to_string());
                 }
             }
-            if ui.add_enabled(!graded.is_empty(), egui::Button::new("Copy grade")).clicked() {
+            if ui.add_enabled(!graded.is_empty(), egui::Button::new(tr("Copy grade"))).clicked() {
                 let copied = self.editor.item(item).map(|it| it.effects.iter().filter(|e| GRADING.contains(&e.type_id.as_str())).cloned().collect::<Vec<_>>());
                 self.color_tab.clipboard = copied.filter(|c| !c.is_empty());
             }
-            if ui.add_enabled(self.color_tab.clipboard.is_some(), egui::Button::new("Paste grade")).on_hover_text("Onto every selected clip, replacing its grade").clicked()
+            if ui.add_enabled(self.color_tab.clipboard.is_some(), egui::Button::new(tr("Paste grade"))).on_hover_text(tr("Onto every selected clip, replacing its grade")).clicked()
                 && let Some(copied) = self.color_tab.clipboard.clone()
             {
                 let mut ops: Vec<Op> = graded.iter().map(|(item, effect, _)| Op::RemoveEffect { seq, item: *item, effect: *effect }).collect();
@@ -253,7 +254,7 @@ impl App {
                     self.error = Some(e.to_string());
                 }
             }
-            if ui.add_enabled(!graded.is_empty(), egui::Button::new("Reset")).on_hover_text("Takes the grade off (Ctrl+Z brings it back)").clicked() {
+            if ui.add_enabled(!graded.is_empty(), egui::Button::new(tr("Reset"))).on_hover_text(tr("Takes the grade off (Ctrl+Z brings it back)")).clicked() {
                 let ops = graded.iter().map(|(item, effect, _)| Op::RemoveEffect { seq, item: *item, effect: *effect }).collect();
                 if let Err(e) = self.editor.apply("Reset grade", ops) {
                     self.error = Some(e.to_string());
@@ -315,7 +316,7 @@ impl App {
             released = true;
         }
         released |= r.drag_stopped();
-        let r = r.on_hover_text(format!("{name}: R {:+.3}  G {:+.3}  B {:+.3}", rgb[0] + master, rgb[1] + master, rgb[2] + master));
+        let r = r.on_hover_text(trf("{name}: R {0}  G {1}  B {2}", &[("name", (name)), ("0", &format!("{:+.3}", rgb[0] + master)), ("1", &format!("{:+.3}", rgb[1] + master)), ("2", &format!("{:+.3}", rgb[2] + master))]));
         let _ = r;
         let mut m = master;
         let s = ui.add(egui::Slider::new(&mut m, -1.0..=1.0).show_value(true).fixed_decimals(3));
@@ -387,7 +388,7 @@ impl App {
             painter.circle_filled(pos, if active { 5.5 } else { 4.0 }, channel.color());
             painter.circle_stroke(pos, if active { 5.5 } else { 4.0 }, egui::Stroke::new(1.0, egui::Color32::BLACK));
         }
-        if ui.small_button(format!("Reset {}", channel.name())).clicked() {
+        if ui.small_button(trf("Reset {0}", &[("0", (channel.name()))])).clicked() {
             for i in 0..8 {
                 self.set_grade(item, CURVES, &format!("{}_{i}", channel.prefix()), channel.neutral(i), t);
             }
@@ -399,7 +400,7 @@ impl App {
     fn hsl_mixer(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) -> bool {
         ui.horizontal(|ui| {
             for (part, name) in [(HslPart::Hue, "Hue"), (HslPart::Saturation, "Saturation"), (HslPart::Luminance, "Luminance")] {
-                if ui.selectable_label(self.color_tab.hsl == part, name).clicked() {
+                if ui.selectable_label(self.color_tab.hsl == part, tr(name)).clicked() {
                     self.color_tab.hsl = part;
                 }
             }
@@ -416,7 +417,7 @@ impl App {
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                 ui.painter().circle_filled(r.center(), 5.5, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
-                let s = ui.add(egui::Slider::new(&mut v, lo..=hi).text(label).fixed_decimals(if hi > 10.0 { 0 } else { 2 }));
+                let s = ui.add(egui::Slider::new(&mut v, lo..=hi).text(tr(label)).fixed_decimals(if hi > 10.0 { 0 } else { 2 }));
                 if s.changed() {
                     self.set_grade(item, HSL, &param, v, t);
                 }
@@ -501,7 +502,7 @@ impl App {
                 painter.image(texture.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
             }
             _ => {
-                painter.text(rect.center(), egui::Align2::CENTER_CENTER, if self.playing { "Scopes update when paused" } else { "…" }, egui::FontId::proportional(12.0), egui::Color32::from_gray(120));
+                painter.text(rect.center(), egui::Align2::CENTER_CENTER, if self.playing { tr("Scopes update when paused") } else { "…" }, egui::FontId::proportional(12.0), egui::Color32::from_gray(120));
             }
         }
         // The graticule.

@@ -3,6 +3,7 @@
 //! switch, turn one sideways, change its resolution, rename or remove it, and add more —
 //! from presets (with the platforms each is for) or at a custom size.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_doc::{AspectPreset, CanvasSize, FormatVariant, Op, VariantId};
@@ -42,7 +43,7 @@ impl App {
         let rename_key = egui::Id::new("format-rename");
         crate::widgets::sticky_menu(ui, &title, |ui| {
             ui.set_min_width(380.0);
-            ui.label(egui::RichText::new("Formats in this project").small().weak());
+            ui.label(egui::RichText::new(tr("Formats in this project")).small().weak());
             for (i, v) in variants.iter().enumerate() {
                 let renaming: Option<(u64, String)> = ui.data(|d| d.get_temp(rename_key));
                 ui.horizontal(|ui| {
@@ -65,9 +66,9 @@ impl App {
                         }
                         None => {
                             let tip = if i == 0 {
-                                "The main format: transform edits here apply to every format. Double-click to rename."
+                                tr("The main format: transform edits here apply to every format. Double-click to rename.")
                             } else {
-                                "Edits here change only this format (unless “all formats” is on). Double-click to rename."
+                                tr("Edits here change only this format (unless “all formats” is on). Double-click to rename.")
                             };
                             let r = ui.selectable_label(i == current, egui::RichText::new(&v.name).strong()).on_hover_text(tip);
                             if r.clicked() {
@@ -78,17 +79,17 @@ impl App {
                             }
                         }
                     }
-                    ui.label(egui::RichText::new(format!("{}×{}", v.size.width, v.size.height)).small().weak());
+                    ui.label(egui::RichText::new(trf("{0}×{1}", &[("0", &(v.size.width).to_string()), ("1", &(v.size.height).to_string())])).small().weak());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Remove (never the main format).
                         let removable = variants.len() > 1 && i > 0;
-                        if ui.add_enabled(removable, egui::Button::new("✕").small().frame(false)).on_hover_text("Remove this format (its per-format changes go too)").clicked() {
+                        if ui.add_enabled(removable, egui::Button::new(tr("✕")).small().frame(false)).on_hover_text(tr("Remove this format (its per-format changes go too)")).clicked() {
                             action = Some(Action::Remove(v.id));
                         }
                         // Resolution: click for the next size up, right-click for the next down.
                         let at = RESOLUTIONS.iter().position(|(e, _)| *e == v.size.short_edge());
                         let label = at.map_or_else(|| format!("{}p", v.size.short_edge()), |i| RESOLUTIONS[i].1.to_string());
-                        let r = ui.add(egui::Button::new(egui::RichText::new(label).small()).min_size(egui::vec2(48.0, 0.0))).on_hover_text("Resolution — click for bigger, right-click for smaller");
+                        let r = ui.add(egui::Button::new(egui::RichText::new(label).small()).min_size(egui::vec2(48.0, 0.0))).on_hover_text(tr("Resolution — click for bigger, right-click for smaller"));
                         let step = |up: bool| {
                             let i = at.unwrap_or(1) as i32 + if up { 1 } else { -1 };
                             RESOLUTIONS[i.rem_euclid(RESOLUTIONS.len() as i32) as usize].0
@@ -98,14 +99,14 @@ impl App {
                         } else if r.secondary_clicked() {
                             action = Some(Action::Resize(v.id, scale_to(v.size, step(false))));
                         }
-                        if v.size.width != v.size.height && ui.add(egui::Button::new("⟲").small()).on_hover_text("Turn sideways (landscape ↔ portrait)").clicked() {
+                        if v.size.width != v.size.height && ui.add(egui::Button::new(tr("⟲")).small()).on_hover_text(tr("Turn sideways (landscape ↔ portrait)")).clicked() {
                             action = Some(Action::Rotate(v.id));
                         }
                     });
                 });
             }
             ui.separator();
-            ui.label(egui::RichText::new("Add a format").small().weak());
+            ui.label(egui::RichText::new(tr("Add a format")).small().weak());
             for p in AspectPreset::all() {
                 let have = variants.iter().any(|v| v.size.matching_preset().is_some_and(|m| m.id == p.id));
                 let row = ui
@@ -115,7 +116,7 @@ impl App {
                             shape(ui, p.size(1080), 20.0, false);
                             let text = if have { egui::RichText::new(p.name).weak() } else { egui::RichText::new(p.name) };
                             ui.label(text);
-                            ui.label(egui::RichText::new(if have { "already added" } else { p.platforms }).small().weak());
+                            ui.label(egui::RichText::new(if have { tr("already added") } else { p.platforms }).small().weak());
                         })
                         .response
                     })
@@ -133,11 +134,11 @@ impl App {
             ui.separator();
             let mut custom: [u32; 2] = ui.data(|d| d.get_temp(custom_key)).unwrap_or([1920, 1080]);
             ui.horizontal(|ui| {
-                ui.label("Custom size");
+                ui.label(tr("Custom size"));
                 ui.add(egui::DragValue::new(&mut custom[0]).range(16..=8192).suffix(" w"));
-                ui.label("×");
+                ui.label(tr("×"));
                 ui.add(egui::DragValue::new(&mut custom[1]).range(16..=8192).suffix(" h"));
-                if ui.button("Add").on_hover_text("Encoders need even sizes; odd ones are rounded up").clicked() {
+                if ui.button(tr("Add")).on_hover_text(tr("Encoders need even sizes; odd ones are rounded up")).clicked() {
                     action = Some(Action::AddCustom(CanvasSize::new(custom[0].div_ceil(2) * 2, custom[1].div_ceil(2) * 2)));
                 }
             });
@@ -147,7 +148,7 @@ impl App {
             self.format_action(a);
         }
         if self.variant > 0 {
-            ui.checkbox(&mut self.link_formats, "all formats").on_hover_text("Transform edits apply to every format, not just this one");
+            ui.checkbox(&mut self.link_formats, tr("all formats")).on_hover_text(tr("Transform edits apply to every format, not just this one"));
         }
     }
 
@@ -176,7 +177,7 @@ impl App {
                 {
                     ops.push(Op::SetVariantName { seq, variant, name: new.name.into() });
                 }
-                self.editor.apply("Turn format sideways", ops)
+                self.editor.apply(tr("Turn format sideways"), ops)
             }
             Action::Resize(variant, size) => self.editor.apply("Format resolution", vec![Op::SetVariantSize { seq, variant, size }]),
             Action::Rename(variant, name) => self.editor.apply("Rename format", vec![Op::SetVariantName { seq, variant, name }]),

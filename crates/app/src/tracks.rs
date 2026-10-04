@@ -22,6 +22,7 @@
 //! let go. A point on a clip (anchor, focus, an effect's point) is keyed to the track
 //! instead, since where a canvas point lands on a clip depends on the clip.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_doc::{ItemId, ItemKind, Op, ParamTarget};
@@ -313,7 +314,7 @@ impl App {
             None => {
                 let n = self.editor.doc.project().tracks.len() + 1;
                 let id = self.editor.doc.alloc_id();
-                let name = self.editor.item(self.track_editor.as_ref().map_or(ItemId(0), |e| e.item)).map_or(format!("Track {n}"), |i| format!("Track {n} ({})", i.name));
+                let name = self.editor.item(self.track_editor.as_ref().map_or(ItemId(0), |e| e.item)).map_or(format!("Track {n}"), |i| trf("Track {n} ({0})", &[("n", &(n).to_string()), ("0", &(i.name).to_string())]));
                 PointTrack::new(id, &name)
             }
         }
@@ -436,7 +437,7 @@ impl App {
         let t = self.playhead.max(it.range.start).min(it.range.end() - Time(1));
         let Some(shift) = source.track_contribution(&it.eval_context(t)) else { return };
         let op = Op::SetParam { seq: self.editor.seq, item, target: target.clone(), param: ParamId::new(param), source: Some(source.without_track(shift)) };
-        if let Err(e) = self.editor.apply("Stop following track", vec![op]) {
+        if let Err(e) = self.editor.apply(tr("Stop following track"), vec![op]) {
             self.error = Some(e.to_string());
         }
     }
@@ -519,8 +520,8 @@ impl App {
         let run = ed.run.take().expect("checked");
         match (ended, run.result.clone()) {
             (Ok(()), Some(tracked)) => self.apply_tracked(&run, &tracked),
-            (Ok(()), None) => ed.note = Some("The tracker finished without a track.".into()),
-            (Err(e), _) => ed.note = Some(format!("Couldn't follow it: {e}")),
+            (Ok(()), None) => ed.note = Some(tr("The tracker finished without a track.").into()),
+            (Err(e), _) => ed.note = Some(trf("Couldn't follow it: {e}", &[("e", &(e).to_string())])),
         }
     }
 
@@ -567,8 +568,8 @@ impl App {
             let c = self.placement_at(run.clip, at)?.to_canvas.apply(px);
             Some((t, if own { self.unstabilized(at, c) } else { c }))
         });
-        let n = self.track_from_canvas(&samples, 0.75, "Follow with the tracker");
-        self.set_track_note(&format!("Followed it for {:.1} s — {n} points.", to - from));
+        let n = self.track_from_canvas(&samples, 0.75, tr("Follow with the tracker"));
+        self.set_track_note(&trf("Followed it for {0} s — {n} points.", &[("0", &format!("{:.1}", to - from)), ("n", &(n).to_string())]));
     }
 
     /// Starts CoTracker on the footage under the start point.
@@ -584,11 +585,11 @@ impl App {
         };
         let clip = if stabilizing {
             if !is_video(self, item) {
-                self.set_track_note("Only a video clip can be stabilized: this one has no moving picture to track.");
+                self.set_track_note(tr("Only a video clip can be stabilized: this one has no moving picture to track."));
                 return;
             }
             if !self.placement_at(item, t).is_some_and(|p| p.contains(c)) {
-                self.set_track_note("Click a point on this clip itself — the thing in it that should hold still.");
+                self.set_track_note(tr("Click a point on this clip itself — the thing in it that should hold still."));
                 return;
             }
             Some(item)
@@ -607,7 +608,7 @@ impl App {
                 .map(|l| l.item)
         };
         let Some(clip) = clip else {
-            self.set_track_note("There's no video under that point to follow it through.");
+            self.set_track_note(tr("There's no video under that point to follow it through."));
             return;
         };
         let (Some(footage_item), Some(edited)) = (self.editor.item(clip).cloned(), self.editor.item(item).cloned()) else { return };
@@ -620,13 +621,13 @@ impl App {
         let a = footage_item.range.start.max(edited.range.start).max(t - Time::from_seconds_f64(before.max(0.0)));
         let b = footage_item.range.end().min(edited.range.end()).min(t + Time::from_seconds_f64(after.max(0.0)));
         if b <= a {
-            self.set_track_note("Nothing to follow there: set Before or After, over a stretch where the footage and this clip both play.");
+            self.set_track_note(tr("Nothing to follow there: set Before or After, over a stretch where the footage and this clip both play."));
             return;
         }
         let range = TimeRange::new(a, b - a);
         let (s0, s1) = (footage_item.eval_context(a).source_time.as_seconds_f64(), footage_item.eval_context(b).source_time.as_seconds_f64());
         if s1 <= s0 {
-            self.set_track_note("Reversed or frozen footage can't be followed.");
+            self.set_track_note(tr("Reversed or frozen footage can't be followed."));
             return;
         }
         let Some(p) = self.placement_at(clip, t) else { return };
@@ -671,13 +672,13 @@ impl App {
         let Some(ed) = self.track_editor.as_mut() else { return };
         let Some(rec) = ed.recording.take() else { return };
         if rec.samples.len() < 2 {
-            ed.note = Some("Nothing recorded — keep the pointer over the picture while it plays.".into());
+            ed.note = Some(tr("Nothing recorded — keep the pointer over the picture while it plays.").into());
             return;
         }
         let smooth = ed.smoothness;
         let samples = oa_track::smooth(&rec.samples, smooth * 0.25);
         let n = self.track_from_canvas(&samples, 0.5 + smooth * 3.0, "Record track");
-        self.set_track_note(&format!("Recorded — {n} points."));
+        self.set_track_note(&trf("Recorded — {n} points.", &[("n", &(n).to_string())]));
     }
 
     /// The viewer while the track editor is open: the track, the start point, and the
@@ -844,10 +845,10 @@ impl App {
         let Some(ed) = self.track_editor.as_ref() else { return };
         let Some(name) = self.editor.item(ed.item).map(|i| i.name.clone()) else { return };
         let Some((viewer, _)) = self.viewer_canvas else { return };
-        let label = ed.param.rsplit('.').next().unwrap_or(&ed.param).replace('_', " ");
+        let label = crate::i18n::t(&ed.param.rsplit('.').next().unwrap_or(&ed.param).replace('_', " ")).to_string();
         let title = match ed.purpose {
-            Purpose::Track => format!("Track — {name} · {label}"),
-            Purpose::Stabilize => format!("Stabilize — {name}"),
+            Purpose::Track => trf("Track — {name} · {label}", &[("name", &(name).to_string()), ("label", &(label).to_string())]),
+            Purpose::Stabilize => trf("Stabilize — {name}", &[("name", &(name).to_string())]),
         };
         let mut close = false;
         egui::Area::new(egui::Id::new("track-editor-panel")).order(egui::Order::Foreground).fixed_pos(viewer.left_top() + egui::vec2(10.0, 10.0)).show(ctx, |ui| {
@@ -856,7 +857,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.strong(title);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Done").on_hover_text("Close the track editor (Esc)").clicked() {
+                        if ui.button(tr("Done")).on_hover_text(tr("Close the track editor (Esc)")).clicked() {
                             close = true;
                         }
                     });
@@ -870,11 +871,11 @@ impl App {
                     ui.horizontal(|ui| {
                         let ed = self.track_editor.as_mut().expect("open");
                         for (m, name, tip) in [
-                            (Mode::Follow, "Auto", "Click a point; the AI tracker follows it through the footage for you"),
-                            (Mode::Hand, "By hand", "Click where it is; the playhead steps on; click again"),
-                            (Mode::Record, "Record", "Follow it with the mouse while the timeline plays"),
+                            (Mode::Follow, "Auto", tr("Click a point; the AI tracker follows it through the footage for you")),
+                            (Mode::Hand, "By hand", tr("Click where it is; the playhead steps on; click again")),
+                            (Mode::Record, "Record", tr("Follow it with the mouse while the timeline plays")),
                         ] {
-                            if ui.selectable_label(ed.mode == m, name).on_hover_text(tip).clicked() {
+                            if ui.selectable_label(ed.mode == m, tr(name)).on_hover_text(tr(tip)).clicked() {
                                 ed.mode = m;
                                 ed.armed = false;
                             }
@@ -887,9 +888,9 @@ impl App {
                     Some(Mode::Follow) => self.follow_panel(ui),
                     Some(Mode::Hand) => {
                         let ed = self.track_editor.as_mut().expect("open");
-                        ui.label(egui::RichText::new("Click where it is. The playhead steps on; click again for the next point.").small());
+                        ui.label(egui::RichText::new(tr("Click where it is. The playhead steps on; click again for the next point.")).small());
                         ui.horizontal(|ui| {
-                            ui.label("Step");
+                            ui.label(tr("Step"));
                             ui.add(egui::Slider::new(&mut ed.step, 1..=30).suffix(" frames"));
                         });
                     }
@@ -974,7 +975,7 @@ impl App {
         let Some(ed) = self.track_editor.as_ref().filter(|e| e.space == Space::Position) else { return };
         if ed.purpose == Purpose::Track {
             if matches!(ed.usage, Usage::Stabilize { .. }) {
-                ui.label(egui::RichText::new("This clip is stabilized with the track: changes to the track steady it anew. Edit stabilization… sets how firmly.").small().weak());
+                ui.label(egui::RichText::new(tr("This clip is stabilized with the track: changes to the track steady it anew. Edit stabilization… sets how firmly.")).small().weak());
             }
             return;
         }
@@ -986,13 +987,13 @@ impl App {
         if let Usage::Stabilize { strength, lock, smoothing, anchor } = &mut usage {
             let track_changed = |r: &egui::Response, finished: &mut bool| *finished |= r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus());
             egui::Grid::new("track-stabilize").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                ui.label("Hold");
+                ui.label(tr("Hold"));
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(!*lock, "Smooth").on_hover_text("Take out the shake, keep the camera's own moves (pans, walks)").clicked() && *lock {
+                    if ui.selectable_label(!*lock, tr("Smooth")).on_hover_text(tr("Take out the shake, keep the camera's own moves (pans, walks)")).clicked() && *lock {
                         *lock = false;
                         finished = true;
                     }
-                    if ui.selectable_label(*lock, "Locked").on_hover_text("Rigid: the tracked point never moves, as on a tripod").clicked() && !*lock {
+                    if ui.selectable_label(*lock, tr("Locked")).on_hover_text(tr("Rigid: the tracked point never moves, as on a tripod")).clicked() && !*lock {
                         *lock = true;
                         finished = true;
                     }
@@ -1001,34 +1002,34 @@ impl App {
                 if *lock {
                     // Where it's held: no reference point needed — where it is now, or
                     // anywhere on the frame.
-                    ui.label("Hold it");
+                    ui.label(tr("Hold it"));
                     ui.horizontal_wrapped(|ui| {
-                        if ui.selectable_label(anchor.is_none() && !picking, "where it is now").on_hover_text("Where the tracked point is at the playhead").clicked() {
+                        if ui.selectable_label(anchor.is_none() && !picking, "where it is now").on_hover_text(tr("Where the tracked point is at the playhead")).clicked() {
                             *anchor = None;
                             finished = true;
                             pick = Some(false);
                         }
-                        if ui.selectable_label(*anchor == Some([0.0, 0.0]) && !picking, "at the center").on_hover_text("The middle of the frame").clicked() {
+                        if ui.selectable_label(*anchor == Some([0.0, 0.0]) && !picking, "at the center").on_hover_text(tr("The middle of the frame")).clicked() {
                             *anchor = Some([0.0, 0.0]);
                             finished = true;
                             pick = Some(false);
                         }
                         let custom = anchor.is_some_and(|a| a != [0.0, 0.0]);
-                        if ui.selectable_label(picking || custom, if picking { "click in the picture…" } else { "at a point I pick" }).on_hover_text("Click anywhere on the frame: the tracked point is always kept there").clicked() {
+                        if ui.selectable_label(picking || custom, if picking { "click in the picture…" } else { "at a point I pick" }).on_hover_text(tr("Click anywhere on the frame: the tracked point is always kept there")).clicked() {
                             pick = Some(!picking);
                         }
                     });
                     ui.end_row();
                 }
-                ui.label("Smoothing");
+                ui.label(tr("Smoothing"));
                 let r = ui
                     .add_enabled(!*lock, egui::Slider::new(smoothing, 0.05..=5.0).logarithmic(true).suffix(" s").max_decimals(2))
-                    .on_hover_text("Movement quicker than this is taken out. Longer is steadier; shorter keeps more of the camera's motion.");
+                    .on_hover_text(tr("Movement quicker than this is taken out. Longer is steadier; shorter keeps more of the camera's motion."));
                 track_changed(&r, &mut finished);
                 ui.end_row();
-                ui.label("Strength");
+                ui.label(tr("Strength"));
                 let mut pct = *strength * 100.0;
-                let r = ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix(" %").max_decimals(0)).on_hover_text("How much of the movement is taken out: less keeps some of it, for a natural feel");
+                let r = ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix(" %").max_decimals(0)).on_hover_text(tr("How much of the movement is taken out: less keeps some of it, for a natural feel"));
                 *strength = pct / 100.0;
                 track_changed(&r, &mut finished);
                 ui.end_row();
@@ -1059,8 +1060,8 @@ impl App {
             let now = self.editor.param_value(item, &ParamTarget::Item, oa_doc::schema::SCALE, self.playhead).and_then(|v| v.as_vec2()).unwrap_or([1.0, 1.0]);
             let needed = [now[0].max(scale), now[1].max(scale)];
             let covered = needed == now;
-            let label = if covered { "Edges hidden".to_string() } else { format!("Zoom in to hide the edges ({:.0}%)", scale * 100.0) };
-            if ui.add_enabled(!covered, egui::Button::new(label)).on_hover_text("Scales the clip up just enough that the stabilization never shows past its edges").clicked() {
+            let label = if covered { "Edges hidden".to_string() } else { trf("Zoom in to hide the edges ({0}%)", &[("0", &format!("{:.0}", scale * 100.0))]) };
+            if ui.add_enabled(!covered, egui::Button::new(label)).on_hover_text(tr("Scales the clip up just enough that the stabilization never shows past its edges")).clicked() {
                 self.editor.set_value_at(item, ParamTarget::Item, oa_doc::schema::SCALE, Value::Vec2(needed), self.playhead, "stabilize-zoom");
                 self.editor.doc.seal();
             }
@@ -1076,13 +1077,13 @@ impl App {
         let shown = current.and_then(|id| tracks.iter().find(|t| t.0 == id)).map_or("New track".to_string(), |t| t.1.clone());
         let mut pick = None;
         ui.horizontal(|ui| {
-            ui.label("Track");
+            ui.label(tr("Track"));
             egui::ComboBox::from_id_salt("track-pick").selected_text(shown).width(200.0).show_ui(ui, |ui| {
-                if ui.selectable_label(current.is_none(), "New track").on_hover_text("Start a new track with the tools below").clicked() {
+                if ui.selectable_label(current.is_none(), "New track").on_hover_text(tr("Start a new track with the tools below")).clicked() {
                     pick = Some(None);
                 }
                 for (id, name, n) in &tracks {
-                    if ui.selectable_label(current == Some(*id), format!("{name}  ({n} points)")).on_hover_text("Follow this track").clicked() {
+                    if ui.selectable_label(current == Some(*id), format!("{name}  ({n} points)")).on_hover_text(tr("Follow this track")).clicked() {
                         pick = Some(Some(*id));
                     }
                 }
@@ -1105,7 +1106,7 @@ impl App {
         let Some(t) = self.editor.doc.project().tracks.get(&id).cloned() else { return };
         ui.horizontal(|ui| {
             let mut name = t.name.clone();
-            let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(170.0)).on_hover_text("The track's name");
+            let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(170.0)).on_hover_text(tr("The track's name"));
             if r.changed() {
                 let mut renamed = (*t).clone();
                 renamed.name = name;
@@ -1116,48 +1117,48 @@ impl App {
             if r.lost_focus() {
                 self.editor.doc.seal();
             }
-            if follows == Some(id) && ui.button("Stop following").on_hover_text("The position stops following the track and stays where it is now").clicked() {
+            if follows == Some(id) && ui.button(tr("Stop following")).on_hover_text(tr("The position stops following the track and stays where it is now")).clicked() {
                 self.let_go_of_track();
             }
         });
         ui.horizontal(|ui| {
             let others = self.editor.doc.project().tracks.len();
             if ui
-                .button("🗑 Delete track")
-                .on_hover_text(format!("Delete “{}” from the project; anything following it stays where it is now ({others} track{} in the project)", t.name, if others == 1 { "" } else { "s" }))
+                .button(tr("🗑 Delete track"))
+                .on_hover_text(trf("Delete “{0}” from the project; anything following it stays where it is now ({others} track{1} in the project)", &[("0", &(t.name).to_string()), ("others", &(others).to_string()), ("1", (if others == 1 { "" } else { "s" }))]))
                 .clicked()
             {
                 self.delete_point_track(id);
             }
         });
         if follows == Some(id) {
-            ui.label(egui::RichText::new("The position is now an offset from this track.").small().weak());
+            ui.label(egui::RichText::new(tr("The position is now an offset from this track.")).small().weak());
         }
     }
 
     fn record_panel(&mut self, ui: &mut egui::Ui) {
         let ed = self.track_editor.as_mut().expect("open");
         if ed.recording.is_some() {
-            ui.label(egui::RichText::new("Recording — follow it with the pointer. Click or Space to stop.").small().color(crate::style::ERROR));
-            if ui.button("■ Stop").clicked() {
+            ui.label(egui::RichText::new(tr("Recording — follow it with the pointer. Click or Space to stop.")).small().color(crate::style::ERROR));
+            if ui.button(tr("■ Stop")).clicked() {
                 self.finish_recording();
             }
             return;
         }
         egui::Grid::new("track-record").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-            ui.label("Speed");
-            ui.add(egui::Slider::new(&mut ed.speed, 0.1..=1.0).suffix("×").max_decimals(2)).on_hover_text("How fast the timeline plays while you follow: slower is easier");
+            ui.label(tr("Speed"));
+            ui.add(egui::Slider::new(&mut ed.speed, 0.1..=1.0).suffix("×").max_decimals(2)).on_hover_text(tr("How fast the timeline plays while you follow: slower is easier"));
             ui.end_row();
-            ui.label("Smoothness");
-            ui.add(egui::Slider::new(&mut ed.smoothness, 0.0..=1.0).max_decimals(2)).on_hover_text("How much of the mouse's shake is taken out (and how few points are kept)");
+            ui.label(tr("Smoothness"));
+            ui.add(egui::Slider::new(&mut ed.smoothness, 0.0..=1.0).max_decimals(2)).on_hover_text(tr("How much of the mouse's shake is taken out (and how few points are kept)"));
             ui.end_row();
         });
         if ed.armed {
-            ui.label(egui::RichText::new("Click in the picture to start. It plays from the playhead to the clip's end, without sound; click or Space stops it.").small().color(crate::style::ACCENT));
-            if ui.button("Cancel").clicked() {
+            ui.label(egui::RichText::new(tr("Click in the picture to start. It plays from the playhead to the clip's end, without sound; click or Space stops it.")).small().color(crate::style::ACCENT));
+            if ui.button(tr("Cancel")).clicked() {
                 ed.armed = false;
             }
-        } else if ui.button("● Record").on_hover_text("Then click in the picture to start").clicked() {
+        } else if ui.button(tr("● Record")).on_hover_text(tr("Then click in the picture to start")).clicked() {
             self.set_playing(false);
             let ed = self.track_editor.as_mut().expect("open");
             ed.armed = true;
@@ -1186,48 +1187,48 @@ impl App {
             };
             ui.add(egui::ProgressBar::new(p).desired_width(280.0).text(text).animate(run.progress.is_none()));
             if let Some(d) = &run.device {
-                ui.label(egui::RichText::new(format!("Running on {d}")).small().weak());
+                ui.label(egui::RichText::new(trf("Running on {d}", &[("d", &d.to_string())])).small().weak());
             }
-            if ui.button("Cancel").clicked() {
+            if ui.button(tr("Cancel")).clicked() {
                 run.job.cancel();
             }
             return;
         }
         // How long, and how closely.
         egui::Grid::new("track-follow").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-            ui.label("Before");
-            ui.add(egui::DragValue::new(&mut ed.before).range(0.0..=600.0).speed(0.05).suffix(" s")).on_hover_text("Follow it back this long from the start point (0: only forward)");
+            ui.label(tr("Before"));
+            ui.add(egui::DragValue::new(&mut ed.before).range(0.0..=600.0).speed(0.05).suffix(" s")).on_hover_text(tr("Follow it back this long from the start point (0: only forward)"));
             ui.end_row();
-            ui.label("After");
-            ui.add(egui::DragValue::new(&mut ed.after).range(0.0..=600.0).speed(0.05).suffix(" s")).on_hover_text("Follow it on this long from the start point (stops at the clip's end)");
+            ui.label(tr("After"));
+            ui.add(egui::DragValue::new(&mut ed.after).range(0.0..=600.0).speed(0.05).suffix(" s")).on_hover_text(tr("Follow it on this long from the start point (stops at the clip's end)"));
             ui.end_row();
-            ui.label("Detail");
+            ui.label(tr("Detail"));
             ui.horizontal(|ui| {
-                for (k, name, tip) in [(1, "Every frame", "Most exact, slowest"), (2, "Every 2nd", "About twice as fast; in-between frames are filled in"), (4, "Every 4th", "Fastest; for slow, smooth movement")] {
-                    ui.selectable_value(&mut ed.detail, k, name).on_hover_text(tip);
+                for (k, name, tip) in [(1, "Every frame", tr("Most exact, slowest")), (2, "Every 2nd", tr("About twice as fast; in-between frames are filled in")), (4, "Every 4th", tr("Fastest; for slow, smooth movement"))] {
+                    ui.selectable_value(&mut ed.detail, k, tr(name)).on_hover_text(tr(tip));
                 }
             });
             ui.end_row();
         });
         let frames = ((ed.before + ed.after) * rate / ed.detail.max(1) as f64).ceil() as usize + 1;
         if frames > oa_track::engine::MAX_FRAMES {
-            ui.label(egui::RichText::new(format!("That's {frames} frames; up to {} are looked at, spread over it. Less time or less detail keeps every one.", oa_track::engine::MAX_FRAMES)).small().color(crate::style::WARNING));
+            ui.label(egui::RichText::new(trf("That's {frames} frames; up to {0} are looked at, spread over it. Less time or less detail keeps every one.", &[("frames", &(frames).to_string()), ("0", &(oa_track::engine::MAX_FRAMES).to_string())])).small().color(crate::style::WARNING));
         }
         let ed = self.track_editor.as_ref().expect("open");
         match ed.start {
             None if matches!(ed.usage, Usage::Stabilize { .. }) => {
-                ui.label(egui::RichText::new("Click a point on this clip that should hold still — something fixed in the scene, with detail (a corner, a sign, a window).").small());
+                ui.label(egui::RichText::new(tr("Click a point on this clip that should hold still — something fixed in the scene, with detail (a corner, a sign, a window).")).small());
             }
             None => {
-                ui.label(egui::RichText::new("Click the thing to follow in the picture.").small());
+                ui.label(egui::RichText::new(tr("Click the thing to follow in the picture.")).small());
             }
             Some((at, _)) => {
-                ui.label(egui::RichText::new(format!("Start point at {:.2} s. Click again to move it.", at.as_seconds_f64())).small());
+                ui.label(egui::RichText::new(trf("Start point at {0} s. Click again to move it.", &[("0", &format!("{:.2}", at.as_seconds_f64()))])).small());
                 ui.horizontal(|ui| {
-                    if ui.button("Follow it").on_hover_text("Follow this point through the footage, before and after, into the track").clicked() {
+                    if ui.button(tr("Follow it")).on_hover_text(tr("Follow this point through the footage, before and after, into the track")).clicked() {
                         self.start_follow();
                     }
-                    if ui.small_button("Clear").clicked()
+                    if ui.small_button(tr("Clear")).clicked()
                         && let Some(ed) = self.track_editor.as_mut()
                     {
                         ed.start = None;
@@ -1250,7 +1251,7 @@ impl App {
             if let Some(p) = self.tracker_setup.progress {
                 ui.add(egui::ProgressBar::new(p).desired_width(280.0));
             }
-            if ui.button("Cancel").clicked() {
+            if ui.button(tr("Cancel")).clicked() {
                 job.cancel();
             }
             return;
@@ -1261,27 +1262,24 @@ impl App {
         let gpu = nvidia();
         if !installed {
             ui.label(
-                egui::RichText::new(format!(
-                    "Following uses CoTracker, Meta's AI point tracker, which runs on your computer. Setting it up downloads Python, PyTorch and the model into {}. CoTracker is for non-commercial use only (CC BY-NC 4.0).",
-                    tracker.root().display()
-                ))
+                egui::RichText::new(trf("Following uses CoTracker, Meta's AI point tracker, which runs on your computer. Setting it up downloads Python, PyTorch and the model into {0}. CoTracker is for non-commercial use only (CC BY-NC 4.0).", &[("0", &(tracker.root().display()).to_string())]))
                 .small(),
             );
         }
         let mut start = None;
         ui.horizontal_wrapped(|ui| {
             let cpu = Compute::Cpu;
-            if !installed && ui.button(format!("Set up (CPU, ~{} MB)", cpu.download_mb())).on_hover_text("Works on any computer, using every core").clicked() {
+            if !installed && ui.button(trf("Set up (CPU, ~{0} MB)", &[("0", &(cpu.download_mb()).to_string())])).on_hover_text(tr("Works on any computer, using every core")).clicked() {
                 start = Some(tracker.install_steps(cpu));
             }
             if let Some(name) = &gpu {
                 let nv = Compute::Nvidia;
-                let label = if installed { format!("Use the GPU ({name}, ~{} MB)", nv.download_mb()) } else { format!("Set up for {name} (~{} MB)", nv.download_mb()) };
-                if (!installed || tracker.compute() == Compute::Cpu) && ui.button(label).on_hover_text("Runs on the graphics card: many times faster than the CPU").clicked() {
+                let label = if installed { trf("Use the GPU ({name}, ~{0} MB)", &[("name", &(name).to_string()), ("0", &(nv.download_mb()).to_string())]) } else { trf("Set up for {name} (~{0} MB)", &[("name", &(name).to_string()), ("0", &(nv.download_mb()).to_string())]) };
+                if (!installed || tracker.compute() == Compute::Cpu) && ui.button(label).on_hover_text(tr("Runs on the graphics card: many times faster than the CPU")).clicked() {
                     start = Some(if installed { tracker.switch_steps(nv) } else { tracker.install_steps(nv) });
                 }
             }
-            if installed && tracker.compute() == Compute::Nvidia && ui.button("Use the CPU instead").on_hover_text("Swap in the smaller CPU build of PyTorch").clicked() {
+            if installed && tracker.compute() == Compute::Nvidia && ui.button(tr("Use the CPU instead")).on_hover_text(tr("Swap in the smaller CPU build of PyTorch")).clicked() {
                 start = Some(tracker.switch_steps(Compute::Cpu));
             }
         });
@@ -1299,9 +1297,9 @@ impl App {
                 Compute::Cpu => "the CPU".to_string(),
                 Compute::Nvidia => nvidia().map_or("an NVIDIA GPU".into(), |n| n.to_string()),
             };
-            ui.label(egui::RichText::new(format!("Set up in {} — runs on {on}.", tracker.root().display())).small());
+            ui.label(egui::RichText::new(trf("Set up in {0} — runs on {on}.", &[("0", &(tracker.root().display()).to_string()), ("on", &(on).to_string())])).small());
         } else {
-            ui.label(egui::RichText::new("Not set up. It's set up from a position's track editor (Follow), or here.").small().weak());
+            ui.label(egui::RichText::new(tr("Not set up. It's set up from a position's track editor (Follow), or here.")).small().weak());
         }
         self.tracker_setup_ui(ui);
         if tracker.is_installed() && self.tracker_setup.job.is_none() {
@@ -1309,18 +1307,18 @@ impl App {
             let asked = ui.data(|d| d.get_temp::<bool>(confirm)).unwrap_or(false);
             ui.horizontal(|ui| {
                 if !asked {
-                    if ui.button("Remove the AI tracker").on_hover_text(format!("Delete {} and everything in it (tracks in projects stay)", tracker.root().display())).clicked() {
+                    if ui.button(tr("Remove the AI tracker")).on_hover_text(trf("Delete {0} and everything in it (tracks in projects stay)", &[("0", &(tracker.root().display()).to_string())])).clicked() {
                         ui.data_mut(|d| d.insert_temp(confirm, true));
                     }
                 } else {
-                    ui.label(egui::RichText::new("Delete it?").color(crate::style::ERROR));
-                    if ui.button("Remove").clicked() {
+                    ui.label(egui::RichText::new(tr("Delete it?")).color(crate::style::ERROR));
+                    if ui.button(tr("Remove")).clicked() {
                         if let Err(e) = tracker.remove() {
                             self.tracker_setup.error = Some(e.to_string());
                         }
                         ui.data_mut(|d| d.remove::<bool>(confirm));
                     }
-                    if ui.button("Keep it").clicked() {
+                    if ui.button(tr("Keep it")).clicked() {
                         ui.data_mut(|d| d.remove::<bool>(confirm));
                     }
                 }
@@ -1361,7 +1359,7 @@ impl App {
 
 /// The NVIDIA card's name, asked once in the background (`None` until it answers, and
 /// when there isn't one).
-fn nvidia() -> Option<String> {
+pub(crate) fn nvidia() -> Option<String> {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, Ordering};
     static GPU: OnceLock<Option<String>> = OnceLock::new();

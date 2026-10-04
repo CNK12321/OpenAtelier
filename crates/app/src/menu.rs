@@ -10,6 +10,7 @@
 //! the same command list as the palette, so it can't drift out of step with it.
 
 
+use crate::i18n::{tr, trf};
 use crate::command::Group;
 use crate::icons;
 use crate::style;
@@ -23,7 +24,7 @@ impl App {
             let mut run: Option<&'static str> = None;
             let (mark, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
             crate::logo::badge(ui.painter(), mark);
-            ui.menu_button("OpenAtelier ▾", |ui| {
+            ui.menu_button(tr("OpenAtelier ▾"), |ui| {
                 ui.set_min_width(240.0);
                 let commands = self.commands();
                 let mut entry = |ui: &mut egui::Ui, id: &str| {
@@ -37,10 +38,10 @@ impl App {
                 entry(ui, "project.open");
                 // egui's own submenu (it opens on hover), with room left for the icon.
                 let recent = self.settings.recent.clone();
-                let sub = ui.menu_button("       Recent", |ui| {
+                let sub = ui.menu_button(tr("       Recent"), |ui| {
                     ui.set_min_width(220.0);
                     if recent.is_empty() {
-                        ui.label(egui::RichText::new("Nothing yet").weak());
+                        ui.label(egui::RichText::new(tr("Nothing yet")).weak());
                     }
                     for p in recent {
                         if icons::menu_item(ui, Some(icons::VIDEO_TRACK), &p.name, "", p.path.exists()).on_hover_text(p.path.display().to_string()).clicked() {
@@ -56,6 +57,7 @@ impl App {
                 entry(ui, "project.save_as");
                 entry(ui, "project.import");
                 entry(ui, "project.export");
+                entry(ui, "project.export_otio");
                 ui.separator();
                 if icons::menu_item(ui, Some(icons::SETTINGS), "Settings…", "Ctrl+,", true).clicked() {
                     self.settings_open = true;
@@ -82,22 +84,26 @@ impl App {
                 self.run_command(id);
             }
 
-            ui.separator();
+            ui.add_space(style::GAP_L);
             // Undo and redo, naming what they'd undo.
             let undo = self.editor.doc.undo_label().map(str::to_string);
             let redo = self.editor.doc.redo_label().map(str::to_string);
-            let tip = |label: &Option<String>, verb: &str| match label {
-                Some(l) => format!("{verb} {l}"),
-                None => format!("Nothing to {}", verb.to_lowercase()),
+            // Whole phrases (word order differs between languages), the step's name in the
+            // language in force.
+            let tip = |label: &Option<String>, undo: bool| match (label, undo) {
+                (Some(l), true) => trf("Undo {what}", &[("what", &crate::i18n::tx(l))]),
+                (Some(l), false) => trf("Redo {what}", &[("what", &crate::i18n::tx(l))]),
+                (None, true) => tr("Nothing to undo").to_string(),
+                (None, false) => tr("Nothing to redo").to_string(),
             };
-            if icons::button(ui, icons::UNDO, &tip(&undo, "Undo"), "Ctrl+Z", undo.is_some()).clicked() {
+            if icons::button(ui, icons::UNDO, &tip(&undo, true), "Ctrl+Z", undo.is_some()).clicked() {
                 self.undo();
             }
-            if icons::button(ui, icons::REDO, &tip(&redo, "Redo"), "Ctrl+Shift+Z", redo.is_some()).clicked() {
+            if icons::button(ui, icons::REDO, &tip(&redo, false), "Ctrl+Shift+Z", redo.is_some()).clicked() {
                 self.redo();
             }
 
-            ui.separator();
+            ui.add_space(style::GAP_L);
             // What's open, and whether it's saved.
             let dirty = self.editor.dirty();
             let name = self
@@ -107,17 +113,25 @@ impl App {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "Untitled".into());
-            ui.label(egui::RichText::new(name).size(style::TEXT));
+            ui.label(egui::RichText::new(name).size(style::TEXT).strong());
             if dirty {
-                ui.label(egui::RichText::new("●").color(style::WARNING)).on_hover_text("Unsaved changes (autosaved)");
+                ui.label(egui::RichText::new(tr("●")).color(style::WARNING)).on_hover_text(tr("Unsaved changes (autosaved)"));
             }
 
-            ui.separator();
+            ui.add_space(style::GAP_L);
+            // The format being edited, and the layout that suits it.
             self.format_picker(ui);
+            let vertical = self.vertical_layout();
+            if crate::widgets::chip(ui, vertical, tr("Vertical layout"))
+                .on_hover_text(tr("For vertical video: the viewer takes the tall column on the right and the properties move to the middle. Remembered with the project."))
+                .clicked()
+            {
+                self.toggle_layout();
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(style::GAP_S);
-                if icons::button(ui, icons::HOME, "Home: projects and plugins", "", true).clicked() {
+                if icons::button(ui, icons::HOME, tr("Home: projects and plugins"), "", true).clicked() {
                     self.go_home();
                 }
                 match &self.export {
@@ -136,16 +150,16 @@ impl App {
                         };
                         let text = if queued > 0 { format!("{status} · {queued} more") } else { status };
                         let bar = ui.add(egui::ProgressBar::new(fraction).desired_width(140.0).text(text)).interact(egui::Sense::click());
-                        if bar.on_hover_text("Show the export and what's queued").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        if bar.on_hover_text(tr("Show the export and what's queued")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             self.export_view.hidden = false;
                         }
                         // More can be queued while this one runs.
-                        if icons::button(ui, icons::EXPORT, "Queue another export…", "", true).clicked() {
+                        if icons::button(ui, icons::EXPORT, tr("Queue another export…"), "", true).clicked() {
                             self.start_export();
                         }
                     }
                     None => {
-                        if icons::text_button(ui, icons::EXPORT, "Export…", true).on_hover_text("Render the video to a file").clicked() {
+                        if icons::text_button(ui, icons::EXPORT, tr("Export…"), true).on_hover_text(tr("Render the video to a file")).clicked() {
                             self.start_export();
                         }
                     }
@@ -166,7 +180,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_space(style::GAP_S);
             if n == 0 {
-                ui.label(egui::RichText::new("Select a clip to edit it — or drop media anywhere").small().weak());
+                ui.label(egui::RichText::new(tr("Select a clip to edit it — or drop media anywhere")).small().weak());
                 return;
             }
             ui.label(egui::RichText::new(if n == 1 { "1 clip".into() } else { format!("{n} clips") }).small().weak());

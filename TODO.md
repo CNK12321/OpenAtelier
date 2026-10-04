@@ -15,7 +15,7 @@ Where things stand and what's next. Architecture and rationale live in
 | `oa-doc` | Project model, format variants + presets, reframe, ops w/ undo (capped at 1000)/coalescing, JSON file; **`repair()` on load** (overlaps → new track, dup ids, order, empty curves, missing formats…); `MediaInfo.still`; `schema::audio()`; `Item::transition_in/out`, `Op::SetTransition`, track/clip on-off ops |
 | `oa-graph` | Render graph IR, cache keys, registry with WGSL, optimizer; `Affine2::invert`; `NodeOp::Transition` + built-in transitions (dissolve, dip, wipe, push) |
 | `oa-plan` | Snapshot + time → graph; **`scene`**: placements, `layers_at`, `hit_test` (same math as rendering); **`transitions`**: timing windows (`window`, `active`) |
-| `oa-edit` | `sections`: timeline-wide dividers/sections (add, move, clear, delete, reorder), paste into a track's free space. `timeline`: trim/split/split_all/ripple_delete/close_gap/move_item/slip/Snapper/snap_to_frame. `transform`: Handles, Gesture (move/scale/rotate/anchor), snapping guides, nudge, reset, `write_param` (variant-aware) |
+| `oa-edit` | `paste`: paste into a track's free space. `timeline`: trim/split/split_all/ripple_delete/close_gap/move_item/slip/Snapper/snap_to_frame. `transform`: Handles, Gesture (move/scale/rotate/anchor), snapping guides, nudge, reset, `write_param` (variant-aware) |
 | `oa-gpu` | wgpu executor, pool, node cache, async fusion, NV12 in/out, blit, readback; `FrameSource::submitted` hook; **text pass** (`text.rs`: glyph atlas, per-letter vertex chain, per-pixel fragment chain) |
 | `oa-text` | **New.** System font index (mmap'd name tables), fallback chain + bundled font, harfrust shaping, line layout (`TextSpec` → `Layout`, cached), glyph signed distance fields |
 | `oa-media` | Probe, import/conform, stills, relink, MF hardware decode **on per-file decode threads with 4-frame lookahead**, leased shared textures |
@@ -54,9 +54,10 @@ so test runs don't leave recovery banners in your real autosave folder.
    rasterized at the size it is shown at (enlarged with nearest neighbor first) so its
    effects run over every displayed pixel.
    Also done: notifications in the bottom-right corner (`notify.rs`) and the start of
-   localization (`i18n.rs` + `crates/app/locales/en.json`). Left there: move the
-   editor's own labels onto `t()` keys, and ship a second language to prove the
-   fallback path.
+   localization (`i18n.rs`), ✅ 2026-09-29 the whole editor translatable and Spanish
+   built in. Left there: the engines' step names and errors (captions, tracker, SAM 2),
+   plural forms (English-style "{n} clip{s}" placeholders read awkwardly in some
+   languages), more languages.
 
 1. **UI/UX overhaul** (started 2026-09-20, DESIGN §11b). ✅ Phase 1–2: design tokens
    (`style.rs`), icon buttons with shortcut tooltips, a single command list
@@ -101,8 +102,11 @@ so test runs don't leave recovery banners in your real autosave folder.
    a VRAM budget the renderer works to (pool + cache, 2 GB default, slider in the
    Performance panel, kept in settings.json), trimming and preview back-off under
    pressure, `OutOfMemory` handling, and device-lost detection that autosaves and stops
-   rendering. Left: rebuilding a lost device in place (eframe shares the device, so it
-   means a restart today) and limits on plugin shaders.
+   rendering. ✅ 2026-09-28: a lost device restarts the app with the work reopened
+   (`app/gpu_reset.rs`; eframe shares one device with the UI, so in place isn't possible),
+   a watchdog that turns off plugins whose frames stall the GPU (`app/gpu_watch.rs`),
+   and load-time limits on plugin shaders (64 KB, 32 passes). Left: a GPU-time budget
+   per effect (timestamp queries) to catch slow-but-not-stuck shaders.
 
 3. **GPU surfaces into the encoder**: feed the MF sink writer D3D11 NV12 textures via
    `MF_SINK_WRITER_D3D_MANAGER` so frames never leave the GPU (needs rendering the two
@@ -141,11 +145,16 @@ so test runs don't leave recovery banners in your real autosave folder.
    replace the ffmpeg audio process with a platform decoder.
 7. **Stateful effects**: the engine reserves `Statefulness::Stateful` (preroll, no cache
    key) but no effect uses it any more and the executor doesn't run them — needed for
-   trails, echoes of the picture, temporal denoise.
+   trails, echoes of the picture, temporal denoise. (Motion Blur doesn't need it: the
+   planner draws the clip at moments across the shutter and averages them,
+   `Planner::motion_blurred`, 2026-09-29.) ✅ 2026-09-29 also: speed ramps (keyframed
+   `time.speed`, integrated by `Item::source_time_at`; the mixer reads a sampled
+   `SpeedRamp`), Luma Key, Shatter. Left there: optical-flow frame blending for smoother
+   slow ramps (frames repeat below 1×), blend modes by hue, saturation, color and luminosity.
 8. **Color management** ✅ 2026-09-20 (DESIGN §9, `oa_doc::color`, `app/color.rs`): input
    transforms per file (curve incl. PQ/HLG and six log formats, gamut, levels, matrix,
    exposure; automatic from tags), display-space wrapping, output tone map + exposure.
-   ✅ The Color tab (2026-09-27): scopes, lift/gamma/gain/offset wheels, tone and white balance, curves, HSL mixer. Left: **10-bit/P010 decode** (HDR/log band at 8 bits today), HDR export, LUTs/OCIO, qualifiers and power windows (secondary grades on part of the picture).
+   ✅ The Color tab (2026-09-27): scopes, lift/gamma/gain/offset wheels, tone and white balance, curves, HSL mixer. ✅ 10-bit decode (2026-09-28: 16-bit planes through ffmpeg where the GPU takes them). Left: HDR export, LUTs/OCIO, qualifiers and power windows (secondary grades on part of the picture).
 9. ✅ **Batch export of all format variants** (Export window, 2026-09-20). Left: cancel-with-partial-output semantics in the UI.
 10. **Editing UI** ✅ 2026-09-20 (DESIGN §5, §11b): curve editor window (`curves.rs`),
     editing inside compound clips with breadcrumbs (`compound.rs`), on-canvas title
@@ -161,9 +170,9 @@ so test runs don't leave recovery banners in your real autosave folder.
     (Pen) with per-point keyframes, an Edit tool with handles for rectangles, ellipses
     and path points, per-shape expand/contract and feather, add/subtract/intersect/
     difference between masks, the center on a point track and scale/rotation on two
-    (`Modulator::TrackPair`), pixel masks at full resolution. Left: **automatic
-    rotoscoping** (a path that follows its outline by itself, e.g. tracking each point),
-    inserting a point on a path segment, a timeline view of path keys, and building
+    (`Modulator::TrackPair`), pixel masks at full resolution. ✅ Automatic rotoscoping with SAM 2 (2026-09-29, a frame-by-frame
+    matte; the bridge not yet run against the real model). Left: turning a matte into an
+    editable path, adding clicks on other frames to correct it, inserting a point on a path segment, a timeline view of path keys, and building
     masks from the Color tab (qualifiers).
 
 ## Background backend track
@@ -183,11 +192,12 @@ when the turn's requested work is already very large (and say so).
   (2× supersampled, smooth text).
 - Parameters: [x] LFO driver (`Modulator::Lfo`: sine/triangle/square/saw, phase, decay; wave editor `app/waves.rs`) · [ ] linking params · [x] audio-reactive drivers (`Modulator::Follow`, `oa_audio::envelope`; connection editor `app/connections.rs`) · [ ] spatial bezier motion paths · [ ] squash & stretch from velocity ·
   [ ] motion blur (sub-frame transform samples) · [ ] speed curves.
-- GPU: [ ] rebuild a lost device in place · [ ] zero-copy hardware decode · [ ] plugin
-  shader loop/time limits.
+- GPU: [x] come back from a lost device (a restart that reopens the work, 2026-09-28) ·
+  [ ] zero-copy hardware decode · [x] plugin shader limits (size, passes, a stall
+  watchdog; 2026-09-28).
 - Media: [x] ffmpeg and ffprobe run without a console window (`oa_media::tool`; one
   flashed up and took the keyboard on every probe, import and seek in release builds,
-  2026-09-21) · [ ] 10-bit/P010 decode · [ ] 4:2:2 · [ ] proxies · [ ] decoder budget · [x] CPU
+  2026-09-21) · [x] 10-bit decode (16-bit planes, 2026-09-28) · [ ] 4:2:2 · [x] proxies (2026-09-28) · [ ] decoder budget · [x] CPU
   decode fallback (`oa_media::ffmpeg`, any platform, 2026-09-24) · [x] Linux · [ ] macOS (VideoToolbox) ·
   [ ] VA-API zero-copy.
 - Audio: [x] sound effects on the effect system: `EffectKind::Sound`, roles/clocks, plugin
@@ -205,7 +215,9 @@ when the turn's requested work is already very large (and say so).
   60 layers, 2026-09-26) · [ ] zero-copy encode · [ ] resume a canceled export.
 - Color: [ ] OCIO configs (a pure-Rust config reader, transforms evaluated on the CPU and
   baked into 3D LUTs; per-file color space, project display/view) · [ ] .cube LUTs ·
-  [ ] 10-bit/P010 decode · [ ] HDR export.
+  [x] 10-bit decode · [ ] HDR export.
+- Interchange: [x] OpenTimelineIO export (`oa_export::otio`, 2026-09-28) · [ ] OTIO import ·
+  [ ] FCPXML.
 - Media: [x] transparent video fixed (2026-09-27): ffmpeg's `-hwaccel auto` picked its Vulkan compute decoders for FFV1/ProRes, which corrupted frames now and then (black flicker, test pattern) — hardware decoding is now only for H.264/HEVC/VP9/AV1/MPEG-2/VC-1/VP8 without alpha; VP8/VP9 alpha decoded with libvpx and detected from `alpha_mode`; transparent media no longer counts as covering the layers under it (`MediaInfo::alpha`); Matroska millisecond stamps no longer repeat every third frame (half-tick slack in `select_frame` for coarse time bases); clicking the same spot again selects the next clip down.
 
 ## Known issues / gaps

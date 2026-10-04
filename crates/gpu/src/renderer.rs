@@ -307,10 +307,16 @@ impl GpuServices<'_> {
                 let plane = |aspect, format| frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(format), aspect, ..Default::default() });
                 (plane(wgpu::TextureAspect::Plane0, wgpu::TextureFormat::R8Unorm), plane(wgpu::TextureAspect::Plane1, wgpu::TextureFormat::Rg8Unorm))
             }
-            Some(chroma) if frame.texture.format() == wgpu::TextureFormat::R8Unorm && chroma.format() == wgpu::TextureFormat::Rg8Unorm => {
+            // 8-bit planes, or 16-bit ones (10- and 12-bit video).
+            Some(chroma)
+                if matches!(
+                    (frame.texture.format(), chroma.format()),
+                    (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm) | (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
+                ) =>
+            {
                 (frame.texture.create_view(&Default::default()), chroma.create_view(&Default::default()))
             }
-            _ => return Err(RenderError::Source(format!("expected NV12 or R8 + RG8 planes, got {:?}", frame.texture.format()))),
+            _ => return Err(RenderError::Source(format!("expected NV12, R8 + RG8 or R16 + RG16 planes, got {:?}", frame.texture.format()))),
         };
         let alpha = frame.alpha.map(|a| a.create_view(&Default::default()));
         let alpha = alpha.as_ref().unwrap_or(self.opaque);
@@ -1123,7 +1129,7 @@ impl Exec<'_> {
                 let origin = [input.origin[0] - left, input.origin[1] - top];
                 let size = [input.size[0] + (left + right) as u32, input.size[1] + (top + bottom) as u32];
                 let mut current = input;
-                let passes = d.pass_count.as_ref().map_or(shader.passes, |count| count.count(uniforms)).clamp(1, 32);
+                let passes = d.pass_count.as_ref().map_or(shader.passes, |count| count.count(uniforms)).clamp(1, oa_graph::plugin::MAX_PASSES);
                 for pass in 0..passes {
                     // A pass may run on a coarser grid (its target divided); the layer area it
                     // covers is the same, the shader works out its cells.

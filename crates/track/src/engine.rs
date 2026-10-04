@@ -45,7 +45,7 @@ impl Compute {
         }
     }
 
-    fn index(self) -> &'static str {
+    pub fn index(self) -> &'static str {
         match self {
             Compute::Cpu => "https://download.pytorch.org/whl/cpu",
             Compute::Nvidia => "https://download.pytorch.org/whl/cu128",
@@ -103,9 +103,46 @@ impl Footage {
     /// `frames` evenly over `duration`, at most [`MAX_FRAMES`], scaled from `native` to fit
     /// [`MAX_SIDE`].
     pub fn new(path: PathBuf, start: f64, duration: f64, frames: usize, native: [f64; 2]) -> Footage {
-        let k = (MAX_SIDE as f64 / native[0].max(native[1]).max(1.0)).min(1.0);
+        Footage::fit(path, start, duration, frames, native, MAX_SIDE, MAX_FRAMES)
+    }
+
+    /// The same, at most `max_side` px and `max_frames` frames.
+    pub fn fit(path: PathBuf, start: f64, duration: f64, frames: usize, native: [f64; 2], max_side: u32, max_frames: usize) -> Footage {
+        let k = (max_side as f64 / native[0].max(native[1]).max(1.0)).min(1.0);
         let even = |x: f64| (((x * k).round() as u32).max(2) / 2) * 2;
-        Footage { path, start, duration: duration.max(1e-3), frames: frames.clamp(2, MAX_FRAMES), size: [even(native[0]), even(native[1])] }
+        Footage { path, start, duration: duration.max(1e-3), frames: frames.clamp(2, max_frames.max(2)), size: [even(native[0]), even(native[1])] }
+    }
+
+    /// ffmpeg reading it into `out`: raw RGB frames, one after another, at its size
+    /// and spacing (`-stats` lines, "frame=  123", say how far it's got).
+    pub fn read_step(&self, ffmpeg: &str, out: &Path) -> Step {
+        let [w, h] = self.size;
+        let fps = self.frames as f64 / self.duration;
+        let os = |s: String| OsString::from(s);
+        let args = vec![
+            os("-v".into()),
+            os("error".into()),
+            os("-nostdin".into()),
+            os("-stats".into()),
+            os("-y".into()),
+            os("-ss".into()),
+            os(format!("{:.6}", self.start.max(0.0))),
+            os("-i".into()),
+            self.path.clone().into_os_string(),
+            os("-t".into()),
+            os(format!("{:.6}", self.duration)),
+            os("-vf".into()),
+            os(format!("fps={fps:.6},scale={w}:{h}")),
+            os("-frames:v".into()),
+            os(self.frames.to_string()),
+            os("-an".into()),
+            os("-f".into()),
+            os("rawvideo".into()),
+            os("-pix_fmt".into()),
+            os("rgb24".into()),
+            out.to_path_buf().into_os_string(),
+        ];
+        Step::Tool { what: "Reading the footage".into(), program: ffmpeg.into(), args }
     }
 
     /// The file time (seconds) of frame `i`.
@@ -179,8 +216,14 @@ impl Tracker {
         ]
     }
 
-    /// uv, Python, PyTorch for `compute`, then CoTracker.
-    pub fn install_steps(&self, compute: Compute) -> Vec<Step> {
+    /// The Python with PyTorch that the AI tools share (the tracker, the rotoscoper) is
+    /// there: each adds only its own part.
+    pub fn has_base(&self) -> bool {
+        self.engine.python().exists() && self.root().join(COMPUTE).exists()
+    }
+
+    /// uv, Python, PyTorch for `compute` and NumPy: what every AI tool here runs on.
+    pub fn base_steps(&self, compute: Compute) -> Vec<Step> {
         let root = self.root();
         let archive = root.join(uv_asset());
         let python = self.engine.python().into_os_string();
@@ -194,6 +237,22 @@ impl Tracker {
         steps.extend([
             Step::Uv { what: "NumPy".into(), args: vec![os("pip"), os("install"), os("--python"), python, os("numpy")] },
             Step::Uv { what: "Tidying up".into(), args: vec![os("cache"), os("clean")] },
+        ]);
+        steps
+    }
+
+    /// PyTorch's index for the build installed (for packages that must match it).
+    pub fn torch_index(&self) -> &'static str {
+        self.compute().index()
+    }
+
+    /// uv, Python, PyTorch for `compute`, then CoTracker (the shared part only if it
+    /// isn't there yet).
+    pub fn install_steps(&self, compute: Compute) -> Vec<Step> {
+        let root = self.root();
+        let os = |s: &str| OsString::from(s);
+        let mut steps = if self.has_base() { Vec::new() } else { self.base_steps(compute) };
+        steps.extend([
             Step::Write { path: self.script(), text: SCRIPT.into() },
             Step::Python { what: "the CoTracker model".into(), args: vec![self.script().into_os_string(), os("download")] },
             Step::Write { path: root.join(READY), text: LAYOUT.into() },

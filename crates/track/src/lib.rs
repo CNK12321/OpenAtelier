@@ -4,6 +4,7 @@
 //! keyframes on a position property; [`simplify`] keeps only the keys the path needs.
 
 pub mod engine;
+pub mod roto;
 
 /// One point of a track: timeline seconds and a position (any 2D space — canvas px,
 /// footage px, fractions).

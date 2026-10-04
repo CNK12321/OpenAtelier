@@ -22,6 +22,7 @@ mod cut_transitions;
 mod logo;
 mod mask_draw;
 mod masks;
+mod media_pick;
 mod points;
 mod surface;
 mod sound_cards;
@@ -29,6 +30,8 @@ mod connections;
 mod tracks;
 mod update;
 mod deps;
+mod drop_in;
+mod eyedropper;
 mod winfocus;
 mod curves;
 mod command;
@@ -38,6 +41,8 @@ mod export_worker;
 mod fontpick;
 mod fullscreen;
 mod formats;
+mod gpu_reset;
+mod gpu_watch;
 mod guard;
 mod home;
 mod icons;
@@ -52,6 +57,8 @@ mod plan_ahead;
 mod plugin_previews;
 mod plugin_scripts;
 mod preview_worker;
+mod proxies;
+mod roto;
 mod previews;
 mod record;
 mod captions;
@@ -70,6 +77,7 @@ mod viewer_render;
 mod waves;
 mod widgets;
 
+use crate::i18n::{tr, trf};
 use eframe::egui;
 use editor::Editor;
 use oa_audio::{AudioClip, AudioEngine, MixHandle, MixState, TimelineAudio};
@@ -99,6 +107,17 @@ struct PendingImport {
     /// the bin, in this folder (recordings).
     to_timeline: bool,
     folder: String,
+    /// Dropped onto the timeline: put there (`Placing`).
+    place: Option<Placing>,
+}
+
+/// Where files dropped onto the timeline go: one after another from the time they were
+/// dropped at (the next one's start, shared by the batch), on the track under the
+/// pointer if it's free and the right kind.
+#[derive(Clone)]
+struct Placing {
+    at: std::rc::Rc<std::cell::Cell<Time>>,
+    track: Option<oa_doc::TrackId>,
 }
 
 /// During playback, how long the preview waits on a video frame before showing a
@@ -109,7 +128,9 @@ const MEDIA_EXTENSIONS: &[&str] =
     &["mp4", "mov", "mkv", "m4v", "webm", "avi", "gif", "png", "jpg", "jpeg", "bmp", "webp", "svg", "mp3", "m4a", "wav", "flac", "aac", "ogg"];
 
 fn main() -> eframe::Result {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // A restart after the GPU was lost: what to bring back (`gpu_reset.rs`).
+    let resume = gpu_reset::Resume::take_from(&mut args);
     let autoplay = args.iter().any(|a| a == "--autoplay");
     let script_path = args.iter().position(|a| a == "--script").and_then(|i| args.get(i + 1)).cloned();
     let files: Vec<PathBuf> =
@@ -155,6 +176,8 @@ fn main() -> eframe::Result {
         .with_title("OpenAtelier")
         .with_app_id("openatelier")
         .with_icon(logo::icon(256));
+    // On Windows the window takes drops itself (drop_in.rs: pictures from browsers too).
+    let viewport = viewport.with_drag_and_drop(!cfg!(windows));
     // Maximized last time, or the first run: maximized from the start.
     let viewport = match &saved {
         Some(w) if w.maximized => viewport.with_maximized(true),
@@ -187,6 +210,7 @@ fn main() -> eframe::Result {
                 app.open_paths(&files);
                 app.screen = home::Screen::Editor;
             }
+            app.resume_after_gpu_reset(resume);
             if autoplay {
                 app.set_playing(true);
             }
@@ -196,15 +220,15 @@ fn main() -> eframe::Result {
     // No window at all (no GPU driver that can draw one): say so, with what to try.
     if let Err(e) = &result {
         let advice = if cfg!(windows) {
-            "Update the graphics driver, or try another graphics API: set the environment variable OA_GPU_BACKEND to vulkan or gl."
+            tr("Update the graphics driver, or try another graphics API: set the environment variable OA_GPU_BACKEND to vulkan or gl.")
         } else {
-            "Install your GPU's Vulkan driver (mesa-vulkan-drivers, or the vendor's), or try OpenGL: set OA_GPU_BACKEND=gl."
+            tr("Install your GPU's Vulkan driver (mesa-vulkan-drivers, or the vendor's), or try OpenGL: set OA_GPU_BACKEND=gl.")
         };
         eprintln!("OpenAtelier couldn't start: {e}\n{advice}");
         let _ = rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
-            .set_title("OpenAtelier couldn't start")
-            .set_description(format!("The graphics card couldn't be set up:\n\n{e}\n\n{advice}"))
+            .set_title(tr("OpenAtelier couldn't start"))
+            .set_description(trf("The graphics card couldn't be set up:\n\n{e}\n\n{advice}", &[("e", &(e).to_string()), ("advice", (advice))]))
             .show();
     }
     result
@@ -262,7 +286,7 @@ fn system_ui_fonts() -> (Option<PathBuf>, Option<PathBuf>) {
         path.extension().is_some_and(|e| ["ttf", "otf", "ttc"].iter().any(|x| e.eq_ignore_ascii_case(x))).then_some(path).and_then(exists)
     };
     let ui = fc("sans-serif:style=Regular");
-    let symbols = fc("DejaVu Sans").or_else(|| fc("Noto Sans Symbols2")).or_else(|| fc("Noto Sans Symbols"));
+    let symbols = fc("DejaVu Sans").or_else(|| fc(tr("Noto Sans Symbols2"))).or_else(|| fc(tr("Noto Sans Symbols")));
     (ui, symbols)
 }
 
@@ -291,6 +315,11 @@ struct App {
     gpu: Arc<GpuContext>,
     /// The viewer's picture: planned and rendered on a thread of its own (`viewer_render`).
     viewer_render: viewer_render::ViewerRender,
+    /// The viewer's frames on the GPU, watched for plugin shaders that stall it.
+    gpu_watch: gpu_watch::GpuWatch,
+    /// Plugins turned off because the GPU was lost while they drew (told to the restarted
+    /// editor).
+    gpu_turned_off: Vec<String>,
     /// Shared with export threads.
     registry: Arc<Registry>,
     editor: Editor,
@@ -323,8 +352,6 @@ struct App {
     clipboard: clips::Clipboard,
     /// Text for the system clipboard, put there next frame (see `copy_selection`).
     clipboard_note: Option<String>,
-    /// Timeline moves and trims snap to edges and the playhead.
-    snapping: bool,
     /// A track being renamed in its header menu, with the name typed so far.
     renaming: Option<(oa_doc::TrackId, String)>,
     /// The property each clip's keyframe line shows, where it isn't the default.
@@ -346,9 +373,10 @@ struct App {
     link_formats: bool,
     viewer_drag: Option<viewer::ViewerDrag>,
     timeline_drag: Option<timeline::TimelineDrag>,
-    /// The track picked by double-clicking it: pastes and duplicates go into its first
-    /// free space after the playhead, and Alt+↑/↓ moves it.
-    selected_track: Option<oa_doc::TrackId>,
+    /// The tracks picked by clicking their headers (Ctrl+click for more, Shift+click for a
+    /// run): pastes and duplicates go into the first one's first free space after the
+    /// playhead, and Alt+↑/↓ moves them all.
+    selected_tracks: Vec<oa_doc::TrackId>,
     /// An effect being dragged out of the inspector, and where clips were on screen last
     /// frame (timeline boxes; the viewer's canvas) to drop it on.
     effect_drag: Option<inspector::EffectDrag>,
@@ -362,6 +390,13 @@ struct App {
     project_view: settings::ProjectView,
     view_epoch: u64,
     view_key: Option<(PathBuf, String)>,
+    /// Proxies of heavy footage, which the viewer plays instead (`proxies.rs`), and
+    /// whether the viewer's files were last set with them on.
+    proxies: proxies::Proxies,
+    proxies_shown: bool,
+    /// Where to put the playhead once the project being opened is in (a restart after
+    /// the GPU was lost).
+    resume_playhead: Option<Time>,
     /// The room the panels were last fitted to: when the window changes size, they are
     /// fitted again from `project_view` (the sizes wanted, not the ones squeezed in).
     fitted_room: egui::Vec2,
@@ -423,6 +458,14 @@ struct App {
     color_tab: color_tab::ColorTab,
     /// The Masks tab: the mask being drawn, the tool, and a copied mask.
     masks: masks::Masks,
+    /// A color property waiting to be picked from the viewer (the eyedropper).
+    color_pick: Option<eyedropper::ColorPick>,
+    /// What's dropped on the window from outside (files, pictures from a browser),
+    /// where something being dragged in is now, and a drop the timeline may take this
+    /// frame (where it landed) before it goes to the bin.
+    drop_in: drop_in::DropIn,
+    file_hover: Option<egui::Pos2>,
+    file_drop: Option<(Vec<drop_in::Dropped>, egui::Pos2)>,
     /// Each compound clip's sound (its clips, in its own time) and whether it shows a
     /// picture, for drawing it on the timeline — worked out again after each edit (the
     /// project snapshot it was made from).
@@ -544,10 +587,13 @@ impl App {
         let autosave = autosave::Autosave::new(autosave::default_dir());
         let recoveries = autosave.recoverable();
         let preview_worker = preview_worker::PreviewWorker::start(gpu.clone(), decoders.clone(), settings.vram_budget(), cc.egui_ctx.clone());
-        let viewer_render = viewer_render::ViewerRender::start(gpu.clone(), decoders.clone(), render_options, registry.clone(), cc.egui_ctx.clone());
+        let gpu_watch = gpu_watch::GpuWatch::default();
+        let viewer_render = viewer_render::ViewerRender::start(gpu.clone(), decoders.clone(), render_options, registry.clone(), cc.egui_ctx.clone(), gpu_watch.clone());
         App {
             gpu,
             viewer_render,
+            gpu_watch,
+            gpu_turned_off: Vec::new(),
             registry,
             editor: Editor::new(),
             decoders,
@@ -581,7 +627,6 @@ impl App {
             selected: Default::default(),
             clipboard: Vec::new(),
             clipboard_note: None,
-            snapping: true,
             renaming: None,
             bands: Default::default(),
             effect_clipboard: Vec::new(),
@@ -594,7 +639,7 @@ impl App {
             link_formats: false,
             viewer_drag: None,
             timeline_drag: None,
-            selected_track: None,
+            selected_tracks: Vec::new(),
             captions: None,
             captions_added: None,
             effect_drag: None,
@@ -606,6 +651,9 @@ impl App {
             // stand in for the ones restored from the project.
             view_epoch: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64),
             view_key: None,
+            proxies: proxies::Proxies::default(),
+            proxies_shown: false,
+            resume_playhead: None,
             fitted_room: egui::Vec2::ZERO,
             window_pending: None,
             window_fitting: Some(0),
@@ -624,6 +672,10 @@ impl App {
             plugin_previews: Default::default(),
             color_tab: Default::default(),
             masks: Default::default(),
+            color_pick: None,
+            drop_in: Default::default(),
+            file_hover: None,
+            file_drop: None,
             compound_looks: Default::default(),
             script_consent: None,
             compound_trail: Vec::new(),
@@ -717,7 +769,7 @@ impl App {
                 self.autosave.move_on();
                 self.recoveries = self.autosave.recoverable();
             }
-            Err(e) => self.report_error(format!("couldn't keep the unsaved work: {e}")),
+            Err(e) => self.report_error(trf("couldn't keep the unsaved work: {e}", &[("e", &e.to_string())])),
         }
     }
 
@@ -735,7 +787,7 @@ impl App {
         self.variant = 0;
         self.selection = None;
         self.selected.clear();
-        self.selected_track = None;
+        self.selected_tracks.clear();
         self.clipboard.clear();
         self.clipboard_note = None;
         self.effect_clipboard.clear();
@@ -899,9 +951,70 @@ impl App {
         }
     }
 
+    /// What was dropped on the window: files open or import as they would from the
+    /// bin; pictures from a browser are saved first (`<app>/dropped`), and addresses
+    /// downloaded. With `place` (dropped onto the timeline: a time and the track under
+    /// it), the media also goes there, one after another.
+    pub(crate) fn take_dropped(&mut self, items: Vec<drop_in::Dropped>, place: Option<(Time, Option<oa_doc::TrackId>)>) {
+        let mut files = Vec::new();
+        let mut urls = Vec::new();
+        for item in items {
+            match item {
+                drop_in::Dropped::File(path) => files.push(path),
+                drop_in::Dropped::Data { name, bytes } => match drop_in::save(&name, &bytes) {
+                    Ok(path) => files.push(path),
+                    Err(e) => self.report_error(e),
+                },
+                drop_in::Dropped::Url(url) => match drop_in::data_url(&url) {
+                    Some(bytes) => match drop_in::save("dropped", &bytes) {
+                        Ok(path) => files.push(path),
+                        Err(e) => self.report_error(e),
+                    },
+                    None => urls.push(url),
+                },
+            }
+        }
+        let is_project = |p: &Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
+        let Some((at, track)) = place.filter(|_| !files.iter().any(|f| is_project(f))) else {
+            self.open_paths(&files);
+            for url in urls {
+                self.import_url(url, None);
+            }
+            return;
+        };
+        // Onto the timeline: a folder's media too, all in a row.
+        let place = Placing { at: std::rc::Rc::new(std::cell::Cell::new(at)), track };
+        let folder = if self.bin.tab == bin::BinTab::Project { self.bin.folder.clone() } else { String::new() };
+        let (dirs, mut files): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|p| p.is_dir());
+        files.extend(dirs.iter().flat_map(|d| bin::media_in_folder(d, &folder)).flat_map(|(_, f)| f));
+        self.import_files(&files, false, &folder, Some(place.clone()));
+        for url in urls {
+            self.import_url(url, Some(place.clone()));
+        }
+    }
+
+    /// Downloads `url` (a picture or a video dragged out of a browser as a link) into
+    /// `<app>/dropped`, then imports it like a file.
+    fn import_url(&mut self, url: String, place: Option<Placing>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bridge = self.bridge();
+        let name = url.split(['?', '#']).next().unwrap_or(&url).rsplit('/').find(|s| !s.is_empty()).unwrap_or("download").to_string();
+        let address = url.clone();
+        std::thread::spawn(move || {
+            let result = drop_in::download(&address).and_then(|file| Self::import_with(bridge, &file));
+            let _ = tx.send(result);
+        });
+        let folder = if self.bin.tab == bin::BinTab::Project { self.bin.folder.clone() } else { String::new() };
+        self.imports.push_back(PendingImport { path: PathBuf::from(&url), name: drop_in::safe_name(&name), rx, to_timeline: false, folder, place });
+    }
+
     /// Imports media files; with `to_timeline` they're also added to the end of the
     /// timeline, otherwise they only go into the bin's `folder`.
     pub(crate) fn import_paths(&mut self, paths: &[PathBuf], to_timeline: bool, folder: &str) {
+        self.import_files(paths, to_timeline, folder, None);
+    }
+
+    fn import_files(&mut self, paths: &[PathBuf], to_timeline: bool, folder: &str, place: Option<Placing>) {
         for path in paths {
             let (tx, rx) = std::sync::mpsc::channel();
             let (bridge, file) = (self.bridge(), path.clone());
@@ -909,7 +1022,7 @@ impl App {
                 let _ = tx.send(Self::import_with(bridge, &file));
             });
             let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().to_string());
-            self.imports.push_back(PendingImport { path: path.clone(), name, rx, to_timeline, folder: folder.to_string() });
+            self.imports.push_back(PendingImport { path: path.clone(), name, rx, to_timeline, folder: folder.to_string(), place: place.clone() });
         }
     }
 
@@ -933,15 +1046,24 @@ impl App {
                         Ok(media) => {
                             added = true;
                             if let Some(reason) = conformed {
-                                self.notify(format!("{name}: converted for playback ({reason})"));
+                                self.notify(trf("{name}: converted for playback ({reason})", &[("name", &name.to_string()), ("reason", &reason.to_string())]));
                             }
                             if !job.folder.is_empty() {
                                 let op = oa_doc::Op::SetMediaFolder { media, folder: job.folder.clone() };
-                                if let Err(e) = self.editor.apply("Move to folder", vec![op]) {
+                                if let Err(e) = self.editor.apply(tr("Move to folder"), vec![op]) {
                                     self.error = Some(e.to_string());
                                 }
                             }
-                            if job.to_timeline {
+                            if let Some(place) = &job.place {
+                                // Where it was dropped; the next one in the batch after it.
+                                match self.editor.place_clip(&name, oa_doc::ItemKind::Media { media }, duration, place.at.get(), place.track) {
+                                    Ok(item) => {
+                                        place.at.set(place.at.get() + duration);
+                                        self.selection = Some(item);
+                                    }
+                                    Err(e) => self.error = Some(e.to_string()),
+                                }
+                            } else if job.to_timeline {
                                 match self.editor.append_clip(media, duration) {
                                     Ok(item) => self.selection = Some(item),
                                     Err(e) => self.error = Some(e.to_string()),
@@ -971,13 +1093,16 @@ impl App {
                 let recovered = self.recovering.take_if(|(r, _)| r.file == path);
                 let ok = result.is_ok();
                 self.finish_open(result, recovered.as_ref());
+                if let Some(t) = self.resume_playhead.take().filter(|_| ok) {
+                    self.set_playhead(t);
+                }
                 if let Some((r, _)) = recovered.filter(|_| ok) {
                     self.recoveries.retain(|x| x.file != r.file);
                     if let Err(e) = r.discard() {
-                        self.report_error(format!("{}: {e}", r.file.display()));
+                        self.report_error(trf("{0}: {e}", &[("0", &(r.file.display()).to_string()), ("e", &(e).to_string())]));
                     }
                     self.autosave.soon();
-                    self.notify(format!("recovered unsaved work from {}", r.name()));
+                    self.notify(trf("recovered unsaved work from {0}", &[("0", &(r.name()).to_string())]));
                 }
             }
         }
@@ -1006,7 +1131,7 @@ impl App {
     pub(crate) fn discard_recovery(&mut self, r: &autosave::Recovery) {
         match r.discard() {
             Ok(()) => self.recoveries.retain(|x| x.file != r.file),
-            Err(e) => self.report_error(format!("{}: {e}", r.file.display())),
+            Err(e) => self.report_error(trf("{0}: {e}", &[("0", &(r.file.display()).to_string()), ("e", &(e).to_string())])),
         }
     }
 
@@ -1050,8 +1175,46 @@ impl App {
 
     /// Rebuilds the frame sources from the pool (after import, open, or relink).
     fn rebuild_sources(&mut self) {
-        self.viewer_render.set_media(self.media_entries(), true);
+        self.viewer_render.set_media(self.viewer_entries(), true);
         self.add_new_sources();
+    }
+
+    /// The files the viewer plays: each file's proxy where there's one ready and proxies
+    /// are on (the same times, a smaller picture), the file itself otherwise.
+    fn viewer_entries(&self) -> Vec<export_worker::MediaEntry> {
+        let mut entries = self.media_entries();
+        if self.settings.use_proxies {
+            for e in &mut entries {
+                if let Some((path, track)) = self.editor.pool_item(oa_doc::MediaId(e.id)).and_then(|m| self.proxies.ready(&m.decode_path)) {
+                    e.path = path.to_path_buf();
+                    e.track = Some(track.clone());
+                }
+            }
+        }
+        entries
+    }
+
+    /// Looks for each video file's proxy (making one for heavy footage, if that's on),
+    /// and when what the viewer plays changes — a proxy ready, proxies switched — starts
+    /// its decoders over on the new files.
+    fn proxy_tick(&mut self) {
+        for m in &self.editor.pool {
+            if m.missing || m.kind != MediaKind::Video {
+                continue;
+            }
+            let Some(track) = &m.probe.video else { continue };
+            let make = self.settings.auto_proxies && proxies::heavy(track);
+            self.proxies.find(&m.decode_path, make);
+        }
+        let using = self.settings.use_proxies;
+        if self.proxies.poll() | (self.proxies_shown != using) {
+            self.proxies_shown = using;
+            self.viewer_render.set_media(self.viewer_entries(), true);
+            // The frame on screen came from the other files: rendered again (it stays
+            // up meanwhile).
+            self.rendered = None;
+            self.asked = None;
+        }
     }
 
     /// Registers pool media the frame sources don't know yet, leaving running decoders
@@ -1061,9 +1224,9 @@ impl App {
         // The viewer's render thread registers the files it doesn't know yet (its
         // decoders; stills decode in the background); the preview thread decodes for
         // itself too.
-        let entries = self.media_entries();
-        self.viewer_render.set_media(entries.clone(), false);
-        self.preview_worker.set_media(entries);
+        self.viewer_render.set_media(self.viewer_entries(), false);
+        // Previews (and the Color tab's scopes) read the files themselves.
+        self.preview_worker.set_media(self.media_entries());
         // Pool changes (relinks, imports) can change what's audible without a new clip.
         self.mixed = None;
     }
@@ -1143,7 +1306,7 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
                 inspector::set_compact(ui, compact);
                 if !compact {
-                    ui.heading("Clip");
+                    ui.heading(tr("Clip"));
                 }
                 // A property changed here changes on every selected clip.
                 self.editor.linked = if self.selected.len() > 1 { self.selected_clips() } else { Vec::new() };
@@ -1181,12 +1344,32 @@ impl App {
         self.viewer(ui);
     }
 
+    /// Writes the open timeline as OpenTimelineIO (`oa_export::otio`), for finishing in
+    /// another editor: the edit, pointing at the original files.
+    pub(crate) fn export_otio(&mut self) {
+        // The project's own timeline, even while a compound clip is open.
+        let (seq, _) = self.main_timeline();
+        let name = self.editor.doc.project().sequence(seq).map_or_else(|| "Timeline".to_string(), |s| s.name.clone());
+        let stem = self.editor.path.as_ref().and_then(|p| p.file_stem()).map_or(name.clone(), |s| s.to_string_lossy().trim_end_matches(".oaproj").to_string());
+        let Some(path) = rfd::FileDialog::new().add_filter(tr("OpenTimelineIO"), &["otio"]).set_file_name(format!("{stem}.otio")).save_file() else { return };
+        let project = self.editor.doc.project();
+        let media_path = |id: oa_doc::MediaId| {
+            let m = project.media(id)?;
+            let audio = m.info.as_ref().is_none_or(|i| i.has_audio);
+            Some((PathBuf::from(&m.path), audio))
+        };
+        match oa_export::otio::write(project, seq, &media_path, &path) {
+            Ok(()) => self.notify(trf("Wrote {0} — open it in DaVinci Resolve (File → Import → Timeline) or another editor that reads OpenTimelineIO. Effects and titles stay in OpenAtelier.", &[("0", &(path.file_name().map_or_else(String::new, |n| n.to_string_lossy().to_string())).to_string())])),
+            Err(e) => self.report_error(trf("Couldn't write the timeline: {e}", &[("e", &e.to_string())])),
+        }
+    }
+
     /// Opens the Export window (type, format, resolution, quality…).
     pub(crate) fn start_export(&mut self) {
         // The project's own timeline, even while a compound clip is open.
         let (seq, _) = self.main_timeline();
         if self.editor.doc.project().sequence(seq).is_none_or(|s| s.duration() <= Time::ZERO) {
-            self.error = Some("nothing to export: the timeline is empty".into());
+            self.error = Some(tr("nothing to export: the timeline is empty").into());
             return;
         }
         self.export_dialog = true;
@@ -1236,9 +1419,9 @@ impl App {
                     summary.encoder,
                     summary.timings
                 ));
-                self.notify(format!("Exported {name} ({}×{}, {:.0} fps).", summary.size[0], summary.size[1], summary.frames_per_second()));
+                self.notify(trf("Exported {name} ({0}×{1}, {2} fps).", &[("name", &(name).to_string()), ("0", &(summary.size[0]).to_string()), ("1", &(summary.size[1]).to_string()), ("2", &format!("{:.0}", summary.frames_per_second()))]));
             }
-            Err(e) => self.report_error(format!("{name}: {e}")),
+            Err(e) => self.report_error(trf("{name}: {e}", &[("name", &name.to_string()), ("e", &e.to_string())])),
         }
         self.next_export();
     }
@@ -1255,7 +1438,7 @@ impl App {
         if self.export.take().is_some()
             && let Some(path) = self.export_path.take()
         {
-            self.notify(format!("Canceled {}.", path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().to_string())));
+            self.notify(trf("Canceled {0}.", &[("0", &(path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().to_string())).to_string())]));
         }
         self.export_label.clear();
         self.next_export();
@@ -1267,14 +1450,14 @@ impl App {
         let path = match (&self.editor.path, save_as) {
             (Some(path), false) => Some(path.clone()),
             _ => rfd::FileDialog::new()
-                .add_filter("OpenAtelier project", &["json"])
+                .add_filter(tr("OpenAtelier project"), &["json"])
                 .set_file_name("project.oaproj.json")
                 .save_file(),
         };
         let Some(path) = path else { return };
         match self.editor.save(&path) {
             Ok(()) => {
-                self.notify(format!("saved {}", path.display()));
+                self.notify(trf("saved {0}", &[("0", &(path.display()).to_string())]));
                 // An untitled project takes its name from the file it was saved as.
                 let name = self.editor.doc.project().name.clone();
                 let name = if name.is_empty() || name == "Untitled" { thumbnail::name_from_path(&path) } else { name };
@@ -1346,6 +1529,36 @@ impl App {
         let rate = self.editor.sequence().rate;
         let index = rate.frame_at(self.playhead) + frames;
         self.set_playhead(rate.frame_start(index.max(0)));
+    }
+
+    /// The playhead to the first frame (`start`) or the last frame of the selected clip —
+    /// or, with none selected, the topmost clip under the playhead. Already there: on to
+    /// the clip before or after it on its track (which becomes the selection, if a clip
+    /// was selected).
+    pub(crate) fn go_to_clip_edge(&mut self, start: bool) {
+        let s = self.editor.sequence();
+        let rate = s.rate;
+        let t = self.playhead;
+        let under = || {
+            // Picture tracks top down, then sound.
+            let order = s.tracks.iter().enumerate().rev().filter(|(_, tr)| tr.kind == oa_doc::TrackKind::Video).chain(s.tracks.iter().enumerate().filter(|(_, tr)| tr.kind == oa_doc::TrackKind::Audio));
+            order.filter(|(_, tr)| tr.enabled).find_map(|(ti, tr)| tr.items.iter().position(|i| i.range.contains(t)).map(|ii| (ti, ii)))
+        };
+        let Some((ti, ii)) = self.selection.and_then(|id| s.find_item(id)).or_else(under) else { return };
+        let items = &s.tracks[ti].items;
+        let edge = |i: &oa_doc::Item| if start { i.range.start } else { rate.frame_start((rate.frame_at(i.range.end()) - 1).max(rate.frame_at(i.range.start))) };
+        let mut at = (ii, edge(&items[ii]));
+        if at.1 == t {
+            let next = if start { ii.checked_sub(1) } else { Some(ii + 1).filter(|n| *n < items.len()) };
+            if let Some(n) = next {
+                at = (n, edge(&items[n]));
+            }
+        }
+        let landed = items[at.0].id;
+        if self.selection.is_some_and(|s| s != landed) {
+            self.select_clip(landed, false);
+        }
+        self.set_playhead(at.1);
     }
 
     /// While playing, the **audio clock** decides where we are — video follows it. With
@@ -1442,7 +1655,7 @@ impl App {
         });
         match spawned {
             Ok(handle) => self.saving = Some((path, snapshot, handle)),
-            Err(e) => self.report_error(format!("couldn't start saving: {e}")),
+            Err(e) => self.report_error(trf("couldn't start saving: {e}", &[("e", &e.to_string())])),
         }
     }
 
@@ -1464,7 +1677,7 @@ impl App {
             // Don't nag every 20 seconds if the disk is unhappy; say it once.
             Err(e) => {
                 self.settings.set_save_as_you_go(false);
-                self.report_error(format!("{e} — saving as you go is off for now; the recovery autosave is still running."));
+                self.report_error(trf("{e} — saving as you go is off for now; the recovery autosave is still running.", &[("e", &e.to_string())]));
             }
         }
     }
@@ -1482,23 +1695,23 @@ impl App {
         let mut choice: Option<&str> = None;
         egui::Modal::new(egui::Id::new("closing")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("Save before closing?");
+            ui.heading(tr("Save before closing?"));
             ui.add_space(style::GAP_S);
             ui.label(match &name {
                 Some(file) => format!("{file} has changes that aren't saved."),
-                None => "This project has never been saved.".to_string(),
+                None => tr("This project has never been saved.").to_string(),
             });
-            ui.label(egui::RichText::new("There's an autosave either way — this is the real file.").small().weak());
+            ui.label(egui::RichText::new(tr("There's an autosave either way — this is the real file.")).small().weak());
             ui.add_space(style::GAP_L);
             ui.horizontal(|ui| {
-                if ui.button("Save and close").clicked() {
+                if ui.button(tr("Save and close")).clicked() {
                     choice = Some("save");
                 }
-                if ui.button("Close without saving").clicked() {
+                if ui.button(tr("Close without saving")).clicked() {
                     choice = Some("discard");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Keep editing").clicked() {
+                    if ui.button(tr("Keep editing")).clicked() {
                         choice = Some("cancel");
                     }
                 });
@@ -1531,10 +1744,22 @@ impl App {
         }
         if self.gpu.health.is_lost() {
             self.gpu_lost = true;
-            // The user's work first: get it on disk before saying anything.
+            // A plugin's effect on the GPU when it went: turned off first, so the
+            // restarted editor doesn't run it straight into the same reset.
+            // (Only the setting: nothing can be rebuilt on the lost device.)
+            let effects = self.gpu_watch.in_flight();
+            for (id, name) in self.plugins_providing(&effects) {
+                self.settings.set_plugin_enabled(&id, false);
+                self.gpu_turned_off.push(name);
+            }
+            // Scripted runs (tests) stop there; otherwise the work is saved and a new
+            // OpenAtelier opens it (`gpu_reset.rs`) — this one can't draw any more.
+            let not_restarted = if self.script.is_some() { Err("scripted run".to_string()) } else { self.restart_after_gpu_reset() };
+            // Still here: it didn't restart. The user's work first, then say so.
             let _ = self.autosave.write_now(&self.editor.doc.snapshot(), self.editor.path.as_deref());
             let why = self.gpu.health.message().unwrap_or_else(|| "the graphics device was lost".into());
-            self.report_error(format!("{why}. Your work has been autosaved — restart OpenAtelier to carry on."));
+            let also = not_restarted.err().filter(|e| e != "scripted run").map(|e| format!(" ({e})")).unwrap_or_default();
+            self.report_error(trf("{why}{also}. Your work has been autosaved — restart OpenAtelier to carry on. If it keeps happening, try another graphics API in Settings → Graphics, or update the graphics driver.", &[("why", &why.to_string()), ("also", &also.to_string())]));
             return;
         }
         let memory = self.memory;
@@ -1546,11 +1771,7 @@ impl App {
             _ => self.memory_backoff,
         };
         if was >= 1.0 && self.memory_backoff < 1.0 {
-            self.notify(format!(
-                "Short of GPU memory ({} of {}): rendering the preview smaller.",
-                bytes(memory.used()),
-                bytes(memory.budget)
-            ));
+            self.notify(trf("Short of GPU memory ({0} of {1}): rendering the preview smaller.", &[("0", &(bytes(memory.used())).to_string()), ("1", &(bytes(memory.budget)).to_string())]));
         }
     }
 
@@ -1783,10 +2004,21 @@ impl App {
                 self.undo();
             }
         }
-        // Nudge the selected layer: Ctrl+arrows (Shift for 10 px).
+        // Ctrl+← / Ctrl+→: to the start / end of the clip.
+        if pressed(M::COMMAND, Key::ArrowLeft) {
+            self.go_to_clip_edge(true);
+        }
+        if pressed(M::COMMAND, Key::ArrowRight) {
+            self.go_to_clip_edge(false);
+        }
+        // Nudge the selected layer: Alt+arrows (Shift for 10 px). With tracks picked,
+        // Alt+↑/↓ moves them instead (below).
         let arrows = [(Key::ArrowLeft, [-1.0, 0.0]), (Key::ArrowRight, [1.0, 0.0]), (Key::ArrowUp, [0.0, -1.0]), (Key::ArrowDown, [0.0, 1.0])];
         for (key, d) in arrows {
-            for (mods, step) in [(M::COMMAND | M::SHIFT, 10.0), (M::COMMAND, 1.0)] {
+            if d[0] == 0.0 && !self.selected_tracks.is_empty() {
+                continue;
+            }
+            for (mods, step) in [(M::ALT | M::SHIFT, 10.0), (M::ALT, 1.0)] {
                 if pressed(mods, key) && self.selection.is_some() {
                     // Every selected clip that has a picture (and is on screen now).
                     let mut ops = Vec::new();
@@ -1858,8 +2090,8 @@ impl App {
             // Finish cropping; the clip stays selected.
             self.end_crop();
         } else if pressed(M::NONE, Key::Escape) {
-            if self.selected_track.take().is_some() {
-                // First Escape lets go of the track.
+            if !std::mem::take(&mut self.selected_tracks).is_empty() {
+                // First Escape lets go of the tracks.
             } else if self.selected.is_empty() && self.selection.is_none() {
                 self.close_compound(1);
             }
@@ -1873,17 +2105,18 @@ impl App {
             self.select_all();
         }
         if pressed(M::COMMAND, Key::D) {
-            match self.selected_track {
+            match self.selected_tracks.first().copied() {
                 Some(track) => self.duplicate_into_track(track),
                 None => self.duplicate_selection(),
             }
         }
-        if let Some(track) = self.selected_track {
+        if !self.selected_tracks.is_empty() {
+            let tracks = self.selected_tracks.clone();
             if pressed(M::ALT, Key::ArrowUp) {
-                self.move_track(track, true);
+                self.move_tracks(&tracks, true);
             }
             if pressed(M::ALT, Key::ArrowDown) {
-                self.move_track(track, false);
+                self.move_tracks(&tracks, false);
             }
         }
         if pressed(M::COMMAND | M::SHIFT, Key::G) {
@@ -1904,7 +2137,7 @@ impl App {
             self.cut_selection();
         }
         if paste {
-            match self.selected_track {
+            match self.selected_tracks.first().copied() {
                 Some(track) => self.paste_into_track(track),
                 None => {
                     let at = self.playhead;
@@ -1998,7 +2231,7 @@ impl App {
             (None, None) => None,
         };
         let Some((item, end)) = target else {
-            self.error = Some("no cut near the playhead; select a clip to fade it".into());
+            self.error = Some(tr("no cut near the playhead; select a clip to fade it").into());
             return;
         };
         let ops = oa_edit::timeline::set_transition(
@@ -2018,7 +2251,7 @@ impl App {
     pub(crate) fn undo(&mut self) {
         let captions = self.editor.doc.undo_label() == Some(captions::ADD_CAPTIONS);
         match self.editor.doc.undo() {
-            Err(oa_doc::EditError::LastSequence) => self.notify("Nothing more to undo."),
+            Err(oa_doc::EditError::LastSequence) => self.notify(tr("Nothing more to undo.")),
             Err(e) => self.error = Some(e.to_string()),
             Ok(true) if captions => self.reopen_captions(),
             Ok(_) => {}
@@ -2076,37 +2309,37 @@ impl App {
 
     fn stats_panel(&mut self, ui: &mut egui::Ui) {
         let avg: f32 = if self.frame_ms.is_empty() { 0.0 } else { self.frame_ms.iter().sum::<f32>() / self.frame_ms.len() as f32 };
-        ui.label(format!("{avg:.1} ms per frame ({:.0} fps)", if avg > 0.0 { 1000.0 / avg } else { 0.0 }));
+        ui.label(trf("{avg} ms per frame ({0} fps)", &[("avg", &format!("{:.1}", avg)), ("0", &format!("{:.0}", if avg > 0.0 { 1000.0 / avg } else { 0.0 }))]));
         if let Some(p) = &self.preview {
-            ui.label(format!("{}x{} rendered", p.size[0], p.size[1]));
+            ui.label(trf("{0}x{1} rendered", &[("0", &(p.size[0]).to_string()), ("1", &(p.size[1]).to_string())]));
         }
         let s = &self.stats;
-        ui.label(format!("{} passes, {} cache hits, {} fused", s.passes, s.cache_hits, s.fused_chains));
-        ui.label(format!("pool {:.0} MB, cache {:.0} MB", s.pool_bytes as f64 / 1e6, s.cache_bytes as f64 / 1e6));
+        ui.label(trf("{0} passes, {1} cache hits, {2} fused", &[("0", &(s.passes).to_string()), ("1", &(s.cache_hits).to_string()), ("2", &(s.fused_chains).to_string())]));
+        ui.label(trf("pool {0} MB, cache {1} MB", &[("0", &format!("{:.0}", s.pool_bytes as f64 / 1e6)), ("1", &format!("{:.0}", s.cache_bytes as f64 / 1e6))]));
         let memory = self.memory;
         let note = match memory.pressure {
             oa_gpu::Pressure::Over => " — full, rendering smaller",
             oa_gpu::Pressure::Tight => " — trimming the cache",
             oa_gpu::Pressure::Easy => "",
         };
-        ui.label(format!("GPU memory {} of {}{note}", bytes(memory.used()), bytes(memory.budget)));
+        ui.label(trf("GPU memory {0} of {1}{note}", &[("0", &(bytes(memory.used())).to_string()), ("1", &(bytes(memory.budget)).to_string()), ("note", (note))]));
         ui.add(egui::ProgressBar::new(memory.fraction().min(1.0)).desired_height(6.0));
         let mut budget_mb = memory.budget / (1 << 20);
-        let r = ui.add(egui::Slider::new(&mut budget_mb, 256..=16384).text("budget (MB)").logarithmic(true));
+        let r = ui.add(egui::Slider::new(&mut budget_mb, 256..=16384).text(tr("budget (MB)")).logarithmic(true));
         if r.changed() {
             self.settings.set_vram_budget(budget_mb);
             self.viewer_render.set_budget(budget_mb << 20);
         }
         let mut as_you_go = self.settings.save_as_you_go;
         if ui
-            .checkbox(&mut as_you_go, "save as you go")
-            .on_hover_text("Keeps the project file up to date while you edit (every 20 s, when you pause)")
+            .checkbox(&mut as_you_go, tr("save as you go"))
+            .on_hover_text(tr("Keeps the project file up to date while you edit (every 20 s, when you pause)"))
             .changed()
         {
             self.settings.set_save_as_you_go(as_you_go);
         }
         if self.memory_backoff < 1.0 {
-            ui.label(egui::RichText::new(format!("preview at {:.0}% to fit", self.memory_backoff * 100.0)).small().weak());
+            ui.label(egui::RichText::new(trf("preview at {0}% to fit", &[("0", &format!("{:.0}", self.memory_backoff * 100.0))])).small().weak());
         }
         if self.gpu.health.errors() > 0 {
             ui.colored_label(egui::Color32::YELLOW, format!("{} GPU errors reported", self.gpu.health.errors()));
@@ -2136,12 +2369,12 @@ impl App {
         match &self.audio {
             Some(audio) => {
                 ui.label(egui::RichText::new(audio.device_name()).small());
-                ui.label(format!("{:.0} ms buffered, {} underruns", audio.buffered() * 1000.0, audio.underruns()));
+                ui.label(trf("{0} ms buffered, {1} underruns", &[("0", &format!("{:.0}", audio.buffered() * 1000.0)), ("1", &(audio.underruns()).to_string())]));
                 let drift = (self.playhead - audio.position()).as_seconds_f64() * 1000.0;
-                ui.label(format!("clock: audio ({drift:+.0} ms)"));
+                ui.label(trf("clock: audio ({drift} ms)", &[("drift", &format!("{:+.0}", drift))]));
             }
             None => {
-                ui.label(egui::RichText::new("no sound (clock: wall time)").weak());
+                ui.label(egui::RichText::new(tr("no sound (clock: wall time)")).weak());
             }
         }
     }
@@ -2182,9 +2415,12 @@ impl App {
     fn frame_ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         winfocus::keep(frame, ctx);
+        self.drop_in.install(frame, ctx);
         self.toasts(ctx);
         self.confirm_close(ctx);
         self.check_gpu();
+        self.watch_gpu();
+        self.poll_roto(ctx);
         self.advance_playback();
         if self.export.is_some() {
             self.step_export();
@@ -2195,10 +2431,17 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
-        if !dropped.is_empty() {
-            self.open_paths(&dropped);
+        // A drop the timeline didn't take last frame (it landed elsewhere, or the timeline
+        // wasn't showing) goes into the bin; then this frame's drops, for the timeline.
+        if let Some((items, _)) = self.file_drop.take() {
+            self.take_dropped(items, None);
+        }
+        self.file_hover = self.drop_in.hover(ctx);
+        for (items, at) in self.drop_in.take(ctx) {
             self.screen = home::Screen::Editor;
+            if let Some((earlier, _)) = self.file_drop.replace((items, at)) {
+                self.take_dropped(earlier, None);
+            }
         }
         // An effect drag the inspector didn't finish (its list went away) ends here.
         if self.effect_drag.is_some() && !ctx.input(|i| i.pointer.primary_down() || i.pointer.any_released()) {
@@ -2216,8 +2459,13 @@ impl App {
         self.thumbs_frame_start();
         self.font_samples.frame_start();
         self.poll_imports();
+        self.poll_eyedropper();
         if !self.imports.is_empty() || self.opening.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        self.proxy_tick();
+        if self.proxies.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
         // Edits made anywhere last frame reach the speakers here.
         self.sync_audio();
@@ -2255,7 +2503,9 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.window_title = title;
         }
-        egui::Panel::top("menu").show(root, |ui| self.menu_bar(ui));
+        // The top bar: a shade darker than the panels, with room around its controls.
+        let bar = egui::Frame::new().fill(root.visuals().panel_fill.lerp_to_gamma(root.visuals().extreme_bg_color, 0.45)).inner_margin(egui::Margin::symmetric(6, 5));
+        egui::Panel::top("menu").frame(bar).show(root, |ui| self.menu_bar(ui));
         self.update_banner(root);
         self.deps_banner(root);
 
@@ -2297,13 +2547,28 @@ impl App {
 
         let controls = egui::Panel::bottom(egui::Id::new(("controls", epoch))).resizable(true).default_size(fit_timeline).size_range(150.0..=760.0).show(root, |ui| {
             ui.add_space(style::GAP_S);
-            // Playback, centered under the viewer; then where we are in the sequence.
-            ui.horizontal(|ui| {
-                ui.add_space(style::GAP_S);
-                if icons::button(ui, icons::SKIP_START, "Go to the start", "Home", true).clicked() {
+            // The tracks are as tall as the settings say.
+            self.timeline_view.row_height = self.settings.track_height.min(timeline::ROW_HEIGHTS.len() - 1);
+            // Where we are on the left, playback in the middle, what the selection can do
+            // and the playback volume on the right.
+            let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), style::ICON + 4.0), egui::Sense::hover());
+            let gap = ui.spacing().item_spacing.x;
+            let transport = egui::Rect::from_center_size(row.center(), egui::vec2(5.0 * style::ICON + 4.0 * gap, row.height()));
+            let left = egui::Rect::from_min_max(row.min + egui::vec2(style::GAP_S, 0.0), egui::pos2(transport.left() - style::GAP_L, row.bottom()));
+            let right = egui::Rect::from_min_max(egui::pos2(transport.right() + style::GAP_L, row.top()), row.max - egui::vec2(style::GAP_S, 0.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                ui.set_clip_rect(left.intersect(ui.clip_rect()));
+                ui.label(
+                    egui::RichText::new(trf("{0}s / {duration}s", &[("0", &format!("{:.2}", self.playhead.as_seconds_f64())), ("duration", &format!("{:.2}", duration))]))
+                        .size(style::TEXT_L),
+                );
+                ui.label(egui::RichText::new(trf("frame {0}", &[("0", &(rate.frame_at(self.playhead)).to_string())])).small().weak());
+            });
+            ui.scope_builder(egui::UiBuilder::new().max_rect(transport).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                if icons::button(ui, icons::SKIP_START, tr("Go to the start"), "Home", true).clicked() {
                     self.set_playhead(Time::ZERO);
                 }
-                if icons::button(ui, icons::STEP_BACK, "Back a frame", "←", true).clicked() {
+                if icons::button(ui, icons::STEP_BACK, tr("Back a frame"), "←", true).clicked() {
                     self.step(-1);
                 }
                 let (glyph, tip) = if self.playing { (icons::PAUSE, "Pause") } else { (icons::PLAY, "Play") };
@@ -2311,90 +2576,84 @@ impl App {
                     let playing = !self.playing;
                     self.set_playing(playing);
                 }
-                if icons::button(ui, icons::STEP_ON, "On a frame", "→", true).clicked() {
+                if icons::button(ui, icons::STEP_ON, tr("On a frame"), "→", true).clicked() {
                     self.step(1);
                 }
-                if icons::button(ui, icons::SKIP_END, "Go to the end", "End", true).clicked() {
+                if icons::button(ui, icons::SKIP_END, tr("Go to the end"), "End", true).clicked() {
                     let end = self.editor.duration();
                     self.set_playhead(end);
                 }
-                ui.label(
-                    egui::RichText::new(format!("{:.2}s / {duration:.2}s", self.playhead.as_seconds_f64()))
-                        .size(style::TEXT_L),
-                );
-                ui.label(egui::RichText::new(format!("frame {}", rate.frame_at(self.playhead))).small().weak());
+            });
+            ui.scope_builder(egui::UiBuilder::new().max_rect(right).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                ui.set_clip_rect(right.intersect(ui.clip_rect()));
+                // Everything the selection can do, CapCut-style.
+                self.action_bar(ui);
                 // How loud playback is here (not part of the project or the export).
                 // Both act at the output (after what's already buffered): at once, and
                 // unmuting comes back at the volume it was.
-                let mut volume = self.volume;
-                let speaker = if self.muted || volume <= 0.001 { "🔇" } else { "🔊" };
-                if ui.small_button(speaker).on_hover_text("Mute playback (only here — the project and export are unchanged)").clicked() {
-                    self.muted = !self.muted;
-                    if let Some(audio) = &self.audio {
-                        audio.set_muted(self.muted);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut volume = self.volume;
+                    let r = ui.add(egui::Slider::new(&mut volume, 0.0..=1.5).show_value(false)).on_hover_text(tr("Playback volume, only here"));
+                    if (volume - self.volume).abs() > f32::EPSILON || r.changed() {
+                        self.volume = volume;
+                        if let Some(audio) = &self.audio {
+                            audio.set_gain(volume);
+                        }
                     }
-                }
-                let r = ui.add(egui::Slider::new(&mut volume, 0.0..=1.5).show_value(false)).on_hover_text("Playback volume, only here");
-                if (volume - self.volume).abs() > f32::EPSILON || r.changed() {
-                    self.volume = volume;
-                    if let Some(audio) = &self.audio {
-                        audio.set_gain(volume);
+                    let speaker = if self.muted || volume <= 0.001 { "🔇" } else { "🔊" };
+                    if ui.small_button(speaker).on_hover_text(tr("Mute playback (only here — the project and export are unchanged)")).clicked() {
+                        self.muted = !self.muted;
+                        if let Some(audio) = &self.audio {
+                            audio.set_muted(self.muted);
+                        }
                     }
-                }
-
-                // Everything the selection can do, CapCut-style.
-                ui.separator();
-                self.action_bar(ui);
+                });
             });
             ui.add_space(style::GAP_S);
-            // The timeline's own tools, next to its tracks.
-            ui.horizontal(|ui| {
-                ui.add_space(style::GAP_S);
-                if icons::button(ui, icons::TITLE, "Add a title", "Ctrl+T", true).clicked() {
-                    self.add_text();
-                }
-                if icons::button(ui, icons::CAPTIONS, "Captions: turn the speech on the timeline into captions", "", true).clicked() {
-                    self.open_captions();
-                }
+            self.compound_trail_bar(ui);
+            // The rest of the panel, cut in two exact pieces: the tracks scroll in the top
+            // one and the bar under them fills the bottom one. Nothing is laid out past
+            // them — a panel holding more than its size grows by that much every frame.
+            let area = ui.available_rect_before_wrap();
+            // (Its buttons are an icon tall; a little room around them.)
+            let bar_height = style::ICON + 2.0 * style::GAP_S + 4.0;
+            let tracks = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), (area.bottom() - bar_height).max(area.top())));
+            let bar = egui::Rect::from_min_max(egui::pos2(area.left(), tracks.bottom()), area.max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(tracks).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
+                ui.set_clip_rect(tracks.intersect(ui.clip_rect()));
+                egui::ScrollArea::vertical().max_height(tracks.height()).min_scrolled_height(0.0).auto_shrink([false, false]).show(ui, |ui| {
+                    self.timeline(ui);
+                    ui.add_space(4.0);
+                });
+            });
+            ui.scope_builder(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                ui.set_clip_rect(bar.intersect(ui.clip_rect()));
                 // Two clearly different buttons: a film strip for a video track, a note
                 // for an audio one, each with a small + drawn into the corner.
-                for (icon, what, kind) in [
-                    (icons::VIDEO_TRACK, "video", oa_doc::TrackKind::Video),
-                    (icons::AUDIO_TRACK, "audio", oa_doc::TrackKind::Audio),
+                for (icon, kind) in [
+                    (icons::VIDEO_TRACK, oa_doc::TrackKind::Video),
+                    (icons::AUDIO_TRACK, oa_doc::TrackKind::Audio),
                 ] {
-                    let r = icons::add_button(ui, icon, &format!("Add a {what} track"));
+                    let r = icons::add_button(ui, icon, if kind == oa_doc::TrackKind::Video { tr("Add a video track") } else { tr("Add an audio track") });
                     if r.clicked()
                         && let Err(e) = self.editor.add_track(kind)
                     {
                         self.report_error(e.to_string());
                     }
                 }
-                ui.separator();
-                let snapping = self.snapping;
-                let r = icons::button(ui, icons::SNAP, "Snap to clip edges and the playhead (Ctrl flips it while dragging)", "", true);
-                if snapping {
-                    ui.painter().rect_stroke(r.rect, style::ROUNDING, egui::Stroke::new(1.5, style::ACCENT), egui::StrokeKind::Inside);
+                // Captions, once there's sound among the selected clips.
+                if self.selected_clips().into_iter().any(|id| self.is_audible(id))
+                    && icons::button(ui, icons::CAPTIONS, tr("Captions: turn the speech on the timeline into captions"), "", true).clicked()
+                {
+                    self.open_captions();
                 }
-                if r.clicked() {
-                    self.snapping = !snapping;
-                }
-                if icons::button(ui, icons::FIT, "Fit the whole sequence", "", true).clicked() {
-                    self.timeline_view.fit = true;
-                }
-                // How tall the tracks are drawn: four steps, small to large.
-                let tall = self.timeline_view.row_height;
-                if icons::button(ui, icons::TRACK_HEIGHT, "Track height", "", true).clicked() {
-                    self.timeline_view.row_height = (tall + 1) % timeline::ROW_HEIGHTS.len();
-                }
-                ui.label(egui::RichText::new("Ctrl+wheel zooms · wheel scrolls · drag the top edge for more room").small().weak());
-            });
-            ui.add_space(style::GAP_S);
-            self.compound_trail_bar(ui);
-            // The tracks scroll inside whatever height the panel has, rather than the
-            // panel growing with every track until the viewer is gone.
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                self.timeline(ui);
-                ui.add_space(4.0);
+                ui.label(egui::RichText::new(tr("Wheel scrolls through time · Shift+wheel up and down · Ctrl+wheel zooms")).small().weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(style::GAP_S);
+                    if icons::flat_button(ui, icons::FIT, tr("Fit")).on_hover_text(tr("Fit the whole sequence")).clicked() {
+                        self.timeline_view.fit = true;
+                    }
+                });
             });
         });
 

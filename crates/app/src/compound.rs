@@ -3,6 +3,7 @@
 //! the tracks leads back out. Edits land in the compound's sequence, so every clip
 //! using it changes with them — it's the same media.
 
+use crate::i18n::tr;
 use crate::App;
 use eframe::egui;
 use oa_doc::{ItemId, ItemKind, SeqId, TrackId, TrackKind};
@@ -27,7 +28,7 @@ impl App {
         let Some(inner) = self.editor.doc.project().sequence(sequence) else { return };
         let first = |kind: TrackKind| inner.tracks.iter().find(|t| t.kind == kind).map(|t| t.id);
         let Some(video) = first(TrackKind::Video).or_else(|| inner.tracks.first().map(|t| t.id)) else {
-            self.report_error("This compound clip has no tracks to edit.");
+            self.report_error(tr("This compound clip has no tracks to edit."));
             return;
         };
         let audio = first(TrackKind::Audio).unwrap_or(video);
@@ -77,7 +78,7 @@ impl App {
         }
         let keep = self.compound_trail.iter().position(|c| !exists(self, c.seq)).unwrap_or(self.compound_trail.len());
         self.close_compound(self.compound_trail.len() - keep + 1);
-        self.notify("The compound clip being edited was undone; back on its timeline.");
+        self.notify(tr("The compound clip being edited was undone; back on its timeline."));
     }
 
     /// The project's own timeline and the format it's shown in — what's exported and
@@ -118,13 +119,13 @@ impl App {
         let mut go_up: Option<usize> = None;
         egui::Frame::new().fill(crate::style::ACCENT.gamma_multiply(0.18)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(8, 3)).show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("⬅ Back").on_hover_text("Close this compound clip (Esc with nothing selected)").clicked() {
+                if ui.button(tr("⬅ Back")).on_hover_text(tr("Close this compound clip (Esc with nothing selected)")).clicked() {
                     go_up = Some(1);
                 }
                 let last = names.len() - 1;
                 for (i, n) in names.iter().enumerate() {
                     if i > 0 {
-                        ui.label(egui::RichText::new("▸").weak());
+                        ui.label(egui::RichText::new(tr("▸")).weak());
                     }
                     if i == last {
                         ui.strong(n);
@@ -132,7 +133,7 @@ impl App {
                         go_up = Some(last - i);
                     }
                 }
-                ui.label(egui::RichText::new("Editing a compound clip: every use of it changes.").small().weak());
+                ui.label(egui::RichText::new(tr("Editing a compound clip: every use of it changes.")).small().weak());
             });
         });
         if let Some(n) = go_up {

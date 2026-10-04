@@ -1,6 +1,7 @@
 //! Sound effect cards that draw more than sliders: the equalizer's curve with its
 //! draggable bands, and the live level meters on dynamics and stereo effects.
 
+use crate::i18n::tr;
 use crate::App;
 use eframe::egui;
 use oa_audio::fx::{eq_bands, eq_response_db, BandShape};
@@ -140,7 +141,7 @@ impl App {
             self.editor.doc.seal();
         }
 
-        egui::CollapsingHeader::new(egui::RichText::new("Numbers").small()).id_salt(("eq-numbers", fx.id.0)).show(ui, |ui| {
+        egui::CollapsingHeader::new(egui::RichText::new(tr("Numbers")).small()).id_salt(("eq-numbers", fx.id.0)).show(ui, |ui| {
             for schema in &d.params {
                 self.param_widget(ui, item, &target, schema, t, &salt);
             }
@@ -152,7 +153,7 @@ impl App {
     pub(crate) fn sound_meter(&mut self, ui: &mut egui::Ui, fx: &EffectInstance) {
         let Some(kind) = meter_kind(&fx.type_id) else { return };
         let Some(m) = oa_audio::fx::meter(fx.id.0) else {
-            ui.label(egui::RichText::new("Play to see its levels").small().weak());
+            ui.label(egui::RichText::new(tr("Play to see its levels")).small().weak());
             return;
         };
         // Keep the bars moving while sound is flowing; meters go stale on their own.
@@ -173,18 +174,18 @@ impl App {
                 ui.label(egui::RichText::new(value).small().monospace());
             });
         };
-        row(ui, "in", level(m.input_db), false, hot(m.input_db), format!("{:>5.1}", m.input_db.max(-99.0)));
-        row(ui, "out", level(m.output_db), false, hot(m.output_db), format!("{:>5.1}", m.output_db.max(-99.0)));
+        row(ui, tr("in"), level(m.input_db), false, hot(m.input_db), format!("{:>5.1}", m.input_db.max(-99.0)));
+        row(ui, tr("out"), level(m.output_db), false, hot(m.output_db), format!("{:>5.1}", m.output_db.max(-99.0)));
         match kind {
             MeterKind::Reduction => {
                 let gr = m.reduction_db.abs();
-                row(ui, "cut", gr / 24.0, true, amber, format!("{:>5.1}", -gr));
+                row(ui, tr("cut"), gr / 24.0, true, amber, format!("{:>5.1}", -gr));
             }
             MeterKind::Correlation => {
                 // +1 is mono-safe, 0 is wide, below 0 cancels when summed to mono.
                 let c = m.correlation.clamp(-1.0, 1.0);
                 let color = if c < 0.0 { red } else if c < 0.3 { amber } else { green };
-                row(ui, "phase", (c + 1.0) / 2.0, false, color, format!("{c:>+5.2}"));
+                row(ui, tr("phase"), (c + 1.0) / 2.0, false, color, format!("{c:>+5.2}"));
             }
         }
     }

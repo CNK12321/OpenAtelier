@@ -98,6 +98,11 @@ impl Autosave {
         }
     }
 
+    /// This session's autosave file.
+    pub fn path(&self) -> PathBuf {
+        self.file()
+    }
+
     fn file(&self) -> PathBuf {
         self.dir.join(format!("{}.oaproj.json", self.session))
     }

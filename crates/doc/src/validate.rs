@@ -199,6 +199,15 @@ pub fn repair(p: &mut Project) -> Report {
 fn repair_item(item: &mut Item, fresh: &mut impl FnMut() -> u64, r: &mut Report) {
     let what = format!("clip {:?}", item.name);
     sanitize_params(&mut item.params, &what, r);
+    // Blending was a property; it's the Blend effect now. An upgrade, not damage: not
+    // reported. Keyframes come along as they were.
+    if let Some(mode) = item.params.0.remove(&oa_params::ParamId::new(crate::schema::BLEND))
+        && mode != oa_params::ParamSource::Static(oa_params::Value::Enum("normal".into()))
+    {
+        let mut fx = EffectInstance::new(EffectId(fresh()), crate::schema::BLEND_EFFECT);
+        fx.params.set(crate::schema::BLEND_MODE, mode);
+        item.effects.push(fx);
+    }
     for end in [ClipEnd::Head, ClipEnd::Tail] {
         let slot = item.transition_mut(end);
         if slot.as_ref().is_some_and(|t| t.duration <= Time::ZERO) {

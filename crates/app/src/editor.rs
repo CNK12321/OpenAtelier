@@ -1,5 +1,6 @@
 //! The edit session: a project, its media pool, and the operations the UI drives.
 
+use crate::i18n::tr;
 use oa_doc::*;
 use oa_media::{Imported, MediaKind, MediaProbe};
 use oa_params::{KeyframeAnchor, ParamId, ParamSource, Value};
@@ -244,7 +245,7 @@ impl Editor {
         let count = s.tracks.iter().filter(|t| t.kind == kind && t.effects).count();
         let name = format!("{}FX{}", if kind == TrackKind::Video { "V" } else { "A" }, count + 1);
         let id = TrackId(self.doc.alloc_id());
-        self.doc.edit("Add effect track", vec![Op::InsertTrack { seq: self.seq, index, track: Arc::new(Track::effects(id, &name, kind)) }])?;
+        self.doc.edit(tr("Add effect track"), vec![Op::InsertTrack { seq: self.seq, index, track: Arc::new(Track::effects(id, &name, kind)) }])?;
         Ok(id)
     }
 
@@ -260,7 +261,7 @@ impl Editor {
         let length = next.map_or(Time::from_seconds(5), |n| (n - at).min(Time::from_seconds(5)));
         let id = ItemId(self.doc.alloc_id());
         let item = Item::new(id, "Effects", ItemKind::Adjustment, TimeRange::new(at, length));
-        self.apply("Add effect container", vec![Op::InsertItem { seq: self.seq, track, item }])?;
+        self.apply(tr("Add effect container"), vec![Op::InsertItem { seq: self.seq, track, item }])?;
         Ok(id)
     }
 
@@ -334,7 +335,7 @@ impl Editor {
             ops.push(Op::InsertItem { seq: self.seq, track, item: Item::new(item_id, &name, ItemKind::Nested { sequence: id }, range) });
             clip = Some(item_id);
         }
-        self.apply(if nest { "Nest clips" } else { "Make compound clip" }, ops)?;
+        self.apply(if nest { "Nest clips" } else { tr("Make compound clip") }, ops)?;
         Ok((id, clip))
     }
 
@@ -413,7 +414,7 @@ impl Editor {
 
     /// Deletes compound `seq` (refused while a clip uses it).
     pub fn remove_compound(&mut self, seq: SeqId) -> Result<(), EditError> {
-        self.apply("Delete compound clip", vec![Op::RemoveSequence(seq)])
+        self.apply(tr("Delete compound clip"), vec![Op::RemoveSequence(seq)])
     }
 
     /// Applies a command's ops as one undo step (nothing happens for an empty list).

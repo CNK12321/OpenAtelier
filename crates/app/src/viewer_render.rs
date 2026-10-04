@@ -91,10 +91,10 @@ pub struct ViewerRender {
 }
 
 impl ViewerRender {
-    pub fn start(gpu: Arc<GpuContext>, decoders: oa_media::DecoderChoice, options: RenderOptions, registry: Arc<Registry>, repaint: eframe::egui::Context) -> Self {
+    pub fn start(gpu: Arc<GpuContext>, decoders: oa_media::DecoderChoice, options: RenderOptions, registry: Arc<Registry>, repaint: eframe::egui::Context, watch: crate::gpu_watch::GpuWatch) -> Self {
         let (tx, jobs) = channel();
         let (done, rx) = channel();
-        let spawned = std::thread::Builder::new().name("oa-viewer".into()).spawn(move || run(gpu, decoders, options, registry, jobs, done, repaint));
+        let spawned = std::thread::Builder::new().name("oa-viewer".into()).spawn(move || run(gpu, decoders, options, registry, jobs, done, repaint, watch));
         if let Err(e) = spawned {
             eprintln!("couldn't start the viewer's render thread: {e}");
         }
@@ -129,7 +129,16 @@ impl ViewerRender {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(gpu: Arc<GpuContext>, decoders: oa_media::DecoderChoice, options: RenderOptions, registry: Arc<Registry>, jobs: Receiver<Msg>, done: Sender<Rendered>, repaint: eframe::egui::Context) {
+fn run(
+    gpu: Arc<GpuContext>,
+    decoders: oa_media::DecoderChoice,
+    options: RenderOptions,
+    registry: Arc<Registry>,
+    jobs: Receiver<Msg>,
+    done: Sender<Rendered>,
+    repaint: eframe::egui::Context,
+    watch: crate::gpu_watch::GpuWatch,
+) {
     let mut renderer = Renderer::new(gpu.clone(), options);
     let _ = renderer.warm_up(&registry);
     let mut sources = Sources::new();
@@ -155,7 +164,13 @@ fn run(gpu: Arc<GpuContext>, decoders: oa_media::DecoderChoice, options: RenderO
         let started = Instant::now();
         let result = render(&gpu, &mut renderer, &mut sources, &mut ahead, &mut ring, &mut turn, &r);
         let (texture, size, settled, report, error) = match result {
-            Ok(f) => (f.texture, f.size, f.settled, f.report, None),
+            Ok(f) => {
+                // On the GPU now: watched until it's done (`gpu_watch.rs`).
+                if f.texture.is_some() {
+                    watch.submitted(&gpu.queue, f.effects);
+                }
+                (f.texture, f.size, f.settled, f.report, None)
+            }
             Err(e) => (None, [0, 0], false, PlanReport::default(), Some(e)),
         };
         let rendered = Rendered {
@@ -184,6 +199,8 @@ struct Frame {
     size: [u32; 2],
     settled: bool,
     report: PlanReport,
+    /// The effects it used (for the GPU watch).
+    effects: Vec<Arc<str>>,
 }
 
 /// Plans (or takes the plan made ahead) and renders one request into the next display
@@ -218,6 +235,7 @@ fn render(
         })?,
     };
     let report = planned.report;
+    let effects = planned.graph.effect_types();
     if let Some(next) = r.next {
         ahead.ask(job(next));
     }
@@ -231,14 +249,14 @@ fn render(
     sources.set_wait_budget(None);
     let image = match image {
         Ok(image) => image,
-        Err(oa_gpu::RenderError::NotReady) => return Ok(Frame { texture: None, size: [0, 0], settled: false, report }),
+        Err(oa_gpu::RenderError::NotReady) => return Ok(Frame { texture: None, size: [0, 0], settled: false, report, effects }),
         Err(e) => return Err(e.to_string()),
     };
     let settled = oa_gpu::FrameSource::settled(sources);
     *turn = (*turn + 1) % ring.len();
     let texture = oa_gpu::readback::display_texture_into(gpu, renderer.pipelines(), &image, ring[*turn].take()).map_err(|e| e.to_string())?;
     ring[*turn] = Some(texture.clone());
-    Ok(Frame { texture: Some(texture), size: image.size, settled, report })
+    Ok(Frame { texture: Some(texture), size: image.size, settled, report, effects })
 }
 
 /// Files the viewer may show: registered with its decoders (stills decode in the
@@ -320,7 +338,7 @@ mod tests {
         let gpu = Arc::new(gpu);
         let registry = Arc::new(Registry::with_builtins());
         let options = RenderOptions { fusion: oa_gpu::FusionMode::Blocking, wait: true, ..Default::default() };
-        let v = ViewerRender::start(gpu, oa_media::DecoderChoice::default(), options, registry.clone(), eframe::egui::Context::default());
+        let v = ViewerRender::start(gpu, oa_media::DecoderChoice::default(), options, registry.clone(), eframe::egui::Context::default(), Default::default());
         let p = project();
 
         v.request(request(1, &p, &registry, SeqId(1)));

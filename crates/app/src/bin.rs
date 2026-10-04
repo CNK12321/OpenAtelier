@@ -3,6 +3,7 @@
 //! was added, name, type or length; filter by name. Double-click a card (or its ＋) to
 //! add it to the timeline; right-click for more.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_doc::{ItemKind, MediaId, SeqId, TrackKind};
@@ -27,10 +28,10 @@ impl BinSort {
 
     fn label(self) -> &'static str {
         match self {
-            BinSort::Added => "Added",
-            BinSort::Name => "Name",
-            BinSort::Kind => "Type",
-            BinSort::Length => "Length",
+            BinSort::Added => tr("Added"),
+            BinSort::Name => tr("Name"),
+            BinSort::Kind => tr("Type"),
+            BinSort::Length => tr("Length"),
         }
     }
 }
@@ -249,14 +250,14 @@ impl App {
             }
         };
         if name.contains('/') {
-            self.report_error("A folder name can't contain \"/\".");
+            self.report_error(tr("A folder name can't contain \"/\"."));
             return false;
         }
         let here = self.bin.folder.clone();
         let path = if here.is_empty() { name } else { format!("{here}/{name}") };
         let mut folders = self.editor.doc.project().bin_folders.clone();
         if self.bin_folders().contains(&path) {
-            self.report_error(format!("There's already a folder called {path}."));
+            self.report_error(trf("There's already a folder called {path}.", &[("path", &path.to_string())]));
             return false;
         }
         folders.push(path);
@@ -303,7 +304,7 @@ impl App {
     /// Moves a file into `folder` ("" is the top).
     fn move_to_folder(&mut self, media: MediaId, folder: &str) {
         let op = oa_doc::Op::SetMediaFolder { media, folder: folder.to_string() };
-        if let Err(e) = self.editor.apply("Move to folder", vec![op]) {
+        if let Err(e) = self.editor.apply(tr("Move to folder"), vec![op]) {
             self.report_error(e.to_string());
         }
     }
@@ -312,7 +313,7 @@ impl App {
     /// one typed in (made inside the folder being shown).
     fn folder_menu(&mut self, ui: &mut egui::Ui, media: MediaId) {
         let current = self.editor.doc.project().media(media).map(|m| m.folder.clone()).unwrap_or_default();
-        ui.menu_button("Move to folder", |ui| {
+        ui.menu_button(tr("Move to folder"), |ui| {
             if ui.radio(current.is_empty(), "Media (top)").clicked() {
                 self.move_to_folder(media, "");
                 ui.close();
@@ -333,12 +334,12 @@ impl App {
             return;
         }
         ui.horizontal_wrapped(|ui| {
-            if ui.small_button("Media").clicked() {
+            if ui.small_button(tr("Media")).clicked() {
                 self.bin.folder.clear();
             }
             let mut path = String::new();
             for part in here.split('/') {
-                ui.label("›");
+                ui.label(tr("›"));
                 if !path.is_empty() {
                     path.push('/');
                 }
@@ -363,7 +364,7 @@ impl App {
             egui::pos2(rect.left(), thumb.bottom() + 2.0),
             egui::vec2(CARD_W, 24.0),
         )));
-        let r = child.add(egui::TextEdit::singleline(&mut name).hint_text("Folder name").desired_width(CARD_W - 4.0));
+        let r = child.add(egui::TextEdit::singleline(&mut name).hint_text(tr("Folder name")).desired_width(CARD_W - 4.0));
         if std::mem::take(&mut self.bin.naming_fresh) {
             r.request_focus();
         }
@@ -428,11 +429,11 @@ impl App {
         }
         let path = path.to_string();
         crate::widgets::context_menu(&response, |ui| {
-            if ui.button("Open").clicked() {
+            if ui.button(tr("Open")).clicked() {
                 self.bin.folder = path.clone();
                 ui.close();
             }
-            if ui.button("Delete").on_hover_text("Puts everything inside it back at the top").clicked() {
+            if ui.button(tr("Delete")).on_hover_text(tr("Puts everything inside it back at the top")).clicked() {
                 self.remove_folder(&path);
                 ui.close();
             }
@@ -443,62 +444,78 @@ impl App {
         // Nothing in here may ask for more width than the panel has, or the panel grows
         // to fit it and the viewer loses the room.
         ui.set_max_width(ui.available_width());
-        ui.horizontal(|ui| {
+        // The tabs run down the left edge, so nothing on the top row can run into them.
+        let full = ui.available_rect_before_wrap();
+        let strip = egui::Rect::from_min_max(full.min, egui::pos2(full.left() + TAB_STRIP, full.bottom()));
+        let body = egui::Rect::from_min_max(egui::pos2(strip.right() + crate::style::GAP_S, full.top()), full.max);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(strip).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
             let compounds = self.editor.compounds().len();
             let tabs = [
-                (BinTab::Project, "Media".to_string(), "What this project has imported"),
-                (BinTab::Compounds, format!("Compounds ({compounds})"), "This project's compound clips"),
-                (BinTab::Assets, "Assets".to_string(), "Files kept on this computer, for every project"),
+                (BinTab::Project, tr("Media").to_string(), tr("What this project has imported")),
+                (BinTab::Compounds, trf("Compounds ({n})", &[("n", &compounds.to_string())]), tr("This project's compound clips")),
+                (BinTab::Assets, tr("Assets").to_string(), tr("Files kept on this computer, for every project")),
             ];
-            for (tab, label, tip) in tabs {
-                if bin_tab(ui, self.bin.tab == tab, &label).on_hover_text(tip).clicked() {
-                    self.bin.tab = tab;
-                }
-            }
+            crate::widgets::side_tabs(ui, &mut self.bin.tab, &tabs);
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(egui::Align::Min)), |ui| self.media_body(ui));
+    }
+
+    /// The bin beside its tabs: the tab's buttons, search and sorting, and its cards.
+    fn media_body(&mut self, ui: &mut egui::Ui) {
+        ui.set_max_width(ui.available_width());
+        ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.bin.tab != BinTab::Compounds && crate::icons::button(ui, crate::icons::NEW_FOLDER, "New folder", "", true).clicked() {
-                    self.bin.naming = Some(String::new());
-                    self.bin.naming_fresh = true;
+                // Folders: a new one, or (in Media) a folder from disk with its folders.
+                if self.bin.tab != BinTab::Compounds {
+                    let r = crate::icons::button(ui, crate::icons::NEW_FOLDER, tr("Folders"), "", true);
+                    egui::Popup::menu(&r).show(|ui| {
+                        if crate::icons::menu_item(ui, Some(crate::icons::NEW_FOLDER), tr("New folder"), "", true).clicked() {
+                            self.bin.naming = Some(String::new());
+                            self.bin.naming_fresh = true;
+                            ui.close();
+                        }
+                        match self.bin.tab {
+                            BinTab::Project => {
+                                if crate::icons::menu_item(ui, Some(crate::icons::FOLDER_OPEN), tr("Import a folder (its folders come in as bin folders)…"), "", true).clicked() {
+                                    ui.close();
+                                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                        self.open_paths(&[dir]);
+                                    }
+                                }
+                            }
+                            BinTab::Assets => {
+                                if crate::icons::menu_item(ui, Some(crate::icons::FOLDER), tr("Open the assets folder"), "", true).clicked() {
+                                    ui.close();
+                                    let dir = self.assets.dir.clone();
+                                    let _ = std::fs::create_dir_all(&dir);
+                                    #[cfg(windows)]
+                                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                                    #[cfg(not(windows))]
+                                    let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                                }
+                            }
+                            BinTab::Compounds => {}
+                        }
+                    });
                 }
                 match self.bin.tab {
                     BinTab::Compounds => {}
                     BinTab::Project => {
-                        if crate::icons::button(ui, crate::icons::FOLDER_OPEN, "Import a folder (its folders come in as bin folders)…", "", true).clicked()
-                            && let Some(dir) = rfd::FileDialog::new().pick_folder()
-                        {
-                            self.open_paths(&[dir]);
-                        }
-                        if crate::icons::button(ui, crate::icons::SAMPLES, "Import everything in ./samples", "", true).clicked() {
-                            let mut files: Vec<PathBuf> = std::fs::read_dir("samples")
-                                .into_iter()
-                                .flatten()
-                                .flatten()
-                                .map(|e| e.path())
-                                .filter(|p| p.extension().is_some_and(|e| crate::MEDIA_EXTENSIONS.iter().any(|m| e.eq_ignore_ascii_case(m))))
-                                .collect();
-                            files.sort();
-                            self.open_paths(&files);
-                        }
                         if crate::icons::button(ui, crate::icons::IMPORT, "Import media…", "Ctrl+I", true).clicked()
-                            && let Some(files) = rfd::FileDialog::new().add_filter("Media", crate::MEDIA_EXTENSIONS).pick_files()
+                            && let Some(files) = rfd::FileDialog::new().add_filter(tr("Media"), crate::MEDIA_EXTENSIONS).pick_files()
                         {
                             self.open_paths(&files);
                         }
                         if crate::icons::button(ui, crate::icons::MIC, "Record audio…", "", true).clicked() {
                             self.open_recorder();
                         }
+                        if crate::icons::button(ui, crate::icons::TITLE, tr("Add a title"), "Ctrl+T", true).clicked() {
+                            self.add_text();
+                        }
                     }
                     BinTab::Assets => {
-                        if crate::icons::button(ui, crate::icons::FOLDER, "Open the assets folder", "", true).clicked() {
-                            let dir = self.assets.dir.clone();
-                            let _ = std::fs::create_dir_all(&dir);
-                            #[cfg(windows)]
-                            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
-                            #[cfg(not(windows))]
-                            let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
-                        }
-                        if crate::icons::button(ui, crate::icons::IMPORT, "Add files to the assets library…", "", true).clicked()
-                            && let Some(files) = rfd::FileDialog::new().add_filter("Media", crate::MEDIA_EXTENSIONS).pick_files()
+                        if crate::icons::button(ui, crate::icons::IMPORT, tr("Add files to the assets library…"), "", true).clicked()
+                            && let Some(files) = rfd::FileDialog::new().add_filter(tr("Media"), crate::MEDIA_EXTENSIONS).pick_files()
                         {
                             let folder = self.bin.asset_folder.clone();
                             for file in files {
@@ -511,18 +528,21 @@ impl App {
                 }
             });
         });
-        ui.horizontal_wrapped(|ui| {
-            let room = (ui.available_width() - 110.0).clamp(80.0, 320.0);
-            ui.add(egui::TextEdit::singleline(&mut self.bin.search).hint_text("Search").desired_width(room));
-            egui::ComboBox::from_id_salt("bin-sort").width(64.0).selected_text(self.bin.sort.label()).show_ui(ui, |ui| {
-                for s in BinSort::ALL {
-                    ui.selectable_value(&mut self.bin.sort, s, s.label());
+        // One row: the order on the right, the search filling the rest (it used to wrap
+        // the arrow onto a line of its own).
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let arrow = if self.bin.descending { "↓" } else { "↑" };
+                if crate::widgets::chip(ui, false, arrow).on_hover_text(tr("Reverse the order")).clicked() {
+                    self.bin.descending = !self.bin.descending;
                 }
+                egui::ComboBox::from_id_salt("bin-sort").width(70.0).selected_text(self.bin.sort.label()).show_ui(ui, |ui| {
+                    for s in BinSort::ALL {
+                        ui.selectable_value(&mut self.bin.sort, s, s.label());
+                    }
+                });
+                ui.add(egui::TextEdit::singleline(&mut self.bin.search).hint_text(tr("Search")).desired_width(ui.available_width()));
             });
-            let arrow = if self.bin.descending { "⬇" } else { "⬆" };
-            if ui.small_button(arrow).on_hover_text("Reverse the order").clicked() {
-                self.bin.descending = !self.bin.descending;
-            }
         });
         ui.separator();
         if self.bin.tab == BinTab::Assets {
@@ -549,8 +569,8 @@ impl App {
         if cards.is_empty() && loading.is_empty() {
             let text = match (self.bin.search.trim().is_empty(), compounds) {
                 (false, _) => "Nothing matches.",
-                (true, true) => "No compound clips yet — select clips on the timeline and group them into one.",
-                (true, false) => "Nothing imported yet — drop files or folders here, or use Import.",
+                (true, true) => tr("No compound clips yet — select clips on the timeline and group them into one."),
+                (true, false) => tr("Nothing imported yet — drop files or folders here, or use Import."),
             };
             ui.label(egui::RichText::new(text).weak());
         }
@@ -602,7 +622,7 @@ impl App {
                 // Sound alone: its waveform across the card, and a note.
                 let band = thumb.shrink2(egui::vec2(6.0, 14.0));
                 self.paint_compound_sound(&ctx, &painter, &sound, band, |x| ((x - band.left()) / band.width().max(1.0)) as f64 * duration);
-                painter.text(thumb.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, "♪ sound only", egui::FontId::proportional(10.0), visuals.weak_text_color());
+                painter.text(thumb.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, tr("♪ sound only"), egui::FontId::proportional(10.0), visuals.weak_text_color());
                 drawn = true;
             } else if let Some(strip) = self.compound_strip(&ctx, seq) {
                 let at = match response.hover_pos() {
@@ -721,6 +741,27 @@ impl App {
         if let Some(reason) = &card.conformed {
             tip.push_str(&format!("\nconverted for playback ({reason})"));
         }
+        // Its proxy: a small tag in the picture's corner ("P", or how far along).
+        if let Entry::Media(id) = card.entry
+            && let Some(state) = self.editor.pool_item(id).and_then(|m| self.proxies.state(&m.decode_path))
+        {
+            use crate::proxies::State;
+            let (tag, note) = match state {
+                State::Ready { .. } => ("P".to_string(), "plays a proxy in the viewer (a small copy; exports use the file)".to_string()),
+                State::Making(p) => (format!("{:.0}%", p * 100.0), format!("making a proxy: {:.0}%", p * 100.0)),
+                State::Queued => ("…".to_string(), "a proxy is waiting to be made".to_string()),
+                State::Failed(e) => ("!".to_string(), format!("couldn't make a proxy: {e}")),
+                State::Checking | State::Missing => (String::new(), String::new()),
+            };
+            if !tag.is_empty() {
+                let galley = painter.layout_no_wrap(tag, egui::FontId::proportional(10.0), egui::Color32::WHITE);
+                let r = egui::Rect::from_min_size(thumb.left_top() + egui::vec2(3.0, 3.0), galley.size() + egui::vec2(6.0, 2.0));
+                let fill = if matches!(state, State::Failed(_)) { crate::style::ERROR } else { crate::style::ACCENT.gamma_multiply(0.85) };
+                painter.rect_filled(r, 3.0, fill);
+                painter.galley(r.min + egui::vec2(3.0, 1.0), galley, egui::Color32::WHITE);
+                tip.push_str(&format!("\n{note}"));
+            }
+        }
         tip.push_str("\nDouble-click or ＋ to add to the timeline; right-click for more.");
         let response = response.on_hover_text(tip);
 
@@ -743,18 +784,18 @@ impl App {
         let (missing, length) = (card.missing, card.length);
         let is_audio = card.kind == MediaKind::Audio;
         crate::widgets::context_menu(&response, |ui| {
-            if ui.add_enabled(!missing, egui::Button::new("Add to timeline")).clicked() {
+            if ui.add_enabled(!missing, egui::Button::new(tr("Add to timeline"))).clicked() {
                 self.add_bin_entry(entry, length);
                 ui.close();
             }
             match entry {
                 Entry::Media(id) => {
-                    if ui.button("Save to assets").on_hover_text("Keeps a copy on this computer, for every project").clicked() {
+                    if ui.button(tr("Save to assets")).on_hover_text(tr("Keeps a copy on this computer, for every project")).clicked() {
                         let path = self.editor.pool_item(id).map(|m| m.decode_path.clone());
                         if let Some(path) = path {
                             let folder = self.bin.asset_folder.clone();
                             match self.assets.add(&path, &folder) {
-                                Ok(_) => self.notify("Saved to assets."),
+                                Ok(_) => self.notify(tr("Saved to assets.")),
                                 Err(e) => self.report_error(e),
                             }
                         }
@@ -762,14 +803,15 @@ impl App {
                     }
                     self.folder_menu(ui, id);
                     if !is_audio {
+                        self.proxy_menu(ui, id);
                         self.scaling_menu(ui, id);
                         if self.settings.advanced_color {
                             self.color_menu(ui, id);
                         }
                     }
                     if missing
-                        && ui.button("Relink…").clicked()
-                        && let Some(file) = rfd::FileDialog::new().add_filter("Media", crate::MEDIA_EXTENSIONS).pick_file()
+                        && ui.button(tr("Relink…")).clicked()
+                        && let Some(file) = rfd::FileDialog::new().add_filter(tr("Media"), crate::MEDIA_EXTENSIONS).pick_file()
                     {
                         self.relink(id, &file);
                         ui.close();
@@ -777,7 +819,7 @@ impl App {
                 }
                 Entry::Compound(seq) => {
                     let used = self.editor.doc.project().sequences.keys().any(|&s| s != seq && self.editor.doc.project().sequence_reaches(s, seq));
-                    if ui.add_enabled(!used, egui::Button::new("Delete")).on_disabled_hover_text("A clip on the timeline uses it").clicked() {
+                    if ui.add_enabled(!used, egui::Button::new(tr("Delete"))).on_disabled_hover_text(tr("A clip on the timeline uses it")).clicked() {
                         if let Err(e) = self.editor.remove_compound(seq) {
                             self.error = Some(e.to_string());
                         }
@@ -815,11 +857,11 @@ impl App {
             Entry::Compound(sequence) => (ItemKind::Nested { sequence }, self.editor.doc.project().sequence(sequence).map(|s| s.duration())),
         };
         let ops = oa_edit::swap::swap_media(self.editor.doc.project(), self.editor.seq, item, kind, &drop.name, length);
-        match ops.and_then(|ops| self.editor.apply(&format!("Swap in {}", drop.name), ops)) {
+        match ops.and_then(|ops| self.editor.apply(&trf("Swap in {0}", &[("0", &(drop.name).to_string())]), ops)) {
             Ok(()) => {
                 self.selection = Some(item);
                 self.sync_selection();
-                self.notify(format!("Swapped in {} — the clip kept its place, transform and effects.", drop.name));
+                self.notify(trf("Swapped in {0} — the clip kept its place, transform and effects.", &[("0", &(drop.name).to_string())]));
             }
             Err(e) => self.error = Some(format!("can't swap in {}: {e}", drop.name)),
         }
@@ -846,12 +888,12 @@ impl App {
         let here = self.bin.asset_folder.clone();
         if !here.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                if ui.small_button("Assets").clicked() {
+                if ui.small_button(tr("Assets")).clicked() {
                     self.bin.asset_folder.clear();
                 }
                 let mut path = String::new();
                 for part in here.split('/') {
-                    ui.label("›");
+                    ui.label(tr("›"));
                     if !path.is_empty() {
                         path.push('/');
                     }
@@ -865,7 +907,7 @@ impl App {
         if self.assets.items.is_empty() && self.assets.folders.is_empty() {
             ui.label(
                 egui::RichText::new(
-                    "Nothing here yet. Right-click a clip in Media → Save to assets, or add files with the arrow above — they stay available in every project.",
+                    tr("Nothing here yet. Right-click a clip in Media → Save to assets, or add files with the arrow above — they stay available in every project."),
                 )
                 .weak(),
             );
@@ -1002,7 +1044,7 @@ impl App {
             visuals.weak_text_color(),
         );
 
-        let response = response.on_hover_text(format!("{}\nDouble-click or ＋ to use it in this project", asset.path.display()));
+        let response = response.on_hover_text(trf("{0}\nDouble-click or ＋ to use it in this project", &[("0", &(asset.path.display()).to_string())]));
         if response.clicked() && over_listen {
             self.audition(&asset.path, Time::ZERO);
         } else if (response.clicked() && over_plus) || response.double_clicked() {
@@ -1010,11 +1052,11 @@ impl App {
         }
         let asset = asset.clone();
         crate::widgets::context_menu(&response, |ui| {
-            if ui.button("Use in this project").clicked() {
+            if ui.button(tr("Use in this project")).clicked() {
                 self.use_asset(&asset);
                 ui.close();
             }
-            if ui.button("Show in folder").clicked() {
+            if ui.button(tr("Show in folder")).clicked() {
                 let dir = asset.path.parent().unwrap_or(&asset.path).to_path_buf();
                 #[cfg(windows)]
                 let _ = std::process::Command::new("explorer").arg(&dir).spawn();
@@ -1024,8 +1066,8 @@ impl App {
             }
             ui.separator();
             if ui
-                .button("Remove from assets")
-                .on_hover_text("Deletes this copy; whatever you copied it from is untouched")
+                .button(tr("Remove from assets"))
+                .on_hover_text(tr("Deletes this copy; whatever you copied it from is untouched"))
                 .clicked()
             {
                 if let Err(e) = self.assets.remove(&asset.path) {
@@ -1043,34 +1085,8 @@ impl App {
     }
 }
 
-/// One of the bin's tabs: a label on a tab with rounded top corners, raised and
-/// underlined in the accent color when it's the one showing.
-fn bin_tab(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
-    let font = egui::FontId::proportional(crate::style::TEXT);
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER);
-    let size = egui::vec2(galley.size().x + 2.0 * crate::style::GAP_L, crate::style::ICON + 2.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.visuals();
-        let r = crate::style::ROUNDING as u8;
-        let corners = egui::CornerRadius { nw: r, ne: r, sw: 0, se: 0 };
-        let fill = if selected {
-            visuals.widgets.active.weak_bg_fill
-        } else if response.hovered() {
-            visuals.widgets.hovered.weak_bg_fill
-        } else {
-            visuals.widgets.inactive.weak_bg_fill.gamma_multiply(0.5)
-        };
-        ui.painter().rect_filled(rect, corners, fill);
-        if selected {
-            let line = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 2.0), rect.right_bottom());
-            ui.painter().rect_filled(line, 0.0, crate::style::ACCENT);
-        }
-        let color = if selected { visuals.strong_text_color() } else { visuals.weak_text_color() };
-        ui.painter().galley(rect.center() - galley.size() * 0.5, galley, color);
-    }
-    response
-}
+/// How wide the bin's column of tabs is.
+const TAB_STRIP: f32 = crate::style::ICON + 2.0;
 
 /// The media in `dir` and the folders inside it, to import into the bin folder
 /// `parent`: (bin folder, its files), the folder named after `dir` first. Hidden files

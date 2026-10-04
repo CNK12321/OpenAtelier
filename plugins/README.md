@@ -74,7 +74,10 @@ manifest (`"bounds": {"file": "shape.bounds"}`).
 `{"id": "radius", "type": "float", "default": 8, "min": 0, "max": 100, "unit": "layer_pixels"}`
 
 * **Types**: `float`, `int`, `bool`, `vec2`, `vec3`, `color` (straight RGBA), `enum`
-  (with `"options"`; the default is the first unless given), `gradient` (a color, or a
+  (with `"options"`; the default is the first unless given; with `"multiple": true` it
+  takes any number of them — the default a list, `["red", "green"]` — shown as a list of
+  checkboxes, and the shader gets a bitmask, bit i for option i, up to 24 options),
+  `gradient` (a color, or a
   whole gradient as the editor saves one), `media` (a picture from the project — the
   effect's second input), `text`.
 * Every one is keyframable (and can wiggle) unless `"static_only": true`.

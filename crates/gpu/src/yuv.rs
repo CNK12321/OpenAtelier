@@ -112,6 +112,9 @@ pub(crate) fn uniforms(frame: &Nv12Frame<'_>, out_size: [u32; 2]) -> [f32; 64] {
     let display = frame.display_size();
     u[8] = (display[0] as f32 / out_size[0] as f32).max(display[1] as f32 / out_size[1] as f32);
     u[9] = (frame.rotation_quarter_turns % 4) as f32;
+    // 16-bit planes (10- and 12-bit video): video range sits at the 16-bit codes
+    // (16 << 8 = 4096 for black, 64 << 6 in 10 bits), not at n/255.
+    u[10] = (frame.texture.format() == wgpu::TextureFormat::R16Unorm) as u8 as f32;
     u
 }
 
@@ -132,9 +135,12 @@ fn vs_full(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
 fn yuv_to_rgb(uv: vec2f) -> vec3f {
     var y = textureSampleLevel(luma, samp, uv, 0.0).r;
     var c = textureSampleLevel(chroma, samp, uv, 0.0).rg;
+    let deep = P.h[2].z > 0.5;
+    let unit = select(255.0, 65535.0, deep);
+    let step = select(1.0, 256.0, deep);
     if (P.h[1].z < 0.5) {
-        y = (y - 16.0 / 255.0) * (255.0 / 219.0);
-        c = (c - 16.0 / 255.0) * (255.0 / 224.0);
+        y = (y - 16.0 * step / unit) * (unit / (219.0 * step));
+        c = (c - 16.0 * step / unit) * (unit / (224.0 * step));
     }
     let cb = c.x - 0.5;
     let cr = c.y - 0.5;

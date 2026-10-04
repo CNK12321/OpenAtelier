@@ -10,6 +10,7 @@
 //!   handles, click the first point (or press Enter) to close it — only closed paths
 //!   fill. Esc drops a path of fewer than three points.
 
+use crate::i18n::{tr, trf};
 use crate::inspector::Tab;
 use crate::masks::{drawing_point, framed, to_drawing, bitmap_size, Drag, Magic, Tool};
 use crate::App;
@@ -224,6 +225,23 @@ impl App {
         if tool == Tool::Select {
             return false;
         }
+        // Rotoscope: clicks on the clip's picture itself (not the mask's move), for SAM 2.
+        if tool == Tool::Rotoscope {
+            let layer_screen = |f: [f64; 2]| to_screen(p.to_canvas.apply([f[0] * p.native[0], f[1] * p.native[1]]));
+            self.paint_roto_clicks(&painter, item, &layer_screen);
+            if response.hover_pos().is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            let (pressed, alt) = ui.input(|i| (i.pointer.primary_pressed(), i.modifiers.alt));
+            if pressed
+                && let Some(o) = ui.input(|i| i.pointer.press_origin()).filter(|o| response.rect.contains(*o))
+                && let Some(f) = p.to_layer_fraction(to_canvas(o)).filter(|f| (0.0..=1.0).contains(&f[0]) && (0.0..=1.0).contains(&f[1]))
+            {
+                self.set_playing(false);
+                self.roto_click(item, f, !alt);
+            }
+            return true;
+        }
 
         let point = |q: egui::Pos2| drawing_point(&p, &values, m.frame, to_canvas(q));
         let (pressed, down, latest, origin, alt) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.latest_pos(), i.pointer.press_origin(), i.modifiers.alt));
@@ -324,7 +342,7 @@ impl App {
                             self.masks.point = None;
                         }
                         Some((i, n, _)) => {
-                            self.edit_mask(item, id, "Add path point", Some("mask-pen"), |m| {
+                            self.edit_mask(item, id, tr("Add path point"), Some("mask-pen"), |m| {
                                 if let Some(MaskShape::Path { points, .. }) = m.shapes.get_mut(i) {
                                     points.push(PathPoint::new(start));
                                 }
@@ -341,7 +359,7 @@ impl App {
                         }
                     }
                 }
-                Tool::Select => {}
+                Tool::Select | Tool::Rotoscope => {}
             }
         }
         if down
@@ -515,13 +533,13 @@ impl App {
         if m.shapes.is_empty() {
             return;
         }
-        crate::inspector::section(ui, "Shapes", "What's drawn in this mask, in order: each adds to it or erases from it. Pick one to reshape it (Edit) or change its edge.");
+        crate::inspector::section(ui, tr("Shapes"), tr("What's drawn in this mask, in order: each adds to it or erases from it. Pick one to reshape it (Edit) or change its edge."));
         let picked = self.masks.shape.filter(|i| *i < m.shapes.len());
         let mut remove = None;
         egui::ScrollArea::vertical().id_salt(("mask-shapes", id)).max_height(150.0).show(ui, |ui| {
             for (i, shape) in m.shapes.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    let label = format!("{}. {}{}", i + 1, shape.kind_name(), if shape.erases() && !matches!(shape, MaskShape::Stroke { .. }) { " (erases)" } else { "" });
+                    let label = format!("{}. {}{}", i + 1, tr(shape.kind_name()), if shape.erases() && !matches!(shape, MaskShape::Stroke { .. }) { tr(" (erases)") } else { "" });
                     if ui.selectable_label(picked == Some(i), label).clicked() {
                         (self.masks.shape, self.masks.point) = (Some(i), None);
                         if matches!(shape, MaskShape::Rect { .. } | MaskShape::Ellipse { .. } | MaskShape::Path { .. }) && self.masks.tool != Tool::Pen {
@@ -529,7 +547,7 @@ impl App {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").on_hover_text("Delete this shape").clicked() {
+                        if ui.small_button(tr("✕")).on_hover_text(tr("Delete this shape")).clicked() {
                             remove = Some(i);
                         }
                     });
@@ -549,8 +567,8 @@ impl App {
         let (expand, feather) = shape.edge();
         let unit = native[1].max(1.0);
         let (mut e, mut f) = (expand * unit, feather * unit);
-        let er = ui.add(egui::Slider::new(&mut e, -200.0..=200.0).text("expand").suffix(" px")).on_hover_text("Grow the shape outward (or, below zero, shrink it)");
-        let fr = ui.add(egui::Slider::new(&mut f, 0.0..=300.0).text("feather").suffix(" px")).on_hover_text("How far its own edge fades (the mask's Softness fades every shape together)");
+        let er = ui.add(egui::Slider::new(&mut e, -200.0..=200.0).text(tr("expand")).suffix(" px")).on_hover_text(tr("Grow the shape outward (or, below zero, shrink it)"));
+        let fr = ui.add(egui::Slider::new(&mut f, 0.0..=300.0).text(tr("feather")).suffix(" px")).on_hover_text(tr("How far its own edge fades (the mask's Softness fades every shape together)"));
         if er.changed() || fr.changed() {
             self.edit_mask(item, id, "Shape edge", Some("mask-edge"), |m| {
                 if let Some(s) = m.shapes.get_mut(i) {
@@ -563,7 +581,7 @@ impl App {
             self.editor.doc.seal();
         }
         let mut erasing = shape.erases();
-        if ui.checkbox(&mut erasing, "Erases").on_hover_text("Takes this away from the mask instead of adding it").changed() {
+        if ui.checkbox(&mut erasing, tr("Erases")).on_hover_text(tr("Takes this away from the mask instead of adding it")).changed() {
             self.edit_mask(item, id, "Shape erases", None, |m| {
                 if let Some(s) = m.shapes.get_mut(i) {
                     *s.erase_mut() = erasing;
@@ -574,15 +592,15 @@ impl App {
         let local = t - it.range.start;
         let near = self.half_frame();
         let mut close = *closed;
-        if ui.checkbox(&mut close, "Closed").on_hover_text("Only a closed path fills").changed() && points.len() >= 3 {
+        if ui.checkbox(&mut close, tr("Closed")).on_hover_text(tr("Only a closed path fills")).changed() && points.len() >= 3 {
             self.edit_mask(item, id, "Close path", None, |m| {
                 if let Some(MaskShape::Path { closed, .. }) = m.shapes.get_mut(i) {
                     *closed = close;
                 }
             });
         }
-        ui.checkbox(&mut self.masks.animate_points, "Keyframe points (rotoscope)")
-            .on_hover_text("On: moving a point with Edit keys it at the playhead, so the outline can follow something frame by frame. Off: a point that isn't keyframed yet just moves.");
+        ui.checkbox(&mut self.masks.animate_points, tr("Keyframe points (rotoscope)"))
+            .on_hover_text(tr("On: moving a point with Edit keys it at the playhead, so the outline can follow something frame by frame. Off: a point that isn't keyframed yet just moves."));
         // Every key of the path, for stepping through them.
         let mut times: Vec<Time> = points.iter().filter(|p| p.animated()).flat_map(|p| p.keys.iter().map(|k| k.t)).collect();
         times.sort();
@@ -590,16 +608,16 @@ impl App {
         ui.horizontal(|ui| {
             let prev = times.iter().rev().find(|k| k.0 < local.0 - near.0).copied();
             let next = times.iter().find(|k| k.0 > local.0 + near.0).copied();
-            if ui.add_enabled(prev.is_some(), egui::Button::new("◀ key")).clicked() {
+            if ui.add_enabled(prev.is_some(), egui::Button::new(tr("◀ key"))).clicked() {
                 self.set_playhead(it.range.start + prev.expect("enabled"));
             }
-            if ui.add_enabled(next.is_some(), egui::Button::new("key ▶")).clicked() {
+            if ui.add_enabled(next.is_some(), egui::Button::new(tr("key ▶"))).clicked() {
                 self.set_playhead(it.range.start + next.expect("enabled"));
             }
-            ui.label(egui::RichText::new(format!("{} points · {} keyed moments", points.len(), times.len())).small().weak());
+            ui.label(egui::RichText::new(trf("{0} points · {1} keyed moments", &[("0", &(points.len()).to_string()), ("1", &(times.len()).to_string())])).small().weak());
         });
         ui.horizontal(|ui| {
-            if ui.button("Key all points here").on_hover_text("A key for every point at the playhead, where they are now — the start of rotoscoping").clicked() {
+            if ui.button(tr("Key all points here")).on_hover_text(tr("A key for every point at the playhead, where they are now — the start of rotoscoping")).clicked() {
                 self.edit_mask(item, id, "Key path", None, |m| {
                     if let Some(MaskShape::Path { points, .. }) = m.shapes.get_mut(i) {
                         for p in points.iter_mut() {
@@ -609,9 +627,9 @@ impl App {
                     }
                 });
             }
-            if ui.button("Remove keys here").on_hover_text("The points' keys at the playhead (the picked point's only, when one is picked)").clicked() {
+            if ui.button(tr("Remove keys here")).on_hover_text(tr("The points' keys at the playhead (the picked point's only, when one is picked)")).clicked() {
                 let only = self.masks.point;
-                self.edit_mask(item, id, "Remove path keys", None, |m| {
+                self.edit_mask(item, id, tr("Remove path keys"), None, |m| {
                     if let Some(MaskShape::Path { points, .. }) = m.shapes.get_mut(i) {
                         for (k, p) in points.iter_mut().enumerate() {
                             if only.is_none_or(|o| o == k) {
@@ -624,7 +642,7 @@ impl App {
         });
         if let Some(k) = self.masks.point.filter(|k| *k < points.len()) {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("Point {} · {} keys", k + 1, points[k].keys.len())).small());
+                ui.label(egui::RichText::new(trf("Point {0} · {1} keys", &[("0", &(k + 1).to_string()), ("1", &(points[k].keys.len()).to_string())])).small());
                 let corner = points[k].at(local).handle_in == [0.0, 0.0] && points[k].at(local).handle_out == [0.0, 0.0];
                 if ui.small_button(if corner { "Make smooth" } else { "Make corner" }).clicked() {
                     let animate = self.masks.animate_points;
@@ -639,8 +657,8 @@ impl App {
                         }
                     });
                 }
-                if points.len() > 3 && ui.small_button("Delete point").clicked() {
-                    self.edit_mask(item, id, "Delete path point", None, |m| {
+                if points.len() > 3 && ui.small_button(tr("Delete point")).clicked() {
+                    self.edit_mask(item, id, tr("Delete path point"), None, |m| {
                         if let Some(MaskShape::Path { points, .. }) = m.shapes.get_mut(i) {
                             points.remove(k);
                         }

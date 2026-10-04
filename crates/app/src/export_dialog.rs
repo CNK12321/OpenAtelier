@@ -7,6 +7,7 @@
 //! with a picture and a summary of what it'll make beside them. Exports run one after
 //! another from a queue; the choices are remembered (`ExportPrefs`).
 
+use crate::i18n::{tr, trf};
 use crate::style;
 use crate::App;
 use eframe::egui;
@@ -192,7 +193,7 @@ impl App {
         let gif = prefs.codec == "gif";
         let audio_only = is_audio(&prefs.codec);
         let stills = prefs.codec == "png";
-        crate::widgets::on_screen(egui::Window::new("Export"), ctx)
+        crate::widgets::on_screen(egui::Window::new(tr("Export")), ctx)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -203,11 +204,11 @@ impl App {
                     // Left: the choices.
                     ui.vertical(|ui| {
                         ui.set_width(450.0);
-                        heading(ui, "FILE TYPE");
+                        heading(ui, tr("FILE TYPE"));
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                             for (k, name, detail, _, hint) in TYPES {
-                                if type_card(ui, name, detail, hint, prefs.codec == k) {
+                                if type_card(ui, tr(name), tr(detail), tr(hint), prefs.codec == k) {
                                     prefs.codec = k.to_string();
                                     if k == "gif" && prefs.short_edge == 0 {
                                         prefs.short_edge = 480;
@@ -222,31 +223,31 @@ impl App {
                         } else if transparent && !keeps_alpha {
                             egui::Frame::new().fill(style::WARNING.gamma_multiply(0.15)).corner_radius(6.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.colored_label(style::WARNING, "The background is transparent, but this type can't keep it — it'll be black.");
-                                    if ui.small_button("Use ProRes 4444").clicked() {
+                                    ui.colored_label(style::WARNING, tr("The background is transparent, but this type can't keep it — it'll be black."));
+                                    if ui.small_button(tr("Use ProRes 4444")).clicked() {
                                         prefs.codec = "prores4444".into();
                                     }
-                                    if ui.small_button("Use WebM").clicked() {
+                                    if ui.small_button(tr("Use WebM")).clicked() {
                                         prefs.codec = "webm".into();
                                     }
                                 });
                             });
                         } else if transparent {
-                            ui.label(egui::RichText::new("✓ Transparent background kept").small().color(egui::Color32::from_rgb(90, 200, 120)));
+                            ui.label(egui::RichText::new(tr("✓ Transparent background kept")).small().color(egui::Color32::from_rgb(90, 200, 120)));
                         }
 
                         if !audio_only {
-                            heading(ui, "FORMAT");
+                            heading(ui, tr("FORMAT"));
                             ui.horizontal_wrapped(|ui| {
                                 for (i, v) in sequence.variants.iter().enumerate() {
-                                    chip(ui, which == i, &v.name).on_hover_text(format!("{}×{}", v.size.width, v.size.height)).clicked().then(|| which = i);
+                                    chip(ui, which == i, &v.name).on_hover_text(trf("{0}×{1}", &[("0", &(v.size.width).to_string()), ("1", &(v.size.height).to_string())])).clicked().then(|| which = i);
                                 }
                                 if sequence.variants.len() > 1 {
-                                    chip(ui, which == usize::MAX, format!("Every format ({})", sequence.variants.len())).on_hover_text("One file each, into a folder").clicked().then(|| which = usize::MAX);
+                                    chip(ui, which == usize::MAX, trf("Every format ({0})", &[("0", &(sequence.variants.len()).to_string())])).on_hover_text(tr("One file each, into a folder")).clicked().then(|| which = usize::MAX);
                                 }
                             });
 
-                            heading(ui, "RESOLUTION");
+                            heading(ui, tr("RESOLUTION"));
                             ui.horizontal_wrapped(|ui| {
                                 for (edge, label) in RESOLUTIONS {
                                     chip(ui, prefs.short_edge == edge, label).clicked().then(|| prefs.short_edge = edge);
@@ -254,17 +255,17 @@ impl App {
                             });
                         }
 
-                        heading(ui, "PART");
+                        heading(ui, tr("PART"));
                         ui.horizontal_wrapped(|ui| {
-                            if chip(ui, range.is_none(), format!("Whole timeline · {}", clock(whole))).clicked() {
+                            if chip(ui, range.is_none(), trf("Whole timeline · {0}", &[("0", &(clock(whole)).to_string())])).clicked() {
                                 range = None;
                             }
                             if let Some((a, b)) = selection
-                                && chip(ui, range == Some((a, b)), format!("Selected clips · {}", clock(b - a))).clicked()
+                                && chip(ui, range == Some((a, b)), trf("Selected clips · {0}", &[("0", &(clock(b - a)).to_string())])).clicked()
                             {
                                 range = Some((a, b));
                             }
-                            if chip(ui, range.is_some() && range != selection, "From – to").clicked() && (range.is_none() || range == selection) {
+                            if chip(ui, range.is_some() && range != selection, tr("From – to")).clicked() && (range.is_none() || range == selection) {
                                 let at = self.playhead.min(whole);
                                 range = Some((at, (at + Time::from_seconds(5)).min(whole).max(at + Time::from_seconds_f64(0.1))));
                             }
@@ -275,14 +276,14 @@ impl App {
                                 let mut fa = a.as_seconds_f64();
                                 let mut fb = b.as_seconds_f64();
                                 let limit = whole.as_seconds_f64();
-                                ui.label("from");
+                                ui.label(tr("from"));
                                 ui.add(egui::DragValue::new(&mut fa).range(0.0..=limit).speed(0.05).custom_formatter(|v, _| clock(Time::from_seconds_f64(v))));
-                                if ui.small_button("⏵ here").on_hover_text("Start at the playhead").clicked() {
+                                if ui.small_button(tr("⏵ here")).on_hover_text(tr("Start at the playhead")).clicked() {
                                     fa = self.playhead.as_seconds_f64();
                                 }
-                                ui.label("to");
+                                ui.label(tr("to"));
                                 ui.add(egui::DragValue::new(&mut fb).range(0.0..=limit).speed(0.05).custom_formatter(|v, _| clock(Time::from_seconds_f64(v))));
-                                if ui.small_button("here ⏴").on_hover_text("End at the playhead").clicked() {
+                                if ui.small_button(tr("here ⏴")).on_hover_text(tr("End at the playhead")).clicked() {
                                     fb = self.playhead.as_seconds_f64();
                                 }
                                 let (lo, hi) = (fa.min(fb).clamp(0.0, limit), fa.max(fb).clamp(0.0, limit));
@@ -292,14 +293,14 @@ impl App {
                         }
 
                         if gif {
-                            heading(ui, "FRAME RATE");
+                            heading(ui, tr("FRAME RATE"));
                             ui.horizontal(|ui| {
                                 for fps in [10, 12, 15, 20, 24, 30] {
                                     chip(ui, prefs.gif_fps == fps, format!("{fps} fps")).clicked().then(|| prefs.gif_fps = fps);
                                 }
                             });
                         } else if !prefs.codec.starts_with("prores") && !audio_only && !stills {
-                            heading(ui, "QUALITY");
+                            heading(ui, tr("QUALITY"));
                             ui.horizontal(|ui| {
                                 // Shown as better → smaller; stored on x264's scale (lower is better).
                                 let mut q = 40 - prefs.crf as i32;
@@ -315,26 +316,24 @@ impl App {
                         }
 
                         if audio_only {
-                            heading(ui, "SOUND");
-                            ui.label(egui::RichText::new("Saved as a WAV — or pick M4A, MP3, FLAC or Opus when choosing where it goes.").small().weak());
+                            heading(ui, tr("SOUND"));
+                            ui.label(egui::RichText::new(tr("Saved as a WAV — or pick M4A, MP3, FLAC or Opus when choosing where it goes.")).small().weak());
                         } else if stills {
-                            heading(ui, "FRAMES");
-                            ui.label(egui::RichText::new("Numbered from 0: name_00000.png, name_00001.png… beside the name you choose. No sound.").small().weak());
+                            heading(ui, tr("FRAMES"));
+                            ui.label(egui::RichText::new(tr("Numbered from 0: name_00000.png, name_00001.png… beside the name you choose. No sound.")).small().weak());
                         } else if !gif {
-                            heading(ui, "ENCODER & SOUND");
+                            heading(ui, tr("ENCODER & SOUND"));
                             ui.horizontal(|ui| {
                                 // Only H.264 and HEVC have a hardware encoder.
                                 let prores = !matches!(prefs.codec.as_str(), "h264" | "hevc");
                                 ui.add_enabled_ui(!prores, |ui| {
-                                    chip(ui, prefs.encoder == "auto" && !prores, "Automatic").on_hover_text("The graphics card's encoder when it can, else software").clicked().then(|| prefs.encoder = "auto".into());
-                                    chip(ui, prefs.encoder == "hardware" && !prores, "Hardware").on_hover_text("Fastest (the GPU's own encoder)").clicked().then(|| prefs.encoder = "hardware".into());
+                                    chip(ui, prefs.encoder == "auto" && !prores, "Automatic").on_hover_text(tr("The graphics card's encoder when it can, else software")).clicked().then(|| prefs.encoder = "auto".into());
+                                    chip(ui, prefs.encoder == "hardware" && !prores, "Hardware").on_hover_text(tr("Fastest (the GPU's own encoder)")).clicked().then(|| prefs.encoder = "hardware".into());
                                 });
-                                chip(ui, prefs.encoder == "software" || prores, "Software").on_hover_text("x264/x265: slower, slightly better per byte").clicked().then(|| prefs.encoder = "software".into());
+                                chip(ui, prefs.encoder == "software" || prores, "Software").on_hover_text(tr("x264/x265: slower, slightly better per byte")).clicked().then(|| prefs.encoder = "software".into());
                                 ui.separator();
-                                ui.checkbox(&mut prefs.audio, "Sound");
-                                ui.checkbox(&mut prefs.text_antialias, "Smooth text").on_hover_text(
-                                    "Anti-aliasing: titles are drawn at twice the size and smoothed down before any effect runs on them. Cleaner edges on thin letters and text effects; a little slower.",
-                                );
+                                ui.checkbox(&mut prefs.audio, tr("Sound"));
+                                ui.checkbox(&mut prefs.text_antialias, tr("Smooth text")).on_hover_text(tr("Anti-aliasing: titles are drawn at twice the size and smoothed down before any effect runs on them. Cleaner edges on thin letters and text effects; a little slower."));
                             });
                         }
                     });
@@ -344,7 +343,7 @@ impl App {
                     // Right: a picture and what it'll make.
                     ui.vertical(|ui| {
                         ui.set_width(220.0);
-                        heading(ui, "PREVIEW");
+                        heading(ui, tr("PREVIEW"));
                         let v = &sequence.variants[if which == usize::MAX { 0 } else { which.min(sequence.variants.len() - 1) }];
                         let aspect = v.size.width as f32 / v.size.height.max(1) as f32;
                         let box_size = if aspect >= 1.0 { egui::vec2(220.0, 220.0 / aspect) } else { egui::vec2(140.0 * aspect, 140.0) };
@@ -356,13 +355,13 @@ impl App {
                         }
                         ui.painter().rect_stroke(pic, 6.0, egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color), egui::StrokeKind::Outside);
 
-                        heading(ui, "YOU'LL GET");
+                        heading(ui, tr("YOU'LL GET"));
                         let (a, b) = range.unwrap_or((Time::ZERO, whole));
                         let seconds = (b - a).as_seconds_f64();
                         let rate = if gif { prefs.gif_fps as f64 } else { sequence.rate.as_f64() };
                         let targets: Vec<usize> = if which == usize::MAX { (0..sequence.variants.len()).collect() } else { vec![which.min(sequence.variants.len() - 1)] };
                         let (_, name, detail, _, _) = TYPES.iter().copied().find(|t| t.0 == prefs.codec).unwrap_or(TYPES[0]);
-                        ui.label(egui::RichText::new(format!("{name} · {detail}")).strong());
+                        ui.label(egui::RichText::new(trf("{name} · {detail}", &[("name", tr(name)), ("detail", tr(detail))])).strong());
                         let mut total = 0.0;
                         let targets = if audio_only { vec![targets[0]] } else { targets };
                         for &i in &targets {
@@ -370,27 +369,27 @@ impl App {
                             let size = out_size(v.size, prefs.short_edge);
                             total += estimate(&prefs, size, sequence.rate.as_f64(), seconds);
                             if !audio_only {
-                                ui.label(egui::RichText::new(format!("{} — {}×{}", v.name, size[0], size[1])).small());
+                                ui.label(egui::RichText::new(trf("{0} — {1}×{2}", &[("0", &(v.name).to_string()), ("1", &(size[0]).to_string()), ("2", &(size[1]).to_string())])).small());
                             }
                         }
                         let per = if audio_only { "48 kHz stereo".to_string() } else { format!("{rate:.3} fps") };
-                        ui.label(egui::RichText::new(format!("{} · {per}{}", clock(b - a), if range.is_some() { format!(" · from {}", clock(a)) } else { String::new() })).small());
-                        ui.label(egui::RichText::new(format!("about {}{}", crate::bytes(total as u64), if targets.len() > 1 { format!(" in {} files", targets.len()) } else { String::new() })).small().weak());
+                        ui.label(egui::RichText::new(trf("{0} · {per}{1}", &[("0", &(clock(b - a)).to_string()), ("per", &(per).to_string()), ("1", &(if range.is_some() { format!(" · from {}", clock(a)) } else { String::new() }).to_string())])).small());
+                        ui.label(egui::RichText::new(trf("about {0}{1}", &[("0", &(crate::bytes(total as u64)).to_string()), ("1", &(if targets.len() > 1 { format!(" in {} files", targets.len()) } else { String::new() }).to_string())])).small().weak());
                         if gif && seconds > 20.0 {
-                            ui.colored_label(style::WARNING, "Long GIFs get very large — a short part is best.");
+                            ui.colored_label(style::WARNING, tr("Long GIFs get very large — a short part is best."));
                         }
 
                         ui.add_space(style::GAP_L);
                         let busy = self.export.is_some();
-                        let label = if busy { "Add to the queue…" } else { "Export…" };
+                        let label = if busy { tr("Add to the queue…") } else { "Export…" };
                         let button = egui::Button::new(egui::RichText::new(label).strong().size(style::TEXT_L).color(egui::Color32::WHITE))
                             .fill(style::ACCENT)
                             .corner_radius(8.0)
                             .min_size(egui::vec2(220.0, 36.0));
-                        if ui.add(button).on_hover_text("Choose where it goes").clicked() {
+                        if ui.add(button).on_hover_text(tr("Choose where it goes")).clicked() {
                             go = true;
                         }
-                        if ui.add(egui::Button::new("Cancel").frame(false).min_size(egui::vec2(220.0, 24.0))).clicked() {
+                        if ui.add(egui::Button::new(tr("Cancel")).frame(false).min_size(egui::vec2(220.0, 24.0))).clicked() {
                             self.export_dialog = false;
                         }
                     });
@@ -445,13 +444,13 @@ impl App {
                 "mov" => "QuickTime movie",
                 "gif" => "Animated GIF",
                 "webm" => "WebM video",
-                "png" => "PNG images (numbered one per frame)",
+                "png" => tr("PNG images (numbered one per frame)"),
                 _ => "MP4 video",
             };
             let Some(p) = rfd::FileDialog::new().add_filter(filter, &[ext]).set_file_name(format!("{stem}.{ext}")).save_file() else { return };
             vec![p.with_extension(ext)]
         } else {
-            let Some(dir) = rfd::FileDialog::new().set_title("Folder for the exports").pick_folder() else { return };
+            let Some(dir) = rfd::FileDialog::new().set_title(tr("Folder for the exports")).pick_folder() else { return };
             targets.iter().map(|(_, name)| dir.join(format!("{stem} - {}.{ext}", safe_name(name)))).collect()
         };
         let encoder = match (prefs.encoder.as_str(), codec) {
@@ -462,7 +461,7 @@ impl App {
         };
         let (audio, buses) = if (prefs.audio || audio_only) && codec.has_sound() { self.audio_mix_of(seq) } else { Default::default() };
         if audio_only && audio.is_empty() {
-            self.error = Some("nothing to hear: the timeline has no sound to export".into());
+            self.error = Some(tr("nothing to hear: the timeline has no sound to export").into());
             return;
         }
         // The project as it is now: what these files will be of, whatever happens next.
@@ -532,7 +531,7 @@ impl App {
         let (mut hide, mut cancel, mut skip) = (false, false, false);
         // A change to the queue: (index, up / down / out).
         let mut change: Option<(usize, i8)> = None;
-        crate::widgets::on_screen(egui::Window::new("Exporting"), ctx)
+        crate::widgets::on_screen(egui::Window::new(tr("Exporting")), ctx)
             .id(egui::Id::new("exporting"))
             .collapsible(true)
             .resizable(false)
@@ -557,10 +556,10 @@ impl App {
                     // Not frames going by: say what it's doing, and for how long.
                     Some((s, for_how_long)) => {
                         let (what, why) = match s {
-                            crate::export_worker::Stage::Opening => ("Opening the encoder…", "Trying the graphics card's encoder first."),
+                            crate::export_worker::Stage::Opening => (tr("Opening the encoder…"), tr("Trying the graphics card's encoder first.")),
                             crate::export_worker::Stage::Finishing => (
-                                "Finishing the file…",
-                                "The encoder's last frames, the sound, and the file's index. Long exports take a little while here.",
+                                tr("Finishing the file…"),
+                                tr("The encoder's last frames, the sound, and the file's index. Long exports take a little while here."),
                             ),
                         };
                         ui.add(egui::ProgressBar::new(fraction).desired_width(width).animate(true).text(what));
@@ -568,47 +567,42 @@ impl App {
                         ui.label(egui::RichText::new(why).small().weak());
                     }
                     None => {
-                        ui.add(egui::ProgressBar::new(fraction).desired_width(width).text(format!("{:.0}%", fraction * 100.0)));
+                        ui.add(egui::ProgressBar::new(fraction).desired_width(width).text(trf("{0}%", &[("0", &format!("{:.0}", fraction * 100.0))])));
                         ui.horizontal(|ui| {
-                            ui.label(format!("Frame {} of {}", done.min(total), total));
-                            ui.label(egui::RichText::new(format!("at {}", clock(self.export_view.at))).weak());
+                            ui.label(trf("Frame {0} of {1}", &[("0", &(done.min(total)).to_string()), ("1", &(total).to_string())]));
+                            ui.label(egui::RichText::new(trf("at {0}", &[("0", &(clock(self.export_view.at)).to_string())])).weak());
                         });
                         ui.label(
-                            egui::RichText::new(format!(
-                                "{:.0} fps · {} left{}",
-                                fps,
-                                if fps > 0.0 { clock(Time::from_seconds_f64(left)) } else { "…".into() },
-                                if queued > 0 { format!(" · {queued} more queued") } else { String::new() }
-                            ))
+                            egui::RichText::new(trf("{0} fps · {1} left{2}", &[("0", &format!("{:.0}", fps)), ("1", &(if fps > 0.0 { clock(Time::from_seconds_f64(left)) } else { "…".into() }).to_string()), ("2", &(if queued > 0 { format!(" · {queued} more queued") } else { String::new() }).to_string())]))
                             .small()
                             .weak(),
                         );
                     }
                 }
                 if !encoder.is_empty() {
-                    ui.label(egui::RichText::new(format!("with {encoder}")).small().weak());
+                    ui.label(egui::RichText::new(trf("with {encoder}", &[("encoder", &encoder.to_string())])).small().weak());
                 }
                 // What's next: in order, each can be moved or taken out. Each keeps the
                 // project as it was when it was queued.
                 if !waiting.is_empty() {
-                    heading(ui, &format!("UP NEXT ({})", waiting.len()));
+                    heading(ui, &trf("UP NEXT ({0})", &[("0", &(waiting.len()).to_string())]));
                     egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                         for (i, (file, what)) in waiting.iter().enumerate() {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(format!("{}.", i + 1)).weak());
+                                ui.label(egui::RichText::new(trf("{0}.", &[("0", &(i + 1).to_string())])).weak());
                                 ui.vertical(|ui| {
                                     ui.set_width(250.0);
                                     ui.label(egui::RichText::new(file).small().strong()).on_hover_text(what);
                                     ui.label(egui::RichText::new(what).small().weak());
                                 });
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("✕").on_hover_text("Take it out of the queue").clicked() {
+                                    if ui.small_button(tr("✕")).on_hover_text(tr("Take it out of the queue")).clicked() {
                                         change = Some((i, 0));
                                     }
-                                    if ui.add_enabled(i + 1 < waiting.len(), egui::Button::new("↓").small()).on_hover_text("Later").clicked() {
+                                    if ui.add_enabled(i + 1 < waiting.len(), egui::Button::new(tr("↓")).small()).on_hover_text(tr("Later")).clicked() {
                                         change = Some((i, 1));
                                     }
-                                    if ui.add_enabled(i > 0, egui::Button::new("↑").small()).on_hover_text("Sooner").clicked() {
+                                    if ui.add_enabled(i > 0, egui::Button::new(tr("↑")).small()).on_hover_text(tr("Sooner")).clicked() {
                                         change = Some((i, -1));
                                     }
                                 });
@@ -617,17 +611,17 @@ impl App {
                     });
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Hide").on_hover_text("Keep exporting; progress stays in the top bar").clicked() {
+                    if ui.button(tr("Hide")).on_hover_text(tr("Keep exporting; progress stays in the top bar")).clicked() {
                         hide = true;
                     }
-                    if queued > 0 && ui.button("Skip").on_hover_text("Stop this one and go on with the next").clicked() {
+                    if queued > 0 && ui.button(tr("Skip")).on_hover_text(tr("Stop this one and go on with the next")).clicked() {
                         skip = true;
                     }
                     if ui.button(if queued > 0 { "Cancel all" } else { "Cancel" }).clicked() {
                         cancel = true;
                     }
                 });
-                ui.label(egui::RichText::new("Add more from Export… while this runs: they wait their turn.").small().weak());
+                ui.label(egui::RichText::new(tr("Add more from Export… while this runs: they wait their turn.")).small().weak());
             });
         if hide {
             self.export_view.hidden = true;

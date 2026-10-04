@@ -9,6 +9,7 @@
 //!
 //! Nothing here touches the document: the library is a place on disk, scanned on demand.
 
+use crate::i18n::tr;
 use oa_media::MediaKind;
 use std::path::{Path, PathBuf};
 
@@ -155,7 +156,7 @@ impl Assets {
     pub fn new_folder(&mut self, parent: &str, name: &str) -> Result<(), String> {
         let name = crate::notify::check_name("folder", name)?;
         if name.contains(['/', '\\']) {
-            return Err("A folder name can't contain a slash.".into());
+            return Err(tr("A folder name can't contain a slash.").into());
         }
         let path = if parent.is_empty() { self.dir.join(&name) } else { self.dir.join(parent).join(&name) };
         std::fs::create_dir_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;

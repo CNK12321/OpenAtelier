@@ -6,6 +6,7 @@
 //! rotation by 15° and turns snapping off. All geometry comes from `oa_edit` /
 //! `oa_plan::scene`, i.e. the renderer's own placement math.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_edit::transform::{Gesture, Guide, Handle, Handles, Modifiers, Scope};
@@ -122,46 +123,37 @@ impl App {
         if self.variant == 0 || self.link_formats { Scope::AllFormats } else { Scope::Variant(self.variant_id()) }
     }
 
-    /// Zoom presets and guide toggles above the picture.
+    /// Above the picture: Center (and the zoom, when zoomed), the guides menu and the
+    /// frame size; Fullscreen on the right.
     fn viewer_toolbar(&mut self, ui: &mut egui::Ui, canvas: [f64; 2]) {
         let ppp = ui.ctx().pixels_per_point();
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
             let view = &mut self.view;
-            if ui.selectable_label(view.zoom.is_none(), "Fit").on_hover_text("Fit the whole frame (Ctrl+0)").clicked() {
+            if crate::widgets::chip(ui, view.zoom.is_none(), tr("Center")).on_hover_text(tr("The whole frame, centered (Ctrl+0; Ctrl+1 is 100%)")).clicked() {
                 view.zoom = None;
                 view.pan = egui::Vec2::ZERO;
             }
             // Percentages are canvas pixels per physical screen pixel: 100% is 1:1.
-            for pct in [50.0f32, 100.0, 200.0] {
-                let z = pct / 100.0 / ppp;
-                let on = view.zoom.is_some_and(|v| (v - z).abs() < 1e-4);
-                if ui.selectable_label(on, format!("{pct:.0}%")).clicked() {
-                    view.zoom = Some(z);
-                    view.pan = egui::Vec2::ZERO;
-                }
-            }
             if let Some(z) = view.zoom {
-                ui.label(egui::RichText::new(format!("{:.0}%", z * ppp * 100.0)).weak());
+                ui.label(egui::RichText::new(trf("{0}%", &[("0", &format!("{:.0}", z * ppp * 100.0))])).small().weak());
             }
-            ui.separator();
-            ui.toggle_value(&mut view.thirds, "Thirds").on_hover_text("Rule-of-thirds grid");
-            ui.toggle_value(&mut view.center, "Center").on_hover_text("Center lines");
-            ui.toggle_value(&mut view.safe_areas, "Safe areas").on_hover_text("Action safe (93%) and title safe (90%); tall formats also shade where phone apps put their buttons and captions");
-            ui.separator();
-            let vertical = self.vertical_layout();
-            if ui
-                .selectable_label(vertical, "Vertical layout")
-                .on_hover_text("For vertical video: the viewer takes the tall column on the right and the properties move to the middle. Remembered with the project.")
-                .clicked()
-            {
-                self.toggle_layout();
-            }
-            if ui.button("Fullscreen").on_hover_text("Play it back on the whole screen (F; F, Esc or a double-click to leave)").clicked() {
-                let ctx = ui.ctx().clone();
-                self.set_fullscreen(&ctx, true);
-            }
-            ui.label(egui::RichText::new(format!("{}×{}", canvas[0], canvas[1])).weak().small())
-                .on_hover_text("Ctrl+wheel zooms around the pointer; middle-drag (or the wheel, when zoomed) pans");
+            // The guides, ticked in a menu.
+            let any = view.thirds || view.center || view.safe_areas;
+            let r = crate::widgets::chip(ui, any, &format!("{}  ▾", tr("Guides"))).on_hover_text(tr("Lines over the picture to line things up by"));
+            egui::Popup::menu(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.checkbox(&mut view.thirds, tr("Thirds")).on_hover_text(tr("Rule-of-thirds grid"));
+                ui.checkbox(&mut view.center, tr("Center lines")).on_hover_text(tr("Lines through the middle of the frame"));
+                ui.checkbox(&mut view.safe_areas, tr("Safe areas")).on_hover_text(tr("Action safe (93%) and title safe (90%); tall formats also shade where phone apps put their buttons and captions"));
+            });
+            ui.label(egui::RichText::new(trf("{0}×{1}", &[("0", &(canvas[0]).to_string()), ("1", &(canvas[1]).to_string())])).weak().small())
+                .on_hover_text(tr("Ctrl+wheel zooms around the pointer; middle-drag (or the wheel, when zoomed) pans"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::icons::button(ui, crate::icons::FULLSCREEN, tr("Play it back on the whole screen (F; F, Esc or a double-click to leave)"), "F", true).clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.set_fullscreen(&ctx, true);
+                }
+            });
         });
         // Keyboard: Ctrl+0 fit, Ctrl+1 100%.
         if !ui.ctx().egui_wants_keyboard_input() {
@@ -224,7 +216,7 @@ impl App {
     pub(crate) fn viewer(&mut self, ui: &mut egui::Ui) {
         let Some(preview_id) = self.preview.as_ref().map(|p| p.id) else {
             ui.centered_and_justified(|ui| {
-                ui.label("Import media (or drop files here) to start.");
+                ui.label(tr("Import media (or drop files here) to start."));
             });
             return;
         };
@@ -300,6 +292,16 @@ impl App {
         let modifiers = ui.input(|i| i.modifiers);
         let mods = Modifiers { free: modifiers.shift, step: modifiers.command };
 
+        // An armed eyedropper takes the next click.
+        if self.picking_color() {
+            self.viewer_canvas = Some((available, rect));
+            let at = response.hover_pos().map(|p| {
+                let c = to_canvas(p);
+                [c[0] / canvas[0], c[1] / canvas[1]]
+            });
+            self.eyedropper_viewer(ui, &response, at, rect);
+            return;
+        }
         // The track editor takes the viewer over while it's open.
         if self.track_editor.is_some() {
             self.viewer_canvas = Some((available, rect));
@@ -360,7 +362,7 @@ impl App {
                 _ if hovered_effect_point.is_some() => {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                     if let Some(e) = hovered_effect_point.and_then(|i| effect_points.get(i)) {
-                        response.clone().on_hover_text(format!("{}: {} (drag it; right-click its values in the inspector to track it)", e.name, e.param.replace('_', " ")));
+                        response.clone().on_hover_text(trf("{0}: {1} (drag it; right-click its values in the inspector to track it)", &[("0", &(e.name).to_string()), ("1", &(e.param.replace('_', " ")).to_string())]));
                     }
                 }
                 _ if hovered_point.is_some() => ui.ctx().set_cursor_icon(egui::CursorIcon::Grab),
@@ -589,7 +591,7 @@ impl App {
                         Handle::Body => "Move layer",
                         Handle::Corner(_) | Handle::Edge(_) => "Scale layer",
                         Handle::Rotate => "Rotate layer",
-                        Handle::Anchor => "Move anchor point",
+                        Handle::Anchor => tr("Move anchor point"),
                     };
                     if let Err(e) = self.editor.apply_drag(label, "viewer-drag", update.ops) {
                         self.error = Some(e.to_string());
@@ -841,7 +843,7 @@ impl App {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         if text.is_empty() {
             let at = to_screen(p.to_canvas.apply([layout.size[0] / 2.0, layout.size[1] / 2.0]));
-            ui.painter().text(at, egui::Align2::CENTER_CENTER, "Type your title", egui::FontId::proportional(14.0), egui::Color32::from_white_alpha(140));
+            ui.painter().text(at, egui::Align2::CENTER_CENTER, tr("Type your title"), egui::FontId::proportional(14.0), egui::Color32::from_white_alpha(140));
         }
     }
 }

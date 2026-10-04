@@ -5,6 +5,7 @@
 //! drag the line to raise or lower it (all keys together when keyframed), Ctrl+click the
 //! line to add a key and Ctrl+click a key to remove it.
 
+use crate::i18n::tr;
 use crate::App;
 use eframe::egui;
 use oa_doc::{schema, ItemId, ParamTarget, TrackKind};
@@ -144,12 +145,12 @@ impl App {
             return;
         };
         if curve.anchor != KeyframeAnchor::ClipStart {
-            ui.label("This key follows the source's clock: drag it on the line.");
+            ui.label(tr("This key follows the source's clock: drag it on the line."));
             return;
         }
         // Shown as the inspector shows it: opacity in percent, gain in dB.
         let (k, suffix) = if band.param == schema::OPACITY { (100.0, " %") } else if band.param == schema::AUDIO_GAIN { (1.0, " dB") } else { (1.0, "") };
-        let name = band.param.rsplit('.').next().unwrap_or(&band.param).replace('_', " ");
+        let name = crate::i18n::t(&band.param.rsplit('.').next().unwrap_or(&band.param).replace('_', " ")).to_string();
         let key = curve.keys[index].clone();
         let mut changed = false;
         let mut finished = false;
@@ -166,7 +167,7 @@ impl App {
                 finished |= r.drag_stopped() || r.lost_focus();
                 ui.end_row();
             }
-            ui.label("at");
+            ui.label(tr("at"));
             let mut secs = key.t.as_seconds_f64();
             let r = ui.add(egui::DragValue::new(&mut secs).speed(0.01).range(0.0..=it.range.duration.as_seconds_f64()).max_decimals(3).suffix(" s into the clip"));
             let moved = Time::from_seconds_f64(secs);
@@ -190,11 +191,11 @@ impl App {
             self.editor.doc.seal();
         }
         ui.separator();
-        if ui.button("Go to this key").clicked() {
+        if ui.button(tr("Go to this key")).clicked() {
             self.set_playhead(it.range.start + key.t);
             ui.close();
         }
-        if ui.button("Delete key").clicked() {
+        if ui.button(tr("Delete key")).clicked() {
             self.toggle_band_key(item, &band, Some(index), it.range.start + key.t);
             ui.close();
         }

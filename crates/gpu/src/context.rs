@@ -103,11 +103,12 @@ pub fn choose(adapters: &[wgpu::Adapter], pref: &GpuPreference) -> Option<wgpu::
 }
 
 /// What to ask of the device: all the adapter allows (large canvases where the hardware
-/// can), NV12 textures where there are any (zero-copy hardware decode).
+/// can), NV12 textures where there are any (zero-copy hardware decode), 16-bit normalized
+/// textures where there are any (10- and 12-bit video, uploaded as 16-bit planes).
 pub fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
     wgpu::DeviceDescriptor {
         label: Some("oa-gpu"),
-        required_features: adapter.features() & wgpu::Features::TEXTURE_FORMAT_NV12,
+        required_features: adapter.features() & (wgpu::Features::TEXTURE_FORMAT_NV12 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM),
         required_limits: adapter.limits(),
         ..Default::default()
     }
@@ -195,6 +196,11 @@ impl GpuContext {
         self.device.features().contains(wgpu::Features::TEXTURE_FORMAT_NV12)
     }
 
+    /// Whether video deeper than 8 bits can be uploaded as it is (R16 + RG16 planes).
+    pub fn supports_deep_video(&self) -> bool {
+        deep_video(&self.device)
+    }
+
     pub fn max_texture_size(&self) -> u32 {
         self.device.limits().max_texture_dimension_2d
     }
@@ -203,4 +209,10 @@ impl GpuContext {
     pub fn describe(&self) -> String {
         describe(&self.info)
     }
+}
+
+/// Whether `device` takes 16-bit normalized textures: 10- and 12-bit video is uploaded as
+/// such (R16 luma, RG16 chroma) instead of being cut down to 8 bits.
+pub fn deep_video(device: &wgpu::Device) -> bool {
+    device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
 }

@@ -31,8 +31,8 @@ pub struct VideoTrack {
     pub time_base: Rational,
     pub avg_rate: Option<FrameRate>,
     pub color: VideoColor,
-    /// HDR transfer (PQ/HLG). Its curve is converted (the input transform), but the
-    /// decoder still hands over 8 bits, so smooth gradients can band.
+    /// HDR transfer (PQ/HLG). Its curve is converted (the input transform); decoded at
+    /// its own depth where the GPU takes 16-bit textures (`bit_depth`).
     pub hdr: bool,
     /// ffprobe's names for the tagged transfer and primaries ("smpte2084", "bt2020"…).
     pub transfer_tag: Option<String>,
@@ -50,6 +50,29 @@ pub struct AudioTrack {
     pub codec: String,
     pub sample_rate: u32,
     pub channels: u16,
+}
+
+impl VideoTrack {
+    /// Bits per sample, from the pixel format: 8, or 10, 12 or 16 for formats like
+    /// `yuv420p10le`, `p010le`, `yuv422p12le`, `gbrp16le` (ProRes, HEVC Main 10, AV1 10-bit,
+    /// DNxHR HQX…). Unknown formats count as 8.
+    pub fn bit_depth(&self) -> u8 {
+        bit_depth(&self.pixel_format)
+    }
+}
+
+/// See [`VideoTrack::bit_depth`].
+pub fn bit_depth(pixel_format: &str) -> u8 {
+    let f = pixel_format.trim_end_matches("le").trim_end_matches("be");
+    // The depth is the number at the end ("yuv420p10", "p010", "gbrp16", "yuva444p12").
+    let digits: String = f.chars().rev().take_while(char::is_ascii_digit).collect::<Vec<_>>().into_iter().rev().collect();
+    match digits.parse::<u32>() {
+        // "p010", "p016": semi-planar, the depth after the p.
+        Ok(n) if f.starts_with('p') && f.len() == 4 => n.clamp(8, 16) as u8,
+        // "nv12", "nv21": the number names the layout, not the depth.
+        Ok(n @ 9..=16) if !f.starts_with("nv") => n as u8,
+        _ => 8,
+    }
 }
 
 impl MediaProbe {
@@ -318,6 +341,28 @@ fn video_track(path: &Path, s: Stream) -> Result<VideoTrack, MediaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bit_depth_comes_from_the_pixel_format() {
+        for (f, bits) in [
+            ("yuv420p", 8),
+            ("yuvj420p", 8),
+            ("nv12", 8),
+            ("nv21", 8),
+            ("rgb24", 8),
+            ("rgba", 8),
+            ("pal8", 8),
+            ("yuv420p10le", 10),
+            ("yuv422p10le", 10),
+            ("yuva444p12le", 12),
+            ("p010le", 10),
+            ("p016le", 16),
+            ("gray16be", 16),
+            ("gbrp10le", 10),
+        ] {
+            assert_eq!(bit_depth(f), bits, "{f}");
+        }
+    }
 
     fn index(pts: &[i64], keys: &[usize]) -> FrameIndex {
         FrameIndex { time_base: Rational::new(1, 15360), pts: pts.to_vec(), keyframes: keys.to_vec() }

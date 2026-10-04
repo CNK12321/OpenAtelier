@@ -73,6 +73,8 @@ enum Shape {
     Download,
     Sparkle,
     Info,
+    Dropper,
+    Fullscreen,
 }
 
 macro_rules! icons {
@@ -129,6 +131,8 @@ icons! {
     EXPORT = "file_download", '\u{e2c4}', Download;
     EFFECTS = "auto_awesome", '\u{e65f}', Sparkle;
     INFO = "info", '\u{e88e}', Info;
+    COLORIZE = "colorize", '\u{e3b8}', Dropper;
+    FULLSCREEN = "fullscreen", '\u{e5d0}', Fullscreen;
 }
 
 /// The subset font, built into the program: reading it from `assets/fonts` only worked
@@ -479,12 +483,28 @@ pub fn paint(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui:
             line((12.0, 11.0), (12.0, 17.0));
             painter.circle_filled(at(12.0, 7.5), 1.3 * u, color);
         }
+        Shape::Fullscreen => {
+            // Four corners, opening outwards.
+            for (x, y, dx, dy) in [(5.0, 5.0, 1.0, 1.0), (19.0, 5.0, -1.0, 1.0), (5.0, 19.0, 1.0, -1.0), (19.0, 19.0, -1.0, -1.0)] {
+                line((x, y), (x + 4.0 * dx, y));
+                line((x, y), (x, y + 4.0 * dy));
+            }
+        }
+        Shape::Dropper => {
+            // A pipette, its bulb top right, the tip bottom left, a collar across the neck.
+            painter.circle_filled(at(17.5, 6.5), 3.5 * u, color);
+            painter.line_segment([at(10.5, 7.5), at(16.5, 13.5)], egui::Stroke::new(2.4 * u, color));
+            painter.line_segment([at(14.5, 9.5), at(6.0, 18.0)], egui::Stroke::new(2.6 * u, color));
+            poly(&[(6.8, 18.8), (5.2, 17.2), (3.0, 21.0)]);
+        }
     }
 }
 
 /// A button with an icon before its text. `primary` fills it with the accent (the one
 /// thing a screen most wants done).
 pub fn text_button(ui: &mut egui::Ui, icon: Icon, text: &str, primary: bool) -> egui::Response {
+    // Its label in the language in force (the English is the key).
+    let text: &str = &crate::i18n::tx(text);
     let font = egui::FontId::proportional(crate::style::TEXT);
     let text_color = if primary { egui::Color32::WHITE } else { ui.visuals().text_color() };
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, text_color);
@@ -508,8 +528,30 @@ pub fn text_button(ui: &mut egui::Ui, icon: Icon, text: &str, primary: bool) -> 
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// An icon and its text with nothing behind them until hovered: for a bar where a filled
+/// button would be too loud (the timeline's Fit).
+pub fn flat_button(ui: &mut egui::Ui, icon: Icon, text: &str) -> egui::Response {
+    let text: &str = &crate::i18n::tx(text);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(crate::style::TEXT), egui::Color32::PLACEHOLDER);
+    let icon_size = 16.0;
+    let size = egui::vec2(6.0 + icon_size + 4.0 + galley.size().x + 8.0, crate::style::ICON);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        if response.hovered() || response.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, crate::style::ROUNDING, visuals.bg_fill);
+        }
+        let color = visuals.fg_stroke.color;
+        let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.left() + 6.0 + icon_size / 2.0, rect.center().y), egui::vec2(icon_size, icon_size));
+        paint(ui.painter(), icon_rect, icon, color);
+        ui.painter().galley(egui::pos2(icon_rect.right() + 4.0, rect.center().y - galley.size().y / 2.0), galley, color);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// A menu row: icon (or the room for one), text, and the shortcut on the right.
 pub fn menu_item(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, shortcut: &str, enabled: bool) -> egui::Response {
+    let text: &str = &crate::i18n::tx(text);
     let font = egui::FontId::proportional(crate::style::TEXT);
     let weak = ui.visuals().weak_text_color();
     let color = if enabled { ui.visuals().text_color() } else { weak };
@@ -535,6 +577,7 @@ pub fn menu_item(ui: &mut egui::Ui, icon: Option<Icon>, text: &str, shortcut: &s
 /// over its corner. Two of these side by side read as "add a video track" and "add an
 /// audio track"; two identical plus signs don't.
 pub fn add_button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
+    let tip: &str = &crate::i18n::tx(tip);
     let size = egui::vec2(crate::style::ICON, crate::style::ICON);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
@@ -555,6 +598,8 @@ pub fn add_button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
 /// A square icon button: the icon, a tooltip that always names its shortcut, and the
 /// same hit area as every other one.
 pub fn button(ui: &mut egui::Ui, icon: Icon, tip: &str, shortcut: &str, enabled: bool) -> egui::Response {
+    // Its tooltip in the language in force (the English is the key).
+    let tip: &str = &crate::i18n::tx(tip);
     let size = egui::vec2(crate::style::ICON, crate::style::ICON);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let response = if enabled { response } else { response.on_disabled_hover_text(tip) };

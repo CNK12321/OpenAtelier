@@ -3,6 +3,7 @@
 //! is a picture — counts piled up and brightened on a log scale, the way a hardware scope
 //! glows where many pixels land — with its graticule drawn over it by the tab.
 
+use crate::i18n::tr;
 use eframe::egui;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -19,10 +20,10 @@ impl Scope {
 
     pub fn name(self) -> &'static str {
         match self {
-            Scope::Waveform => "Waveform",
-            Scope::Parade => "Parade",
-            Scope::Vectorscope => "Vectorscope",
-            Scope::Histogram => "Histogram",
+            Scope::Waveform => tr("Waveform"),
+            Scope::Parade => tr("Parade"),
+            Scope::Vectorscope => tr("Vectorscope"),
+            Scope::Histogram => tr("Histogram"),
         }
     }
 

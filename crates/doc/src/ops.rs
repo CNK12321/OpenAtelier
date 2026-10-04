@@ -43,8 +43,6 @@ pub enum Op {
     /// Mute/hide a whole track (disabled tracks don't render or play).
     SetTrackEnabled { seq: SeqId, track: TrackId, enabled: bool },
     SetTrackName { seq: SeqId, track: TrackId, name: String },
-    /// Replaces the timeline's dividers (kept sorted by time).
-    SetDividers { seq: SeqId, dividers: Vec<Divider> },
     /// Enable or disable one clip.
     SetItemEnabled { seq: SeqId, item: ItemId, enabled: bool },
     /// The clip's outro plays its intro backwards (instead of its own outro effects).
@@ -240,14 +238,6 @@ impl Op {
                 let old = std::mem::replace(&mut Arc::make_mut(t).name, name);
                 vec![Op::SetTrackName { seq, track, name: old }]
             }
-            Op::SetDividers { seq, mut dividers } => {
-                if dividers.iter().any(|d| d.at < oa_time::Time::ZERO) {
-                    return Err(EditError::InvalidRange);
-                }
-                dividers.sort_by_key(|d| (d.at, d.id));
-                let old = std::mem::replace(&mut seq_mut(p, seq)?.dividers, dividers);
-                vec![Op::SetDividers { seq, dividers: old }]
-            }
             Op::SetItemEnabled { seq, item, enabled } => {
                 let it = item_mut(p, seq, item)?;
                 let old = std::mem::replace(&mut it.enabled, enabled);
@@ -386,6 +376,8 @@ impl Op {
                             crate::mask::MaskShape::Rect { center, size, .. } | crate::mask::MaskShape::Ellipse { center, size, .. } => center.iter().chain(size).any(|v| bad(*v)),
                             crate::mask::MaskShape::Stroke { points, radius, softness, .. } => bad(*radius) || bad(*softness) || points.iter().flatten().any(|v| !v.is_finite()),
                             crate::mask::MaskShape::Bitmap { bitmap, .. } => bitmap.size[0] == 0 || bitmap.size[1] == 0,
+                            // Frames in time order, each with a size.
+                            crate::mask::MaskShape::Matte { frames, .. } => frames.windows(2).any(|w| w[1].t < w[0].t) || frames.iter().any(|f| f.bitmap.size[0] == 0 || f.bitmap.size[1] == 0),
                             crate::mask::MaskShape::Path { points, .. } => {
                                 points.iter().any(|p| p.keys.is_empty() || p.keys.iter().any(|k| k.at.iter().chain(&k.handle_in).chain(&k.handle_out).any(|v| bad(*v))))
                             }

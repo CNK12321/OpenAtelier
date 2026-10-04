@@ -5,6 +5,7 @@
 //! with it. A transition on the left edge belongs to this clip; one on the right edge to
 //! the next clip, so both clips show the same transition.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_doc::{ClipEnd, ItemId, Op, ParamTarget};
@@ -40,14 +41,14 @@ impl App {
         let owner = if intro { item } else { neighbor };
         let existing = self.editor.item(owner).and_then(|i| i.transition_in.clone());
         let name = self.editor.item(neighbor).map_or_else(String::new, |i| i.name.clone());
-        let (own, cut) = if intro { ("Intro", format!("Transition from “{name}”")) } else { ("Outro", format!("Transition into “{name}”")) };
+        let (own, cut) = if intro { ("Intro", trf("Transition from “{name}”", &[("name", &(name).to_string())])) } else { ("Outro", trf("Transition into “{name}”", &[("name", &(name).to_string())])) };
         let mut transition = existing.is_some();
         ui.horizontal(|ui| {
-            let tip_own = if intro { "The clip arrives on its own: intro effects over its first seconds" } else { "The clip leaves on its own: outro effects over its last seconds" };
+            let tip_own = if intro { tr("The clip arrives on its own: intro effects over its first seconds") } else { tr("The clip leaves on its own: outro effects over its last seconds") };
             if ui.selectable_label(!transition, own).on_hover_text(tip_own).clicked() {
                 transition = false;
             }
-            let tip_cut = "Mix one clip into the other over the cut — the picture and the sound — using footage past both edit points";
+            let tip_cut = tr("Mix one clip into the other over the cut — the picture and the sound — using footage past both edit points");
             if ui.selectable_label(transition, cut).on_hover_text(tip_cut).clicked() {
                 transition = true;
             }
@@ -68,11 +69,11 @@ impl App {
             self.in_out_section(ui, item, intro, t);
             return;
         }
-        let Some(tr) = self.editor.item(owner).and_then(|i| i.transition_in.clone()) else { return };
+        let Some(cut) = self.editor.item(owner).and_then(|i| i.transition_in.clone()) else { return };
         // Which transition.
         let kinds: Vec<(String, String)> = self.registry.transitions().map(|d| (d.type_id.to_string(), d.name.clone())).collect();
-        let current = kinds.iter().find(|k| k.0 == tr.type_id).map_or_else(|| tr.type_id.clone(), |k| k.1.clone());
-        let mut chosen = tr.type_id.clone();
+        let current = kinds.iter().find(|k| k.0 == cut.type_id).map_or_else(|| cut.type_id.clone(), |k| k.1.clone());
+        let mut chosen = cut.type_id.clone();
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt(("cut-transition", owner.0)).selected_text(&current).show_ui(ui, |ui| {
                 for (id, name) in &kinds {
@@ -80,10 +81,10 @@ impl App {
                 }
             });
             // How long: centered on the cut (half on each side).
-            let mut seconds = tr.duration.as_seconds_f64();
-            let r = ui.add(egui::DragValue::new(&mut seconds).speed(0.02).range(0.05..=30.0).suffix(" s")).on_hover_text("How long it lasts, centered on the cut");
+            let mut seconds = cut.duration.as_seconds_f64();
+            let r = ui.add(egui::DragValue::new(&mut seconds).speed(0.02).range(0.05..=30.0).suffix(" s")).on_hover_text(tr("How long it lasts, centered on the cut"));
             if r.changed() {
-                match oa_edit::timeline::set_transition(self.editor.doc.project(), seq, owner, ClipEnd::Head, &tr.type_id, Time::from_seconds_f64(seconds)) {
+                match oa_edit::timeline::set_transition(self.editor.doc.project(), seq, owner, ClipEnd::Head, &cut.type_id, Time::from_seconds_f64(seconds)) {
                     Ok(ops) => {
                         if let Err(e) = self.editor.apply_drag("Transition length", "cut-transition-length", ops) {
                             self.error = Some(e.to_string());
@@ -96,30 +97,30 @@ impl App {
                 self.editor.doc.seal();
             }
         });
-        if chosen != tr.type_id {
-            match oa_edit::timeline::set_transition(self.editor.doc.project(), seq, owner, ClipEnd::Head, &chosen, tr.duration) {
+        if chosen != cut.type_id {
+            match oa_edit::timeline::set_transition(self.editor.doc.project(), seq, owner, ClipEnd::Head, &chosen, cut.duration) {
                 Ok(ops) => self.apply_or_report("Change transition", ops),
                 Err(e) => self.error = Some(e.to_string()),
             }
         }
         // Its settings (angle, color, softness…), keyframable.
-        if let Some(d) = self.registry.effect(&tr.type_id).cloned() {
+        if let Some(d) = self.registry.effect(&cut.type_id).cloned() {
             for s in d.params.iter() {
                 self.param_widget(ui, owner, &ParamTarget::Transition(ClipEnd::Head), s, t, "cut-transition");
             }
         }
         // It borrows footage from past both edit points; a clip without any is held on
         // its last (or first) frame there.
-        let short = [(neighbor, !intro), (item, intro)].into_iter().any(|(id, head)| self.lacks_handle(id, head, tr.duration));
+        let short = [(neighbor, !intro), (item, intro)].into_iter().any(|(id, head)| self.lacks_handle(id, head, cut.duration));
         if short {
-            ui.label(egui::RichText::new("One of the clips has no footage past its edit point for this: it holds on its end frame there. Trim it a little to give it some.").small().color(crate::style::GOLD));
+            ui.label(egui::RichText::new(tr("One of the clips has no footage past its edit point for this: it holds on its end frame there. Trim it a little to give it some.")).small().color(crate::style::GOLD));
         }
         let own_effects = self.editor.item(item).map_or(0, |i| {
             i.effects.iter().filter(|e| if intro { matches!(e.role, oa_doc::EffectRole::In { .. }) } else { matches!(e.role, oa_doc::EffectRole::Out { .. }) }).count()
         });
         if own_effects > 0 {
             let what = if intro { "intro" } else { "outro" };
-            ui.label(egui::RichText::new(format!("The clip's {own_effects} {what} effect{} still play too (switch back to see them).", if own_effects == 1 { "" } else { "s" })).small().weak());
+            ui.label(egui::RichText::new(trf("The clip's {own_effects} {what} effect{0} still play too (switch back to see them).", &[("own_effects", &(own_effects).to_string()), ("what", (what)), ("0", (if own_effects == 1 { "" } else { "s" }))])).small().weak());
         }
     }
 

@@ -11,6 +11,7 @@
 //! project, an overlay draws over the picture — and for code from someone else running
 //! at all. Atelier Core is part of the editor and needs no allowing.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_doc::schema;
@@ -54,13 +55,13 @@ impl App {
             .filter_map(|(on, k)| on.then_some(k))
             .collect();
             if !kinds.is_empty() {
-                what.push(format!("Effect “{}” — {}", d.name, kinds.join(", ")));
+                what.push(trf("Effect “{0}” — {1}", &[("0", &(d.name).to_string()), ("1", &(kinds.join(", ")).to_string())]));
             }
         }
         for s in &p.scripts {
             what.push(match s.kind {
-                ScriptKind::Overlay(_) => format!("Overlay “{}” — draws over the viewer", s.name),
-                ScriptKind::Action(_) => format!("Action “{}” — changes the selected clips when you run it", s.name),
+                ScriptKind::Overlay(_) => trf("Overlay “{0}” — draws over the viewer", &[("0", &(s.name).to_string())]),
+                ScriptKind::Action(_) => trf("Action “{0}” — changes the selected clips when you run it", &[("0", &(s.name).to_string())]),
             });
         }
         self.script_consent = Some(ScriptConsent { plugin: p.id.clone(), name: p.name.clone(), author: p.author.clone(), digest, what });
@@ -72,14 +73,14 @@ impl App {
         let (mut allow, mut close) = (false, false);
         egui::Modal::new(egui::Id::new("script-consent")).show(ctx, |ui| {
             ui.set_max_width(460.0);
-            ui.heading(format!("Allow scripts from “{}”?", c.name));
+            ui.heading(trf("Allow scripts from “{name}”?", &[("name", &c.name)]));
             if !c.author.is_empty() {
-                ui.label(egui::RichText::new(format!("by {}", c.author)).weak());
+                ui.label(egui::RichText::new(trf("by {0}", &[("0", &(c.author).to_string())])).weak());
             }
             ui.add_space(6.0);
-            ui.label("This plugin carries scripts that run on this computer:");
+            ui.label(tr("This plugin carries scripts that run on this computer:"));
             for w in &c.what {
-                ui.label(format!("  •  {w}"));
+                ui.label(trf("  •  {w}", &[("w", &w.to_string())]));
             }
             ui.add_space(6.0);
             ui.label(
@@ -93,10 +94,10 @@ impl App {
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button(egui::RichText::new("Allow its scripts").strong()).clicked() {
+                if ui.button(egui::RichText::new(tr("Allow its scripts")).strong()).clicked() {
                     allow = true;
                 }
-                if ui.button("Not now").clicked() {
+                if ui.button(tr("Not now")).clicked() {
                     close = true;
                 }
             });
@@ -130,15 +131,15 @@ impl App {
             .filter(|p| !p.scripts.is_empty() || (!p.builtin && p.has_scripts()))
             .map(|p| (p.id.clone(), p.name.clone(), self.scripts_allowed(p), p.scripts.clone()))
             .collect();
-        ui.menu_button("Plugins", |ui| {
+        ui.menu_button(tr("Plugins"), |ui| {
             ui.set_min_width(260.0);
             if scripted.is_empty() {
-                ui.label(egui::RichText::new("No plugin actions or overlays").weak());
+                ui.label(egui::RichText::new(tr("No plugin actions or overlays")).weak());
             }
             for (id, name, allowed, scripts) in &scripted {
                 ui.label(egui::RichText::new(name).strong());
                 if !allowed {
-                    if ui.button("⚠ Its scripts need your OK…").on_hover_text("Nothing of this plugin's scripts runs until you allow it").clicked() {
+                    if ui.button(tr("⚠ Its scripts need your OK…")).on_hover_text(tr("Nothing of this plugin's scripts runs until you allow it")).clicked() {
                         self.ask_script_consent(id);
                         ui.close();
                     }
@@ -173,7 +174,7 @@ impl App {
                 }
                 ui.separator();
             }
-            if ui.button("Manage plugins…").clicked() {
+            if ui.button(tr("Manage plugins…")).clicked() {
                 self.go_home();
                 self.home_tab = crate::home::HomeTab::Plugins;
                 ui.close();
@@ -286,7 +287,7 @@ impl App {
             }
         }
         if ops.is_empty() {
-            self.notify(format!("{} changed nothing", s.name));
+            self.notify(trf("{0} changed nothing", &[("0", &(s.name).to_string())]));
             return;
         }
         if let Err(e) = self.editor.apply(&s.name, ops) {

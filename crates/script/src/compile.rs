@@ -55,14 +55,15 @@ impl Frame {
 }
 
 /// A parameter's value as a script reads it: numbers as they are, switches 0/1, a choice
-/// as its option's index, one number of a point or color.
+/// as its option's index (a many-option one: the bitmask of what's chosen), one number of
+/// a point or color.
 pub fn param_number(schema: &ParamSchema, value: Option<&Value>, component: u8) -> f32 {
     let c = component as usize;
     match value.unwrap_or(&schema.default) {
         Value::Float(x) => *x as f32,
         Value::Int(i) => *i as f32,
         Value::Bool(b) => *b as u8 as f32,
-        e @ Value::Enum(_) => schema.option_index(e).unwrap_or(0) as f32,
+        e @ Value::Enum(_) => schema.enum_uniform(e),
         Value::Vec2(v) => v.get(c).copied().unwrap_or(0.0) as f32,
         Value::Vec3(v) => v.get(c).copied().unwrap_or(0.0) as f32,
         Value::Color(v) => v.get(c).copied().unwrap_or(0.0) as f32,

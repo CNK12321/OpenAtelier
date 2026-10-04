@@ -10,14 +10,11 @@
 //! rename/reorder/delete). Ctrl+wheel zooms, the wheel scrolls, and the view follows the
 //! playhead while playing. The commands live in `oa_edit::timeline` and `clips.rs`.
 //!
-//! Tracks: double-click a header (or empty space on a track) to pick it — Ctrl+V and
-//! Ctrl+D then put clips in its first free space after the playhead, Alt+↑/↓ moves it —
-//! and drag a header up or down to reorder. **Dividers** (right-click the timeline, or
-//! the track menu) cut the whole timeline, every track, into colored sections: drag a
-//! divider's line to move it, drag its flag in the ruler to move the whole section among
-//! the others, right-click it to name, recolor, select, clear or delete its section
-//! (`oa_edit::sections`).
+//! Tracks: click a header to pick it (Ctrl+click for more, Shift+click for a run) —
+//! Ctrl+V and Ctrl+D then put clips in the first one's free space after the playhead,
+//! Alt+↑/↓ moves them — and drag a header up or down to reorder.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_doc::{ItemId, TrackId, TrackKind};
@@ -88,8 +85,6 @@ pub(crate) enum Menu {
     Track(TrackId),
     /// Empty space at this time, on this track (if over one).
     Empty(Time, Option<TrackId>),
-    /// A divider (and the section it starts).
-    Divider(u64),
     /// Key `index` of a clip's keyframe line.
     Key(ItemId, usize),
 }
@@ -104,10 +99,6 @@ pub enum TimelineDrag {
     Marquee { from: egui::Pos2, base: std::collections::BTreeSet<ItemId> },
     /// A track header dragged up or down to reorder the tracks.
     Track { track: TrackId },
-    /// A divider line dragged along the timeline (it alone moves).
-    Divider { divider: u64 },
-    /// A section dragged by its divider's flag, to another place among the sections.
-    Section { index: usize },
     /// The clip's keyframe line: one key, or the whole line (`key: None`).
     Band { item: ItemId, band: crate::band::Band, key: Option<usize>, grab_y: f32, original: oa_params::ParamSource, rect: egui::Rect },
 }
@@ -143,17 +134,6 @@ struct ClipRun {
     ids: Vec<ItemId>,
     kind: TrackKind,
     enabled: bool,
-}
-
-/// A divider as drawn: its line, the tinted stretch it starts, and its flag.
-struct Mark {
-    /// Its section's index.
-    index: usize,
-    divider: oa_doc::Divider,
-    x: f32,
-    flag: egui::Rect,
-    band: egui::Rect,
-    label: Option<std::sync::Arc<egui::Galley>>,
 }
 
 type Row = (TrackId, TrackKind, String, bool);
@@ -204,7 +184,7 @@ impl App {
         let seq = self.editor.seq;
         let ops = vec![oa_doc::Op::RemoveTrack { seq, track }, oa_doc::Op::InsertTrack { seq, index, track: arc }];
         if let Err(e) = self.editor.apply("Move track", ops) {
-            self.report_error(format!("can't move the track: {e}"));
+            self.report_error(trf("can't move the track: {e}", &[("e", &e.to_string())]));
         }
     }
 
@@ -221,9 +201,7 @@ impl App {
         rows.extend(seq.tracks.iter().filter(|t| t.kind == TrackKind::Audio).map(|t| (t.id, t.kind, t.name.clone(), t.enabled)));
 
         // A picked track that's gone (deleted, or another timeline opened) is let go.
-        if self.selected_track.is_some_and(|t| seq.track(t).is_none()) {
-            self.selected_track = None;
-        }
+        self.selected_tracks.retain(|t| seq.track(*t).is_some());
         let row_height = self.timeline_view.track_height();
         // Effect tracks are half height: they hold effects, not pictures to look at.
         let fx_rows: Vec<bool> = rows.iter().map(|r| seq.track(r.0).is_some_and(|t| t.effects)).collect();
@@ -246,8 +224,17 @@ impl App {
             view.span = (duration * 1.15).max(10.0);
         }
         if let Some(pointer) = response.hover_pos() {
-            let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta()));
-            if zoom != 1.0 {
+            // Ctrl+wheel zooms; the wheel scrolls through time; Shift+wheel scrolls the
+            // tracks up and down (egui hands Shift+wheel over as sideways scrolling, so
+            // it's turned back for the tracks' scroll area, which reads it after this).
+            let (zoom, scroll, shift) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta(), i.modifiers.shift));
+            if shift && zoom == 1.0 {
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::vec2(0.0, scroll.x + scroll.y));
+            } else if zoom == 1.0 && (scroll.x != 0.0 || scroll.y != 0.0) {
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            }
+            if shift {
+            } else if zoom != 1.0 {
                 // Keep the time under the pointer where it is.
                 let at = view.start + ((pointer.x - lane.left()) / lane.width()).clamp(0.0, 1.0) as f64 * view.span;
                 view.span = (view.span / zoom as f64).clamp(0.2, 3600.0);
@@ -386,7 +373,7 @@ impl App {
                 } else if container {
                     // What it does, at a glance.
                     let names: Vec<String> = item.effects.iter().filter(|e| e.enabled).map(|e| self.effect_name(&e.type_id)).collect();
-                    if names.is_empty() { "✦ Empty — add effects".to_string() } else { format!("✦ {}", names.join(" · ")) }
+                    if names.is_empty() { tr("✦ Empty — add effects").to_string() } else { format!("✦ {}", names.join(" · ")) }
                 } else {
                     item.name.clone()
                 };
@@ -454,31 +441,6 @@ impl App {
             egui::Rect::from_center_size(egui::pos2(full.left() + HEADER_WIDTH - 12.0, row_top(r) + row_h(r) / 2.0), egui::vec2(12.0, 12.0))
         };
 
-        // Dividers run across every track: the stretch each one starts is tinted its
-        // color; its line can be dragged along the timeline, and the flag at its top (in
-        // the ruler) drags the whole section.
-        let mut marks: Vec<Mark> = Vec::new();
-        let rows_bottom = row_top(rows.len().max(1));
-        if !seq.dividers.is_empty() {
-            let all = oa_edit::sections::sections(seq);
-            for (index, sec) in all.iter().enumerate() {
-                let Some(d) = &sec.divider else { continue };
-                let x = x_of(sec.start);
-                let x1 = if index + 1 == all.len() { lane.right() } else { x_of(sec.end) };
-                let band = egui::Rect::from_min_max(egui::pos2(x, full.top()), egui::pos2(x1.max(x), rows_bottom));
-                let label = if d.name.is_empty() { None } else { Some(painter.layout_no_wrap(d.name.clone(), egui::FontId::proportional(9.5), egui::Color32::BLACK)) };
-                let width = label.as_ref().map_or(12.0, |g| g.size().x + 8.0);
-                let flag = egui::Rect::from_min_size(egui::pos2(x, full.top() + 1.0), egui::vec2(width, 11.0));
-                marks.push(Mark { index, divider: d.clone(), x, flag, band, label });
-            }
-        }
-        let flag_at = |p: egui::Pos2| marks.iter().find(|m| m.flag.contains(p) && p.x >= lane.left());
-        // The line is grabbed in the ruler, or in a track's upper half: the lower half is
-        // left to the edges of clips that start or end at the divider.
-        let line_at = |p: egui::Pos2| {
-            let grabbable = p.y < full.top() + RULER_HEIGHT || row_at(p.y).is_some_and(|r| p.y < row_top(r) + row_h(r) * 0.5);
-            marks.iter().find(|m| grabbable && (p.x - m.x).abs() <= 4.0 && p.x >= lane.left())
-        };
         let header_at = |p: egui::Pos2| {
             (p.x < lane.left() && p.y >= full.top() + RULER_HEIGHT).then(|| row_at(p.y)).flatten().filter(|r| !toggle_rect(*r).expand(3.0).contains(p))
         };
@@ -486,9 +448,9 @@ impl App {
         // Hover cursor.
         if self.timeline_drag.is_none()
             && let Some(pos) = response.hover_pos()
-            && (flag_at(pos).is_some() || line_at(pos).is_some() || header_at(pos).is_some())
+            && header_at(pos).is_some()
         {
-            ui.ctx().set_cursor_icon(if line_at(pos).is_some() && flag_at(pos).is_none() { egui::CursorIcon::ResizeColumn } else { egui::CursorIcon::Grab });
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         } else if self.timeline_drag.is_none()
             && let Some(pos) = response.hover_pos()
             && let Some(b) = clip_at(pos)
@@ -526,11 +488,7 @@ impl App {
         if response.drag_started()
             && let Some(origin) = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos())
         {
-            self.timeline_drag = Some(if let Some(m) = flag_at(origin) {
-                TimelineDrag::Section { index: m.index }
-            } else if let Some(m) = line_at(origin) {
-                TimelineDrag::Divider { divider: m.divider.id }
-            } else if in_ruler(origin) {
+            self.timeline_drag = Some(if in_ruler(origin) {
                 TimelineDrag::Scrub
             } else if let Some(r) = header_at(origin) {
                 TimelineDrag::Track { track: rows[r].0 }
@@ -577,7 +535,7 @@ impl App {
             && let Some(pos) = response.interact_pointer_pos()
         {
             // Shift turns snapping off for the duration of the drag; Ctrl flips it.
-            let snapping = self.snapping != mods.command && !mods.shift;
+            let snapping = self.settings.snapping != mods.command && !mods.shift;
             let tolerance = px_to_time(SNAP_PX);
             let s = self.editor.sequence();
             let (sid, playhead) = (self.editor.seq, self.playhead);
@@ -588,29 +546,9 @@ impl App {
                     Ok(())
                 }
                 // Painted below; applied on release.
-                Some(TimelineDrag::Track { .. }) | Some(TimelineDrag::Section { .. }) => {
+                Some(TimelineDrag::Track { .. }) => {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                     Ok(())
-                }
-                Some(TimelineDrag::Divider { divider }) => {
-                    // Along the timeline, snapped to frames, never past its neighbors.
-                    let divider = *divider;
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                    let frame = cmd::min_duration(s);
-                    match s.dividers.iter().position(|d| d.id == divider) {
-                        Some(i) => {
-                            let lo = if i == 0 { Time::ZERO } else { s.dividers[i - 1].at + frame };
-                            let hi = s.dividers.get(i + 1).map(|n| n.at - frame);
-                            let mut at = cmd::snap_to_frame(s, time_at(pos.x)).max(lo);
-                            if let Some(hi) = hi {
-                                at = at.min(hi);
-                            }
-                            let change = oa_doc::Divider { at, ..s.dividers[i].clone() };
-                            let ops = oa_edit::sections::edit_divider(self.editor.doc.project(), sid, divider, Some(change));
-                            ops.and_then(|ops| self.editor.apply_drag("Move divider", "divider-move", ops))
-                        }
-                        None => Ok(()),
-                    }
                 }
                 Some(TimelineDrag::Band { item, band, key, grab_y, original, rect }) => {
                     let (item, band, key, dy, original, rect) = (*item, band.clone(), *key, pos.y - *grab_y, original.clone(), *rect);
@@ -701,22 +639,10 @@ impl App {
         }
         if response.drag_stopped()
             && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
-        {
-            match self.timeline_drag {
-                Some(TimelineDrag::Track { track }) => {
-                    if let Some(to) = track_drop_row(&rows, track, pos.y, &row_at, full.top() + RULER_HEIGHT) {
-                        self.reorder_track(&rows, track, to);
-                    }
+            && let Some(TimelineDrag::Track { track }) = self.timeline_drag
+                && let Some(to) = track_drop_row(&rows, track, pos.y, &row_at, full.top() + RULER_HEIGHT) {
+                    self.reorder_track(&rows, track, to);
                 }
-                Some(TimelineDrag::Section { index }) => {
-                    let to = oa_edit::sections::section_at(self.editor.sequence(), time_at(pos.x));
-                    if to != index {
-                        self.section_command(crate::clips::SectionCommand::Move { from: index, to });
-                    }
-                }
-                _ => {}
-            }
-        }
         if response.drag_stopped() {
             self.timeline_drag = None;
             self.editor.doc.seal();
@@ -730,7 +656,7 @@ impl App {
         if let Some(r) = toggled {
             let (track, enabled) = (rows[r].0, rows[r].3);
             let op = oa_doc::Op::SetTrackEnabled { seq: self.editor.seq, track, enabled: !enabled };
-            if let Err(e) = self.editor.apply(if enabled { "Turn track off" } else { "Turn track on" }, vec![op]) {
+            if let Err(e) = self.editor.apply(if enabled { tr("Turn track off") } else { tr("Turn track on") }, vec![op]) {
                 self.error = Some(e.to_string());
             }
         } else if response.clicked()
@@ -747,6 +673,28 @@ impl App {
                 self.select_clip(*id, false);
             } else if let Some(b) = clip_at(pos).filter(|_| !in_ruler(pos)) {
                 self.select_clip(b.id, adding);
+            } else if let Some(r) = header_at(pos) {
+                // A track's header picks it: Ctrl+click adds or drops it, Shift+click
+                // picks the run of tracks from the last one picked.
+                let id = rows[r].0;
+                if mods.command {
+                    if let Some(i) = self.selected_tracks.iter().position(|t| *t == id) {
+                        self.selected_tracks.remove(i);
+                    } else {
+                        self.selected_tracks.push(id);
+                    }
+                } else if mods.shift
+                    && let Some(from) = self.selected_tracks.last().and_then(|last| rows.iter().position(|row| row.0 == *last))
+                {
+                    let (a, b) = (from.min(r), from.max(r));
+                    for row in &rows[a..=b] {
+                        if !self.selected_tracks.contains(&row.0) {
+                            self.selected_tracks.push(row.0);
+                        }
+                    }
+                } else {
+                    self.selected_tracks = vec![id];
+                }
             } else if pos.x >= lane.left() {
                 if !in_ruler(pos) && !adding {
                     self.selection = None;
@@ -757,15 +705,15 @@ impl App {
             }
         }
 
-        // Double-click a track's header (or empty space on it) to pick the track: pastes
-        // and duplicates go into it, Alt+↑/↓ moves it; again (or Esc) lets go.
+        // Double-click empty space on a track to pick just that track (pastes and
+        // duplicates go into it, Alt+↑/↓ moves it); again (or Esc) lets go.
         if response.double_clicked()
             && let Some(pos) = response.interact_pointer_pos()
             && !in_ruler(pos)
-            && let Some(r) = header_at(pos).or_else(|| (pos.x >= lane.left() && clip_at(pos).is_none() && flag_at(pos).is_none()).then(|| row_at(pos.y)).flatten())
+            && let Some(r) = (pos.x >= lane.left() && clip_at(pos).is_none()).then(|| row_at(pos.y)).flatten()
         {
             let id = rows[r].0;
-            self.selected_track = if self.selected_track == Some(id) { None } else { Some(id) };
+            self.selected_tracks = if self.selected_tracks == [id] { Vec::new() } else { vec![id] };
         }
 
         // Double-click a compound clip to edit its own timeline.
@@ -781,9 +729,7 @@ impl App {
         if response.secondary_clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            self.timeline_view.menu = if let Some(m) = flag_at(pos).or_else(|| line_at(pos)) {
-                Some(Menu::Divider(m.divider.id))
-            } else if let Some((item, _, Some(key), _)) = band_hit(self, pos) {
+            self.timeline_view.menu = if let Some((item, _, Some(key), _)) = band_hit(self, pos) {
                 Some(Menu::Key(item, key))
             } else if pos.x < lane.left() {
                 row_at(pos.y).map(|r| Menu::Track(rows[r].0))
@@ -797,12 +743,11 @@ impl App {
             };
         }
         // Clicks inside don't close it (every entry closes it itself), so the name fields
-        // for tracks and dividers can be clicked into and typed in.
+        // for tracks can be clicked into and typed in.
         egui::Popup::context_menu(&response).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| match self.timeline_view.menu {
             Some(Menu::Clips) => self.clip_menu(ui),
             Some(Menu::Track(track)) => self.track_menu(ui, track),
             Some(Menu::Empty(at, track)) => self.empty_menu(ui, at, track),
-            Some(Menu::Divider(divider)) => self.divider_menu(ui, divider),
             Some(Menu::Key(item, key)) => self.key_menu(ui, item, key),
             None => {
                 ui.close();
@@ -863,16 +808,11 @@ impl App {
             );
         }
         let clip_painter = painter.with_clip_rect(lane);
-        let rgb = |c: [u8; 3]| egui::Color32::from_rgb(c[0], c[1], c[2]);
-        // The picked track: its header outlined, its lane faintly lit.
-        if let Some(r) = self.selected_track.and_then(|id| rows.iter().position(|row| row.0 == id)) {
+        // The picked tracks: their headers outlined, their lanes faintly lit.
+        for r in self.selected_tracks.iter().filter_map(|id| rows.iter().position(|row| row.0 == *id)) {
             let header = egui::Rect::from_min_max(egui::pos2(full.left(), row_top(r)), egui::pos2(lane.left(), row_top(r) + row_h(r)));
             clip_painter.rect_filled(egui::Rect::from_min_max(egui::pos2(lane.left(), row_top(r)), egui::pos2(full.right(), row_top(r) + row_h(r))), 0.0, crate::style::ACCENT.gamma_multiply(0.08));
             painter.rect_stroke(header.shrink(1.0), 3.0, egui::Stroke::new(1.5, crate::style::ACCENT), egui::StrokeKind::Inside);
-        }
-        // Sections, under the clips.
-        for m in &marks {
-            clip_painter.rect_filled(m.band, 0.0, rgb(m.divider.color).gamma_multiply(0.12));
         }
         let draw_clock = std::time::Instant::now();
         // Runs of clips too narrow to tell apart: one block each, lit if any is selected.
@@ -991,37 +931,13 @@ impl App {
             let v = &mut self.timeline_view.per_clip_ms;
             *v = if *v == 0.0 { ms } else { *v * 0.9 + ms * 0.1 };
         }
-        // Dividers over the clips: a line in the section's color and a flag to drag it by.
-        for m in &marks {
-            let color = rgb(m.divider.color);
-            clip_painter.line_segment([egui::pos2(m.x, m.band.top()), egui::pos2(m.x, m.band.bottom())], egui::Stroke::new(2.0, color));
-            clip_painter.rect_filled(m.flag, egui::CornerRadius { nw: 0, ne: 3, sw: 0, se: 3 }, color);
-            if let Some(label) = &m.label {
-                clip_painter.galley(m.flag.left_top() + egui::vec2(3.0, 0.0), label.clone(), egui::Color32::BLACK);
-            }
-        }
-        // A track or section being dragged: where it would land.
-        if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
-            match self.timeline_drag {
-                Some(TimelineDrag::Track { track }) => {
-                    if let (Some(to), Some(from)) = (track_drop_row(&rows, track, pos.y, &row_at, full.top() + RULER_HEIGHT), rows.iter().position(|r| r.0 == track)) {
-                        let y = if to > from { row_top(to) + row_h(to) } else { row_top(to) };
-                        painter.line_segment([egui::pos2(full.left(), y), egui::pos2(full.right(), y)], egui::Stroke::new(3.0, crate::style::ACCENT));
-                    }
+        // A track being dragged: where it would land.
+        if let Some(pos) = ui.input(|i| i.pointer.latest_pos())
+            && let Some(TimelineDrag::Track { track }) = self.timeline_drag
+                && let (Some(to), Some(from)) = (track_drop_row(&rows, track, pos.y, &row_at, full.top() + RULER_HEIGHT), rows.iter().position(|r| r.0 == track)) {
+                    let y = if to > from { row_top(to) + row_h(to) } else { row_top(to) };
+                    painter.line_segment([egui::pos2(full.left(), y), egui::pos2(full.right(), y)], egui::Stroke::new(3.0, crate::style::ACCENT));
                 }
-                Some(TimelineDrag::Section { index }) => {
-                    let s = self.editor.sequence();
-                    let to = oa_edit::sections::section_at(s, time_at(pos.x));
-                    let all = oa_edit::sections::sections(s);
-                    if let Some(sec) = all.get(to).filter(|_| to != index) {
-                        let x1 = if to + 1 == all.len() { lane.right() } else { x_of(sec.end) };
-                        let target = egui::Rect::from_min_max(egui::pos2(x_of(sec.start), full.top()), egui::pos2(x1, row_top(rows.len().max(1))));
-                        clip_painter.rect_stroke(target, 2.0, egui::Stroke::new(2.0, crate::style::ACCENT), egui::StrokeKind::Inside);
-                    }
-                }
-                _ => {}
-            }
-        }
         for (id, rect) in &bands {
             let selected = self.selection == Some(*id);
             clip_painter.rect_filled(*rect, 2.0, egui::Color32::from_white_alpha(if selected { 110 } else { 60 }));
@@ -1069,13 +985,13 @@ impl App {
             let accent = ui.visuals().selection.stroke.color;
             clip_painter.rect_filled(target.rect, 3.0, accent.gamma_multiply(0.3));
             clip_painter.rect_stroke(target.rect, 3.0, egui::Stroke::new(2.5, accent), egui::StrokeKind::Inside);
-            let label = format!("⇄ Swap for {}", drop.name);
+            let label = trf("⇄ Swap for {0}", &[("0", &(drop.name).to_string())]);
             let galley = clip_painter.layout_no_wrap(label, egui::FontId::proportional(12.0), egui::Color32::WHITE);
             let at = egui::pos2(target.rect.left() + 6.0, target.rect.center().y - galley.size().y / 2.0);
             let bg = egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(5.0, 2.0));
             clip_painter.rect_filled(bg, 3.0, accent);
             clip_painter.galley(at, galley, egui::Color32::WHITE);
-            let hint = clip_painter.layout_no_wrap("Shift: add it instead".into(), egui::FontId::proportional(10.0), egui::Color32::WHITE);
+            let hint = clip_painter.layout_no_wrap(tr("Shift: add it instead").into(), egui::FontId::proportional(10.0), egui::Color32::WHITE);
             let hint_at = egui::pos2(bg.left() + 1.0, bg.bottom() + 3.0);
             if target.rect.contains(hint_at + hint.size()) {
                 clip_painter.galley(hint_at, hint, egui::Color32::from_white_alpha(200));
@@ -1105,6 +1021,29 @@ impl App {
                     self.drop_bin_entry(&drop, time_at(pos.x), track);
                 }
             }
+        }
+        // Files (or a picture from a browser) dragged in from outside: a line where they'd
+        // land, on the track under the pointer; dropped here, they go there.
+        if let Some(pos) = self.file_hover.filter(|p| lane.contains(*p) && !in_ruler(*p)) {
+            let x = x_of(time_at(pos.x));
+            let (y0, y1) = match row_at(pos.y) {
+                Some(r) => (row_top(r), row_top(r) + row_h(r)),
+                None => (full.top() + RULER_HEIGHT, full.bottom()),
+            };
+            let accent = ui.visuals().selection.stroke.color;
+            clip_painter.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], egui::Stroke::new(2.5, accent));
+            let label = clip_painter.layout_no_wrap(tr("Drop to add it here").into(), egui::FontId::proportional(11.0), egui::Color32::WHITE);
+            let bg = egui::Rect::from_min_size(egui::pos2(x + 4.0, y0 + 2.0), label.size()).expand2(egui::vec2(4.0, 2.0)).translate(egui::vec2(4.0, 2.0));
+            clip_painter.rect_filled(bg, 3.0, accent);
+            clip_painter.galley(bg.min + egui::vec2(4.0, 2.0), label, egui::Color32::WHITE);
+            ui.ctx().request_repaint();
+        }
+        if self.file_drop.as_ref().is_some_and(|(_, p)| lane.contains(*p) && !in_ruler(*p))
+            && let Some((items, pos)) = self.file_drop.take()
+        {
+            let track = row_at(pos.y).map(|r| rows[r].0);
+            let at = time_at(pos.x);
+            self.take_dropped(items, Some((at, track)));
         }
         // Where the clips are, for dropping effects dragged out of the inspector — and
         // while one is dragged, the clip it would go onto lights up (red if it can't
@@ -1168,7 +1107,7 @@ impl App {
             for (c, peaks) in sound.iter().zip(&peaks) {
                 let Some(peaks) = peaks.as_ref().filter(|_| c.range.contains(t)) else { continue };
                 // Where in the file (a reversed clip reads down from its pivot).
-                let into = c.source_in.as_seconds_f64() + (t - c.range.start).as_seconds_f64() * c.speed;
+                let into = c.source_at(t).as_seconds_f64();
                 let at = match c.reverse {
                     Some(pivot) => pivot.as_seconds_f64() - into,
                     None => into,
@@ -1220,7 +1159,7 @@ impl App {
             self.copy_selection();
             ui.close();
         }
-        if item(ui, "Paste at playhead", "Ctrl+V", !self.clipboard.is_empty()) {
+        if item(ui, tr("Paste at playhead"), "Ctrl+V", !self.clipboard.is_empty()) {
             let at = self.playhead;
             self.paste_at(at);
             ui.close();
@@ -1230,18 +1169,18 @@ impl App {
             ui.close();
         }
         ui.separator();
-        if item(ui, "Split at playhead", "S", has) {
+        if item(ui, tr("Split at playhead"), "S", has) {
             self.split_at_playhead();
             ui.close();
         }
         if n >= 2 {
-            ui.menu_button("Arrange", |ui| {
+            ui.menu_button(tr("Arrange"), |ui| {
                 use oa_edit::timeline::Arrange;
                 let choices: [(&str, &str, Arrange); 4] = [
-                    ("Move together", "Close the gaps between them: on each track, each starts where the one before ends", Arrange::Together),
-                    ("Line up starts", "Every one starts where the earliest does", Arrange::LineUpStarts),
-                    ("Move to playhead", "The earliest starts at the playhead; the rest keep their spacing", Arrange::StartAt(self.playhead)),
-                    ("Space evenly", "The first and last stay; the ones between are spread out evenly", Arrange::SpaceEvenly),
+                    ("Move together", tr("Close the gaps between them: on each track, each starts where the one before ends"), Arrange::Together),
+                    (tr("Line up starts"), tr("Every one starts where the earliest does"), Arrange::LineUpStarts),
+                    (tr("Move to playhead"), tr("The earliest starts at the playhead; the rest keep their spacing"), Arrange::StartAt(self.playhead)),
+                    ("Space evenly", tr("The first and last stay; the ones between are spread out evenly"), Arrange::SpaceEvenly),
                 ];
                 for (label, hint, how) in choices {
                     if ui.button(label).on_hover_text(hint).clicked() {
@@ -1260,26 +1199,26 @@ impl App {
             ui.close();
         }
         if ui
-            .add_enabled(has, egui::Button::new("As media"))
-            .on_hover_text("Adds these clips to the media bin as one compound clip — use it as a clip, or as a mask or other effect picture")
+            .add_enabled(has, egui::Button::new(tr("As media")))
+            .on_hover_text(tr("Adds these clips to the media bin as one compound clip — use it as a clip, or as a mask or other effect picture"))
             .clicked()
         {
             self.compound_selection(false);
             ui.close();
         }
-        if ui.add_enabled(has, egui::Button::new("Nest into one clip")).on_hover_text("Replaces these clips with one compound clip").clicked() {
+        if ui.add_enabled(has, egui::Button::new(tr("Nest into one clip"))).on_hover_text(tr("Replaces these clips with one compound clip")).clicked() {
             self.compound_selection(true);
             ui.close();
         }
         let compound = self.selection.filter(|id| self.editor.item(*id).is_some_and(|i| matches!(i.kind, oa_doc::ItemKind::Nested { .. })));
         if let Some(id) = compound
-            && ui.button("Open compound clip").on_hover_text("Edit its own timeline (or double-click it)").clicked()
+            && ui.button(tr("Open compound clip")).on_hover_text(tr("Edit its own timeline (or double-click it)")).clicked()
         {
             self.open_compound(id);
             ui.close();
         }
         if self.compound_selected()
-            && ui.button("Break apart").on_hover_text("Put the clips inside back on the timeline, where they play now").clicked()
+            && ui.button(tr("Break apart")).on_hover_text(tr("Put the clips inside back on the timeline, where they play now")).clicked()
         {
             self.break_compounds();
             ui.close();
@@ -1352,7 +1291,7 @@ impl App {
                 &mut self.renaming.as_mut().expect("just set").1
             }
         };
-        let r = ui.add(egui::TextEdit::singleline(name).desired_width(140.0).hint_text("Track name"));
+        let r = ui.add(egui::TextEdit::singleline(name).desired_width(140.0).hint_text(tr("Track name")));
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some((_, name)) = self.renaming.take() {
                 // Checked, not silently dropped: an empty name says so in the corner.
@@ -1372,17 +1311,16 @@ impl App {
             }
             ui.close();
         }
-        let picked = self.selected_track == Some(track);
-        if ui.selectable_label(picked, "Pick this track").on_hover_text("Ctrl+V and Ctrl+D put clips in its first free space after the playhead; Alt+↑/↓ moves it (or double-click its header)").clicked() {
-            self.selected_track = if picked { None } else { Some(track) };
+        let picked = self.selected_tracks.contains(&track);
+        if ui.selectable_label(picked, tr("Pick this track")).on_hover_text(tr("Ctrl+V and Ctrl+D put clips in its first free space after the playhead; Alt+↑/↓ moves it (or click its header; Ctrl+click picks more)")).clicked() {
+            if picked {
+                self.selected_tracks.retain(|t| *t != track);
+            } else {
+                self.selected_tracks.push(track);
+            }
             ui.close();
         }
-        if item(ui, "Add divider at playhead", "", true) {
-            let at = cmd::snap_to_frame(self.editor.sequence(), self.playhead);
-            self.add_divider(at);
-            ui.close();
-        }
-        if item(ui, "Select all on track", "", !t.items.is_empty()) {
+        if item(ui, tr("Select all on track"), "", !t.items.is_empty()) {
             self.selected = t.items.iter().map(|i| i.id).collect();
             self.selection = t.items.last().map(|i| i.id);
             ui.close();
@@ -1395,16 +1333,16 @@ impl App {
             self.move_track(track, false);
             ui.close();
         }
-        if item(ui, if t.kind == TrackKind::Video { "Add video track" } else { "Add audio track" }, "", true) {
+        if item(ui, if t.kind == TrackKind::Video { tr("Add video track") } else { tr("Add audio track") }, "", true) {
             if let Err(e) = self.editor.add_track(t.kind) {
                 self.error = Some(e.to_string());
             }
             ui.close();
         }
         let (label, tip) = if t.kind == TrackKind::Video {
-            ("Add picture effect track above", "A thin track whose effects run over everything below it — this track and the ones under it")
+            (tr("Add picture effect track above"), tr("A thin track whose effects run over everything below it — this track and the ones under it"))
         } else {
-            ("Add sound effect track above", "A thin track whose sound effects run over this track, the ones below it, and the sound of picture tracks")
+            (tr("Add sound effect track above"), tr("A thin track whose sound effects run over this track, the ones below it, and the sound of picture tracks"))
         };
         if ui.button(label).on_hover_text(tip).clicked() {
             match self.editor.add_effect_track(t.kind, track) {
@@ -1419,7 +1357,7 @@ impl App {
             }
             ui.close();
         }
-        if t.effects && item(ui, "Add effect container at playhead", "", true) {
+        if t.effects && item(ui, tr("Add effect container at playhead"), "", true) {
             self.add_container_at(track, self.playhead);
             ui.close();
         }
@@ -1446,7 +1384,7 @@ impl App {
     fn empty_menu(&mut self, ui: &mut egui::Ui, at: Time, track: Option<TrackId>) {
         // On an effect track, that's all there is to put there.
         if let Some(track) = track.filter(|t| self.editor.sequence().track(*t).is_some_and(|t| t.effects)) {
-            if ui.button("Add effect container here").on_hover_text("Its effects run over everything below this track while it lasts").clicked() {
+            if ui.button(tr("Add effect container here")).on_hover_text(tr("Its effects run over everything below this track while it lasts")).clicked() {
                 self.add_container_at(track, at);
                 ui.close();
             }
@@ -1457,13 +1395,13 @@ impl App {
             ui.close();
         }
         if let Some(track) = track
-            && item(ui, "Paste into this track's first gap", "", !self.clipboard.is_empty())
+            && item(ui, tr("Paste into this track's first gap"), "", !self.clipboard.is_empty())
         {
             self.set_playhead(at);
             self.paste_into_track(track);
             ui.close();
         }
-        if item(ui, "Add text here", "", true) {
+        if item(ui, tr("Add text here"), "", true) {
             self.set_playhead(at);
             self.add_text();
             ui.close();
@@ -1472,83 +1410,8 @@ impl App {
             self.select_all();
             ui.close();
         }
-        ui.separator();
-        if item(ui, "Add divider here", "", true) {
-            let at = cmd::snap_to_frame(self.editor.sequence(), at);
-            self.add_divider(at);
-            ui.close();
-        }
-        let s = self.editor.sequence().clone();
-        if !s.dividers.is_empty() {
-            let index = oa_edit::sections::section_at(&s, at);
-            self.section_items(ui, &s, index);
-        }
     }
 
-    /// Menu entries for one section of the timeline.
-    fn section_items(&mut self, ui: &mut egui::Ui, s: &oa_doc::Sequence, index: usize) {
-        use crate::clips::SectionCommand as C;
-        let count = oa_edit::sections::sections(s).len();
-        let clips = oa_edit::sections::members(s, index).len();
-        ui.label(egui::RichText::new(format!("Section {} of {count} · {clips} clip{}", index + 1, if clips == 1 { "" } else { "s" })).small().weak());
-        let run = |app: &mut Self, ui: &mut egui::Ui, label: &str, enabled: bool, tip: &str, command: C| {
-            if ui.add_enabled(enabled, egui::Button::new(label)).on_hover_text(tip).clicked() {
-                app.section_command(command);
-                ui.close();
-            }
-        };
-        run(self, ui, "Select its clips", clips > 0, "Select every clip in this section, on every track", C::Select(index));
-        run(self, ui, "Move earlier", index > 0, "Swap with the section before (its clips and divider move too)", C::Move { from: index, to: index.saturating_sub(1) });
-        run(self, ui, "Move later", index + 1 < count, "Swap with the section after", C::Move { from: index, to: index + 1 });
-        run(self, ui, "Clear its clips", clips > 0, "Remove the clips in this section, keeping the space", C::Clear(index));
-        run(self, ui, "Delete section", true, "Remove this section and its clips; everything after moves back to close the gap", C::Delete(index));
-    }
-
-    /// Right-click on a divider: its name and color, and its section's commands.
-    fn divider_menu(&mut self, ui: &mut egui::Ui, divider: u64) {
-        use crate::clips::SectionCommand as C;
-        let s = self.editor.sequence().clone();
-        let Some(d) = s.dividers.iter().find(|d| d.id == divider).cloned() else {
-            ui.close();
-            return;
-        };
-        let mut name = d.name.clone();
-        let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0).hint_text("Section name"));
-        if r.changed() {
-            let change = oa_doc::Divider { name: name.chars().take(60).collect(), ..d.clone() };
-            let ops = oa_edit::sections::edit_divider(self.editor.doc.project(), self.editor.seq, divider, Some(change));
-            if let Err(e) = ops.and_then(|ops| self.editor.apply_drag("Name section", "divider-name", ops)) {
-                self.report_error(e.to_string());
-            }
-        }
-        if r.lost_focus() {
-            self.editor.doc.seal();
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                ui.close();
-            }
-        }
-        ui.horizontal(|ui| {
-            for c in oa_edit::sections::COLORS {
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                let color = egui::Color32::from_rgb(c[0], c[1], c[2]);
-                ui.painter().circle_filled(rect.center(), 6.5, color);
-                if c == d.color {
-                    ui.painter().circle_stroke(rect.center(), 7.5, egui::Stroke::new(1.5, ui.visuals().strong_text_color()));
-                }
-                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && c != d.color {
-                    self.section_command(C::Edit { divider, change: Some(oa_doc::Divider { color: c, ..d.clone() }) });
-                }
-            }
-        });
-        ui.separator();
-        let index = oa_edit::sections::sections(&s).iter().position(|x| x.divider.as_ref().is_some_and(|x| x.id == divider)).unwrap_or(0);
-        self.section_items(ui, &s, index);
-        ui.separator();
-        if ui.button("Remove divider").on_hover_text("Joins this section to the one before; no clips change").clicked() {
-            self.section_command(C::Edit { divider, change: None });
-            ui.close();
-        }
-    }
 }
 
 impl App {
@@ -1576,8 +1439,16 @@ impl App {
             pool.kind == oa_media::MediaKind::Still,
             pool.probe.has_audio() && self.editor.item(b.id).is_some_and(|i| i.audio_enabled()),
         );
-        // Where in the file the clip is at screen x.
-        let source_at = |x: f32| source_in + (time_at(x).as_seconds_f64() - b.start) * speed;
+        // Where in the file the clip is at screen x (following its speed ramp, if it has
+        // one — only the ramp is copied, not the clip).
+        let ramp = self.editor.item(b.id).and_then(|i| i.speed_ramp().cloned().map(|r| (r, speed.signum())));
+        let source_at = |x: f32| {
+            let local = time_at(x).as_seconds_f64() - b.start;
+            match &ramp {
+                Some((r, dir)) => source_in + dir * oa_doc::ramp_integral(r, local),
+                None => source_in + local * speed,
+            }
+        };
         let r = b.rect;
         let visible = painter.clip_rect();
         let wave_h = if video.is_some() { r.height() * 0.4 } else { r.height() };

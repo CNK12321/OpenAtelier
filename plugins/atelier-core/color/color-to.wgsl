@@ -1,5 +1,6 @@
 // Color To: pixels close to one color become another.
-// Params: from (color), tolerance, softness, to (color), offset_from_original (bool).
+// Params: from (color), tolerance, softness, to (color), offset_from_original (bool),
+// include_alpha (bool).
 
 fn oa_color_to_hsv(c: vec3f) -> vec3f {
     let top = max(c.r, max(c.g, c.b));
@@ -31,9 +32,15 @@ fn oa_color_to(c: vec4f, base: u32) -> vec4f {
     let softness = max(u(base + 5u), 0.0);
     let goal = srgb_encode(vec3f(u(base + 6u), u(base + 7u), u(base + 8u)));
     let keep_offset = u(base + 10u) > 0.5;
+    // Transparency counts too: matched on `from`'s opacity, and `to`'s taken on.
+    let with_alpha = u(base + 11u) > 0.5;
 
-    // How far the pixel is from `from`: 0 the same, 1 as far as black from white.
-    let d = length(px - key) / sqrt(3.0);
+    // How far the pixel is from `from`: 0 the same, 1 as far as black from white (or,
+    // with alpha, as far as clear black from solid white).
+    var d = length(px - key) / sqrt(3.0);
+    if (with_alpha) {
+        d = length(vec4f(px - key, c.a - u(base + 3u))) / 2.0;
+    }
     let near = 1.0 - smoothstep(tolerance, tolerance + softness + 1e-5, d);
 
     var new_color = goal;
@@ -45,6 +52,11 @@ fn oa_color_to(c: vec4f, base: u32) -> vec4f {
         let t = oa_color_to_hsv(goal);
         let hsv = vec3f(fract(t.x + p.x - f.x + 1.0), clamp(t.y + p.y - f.y, 0.0, 1.0), max(t.z + p.z - f.z, 0.0));
         new_color = oa_color_to_rgb(hsv);
+    }
+    if (with_alpha) {
+        // `to`'s opacity is what the pixel becomes, not how much.
+        let result = mix(px, new_color, near);
+        return vec4f(srgb_decode(result), mix(c.a, u(base + 9u), near));
     }
     let result = mix(px, new_color, near * u(base + 9u));
     return vec4f(srgb_decode(result), c.a);

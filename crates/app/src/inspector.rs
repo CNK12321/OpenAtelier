@@ -15,6 +15,7 @@
 //! or off; while it's on, changing the value (here or by dragging in the viewer) sets a
 //! key at the playhead. ◀ ▶ jump between the clip's keyframes.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_doc::{schema, ItemId, ItemKind, ParamTarget};
@@ -164,12 +165,12 @@ pub enum Tab {
 impl Tab {
     fn title(self) -> &'static str {
         match self {
-            Tab::Properties => "Properties",
-            Tab::Transitions => "Transitions",
-            Tab::Effects => "Effects",
-            Tab::Color => "Color",
-            Tab::Masks => "Masks",
-            Tab::Sound => "Sound",
+            Tab::Properties => tr("Properties"),
+            Tab::Transitions => tr("Transitions"),
+            Tab::Effects => tr("Effects"),
+            Tab::Color => tr("Color"),
+            Tab::Masks => tr("Masks"),
+            Tab::Sound => tr("Sound"),
         }
     }
 }
@@ -177,13 +178,13 @@ impl Tab {
 impl App {
     pub(crate) fn inspector(&mut self, ui: &mut egui::Ui) {
         let Some(item) = self.selection.filter(|i| self.editor.item(*i).is_some()) else {
-            ui.label(egui::RichText::new("Select a clip — in the viewer or on the timeline.").weak());
-            section(ui, "Background", "What shows behind the clips, in every format.");
+            ui.label(egui::RichText::new(tr("Select a clip — in the viewer or on the timeline.")).weak());
+            section(ui, tr("Background"), tr("What shows behind the clips, in every format."));
             self.background_section(ui);
-            section(ui, "Background effects", "Run on the background only, under the clips — keyframable like a clip's.");
+            section(ui, tr("Background effects"), tr("Run on the background only, under the clips — keyframable like a clip's."));
             self.effects_section(ui, oa_doc::BACKGROUND, self.playhead);
             if self.settings.advanced_color {
-                section(ui, "Output", "How the picture meets an SDR screen and the exported file — the same for both.");
+                section(ui, tr("Output"), tr("How the picture meets an SDR screen and the exported file — the same for both."));
                 self.output_section(ui);
             }
             return;
@@ -193,15 +194,15 @@ impl App {
         let inside = it.range.contains(t);
         ui.horizontal(|ui| {
             ui.strong(&it.name);
-            ui.label(egui::RichText::new(format!("{:.2}s – {:.2}s", it.range.start.as_seconds_f64(), it.range.end().as_seconds_f64())).weak());
+            ui.label(egui::RichText::new(trf("{0}s – {1}s", &[("0", &format!("{:.2}", it.range.start.as_seconds_f64())), ("1", &format!("{:.2}", it.range.end().as_seconds_f64()))])).weak());
         });
         let group = self.editor.linked.len();
         if group > 1 {
-            ui.label(egui::RichText::new(format!("Editing {group} selected clips together: a change here changes each of them (the position moves them all by the same amount).")).small().color(crate::style::ACCENT))
-                .on_hover_text("The values shown are this clip's. Each clip keeps its own keyframes.");
+            ui.label(egui::RichText::new(trf("Editing {group} selected clips together: a change here changes each of them (the position moves them all by the same amount).", &[("group", &group.to_string())])).small().color(crate::style::ACCENT))
+                .on_hover_text(tr("The values shown are this clip's. Each clip keeps its own keyframes."));
         }
         if !inside {
-            ui.label(egui::RichText::new("The playhead is outside this clip; values shown at its nearest edge.").small().weak());
+            ui.label(egui::RichText::new(tr("The playhead is outside this clip; values shown at its nearest edge.")).small().weak());
         }
         // Evaluate at the playhead, clamped into the clip.
         let t = t.max(it.range.start).min(it.range.end() - Time(1));
@@ -226,13 +227,13 @@ impl App {
         ui.horizontal(|ui| {
             let prev = keys.iter().rev().find(|k| **k < self.playhead).copied();
             let next = keys.iter().find(|k| **k > self.playhead).copied();
-            if ui.add_enabled(prev.is_some(), egui::Button::new("◀ key")).clicked() {
+            if ui.add_enabled(prev.is_some(), egui::Button::new(tr("◀ key"))).clicked() {
                 self.set_playhead(prev.expect("enabled"));
             }
-            if ui.add_enabled(next.is_some(), egui::Button::new("key ▶")).clicked() {
+            if ui.add_enabled(next.is_some(), egui::Button::new(tr("key ▶"))).clicked() {
                 self.set_playhead(next.expect("enabled"));
             }
-            ui.label(egui::RichText::new(format!("{} keyframes", keys.len())).weak());
+            ui.label(egui::RichText::new(trf("{0} keyframes", &[("0", &(keys.len()).to_string())])).weak());
         });
 
         let visual = !matches!(it.kind, ItemKind::Media { .. }) || self.is_visual(item);
@@ -273,15 +274,15 @@ impl App {
     /// then its transform.
     fn properties_tab(&mut self, ui: &mut egui::Ui, item: ItemId, visual: bool, t: Time) {
         let Some(it) = self.editor.item(item).cloned() else { return };
-        section(ui, "Length", "How long the clip runs on the timeline: moves its end, frame by frame if you like. Not animated.");
+        section(ui, tr("Length"), tr("How long the clip runs on the timeline: moves its end, frame by frame if you like. Not animated."));
         self.length_row(ui, item);
         // Footage plays at a speed; a title or a solid has nothing to speed up.
         if matches!(it.kind, ItemKind::Media { .. } | ItemKind::Nested { .. }) {
-            section(ui, "Speed", "The whole clip, picture and sound together. It gets shorter or longer on the timeline.");
+            section(ui, tr("Speed"), tr("The whole clip, picture and sound together. It gets shorter or longer on the timeline."));
             self.speed_row(ui, item);
         }
         if it.kind == ItemKind::Text {
-            section(ui, "Text", "Per-letter and per-pixel text effects are in the Transitions and Effects tabs.");
+            section(ui, tr("Text"), tr("Per-letter and per-pixel text effects are in the Transitions and Effects tabs."));
             self.text_section(ui, item, t);
         }
         if visual {
@@ -293,17 +294,17 @@ impl App {
                     transform::Scope::AllFormats => "all formats",
                     transform::Scope::Variant(_) => "this format only",
                 }).small().weak());
-                if ui.small_button("reset").clicked() {
+                if ui.small_button(tr("reset")).clicked() {
                     match transform::reset_transform(self.editor.doc.project(), self.editor.seq, item, scope) {
                         Ok(ops) => self.apply_or_report("Reset transform", ops),
                         Err(e) => self.error = Some(e.to_string()),
                     }
                 }
-                if ui.small_button("copy").on_hover_text("Copy this clip's transform (keyframes and per-format changes too)").clicked() {
+                if ui.small_button(tr("copy")).on_hover_text(tr("Copy this clip's transform (keyframes and per-format changes too)")).clicked() {
                     self.copy_transform(item);
                 }
                 let pastable = self.transform_clipboard.is_some();
-                if ui.add_enabled(pastable, egui::Button::new("paste").small()).on_hover_text("Paste the copied transform onto the selected clips").clicked() {
+                if ui.add_enabled(pastable, egui::Button::new(tr("paste")).small()).on_hover_text(tr("Paste the copied transform onto the selected clips")).clicked() {
                     let targets = self.selected_clips();
                     self.paste_transform(&targets);
                 }
@@ -321,12 +322,12 @@ impl App {
                     let mut px = [pos[0] * canvas.width as f64, pos[1] * canvas.height as f64];
                     self.key_toggle(ui, item, schema::POSITION, Value::Vec2([0.0, 0.0]), t);
                     match &following {
-                        Some((tr, stabilized)) => {
-                            let how = if *stabilized { format!("Stabilized with “{}”: this is where it sits, the shake taken out on top.", tr.name) } else { format!("Following “{}”: this is the offset from the track.", tr.name) };
-                            ui.label(egui::RichText::new("offset").color(crate::style::GOLD)).on_hover_text(format!("{how} Right-click the numbers → Animate → Edit track… to change or stop it."));
+                        Some((track, stabilized)) => {
+                            let how = if *stabilized { trf("Stabilized with “{0}”: this is where it sits, the shake taken out on top.", &[("0", &(track.name).to_string())]) } else { trf("Following “{0}”: this is the offset from the track.", &[("0", &(track.name).to_string())]) };
+                            ui.label(egui::RichText::new(tr("offset")).color(crate::style::GOLD)).on_hover_text(trf("{how} Right-click the numbers → Animate → Edit track… to change or stop it.", &[("how", &how.to_string())]));
                         }
                         None => {
-                            ui.label("position");
+                            ui.label(tr("position"));
                         }
                     }
                     ui.horizontal(|ui| {
@@ -348,7 +349,7 @@ impl App {
                     let scale = v.vec2(schema::SCALE);
                     let mut pct = [scale[0] * 100.0, scale[1] * 100.0];
                     self.key_toggle(ui, item, schema::SCALE, Value::Vec2([1.0, 1.0]), t);
-                    ui.label("scale");
+                    ui.label(tr("scale"));
                     ui.horizontal(|ui| {
                         // One linked value by default; right-click for X and Y separately
                         // (shown anyway once they differ).
@@ -371,11 +372,11 @@ impl App {
                             crate::widgets::context_menu(r, |ui| {
                                 self.property_menu_items(ui, item, &ParamTarget::Item, schema::SCALE, &Value::Vec2([1.0, 1.0]), None, t);
                                 ui.separator();
-                                if !advanced && ui.button("Advanced: separate X and Y").clicked() {
+                                if !advanced && ui.button(tr("Advanced: separate X and Y")).clicked() {
                                     advanced = true;
                                     ui.close();
                                 }
-                                if advanced && ui.button("Simple: one value (uses X)").clicked() {
+                                if advanced && ui.button(tr("Simple: one value (uses X)")).clicked() {
                                     advanced = false;
                                     self.write_transform(item, t, schema::SCALE, Value::Vec2([pct[0] / 100.0, pct[0] / 100.0]));
                                     self.editor.doc.seal();
@@ -422,12 +423,6 @@ impl App {
                         self.property_menu(&r, item, &ParamTarget::Item, param, &Value::Float(default), band, t);
                         ui.end_row();
                         self.on_mask_row(ui, item, param, t);
-                        if param == schema::OPACITY {
-                            ui.label("");
-                            ui.label("blend");
-                            self.blend_combo(ui, item, t);
-                            ui.end_row();
-                        }
                     }
                 });
             }
@@ -437,7 +432,7 @@ impl App {
             && let ItemKind::Media { media } = it.kind
             && self.editor.pool_item(media).is_some_and(|p| p.probe.video.is_some())
         {
-            section(ui, "Source color", "How this file's values become light: its curve (log, HDR…), gamut and exposure.");
+            section(ui, tr("Source color"), tr("How this file's values become light: its curve (log, HDR…), gamut and exposure."));
             self.source_color_section(ui, media);
         }
     }
@@ -445,9 +440,9 @@ impl App {
     /// How the clip arrives and leaves.
     fn transitions_tab(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
         // Where another clip touches an end, it can be a transition with that clip instead.
-        section(ui, "Start", "How the clip arrives: its own intro (effects over its first seconds, several combine) — or, when a clip ends right where it starts, a transition from that clip.");
+        section(ui, tr("Start"), tr("How the clip arrives: its own intro (effects over its first seconds, several combine) — or, when a clip ends right where it starts, a transition from that clip."));
         self.transition_end(ui, item, true, t);
-        section(ui, "End", "How the clip leaves: its own outro (effects over its last seconds, several combine) — or, when a clip starts right where it ends, a transition into that clip.");
+        section(ui, tr("End"), tr("How the clip leaves: its own outro (effects over its last seconds, several combine) — or, when a clip starts right where it ends, a transition into that clip."));
         self.transition_end(ui, item, false, t);
     }
 
@@ -456,21 +451,21 @@ impl App {
     fn sound_tab(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
         self.slider(ui, item, Prop { label: "volume (dB)", target: ParamTarget::Item, param: schema::AUDIO_GAIN, default: Value::Float(0.0) }, -60.0..=12.0, t);
         ui.label(
-            egui::RichText::new("◇ keyframes the volume — or drag its line on the clip in the timeline to fade by hand.")
+            egui::RichText::new(tr("◇ keyframes the volume — or drag its line on the clip in the timeline to fade by hand."))
                 .small()
                 .weak(),
         );
         if self.is_visual(item) {
             let speed = self.editor.item(item).map_or(1.0, |i| i.time_map.speed.num() as f64 / i.time_map.speed.den() as f64);
             ui.label(
-                egui::RichText::new(format!("Speed {speed:.2}× — set with the picture, in Properties. Extract the audio to give it its own."))
+                egui::RichText::new(trf("Speed {speed}× — set with the picture, in Properties. Extract the audio to give it its own.", &[("speed", &format!("{:.2}", speed))]))
                     .small()
                     .weak(),
             );
         } else {
             self.speed_row(ui, item);
         }
-        section(ui, "Sound effects", "Applied top to bottom, in playback and export alike.");
+        section(ui, tr("Sound effects"), tr("Applied top to bottom, in playback and export alike."));
         self.sound_effects_section(ui, item, t);
     }
 
@@ -479,58 +474,23 @@ impl App {
     /// outros to bring it in and out.
     fn container_panel(&mut self, ui: &mut egui::Ui, item: ItemId, kind: oa_doc::TrackKind, t: Time) {
         let (what, list) = if kind == oa_doc::TrackKind::Video {
-            ("Its effects run over the whole picture below this track — every clip under it, and the background — while it lasts.", List::Effects)
+            (tr("Its effects run over the whole picture below this track — every clip under it, and the background — while it lasts."), List::Effects)
         } else {
-            ("Its sound effects run over everything heard on the audio tracks below it, and the sound of picture tracks, while it lasts — ringing on after for echoes and rooms.", List::Sound)
+            (tr("Its sound effects run over everything heard on the audio tracks below it, and the sound of picture tracks, while it lasts — ringing on after for echoes and rooms."), List::Sound)
         };
         ui.label(egui::RichText::new(what).small().weak());
         if kind == oa_doc::TrackKind::Video {
-            section(ui, "Mix", "How much of the result shows over the untouched picture, and how it combines with it. Intros and outros like Fade fade it in and out.");
+            section(ui, tr("Mix"), tr("How much of the result shows over the untouched picture. Intros and outros like Fade fade it in and out; a Blend effect sets how it combines with it."));
             self.slider(ui, item, Prop { label: "opacity", target: ParamTarget::Item, param: schema::OPACITY, default: Value::Float(1.0) }, 0.0..=1.0, t);
-            ui.horizontal(|ui| {
-                ui.label("blend");
-                self.blend_combo(ui, item, t);
-            });
         }
-        section(ui, if list == List::Sound { "Sound effects" } else { "Effects" }, "Applied top to bottom.");
+        section(ui, if list == List::Sound { "Sound effects" } else { "Effects" }, tr("Applied top to bottom."));
         self.effect_list(ui, item, list, t);
         if kind == oa_doc::TrackKind::Video {
-            section(ui, "Intro", "Brings the effects in over the container's first moments.");
+            section(ui, tr("Intro"), tr("Brings the effects in over the container's first moments."));
             self.in_out_section(ui, item, true, t);
-            section(ui, "Outro", "Takes them away over its last moments.");
+            section(ui, tr("Outro"), tr("Takes them away over its last moments."));
             self.in_out_section(ui, item, false, t);
         }
-    }
-
-    /// How the clip (or an effect container's result) combines with what's under it.
-    fn blend_combo(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
-        let current = self.editor.param_value(item, &ParamTarget::Item, schema::BLEND, t).and_then(|v| v.as_enum().map(str::to_string)).unwrap_or_else(|| "normal".into());
-        let title = |m: &str| match m {
-            "add" => "Add",
-            "multiply" => "Multiply",
-            "screen" => "Screen",
-            "darken" => "Darken",
-            "lighten" => "Lighten",
-            _ => "Normal",
-        };
-        let tip = |m: &str| match m {
-            "add" => "Adds its light to what's under it: glows, flares, fire",
-            "multiply" => "Darkens by its colors, white disappears: shadows, paper textures",
-            "screen" => "Lightens by its colors, black disappears: light leaks, smoke",
-            "darken" => "Keeps the darker of it and what's under it",
-            "lighten" => "Keeps the lighter of it and what's under it",
-            _ => "Covers what's under it",
-        };
-        egui::ComboBox::from_id_salt(("blend", item.0)).selected_text(title(&current)).show_ui(ui, |ui| {
-            for m in schema::BLEND_MODES {
-                if ui.selectable_label(current == m, title(m)).on_hover_text(tip(m)).clicked() && current != m {
-                    self.editor.set_value_at(item, ParamTarget::Item, schema::BLEND, Value::Enum(m.into()), t, "blend");
-                    self.editor.doc.seal();
-                }
-            }
-        })
-        .response
-        .on_hover_text(tip(&current));
     }
 
     /// The clip's intros (`intro`) or outros, in the same cards as its other effects.
@@ -544,7 +504,7 @@ impl App {
         let target = ParamTarget::Item;
         let value = |app: &Self, id: &str| app.editor.param_value(item, &target, id, t);
         let mut content = value(self, schema::TEXT_CONTENT).and_then(|v| v.as_text().map(str::to_string)).unwrap_or_default();
-        let r = ui.add(egui::TextEdit::multiline(&mut content).desired_rows(2).desired_width(f32::INFINITY).hint_text("Type your title"));
+        let r = ui.add(egui::TextEdit::multiline(&mut content).desired_rows(2).desired_width(f32::INFINITY).hint_text(tr("Type your title")));
         if std::mem::take(&mut self.focus_text) {
             r.request_focus();
             if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), r.id) {
@@ -568,15 +528,15 @@ impl App {
             }
             for (param, label, tip) in [(schema::TEXT_BOLD, "B", "Bold"), (schema::TEXT_ITALIC, "I", "Italic")] {
                 let on = matches!(value(self, param), Some(Value::Bool(true)));
-                let text = if param == schema::TEXT_BOLD { egui::RichText::new(label).strong() } else { egui::RichText::new(label).italics() };
-                if ui.selectable_label(on, text).on_hover_text(tip).clicked() {
+                let text = if param == schema::TEXT_BOLD { egui::RichText::new(tr(label)).strong() } else { egui::RichText::new(tr(label)).italics() };
+                if ui.selectable_label(on, text).on_hover_text(tr(tip)).clicked() {
                     self.editor.set_param(item, target.clone(), param, ParamSource::Static(Value::Bool(!on)), param);
                     self.editor.doc.seal();
                 }
             }
             let align = value(self, schema::TEXT_ALIGN).and_then(|v| v.as_enum().map(str::to_string)).unwrap_or_else(|| "center".into());
             for (option, label) in [("left", "Left"), ("center", "Center"), ("right", "Right")] {
-                if ui.selectable_label(align == option, label).clicked() && align != option {
+                if ui.selectable_label(align == option, tr(label)).clicked() && align != option {
                     self.editor.set_param(item, target.clone(), schema::TEXT_ALIGN, ParamSource::Static(Value::Enum(option.into())), "text-align");
                     self.editor.doc.seal();
                 }
@@ -606,10 +566,12 @@ impl App {
     pub(crate) fn param_widget(&mut self, ui: &mut egui::Ui, item: ItemId, target: &ParamTarget, schema: &oa_params::ParamSchema, t: Time, salt: &str) {
         let id = schema.id.as_str();
         let current = self.editor.param_value(item, target, id, t).filter(|v| v.ty() == schema.ty).unwrap_or_else(|| schema.default.clone());
-        let pretty = |id: &str| id.rsplit('.').next().unwrap_or(id).replace(['_', '-'], " ");
+        // Its name from its id ("offset_from_original" → "offset from original"), in the
+        // language in force.
+        let pretty = |id: &str| crate::i18n::t(&id.rsplit('.').next().unwrap_or(id).replace(['_', '-'], " ")).to_string();
         let label = match (id.strip_suffix(schema::SPOKEN_SUFFIX), id.strip_suffix(oa_doc::mask::ON_MASK_SUFFIX)) {
-            (Some(base), _) => format!("{} when spoken", pretty(base)),
-            (_, Some(base)) => format!("{} on mask", pretty(base)),
+            (Some(base), _) => trf("{name} when spoken", &[("name", &pretty(base))]),
+            (_, Some(base)) => trf("{name} on mask", &[("name", &pretty(base))]),
             _ => pretty(id),
         };
         match &schema.default {
@@ -639,23 +601,24 @@ impl App {
                 ui.horizontal(|ui| {
                     self.key_toggle_for(ui, item, target.clone(), id, schema.default.clone(), t);
                     let r = if advanced {
-                        ui.add(egui::Label::new(&label).sense(egui::Sense::click())).on_hover_text("Right-click for a single color")
+                        ui.add(egui::Label::new(&label).sense(egui::Sense::click())).on_hover_text(tr("Right-click for a single color"))
                     } else {
                         let mut c = g.sorted_stops()[0].color;
                         let (r, changed) = crate::widgets::color_swatch(ui, &mut c);
-                        let r = r.on_hover_text("Click to pick · right-click for a gradient");
+                        let r = r.on_hover_text(tr("Click to pick · right-click for a gradient"));
                         if changed {
                             write = Some((oa_params::Gradient { angle: g.angle, stops: vec![oa_params::GradientStop { pos: 0.0, color: c }] }, false));
                         }
+                        self.eyedropper_button(ui, item, target, id, true);
                         ui.label(&label);
                         r
                     };
                     crate::widgets::context_menu(&r, |ui| {
-                        if !advanced && ui.button("Advanced: directional gradient").clicked() {
+                        if !advanced && ui.button(tr("Advanced: directional gradient")).clicked() {
                             advanced = true;
                             ui.close();
                         }
-                        if advanced && ui.button("Simple: one color (keeps the first)").clicked() {
+                        if advanced && ui.button(tr("Simple: one color (keeps the first)")).clicked() {
                             advanced = false;
                             let first = g.sorted_stops()[0].clone();
                             write = Some((oa_params::Gradient { angle: g.angle, stops: vec![oa_params::GradientStop { pos: 0.0, ..first }] }, true));
@@ -698,14 +661,55 @@ impl App {
                     }
                 });
             }
+            // Any number of options: a list that shows what's chosen, a box for each.
+            Value::Enum(_) if schema.multiple => {
+                let title = |o: &str| {
+                    let mut c = crate::i18n::t(o).chars();
+                    c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default()
+                };
+                let chosen: Vec<String> = schema.chosen(&current).into_iter().map(str::to_string).collect();
+                let shown = if chosen.is_empty() { "None".to_string() } else { chosen.iter().map(|o| title(o)).collect::<Vec<_>>().join(", ") };
+                let mut next = chosen.clone();
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    egui::ComboBox::from_id_salt(("param-enum-many", salt, id, item.0)).selected_text(shown).show_ui(ui, |ui| {
+                        let columns = crate::widgets::choice_columns(schema.options.len());
+                        egui::Grid::new(ui.id().with("grid")).num_columns(columns).spacing([12.0, 4.0]).show(ui, |ui| {
+                            for (i, option) in schema.options.iter().enumerate() {
+                                let mut on = next.contains(option);
+                                if ui.checkbox(&mut on, title(option)).changed() {
+                                    if on {
+                                        next.push(option.clone());
+                                    } else {
+                                        next.retain(|o| o != option);
+                                    }
+                                }
+                                if (i + 1) % columns == 0 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                    });
+                    let lr = ui.add(egui::Label::new(&label).sense(egui::Sense::click()));
+                    self.property_menu(&lr, item, target, id, &schema.default, None, t);
+                });
+                if next != chosen {
+                    let keys: Vec<&str> = next.iter().map(String::as_str).collect();
+                    self.editor.set_value_at(item, target.clone(), id, schema.choose(&keys), t, id);
+                    self.editor.doc.seal();
+                }
+            }
             Value::Enum(_) => {
                 let mut selected = current.as_enum().unwrap_or_default().to_string();
                 let was = selected.clone();
                 ui.horizontal(|ui| {
                     ui.add_space(24.0);
-                    egui::ComboBox::from_id_salt(("param-enum", salt, id, item.0)).selected_text(&selected).show_ui(ui, |ui| {
-                        for option in &schema.options {
-                            ui.selectable_value(&mut selected, option.clone(), option);
+                    egui::ComboBox::from_id_salt(("param-enum", salt, id, item.0)).selected_text(crate::i18n::t(&selected)).height(480.0).show_ui(ui, |ui| {
+                        let options: Vec<(String, String)> = schema.options.iter().map(|o| (o.clone(), crate::i18n::t(o).to_string())).collect();
+                        let now = selected.clone();
+                        if let Some(o) = crate::widgets::choice_grid(ui, ui.id().with("grid"), &options, &|o| o == now) {
+                            selected = o;
+                            ui.close();
                         }
                     });
                     let lr = ui.add(egui::Label::new(&label).sense(egui::Sense::click()));
@@ -726,6 +730,7 @@ impl App {
                         let value = Value::Color([r as f64, g as f64, b as f64, a as f64]);
                         self.editor.set_value_at(item, target.clone(), id, value, t, id);
                     }
+                    self.eyedropper_button(ui, item, target, id, false);
                     let lr = ui.add(egui::Label::new(&label).sense(egui::Sense::click()));
                     self.property_menu(&lr, item, target, id, &schema.default, None, t);
                 });
@@ -745,25 +750,13 @@ impl App {
             Value::Media(_) => {
                 // Anything in the pool with a picture can feed an effect (a matte, a map…).
                 // Compound clips (groups made into media) too.
-                let options: Vec<(u64, String)> = self
-                    .editor
-                    .pool
-                    .iter()
-                    .filter(|m| !m.missing && m.probe.video.is_some())
-                    .map(|m| (m.id.0, m.name.clone()))
-                    .chain(self.editor.compounds().into_iter().map(|s| (s.id.0, format!("▣ {}", s.name))))
-                    .collect();
-                let mut chosen = current.as_media();
-                let was = chosen;
-                let name = |m: Option<u64>| m.and_then(|m| options.iter().find(|o| o.0 == m)).map_or("none".to_string(), |o| o.1.clone());
+                let was = current.as_media();
+                let mut chosen = was;
                 ui.horizontal(|ui| {
                     ui.add_space(24.0);
-                    egui::ComboBox::from_id_salt(("param-media", salt, id, item.0)).selected_text(name(chosen)).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut chosen, None, "none");
-                        for (m, n) in &options {
-                            ui.selectable_value(&mut chosen, Some(*m), n);
-                        }
-                    });
+                    if let Some(c) = self.media_selector(ui, ui.id().with(("param-media", salt, id, item.0)), was) {
+                        chosen = c;
+                    }
                     ui.label(&label);
                 });
                 if chosen != was {
@@ -773,7 +766,7 @@ impl App {
             }
             Value::Vec2(_) => self.vec2_row(ui, item, target, schema, t, &label),
             _ => {
-                ui.label(egui::RichText::new(format!("{label}: not editable here yet")).small().weak());
+                ui.label(egui::RichText::new(trf("{label}: not editable here yet", &[("label", &label.to_string())])).small().weak());
             }
         }
         // Highlighted when spoken: the spoken word's value, just under the property.
@@ -826,10 +819,10 @@ impl App {
         ui.horizontal(|ui| {
             let (spot, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
             crate::icons::paint(ui.painter(), spot, crate::icons::MOVE, ui.visuals().weak_text_color());
-            ui.label(egui::RichText::new("Drag its points in the viewer").small().weak());
+            ui.label(egui::RichText::new(tr("Drag its points in the viewer")).small().weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let moved = (0..16).any(|i| fx.params.get(&surface_point_id(i / 4, i % 4)).is_some());
-                if ui.add_enabled(moved, egui::Button::new("Reset").small()).on_hover_text("Put every point back where it rests").clicked() {
+                if ui.add_enabled(moved, egui::Button::new(tr("Reset")).small()).on_hover_text(tr("Put every point back where it rests")).clicked() {
                     let ops = (0..16)
                         .map(|i| oa_doc::Op::SetParam { seq: self.editor.seq, item, target: target.clone(), param: oa_params::ParamId::new(&surface_point_id(i / 4, i % 4)), source: None })
                         .collect();
@@ -839,7 +832,7 @@ impl App {
                 }
             });
         });
-        egui::CollapsingHeader::new(egui::RichText::new("Points").small()).id_salt(("surface-points", fx.id.0)).show(ui, |ui| {
+        egui::CollapsingHeader::new(egui::RichText::new(tr("Points")).small()).id_salt(("surface-points", fx.id.0)).show(ui, |ui| {
             for r in 0..n {
                 for c in 0..n {
                     let id = surface_point_id(r, c);
@@ -877,9 +870,9 @@ impl App {
         let target = ParamTarget::Effect(fx.id);
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Bounded").strong()).on_hover_text("Only these letters; right-click the effect's name to turn it off");
+            ui.label(egui::RichText::new(tr("Bounded")).strong()).on_hover_text(tr("Only these letters; right-click the effect's name to turn it off"));
             for (unit, label) in [(false, "Percent"), (true, "Letters")] {
-                if ui.selectable_label(letters == unit, label).clicked() && letters != unit {
+                if ui.selectable_label(letters == unit, tr(label)).clicked() && letters != unit {
                     // The same range in the other unit.
                     let (start, end, blend) = (v.float(schema::BOUND_START), v.float(schema::BOUND_END), v.float(schema::BOUND_BLEND));
                     let (start, end, blend) = if unit {
@@ -900,7 +893,7 @@ impl App {
                 }
             }
             if letters {
-                ui.label(egui::RichText::new(format!("of {count}")).weak());
+                ui.label(egui::RichText::new(trf("of {count}", &[("count", &count.to_string())])).weak());
             }
         });
         // In letters, the sliders run over the title's letters.
@@ -968,26 +961,26 @@ impl App {
         if list == List::Outro {
             // "Reverse": the outro is the intro played backwards; own outros are off then.
             ui.horizontal(|ui| {
-                let tip = "Play the intro backwards as the outro (turns off the outro's own effects)";
-                if ui.selectable_label(reversing, "Reverse").on_hover_text(tip).clicked() {
+                let tip = tr("Play the intro backwards as the outro (turns off the outro's own effects)");
+                if ui.selectable_label(reversing, tr("Reverse")).on_hover_text(tip).clicked() {
                     ops = Some(("Reverse intro", vec![Op::SetReverseIntro { seq, item, on: !reversing }]));
                 }
                 if reversing {
-                    ui.label(egui::RichText::new("the intro, played backwards").weak());
+                    ui.label(egui::RichText::new(tr("the intro, played backwards")).weak());
                 }
             });
         }
         if cards.is_empty() && !reversing {
             let none = match list {
-                List::Effects => "No effects yet.",
-                List::Sound => "No sound effects yet.",
-                List::Intro => "No intro yet.",
-                List::Outro => "No outro yet.",
+                List::Effects => tr("No effects yet."),
+                List::Sound => tr("No sound effects yet."),
+                List::Intro => tr("No intro yet."),
+                List::Outro => tr("No outro yet."),
             };
             ui.label(egui::RichText::new(none).weak());
         } else if !cards.is_empty() {
-            let order = if in_out { "They play together. Drag ⋮⋮ to reorder, or onto another clip to copy." } else { "Applied top to bottom. Drag ⋮⋮ to reorder, or onto another clip to copy." };
-            let hint = if cards.len() > 1 { order } else { "Drag ⋮⋮ onto another clip to copy it there." };
+            let order = if in_out { tr("They play together. Drag ⋮⋮ to reorder, or onto another clip to copy.") } else { tr("Applied top to bottom. Drag ⋮⋮ to reorder, or onto another clip to copy.") };
+            let hint = if cards.len() > 1 { order } else { tr("Drag ⋮⋮ onto another clip to copy it there.") };
             ui.label(egui::RichText::new(hint).small().weak());
         }
         // Dragging: the effect being dragged, and where each card sits.
@@ -1013,25 +1006,25 @@ impl App {
                                 ui.painter().circle_filled(grip.center() + egui::vec2(dx, y), 1.4, dot);
                             }
                         }
-                        let gr = gr.on_hover_text("Drag to reorder, or onto another clip to copy it there").on_hover_cursor(egui::CursorIcon::Grab);
+                        let gr = gr.on_hover_text(tr("Drag to reorder, or onto another clip to copy it there")).on_hover_cursor(egui::CursorIcon::Grab);
                         if gr.drag_started() {
                             ui.data_mut(|d| d.insert_temp(drag_key, fx.id.0));
                             self.effect_drag = Some(EffectDrag { from: item, effect: fx.clone() });
                         }
                         let mut on = fx.enabled;
-                        if ui.checkbox(&mut on, "").on_hover_text(if on { "Turn off" } else { "Turn on" }).changed() {
+                        if ui.checkbox(&mut on, tr("")).on_hover_text(if on { "Turn off" } else { "Turn on" }).changed() {
                             ops = Some(("Toggle effect", vec![Op::SetEffectEnabled { seq, item, effect: fx.id, enabled: on }]));
                         }
                         let name = d.as_ref().map_or(fx.type_id.as_str(), |d| d.name.as_str());
                         let color = if fx.enabled { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
                         let r = ui.add(egui::Label::new(egui::RichText::new(name).strong().color(color)).sense(egui::Sense::click()));
                         if have < total {
-                            ui.label(egui::RichText::new(format!("on {have} of {total}")).small().weak()).on_hover_text("Only some of the selected clips have it; changes go to those");
+                            ui.label(egui::RichText::new(trf("on {have} of {total}", &[("have", &have.to_string()), ("total", &total.to_string())])).small().weak()).on_hover_text(tr("Only some of the selected clips have it; changes go to those"));
                         }
                         let about = sound_info.as_ref().map(|i| i.description.clone()).or_else(|| d.as_ref().map(|d| d.description.clone())).unwrap_or_default();
                         let tip = if about.is_empty() { String::new() } else { format!("{about}\n") };
                         let more = if is_text && self.can_bound(item, &fx.type_id) { ", or to bound it to some of the letters" } else { "" };
-                        let r = r.on_hover_text(format!("{tip}Right-click to copy or paste{more}"));
+                        let r = r.on_hover_text(trf("{tip}Right-click to copy or paste{more}", &[("tip", &tip.to_string()), ("more", more)]));
                         crate::widgets::context_menu(&r, |ui| self.effect_menu(ui, item, fx));
                         if in_out {
                             // How long it plays, over the clip's start or end.
@@ -1039,7 +1032,7 @@ impl App {
                                 EffectRole::In { duration } | EffectRole::Out { duration } => duration.as_seconds_f64(),
                                 _ => 0.5,
                             };
-                            ui.label("over");
+                            ui.label(tr("over"));
                             let r = ui.add(egui::DragValue::new(&mut seconds).speed(0.02).range(0.05..=length.as_seconds_f64().max(0.05)).suffix(" s"));
                             if r.changed() {
                                 let duration = Time::from_seconds_f64(seconds);
@@ -1051,13 +1044,13 @@ impl App {
                             self.seal_on_release(&r);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("✕").on_hover_text("Remove this effect").clicked() {
+                            if ui.button(tr("✕")).on_hover_text(tr("Remove this effect")).clicked() {
                                 ops = Some(("Remove effect", vec![Op::RemoveEffect { seq, item, effect: fx.id }]));
                             }
                             if !fits.is_empty() {
                                 let n = fits.len();
-                                let tip = format!("Put this effect, with these settings, on the other {n} selected clip{}", if n == 1 { "" } else { "s" });
-                                if ui.small_button("Apply to All Selected").on_hover_text(tip).clicked() {
+                                let tip = trf("Put this effect, with these settings, on the other {n} selected clip{0}", &[("n", &(n).to_string()), ("0", (if n == 1 { "" } else { "s" }))]);
+                                if ui.small_button(tr("Apply to All Selected")).on_hover_text(tip).clicked() {
                                     apply_all = Some(fx.clone());
                                 }
                             }
@@ -1074,8 +1067,8 @@ impl App {
                         let was = kind;
                         ui.horizontal(|ui| {
                             ui.add_space(24.0);
-                            for (k, label, tip) in [(0, "Whole clip", "Plays for the whole clip"), (1, "Intro", "Plays over the clip's first seconds"), (2, "Outro", "Plays over the clip's last seconds")] {
-                                if ui.selectable_label(kind == k, label).on_hover_text(tip).clicked() {
+                            for (k, label, tip) in [(0, "Whole clip", tr("Plays for the whole clip")), (1, "Intro", tr("Plays over the clip's first seconds")), (2, "Outro", tr("Plays over the clip's last seconds"))] {
+                                if ui.selectable_label(kind == k, tr(label)).on_hover_text(tr(tip)).clicked() {
                                     kind = k;
                                 }
                             }
@@ -1103,10 +1096,10 @@ impl App {
                     }
                     match &d {
                         Some(_) if sound && sound_info.is_none() => {
-                            ui.label(egui::RichText::new("Its sound shader didn't compile; it's skipped (see Home → Plugins).").small().weak());
+                            ui.label(egui::RichText::new(tr("Its sound shader didn't compile; it's skipped (see Home → Plugins).")).small().weak());
                         }
                         Some(d) if !sound && !d.renders() => {
-                            ui.label(egui::RichText::new("Can't be rendered by this version yet; it's skipped.").small().weak());
+                            ui.label(egui::RichText::new(tr("Can't be rendered by this version yet; it's skipped.")).small().weak());
                         }
                         Some(d) if d.editor.as_deref() == Some(oa_graph::registry::EDITOR_SURFACE) => self.surface_settings(ui, item, fx, d, t),
                         Some(d) if d.editor.as_deref() == Some(oa_graph::registry::EDITOR_EQUALIZER) => {
@@ -1115,13 +1108,13 @@ impl App {
                         // A grade: edited in the Color tab; its numbers (and keyframes) here.
                         Some(d) if d.editor.as_deref() == Some(oa_graph::registry::EDITOR_COLOR) => {
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(egui::RichText::new("Edited in the Color tab.").small().weak());
-                                if self.settings.advanced_color && ui.small_button("Open the Color tab").clicked() {
+                                ui.label(egui::RichText::new(tr("Edited in the Color tab.")).small().weak());
+                                if self.settings.advanced_color && ui.small_button(tr("Open the Color tab")).clicked() {
                                     self.inspector_tab = Tab::Color;
                                 }
                             });
                             let target = ParamTarget::Effect(fx.id);
-                            egui::CollapsingHeader::new(egui::RichText::new("Numbers").small()).id_salt(("color-numbers", fx.id.0)).show(ui, |ui| {
+                            egui::CollapsingHeader::new(egui::RichText::new(tr("Numbers")).small()).id_salt(("color-numbers", fx.id.0)).show(ui, |ui| {
                                 for schema in &d.params {
                                     self.param_widget(ui, item, &target, schema, t, &fx.id.0.to_string());
                                 }
@@ -1140,7 +1133,7 @@ impl App {
                             }
                         }
                         None => {
-                            ui.label(egui::RichText::new("This effect's plugin is off or isn't installed; its settings are kept.").small().weak());
+                            ui.label(egui::RichText::new(tr("This effect's plugin is off or isn't installed; its settings are kept.")).small().weak());
                         }
                     }
                 });
@@ -1180,7 +1173,7 @@ impl App {
             {
                 let name = self.effect_name(&effects[from].1.type_id);
                 let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, drag_key));
-                let galley = painter.layout_no_wrap(format!("⧉ {name} — drop on a clip to copy"), egui::FontId::proportional(12.0), egui::Color32::WHITE);
+                let galley = painter.layout_no_wrap(trf("⧉ {name} — drop on a clip to copy", &[("name", &(name).to_string())]), egui::FontId::proportional(12.0), egui::Color32::WHITE);
                 let at = p + egui::vec2(14.0, 10.0);
                 let bg = egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(8.0, 4.0));
                 painter.rect_filled(bg, 4.0, crate::style::ACCENT.gamma_multiply(0.9));
@@ -1205,7 +1198,7 @@ impl App {
                         }
                         None if !ui.max_rect().contains(p) => {
                             let name = self.effect_name(&drag.effect.type_id);
-                            self.notify(format!("Drop {name} on a clip in the timeline or the viewer to copy it there."));
+                            self.notify(trf("Drop {name} on a clip in the timeline or the viewer to copy it there.", &[("name", &name.to_string())]));
                         }
                         None => {}
                     }
@@ -1243,14 +1236,14 @@ impl App {
                     })
                     .collect();
                 if offered.is_empty() {
-                    ui.label(egui::RichText::new("No sound effects: Atelier Core is off (Home → Plugins).").small().weak());
+                    ui.label(egui::RichText::new(tr("No sound effects: Atelier Core is off (Home → Plugins).")).small().weak());
                 } else {
+                    let taken: Vec<String> = effects.iter().map(|(_, e)| e.type_id.to_string()).collect();
                     crate::widgets::sticky_menu(ui, &plural("sound effect"), |ui| {
-                        for (type_id, name, about) in &offered {
-                            if ui.button(name).on_hover_text(about).clicked() {
-                                add = Some(type_id.clone());
-                                ui.close();
-                            }
+                        let used = |id: &str| taken.iter().any(|t| t == id);
+                        if let Some(id) = self.sound_picker(ui, &offered, &used) {
+                            add = Some(id);
+                            ui.close();
                         }
                     });
                 }
@@ -1300,14 +1293,14 @@ impl App {
             }
             if n > 1 {
                 let name = self.effect_name(&type_id);
-                self.notify(format!("Added {name} to {n} clips."));
+                self.notify(trf("Added {name} to {n} clips.", &[("name", &name.to_string()), ("n", &n.to_string())]));
             }
             ops = Some(("Add effect", changes));
         }
         if let Some(fx) = apply_all {
             let name = self.effect_name(&fx.type_id);
-            let n = self.apply_effect_to(&fx, &others, "Apply to all selected");
-            self.notify(if n == 0 { format!("The selected clips already have {name} like this.") } else { format!("Applied {name} to {n} more clip{}.", if n == 1 { "" } else { "s" }) });
+            let n = self.apply_effect_to(&fx, &others, tr("Apply to all selected"));
+            self.notify(if n == 0 { trf("The selected clips already have {name} like this.", &[("name", &(name).to_string())]) } else { trf("Applied {name} to {n} more clip{0}.", &[("name", &(name).to_string()), ("n", &(n).to_string()), ("0", (if n == 1 { "" } else { "s" }))]) });
         }
         if let Some((label, ops)) = ops
             && let Err(e) = self.editor.apply(label, self.editor.fanned(ops))
@@ -1337,7 +1330,7 @@ impl App {
             ui.add_space(24.0);
             let r = ui
                 .add(egui::DragValue::new(&mut seconds).speed(1.0 / rate.as_f64().max(1.0)).range(0.0..=86_400.0).max_decimals(3).suffix(" s"))
-                .on_hover_text("Seconds; the end snaps to a frame. Drag, or type a length.");
+                .on_hover_text(tr("Seconds; the end snaps to a frame. Drag, or type a length."));
             if r.changed() {
                 wanted = Some(Change::Set(Time::from_seconds_f64(seconds)));
             }
@@ -1345,13 +1338,13 @@ impl App {
             if r.drag_stopped() || r.lost_focus() {
                 self.editor.doc.seal();
             }
-            if ui.small_button("−1 frame").on_hover_text("One frame shorter").clicked() {
+            if ui.small_button(tr("−1 frame")).on_hover_text(tr("One frame shorter")).clicked() {
                 wanted = Some(Change::By(Time::ZERO - frame));
             }
-            if ui.small_button("+1 frame").on_hover_text("One frame longer").clicked() {
+            if ui.small_button(tr("+1 frame")).on_hover_text(tr("One frame longer")).clicked() {
                 wanted = Some(Change::By(frame));
             }
-            if limit.is_some() && ui.add_enabled(limit.is_some_and(|max| max > old) || !self.editor.linked.is_empty(), egui::Button::new("To the end").small()).on_hover_text("As long as the file allows (or up to the next clip)").clicked() {
+            if limit.is_some() && ui.add_enabled(limit.is_some_and(|max| max > old) || !self.editor.linked.is_empty(), egui::Button::new(tr("To the end")).small()).on_hover_text(tr("As long as the file allows (or up to the next clip)")).clicked() {
                 wanted = Some(Change::ToEnd);
             }
         });
@@ -1367,7 +1360,7 @@ impl App {
         let Some(wanted) = wanted else { return };
         let (ops, short) = self.editor.length_ops(item, &wanted_length(wanted));
         if short > 0 && !dragging {
-            self.notify(format!("{short} of the clips couldn't be that long: the file ends, or the next clip is in the way."));
+            self.notify(trf("{short} of the clips couldn't be that long: the file ends, or the next clip is in the way.", &[("short", &short.to_string())]));
         }
         if !ops.is_empty()
             && let Err(e) = self.editor.apply_drag("Clip length", "clip-length", ops)
@@ -1396,32 +1389,50 @@ impl App {
         let keep = !matches!(it.params.get(schema::AUDIO_KEEP_PITCH).map(|s| s.eval(&it.eval_context(it.range.start))), Some(Value::Bool(false)));
         let mut speed = old;
         let mut reverse = reversed;
+        // Keyframed (a speed ramp): the speed at the playhead, set there as a key; the
+        // clip keeps its length and plays more or less of its file.
+        let t = self.playhead;
+        let ramped = it.speed_ramp().is_some() && signed != 0.0;
+        let at_playhead = it.speed_at((t - it.range.start).clamp(Time::ZERO, it.range.duration)).abs();
+        let mut ramp_value = at_playhead;
         ui.horizontal(|ui| {
-            ui.add_space(24.0);
-            ui.add_enabled(signed != 0.0, egui::Checkbox::new(&mut reverse, "Reverse"))
-                .on_hover_text("Plays the same part of the file backwards, last frame first — the sound too.");
-            let r = ui
-                .add(egui::DragValue::new(&mut speed).speed(0.01).range(0.0..=20.0).max_decimals(3).suffix("×"))
-                .on_hover_text(
-                    "Playback speed, picture and sound together (0.05× to 20×). The clip gets shorter or longer on the timeline. \
-                     0× holds its first frame as a still, silent, at the length it has.",
-                );
-            ui.label("speed");
-            // Between 0× and 0.05× there's nothing useful (a clip hundreds of times its
-            // length): below it is a freeze, and up from a freeze starts at 0.05×.
-            if speed > 0.0 && speed < 0.05 {
-                speed = if old == 0.0 { 0.05 } else { 0.0 };
+            ui.add_space(4.0);
+            if signed != 0.0 {
+                self.key_toggle_for(ui, item, ParamTarget::Item, schema::SPEED, Value::Float(old.clamp(schema::MIN_SPEED, schema::MAX_SPEED)), t);
+            } else {
+                ui.add_space(20.0);
             }
-            for preset in [0.0, 0.25, 0.5, 1.0, 2.0, 4.0] {
-                if ui.small_button(format!("{preset}×")).clicked() {
-                    speed = preset;
+            ui.add_enabled(signed != 0.0, egui::Checkbox::new(&mut reverse, tr("Reverse")))
+                .on_hover_text(tr("Plays the same part of the file backwards, last frame first — the sound too."));
+            let r = if ramped {
+                ui.add(egui::DragValue::new(&mut ramp_value).speed(0.01).range(schema::MIN_SPEED..=schema::MAX_SPEED).max_decimals(3).suffix("×"))
+                    .on_hover_text(tr("The speed here (a key at the playhead). Keyframed, the speed ramps between its keys: the clip keeps its length and plays faster or slower through its file (0.01× to 100×)."))
+            } else {
+                ui.add(egui::DragValue::new(&mut speed).speed(0.01).range(0.0..=schema::MAX_SPEED).max_decimals(3).suffix("×")).on_hover_text(tr(
+                    tr("Playback speed, picture and sound together (0.01× to 100×). The clip gets shorter or longer on the timeline. 0× holds its first frame as a still, silent, at the length it has. The diamond keyframes it: a speed ramp."),
+                ))
+            };
+            ui.label(tr("speed"));
+            // Between 0× and 0.01× there's nothing useful (a clip thousands of times its
+            // length): below it is a freeze, and up from a freeze starts at 0.01×.
+            if speed > 0.0 && speed < schema::MIN_SPEED {
+                speed = if old == 0.0 { schema::MIN_SPEED } else { 0.0 };
+            }
+            let presets: &[f64] = if ramped { &[0.25, 0.5, 1.0, 2.0, 4.0] } else { &[0.0, 0.25, 0.5, 1.0, 2.0, 4.0] };
+            for &preset in presets {
+                if ui.small_button(trf("{preset}×", &[("preset", &preset.to_string())])).clicked() {
+                    if ramped {
+                        ramp_value = preset;
+                    } else {
+                        speed = preset;
+                    }
                 }
             }
             if r.drag_stopped() || r.lost_focus() {
                 self.editor.doc.seal();
             }
             let mut k = keep;
-            if ui.checkbox(&mut k, "keep pitch").on_hover_text("Off: the pitch rises and falls with the speed, like tape").changed() {
+            if ui.checkbox(&mut k, tr("keep pitch")).on_hover_text(tr("Off: the pitch rises and falls with the speed, like tape")).changed() {
                 self.editor.set_param(item, ParamTarget::Item, schema::AUDIO_KEEP_PITCH, ParamSource::Static(Value::Bool(k)), "keep-pitch");
                 self.editor.doc.seal();
             }
@@ -1429,8 +1440,15 @@ impl App {
         if reverse != reversed {
             let ids: Vec<ItemId> = std::iter::once(item).chain(self.editor.linked.iter().copied().filter(|l| *l != item)).collect();
             let ops: Vec<oa_doc::Op> = ids.iter().filter_map(|id| self.editor.item(*id)).filter_map(|it| oa_edit::timeline::reversed(it, reverse).map(|(range, time_map)| oa_doc::Op::SetItemTiming { seq: self.editor.seq, item: it.id, range, time_map })).collect();
-            if let Err(e) = self.editor.apply(if reverse { "Reverse clip" } else { "Play clip forwards" }, ops) {
+            if let Err(e) = self.editor.apply(if reverse { "Reverse clip" } else { tr("Play clip forwards") }, ops) {
                 self.error = Some(e.to_string());
+            }
+            return;
+        }
+        if ramped {
+            if (ramp_value - at_playhead).abs() > 1e-9 {
+                let v = ramp_value.clamp(schema::MIN_SPEED, schema::MAX_SPEED);
+                self.editor.set_value_at(item, ParamTarget::Item, schema::SPEED, Value::Float(v), t, "clip-speed-ramp");
             }
             return;
         }
@@ -1547,9 +1565,9 @@ impl App {
         let keys = self.editor.keyframe_times(item, &target, param);
         let local = t - it.range.start;
         let (state, tip) = match keys.len() {
-            0 => (0, "Keyframe this property (adds a key at the playhead)"),
-            _ if keys.contains(&local) => (2, "Stop keyframing (keeps the current value)"),
-            _ => (1, "Keyframed: change the value to add a key here; click to stop keyframing"),
+            0 => (0, tr("Keyframe this property (adds a key at the playhead)")),
+            _ if keys.contains(&local) => (2, tr("Stop keyframing (keeps the current value)")),
+            _ => (1, tr("Keyframed: change the value to add a key here; click to stop keyframing")),
         };
         let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
         let gold = crate::style::GOLD;
@@ -1666,7 +1684,7 @@ impl App {
         };
         match chosen.as_str() {
             "blur" => {
-                ui.label(egui::RichText::new("The clips on screen, enlarged to fill the frame and blurred.").small().weak());
+                ui.label(egui::RichText::new(tr("The clips on screen, enlarged to fill the frame and blurred.")).small().weak());
                 slider(self, ui, schema::BG_BLUR, "blur", 0.0..=300.0, 1.0, " px");
                 slider(self, ui, schema::BG_DIM, "darken", 0.0..=100.0, 100.0, " %");
             }
@@ -1683,7 +1701,7 @@ impl App {
                 let mut picked = current;
                 let name = |m: Option<u64>| m.and_then(|m| options.iter().find(|o| o.0 == m)).map_or("none — pick a picture".to_string(), |o| o.1.clone());
                 egui::ComboBox::from_id_salt("background-texture").selected_text(name(current)).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut picked, None, "none");
+                    ui.selectable_value(&mut picked, None, tr("none"));
                     for (m, n) in &options {
                         ui.selectable_value(&mut picked, Some(*m), n);
                     }
@@ -1702,22 +1720,22 @@ impl App {
                 let mut write: Option<(oa_params::Gradient, bool)> = None;
                 ui.horizontal(|ui| {
                     let r = if advanced {
-                        ui.add(egui::Label::new("color").sense(egui::Sense::click())).on_hover_text("Right-click for a single color")
+                        ui.add(egui::Label::new(tr("color")).sense(egui::Sense::click())).on_hover_text(tr("Right-click for a single color"))
                     } else {
                         let mut c = g.sorted_stops()[0].color;
                         let (r, changed) = crate::widgets::color_swatch(ui, &mut c);
                         if changed {
                             write = Some((oa_params::Gradient { angle: g.angle, stops: vec![oa_params::GradientStop { pos: 0.0, color: c }] }, false));
                         }
-                        ui.label("color");
-                        r.on_hover_text("Click to pick · right-click for a gradient")
+                        ui.label(tr("color"));
+                        r.on_hover_text(tr("Click to pick · right-click for a gradient"))
                     };
                     crate::widgets::context_menu(&r, |ui| {
-                        if !advanced && ui.button("Advanced: directional gradient").clicked() {
+                        if !advanced && ui.button(tr("Advanced: directional gradient")).clicked() {
                             advanced = true;
                             ui.close();
                         }
-                        if advanced && ui.button("Simple: one color (keeps the first)").clicked() {
+                        if advanced && ui.button(tr("Simple: one color (keeps the first)")).clicked() {
                             advanced = false;
                             let first = g.sorted_stops()[0].clone();
                             write = Some((oa_params::Gradient { angle: g.angle, stops: vec![oa_params::GradientStop { pos: 0.0, ..first }] }, true));
@@ -1751,7 +1769,7 @@ impl App {
             self.key_toggle_for(ui, item, prop.target.clone(), prop.param, prop.default.clone(), t);
             let mut value = self.editor.param_value(item, &prop.target, prop.param, t).and_then(|v| v.as_float()).unwrap_or(default);
             // Dragging stays in the comfortable range; typing a value goes past it.
-            let r = ui.add(egui::Slider::new(&mut value, range).text(prop.label).clamping(egui::SliderClamping::Edits));
+            let r = ui.add(egui::Slider::new(&mut value, range).text(crate::i18n::t(prop.label)).clamping(egui::SliderClamping::Edits));
             if r.changed() {
                 self.editor.set_value_at(item, prop.target.clone(), prop.param, Value::Float(value), t, prop.param);
             }
@@ -1774,19 +1792,19 @@ impl App {
     pub(crate) fn property_menu_items(&mut self, ui: &mut egui::Ui, item: ItemId, target: &ParamTarget, param: &str, default: &Value, band: Option<(f64, f64)>, t: Time) {
         {
             let current = self.editor.param_value(item, target, param, t).unwrap_or_else(|| default.clone());
-            if ui.button("Copy value").clicked() {
+            if ui.button(tr("Copy value")).clicked() {
                 self.value_clipboard = Some(current.clone());
                 ui.close();
             }
             let pastable = self.value_clipboard.clone().and_then(|v| v.coerce(default.ty()));
-            if ui.add_enabled(pastable.is_some(), egui::Button::new("Paste value")).clicked()
+            if ui.add_enabled(pastable.is_some(), egui::Button::new(tr("Paste value"))).clicked()
                 && let Some(v) = pastable
             {
                 self.editor.set_value_at(item, target.clone(), param, v, t, param);
                 self.editor.doc.seal();
                 ui.close();
             }
-            if ui.button("Reset to default").clicked() {
+            if ui.button(tr("Reset to default")).clicked() {
                 self.editor.set_value_at(item, target.clone(), param, default.clone(), t, param);
                 self.editor.doc.seal();
                 ui.close();
@@ -1794,22 +1812,22 @@ impl App {
             if let Some((lo, hi)) = band {
                 ui.separator();
                 let band = crate::band::Band { target: target.clone(), param: param.to_string(), lo, hi };
-                ui.menu_button("Animate", |ui| {
-                    if ui.button("Edit curve…").on_hover_text("Its animation as a graph: drag keys and easing handles").clicked() {
+                ui.menu_button(tr("Animate"), |ui| {
+                    if ui.button(tr("Edit curve…")).on_hover_text(tr("Its animation as a graph: drag keys and easing handles")).clicked() {
                         self.edit_curve(item, band.clone());
                         ui.close();
                     }
-                    if ui.button("Edit wave…").on_hover_text("Make it swing back and forth on its own: shape, frequency, min/max, decay").clicked() {
+                    if ui.button(tr("Edit wave…")).on_hover_text(tr("Make it swing back and forth on its own: shape, frequency, min/max, decay")).clicked() {
                         self.edit_wave(item, band.clone());
                         ui.close();
                     }
-                    if ui.button("Edit connection offset…").on_hover_text("Connect it to the sound: offset it by how loud the mix or a chosen clip is (or its bass, mids or treble)").clicked() {
+                    if ui.button(tr("Edit connection offset…")).on_hover_text(tr("Connect it to the sound: offset it by how loud the mix or a chosen clip is (or its bass, mids or treble)")).clicked() {
                         self.edit_connection(item, band.clone());
                         ui.close();
                     }
                 });
                 let on = self.clip_band(item).is_some_and(|b| b == band);
-                if ui.selectable_label(on, "Default keyframe property").on_hover_text("Show this on the clip in the timeline, where its keyframes can be dragged").clicked() {
+                if ui.selectable_label(on, tr("Default keyframe property")).on_hover_text(tr("Show this on the clip in the timeline, where its keyframes can be dragged")).clicked() {
                     if on {
                         self.bands.remove(&item);
                     } else {
@@ -1824,11 +1842,11 @@ impl App {
             let vector = matches!(default, Value::Vec2(_));
             if tracked || vector {
                 ui.separator();
-                ui.menu_button("Animate", |ui| {
+                ui.menu_button(tr("Animate"), |ui| {
                     if tracked
                         && ui
-                            .button("Edit track…")
-                            .on_hover_text("Make it follow something in the picture: have the AI follow a point, click it in by hand, or record it with the mouse")
+                            .button(tr("Edit track…"))
+                            .on_hover_text(tr("Make it follow something in the picture: have the AI follow a point, click it in by hand, or record it with the mouse"))
                             .clicked()
                     {
                         self.edit_track(item, target.clone(), param, crate::tracks::Purpose::Track);
@@ -1836,8 +1854,8 @@ impl App {
                     }
                     if self.can_stabilize(item, target, param)
                         && ui
-                            .button("Edit stabilization…")
-                            .on_hover_text("Steady this clip: track something in it that should hold still, then choose how firmly — smoothed, or locked in place")
+                            .button(tr("Edit stabilization…"))
+                            .on_hover_text(tr("Steady this clip: track something in it that should hold still, then choose how firmly — smoothed, or locked in place"))
                             .clicked()
                     {
                         self.edit_track(item, target.clone(), param, crate::tracks::Purpose::Stabilize);
@@ -1851,8 +1869,8 @@ impl App {
                             _ => (-1.0, 1.0),
                         };
                         for (axis, name) in [(0u8, "X"), (1u8, "Y")] {
-                            let tip = format!("Connect its {name} to the sound: offset by how loud the mix or a chosen clip is (or its bass, mids or treble) — {name} alone");
-                            if ui.button(format!("Edit {name} connection offset…")).on_hover_text(tip).clicked() {
+                            let tip = trf("Connect its {name} to the sound: offset by how loud the mix or a chosen clip is (or its bass, mids or treble) — {name} alone", &[("name", (name))]);
+                            if ui.button(trf("Edit {name} connection offset…", &[("name", name)])).on_hover_text(tip).clicked() {
                                 let band = crate::band::Band { target: target.clone(), param: param.to_string(), lo, hi };
                                 self.edit_connection_on(item, band, Some(axis));
                                 ui.close();
@@ -1887,7 +1905,7 @@ impl App {
         if let Some(base) = param.strip_suffix(schema::SPOKEN_SUFFIX) {
             if self.can_highlight_spoken(item, target, base) {
                 ui.separator();
-                if ui.button("Remove highlight when spoken").on_hover_text("The spoken word goes back to the same look as the rest").clicked() {
+                if ui.button(tr("Remove highlight when spoken")).on_hover_text(tr("The spoken word goes back to the same look as the rest")).clicked() {
                     self.remove_spoken(item, target, param);
                     ui.close();
                 }
@@ -1900,14 +1918,14 @@ impl App {
         ui.separator();
         let key = schema::spoken(param);
         if self.editor.param_source(item, target, &key).is_none() {
-            let tip = "Give the word being spoken its own value, set just below. Captions know when each word is said; other titles spread their words over the clip.";
-            if ui.button("Highlight when spoken").on_hover_text(tip).clicked() {
+            let tip = tr("Give the word being spoken its own value, set just below. Captions know when each word is said; other titles spread their words over the clip.");
+            if ui.button(tr("Highlight when spoken")).on_hover_text(tip).clicked() {
                 let now = self.editor.param_value(item, target, param, t).unwrap_or_else(|| default.clone());
                 self.editor.set_param(item, target.clone(), &key, ParamSource::Static(now), &key);
                 self.editor.doc.seal();
                 ui.close();
             }
-        } else if ui.button("Remove highlight when spoken").clicked() {
+        } else if ui.button(tr("Remove highlight when spoken")).clicked() {
             self.remove_spoken(item, target, &key);
             ui.close();
         }
@@ -1934,6 +1952,6 @@ impl App {
             .filter(|(it, t)| self.editor.param_source(*it, t, key).is_some())
             .map(|(item, target)| oa_doc::Op::SetParam { seq, item, target, param: oa_params::ParamId::new(key), source: None })
             .collect();
-        self.apply_or_report("Remove highlight when spoken", ops);
+        self.apply_or_report(tr("Remove highlight when spoken"), ops);
     }
 }

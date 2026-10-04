@@ -707,7 +707,9 @@ fn every_offered_effect_changes_the_picture() {
         for d in registry.offered(usage) {
             // These only draw outside the picture, and this clip fills the frame; they have
             // a test of their own (`shadow_and_stroke_draw_around_the_picture`).
-            if [oa_graph::registry::SHADOW, "oa.stylize.stroke"].contains(&d.type_id.as_ref()) {
+            // Blend has nothing under this clip to mix with; it has a test of its own too
+            // (`the_blend_effect_sets_how_the_layer_mixes` in oa-plan).
+            if [oa_graph::registry::SHADOW, "oa.stylize.stroke", oa_graph::registry::BLEND].contains(&d.type_id.as_ref()) {
                 continue;
             }
             let (p, _) = pattern_project(|clip| {
@@ -1231,8 +1233,8 @@ fn color_to_replaces_a_color_and_keeps_its_shading() {
     let mut through = |color: [f32; 4], offset: f32| {
         let mut b = GraphBuilder::new(KeyContext::default());
         let s = solid(&mut b, color, 8.0);
-        // from, tolerance, softness, to, offset from original
-        let e = effect(&mut b, &registry, s, "oa.color.color-to", vec![1.0, 0.0, 0.0, 1.0, 0.3, 0.05, 0.0, 0.0, 1.0, 1.0, offset], 0.0);
+        // from, tolerance, softness, to, offset from original, include alpha
+        let e = effect(&mut b, &registry, s, "oa.color.color-to", vec![1.0, 0.0, 0.0, 1.0, 0.3, 0.05, 0.0, 0.0, 1.0, 1.0, offset, 0.0], 0.0);
         let out = composite(&mut b, 8, [0.0; 4], &[(e, BlendMode::Normal)]);
         render_with(&mut r, &b.finish(out), &registry)[36]
     };
@@ -1245,6 +1247,69 @@ fn color_to_replaces_a_color_and_keeps_its_shading() {
     let flat = through([0.6, 0.0, 0.0, 1.0], 0.0);
     assert!(dark[2] > 0.3 && dark[2] < 0.8 && dark[0] < 0.05, "a darker blue: {dark:?}");
     assert!(flat[2] > 0.95, "without the offset, just blue: {flat:?}");
+}
+
+/// Color To with "include alpha": a color can be made see-through ("to" at 0 opacity),
+/// and "from"'s opacity counts in the match.
+#[test]
+fn color_to_with_alpha_makes_a_color_see_through() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let mut through = |color: [f32; 4], alpha: f32| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let s = solid(&mut b, color, 8.0);
+        // from solid red, tolerance, softness, to clear blue, no offset, include alpha
+        let e = effect(&mut b, &registry, s, "oa.color.color-to", vec![1.0, 0.0, 0.0, 1.0, 0.3, 0.05, 0.0, 0.0, 1.0, 0.0, 0.0, alpha], 0.0);
+        let out = composite(&mut b, 8, [0.0; 4], &[(e, BlendMode::Normal)]);
+        render_with(&mut r, &b.finish(out), &registry)[36]
+    };
+    let gone = through([1.0, 0.0, 0.0, 1.0], 1.0);
+    assert!(gone[3] < 0.02, "solid red became see-through: {gone:?}");
+    let green = through([0.0, 1.0, 0.0, 1.0], 1.0);
+    assert!(green[3] > 0.98 && green[1] > 0.95, "green stays: {green:?}");
+    // The same red at 20% opacity is far from solid red once opacity counts: untouched.
+    let faint = through([1.0, 0.0, 0.0, 0.2], 1.0);
+    assert!(faint[3] > 0.18 && faint[0] > 0.18 && faint[2] < 0.01, "a faint red isn't solid red: {faint:?}");
+    // …and without it, "to"'s opacity is how much (none here): nothing changes.
+    let off = through([1.0, 0.0, 0.0, 1.0], 0.0);
+    assert!(off[3] > 0.98 && off[0] > 0.95, "without alpha, a clear \"to\" changes nothing: {off:?}");
+}
+
+/// Invert flips only the channels chosen: magenta, cyan and yellow the two each is made
+/// of, alpha the transparency.
+#[test]
+fn invert_flips_the_channels_chosen() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let d = registry.effect("oa.color.invert").unwrap();
+    let channels = d.params.iter().find(|p| p.id.as_str() == "channels").unwrap().clone();
+    assert!(channels.multiple);
+    assert_eq!(channels.chosen(&channels.default), vec!["red", "green", "blue"], "red, green and blue by default");
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let mut through = |chosen: &[&str]| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        // Solid red, flipped all the way.
+        let s = solid(&mut b, [1.0, 0.0, 0.0, 1.0], 8.0);
+        let mask = channels.enum_uniform(&channels.choose(chosen));
+        let e = effect(&mut b, &registry, s, "oa.color.invert", vec![1.0, mask], 0.0);
+        let out = composite(&mut b, 8, [0.0; 4], &[(e, BlendMode::Normal)]);
+        render_with(&mut r, &b.finish(out), &registry)[36]
+    };
+    let rgb = through(&["red", "green", "blue"]);
+    assert!(rgb[0] < 0.02 && rgb[1] > 0.98 && rgb[2] > 0.98, "red becomes cyan: {rgb:?}");
+    let red = through(&["red"]);
+    assert!(red[0] < 0.02 && red[1] < 0.02 && red[2] < 0.02 && red[3] > 0.98, "only red flipped: black {red:?}");
+    let magenta = through(&["magenta"]);
+    assert!(magenta[0] < 0.02 && magenta[1] < 0.02 && magenta[2] > 0.98, "magenta flips red and blue: {magenta:?}");
+    let yellow = through(&["yellow"]);
+    assert!(yellow[0] < 0.02 && yellow[1] > 0.98 && yellow[2] < 0.02, "yellow flips red and green: {yellow:?}");
+    let both = through(&["red", "magenta"]);
+    assert_eq!(both.map(|v| (v * 100.0).round()), magenta.map(|v| (v * 100.0).round()), "a channel chosen twice flips once");
+    let alpha = through(&["alpha"]);
+    assert!(alpha[3] < 0.02, "alpha flipped: see-through {alpha:?}");
+    let none = through(&[]);
+    assert!(none[0] > 0.98 && none[3] > 0.98, "nothing chosen, nothing flipped: {none:?}");
 }
 
 /// Effects on pixel art read whole picture pixels: a shader that samples half a pixel
@@ -2048,4 +2113,176 @@ fn nested_compounds_render() {
     let plan = plan_frame(&p, SeqId(100), Time::from_seconds(1), &PlanOptions::default(), &registry).unwrap();
     let g = optimize(&plan.graph, OptLevel::Full, KeyContext::default());
     r.render(&g, &registry, &mut TestPatternSource::default()).expect("a 4K export with a compound scaled up");
+}
+
+/// A white square flying across black: sharp without Motion Blur, its edges smeared along
+/// its path with it (a 180° shutter smears half a frame's travel), and at rest it's the
+/// same either way.
+#[test]
+fn motion_blur_smears_what_moves() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let square = |blur: bool, moving: bool| {
+        pattern_project(|clip| {
+            clip.kind = ItemKind::Solid;
+            clip.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color([1.0, 1.0, 1.0, 1.0])));
+            clip.params.set(schema::SCALE, ParamSource::Static(Value::Vec2([0.25, 0.25])));
+            // Across the whole frame in a quarter second: 0.13 frame widths a frame.
+            let to = if moving { 0.5 } else { -0.5 };
+            let keys = vec![Keyframe::linear(Time::ZERO, Value::Vec2([-0.5, 0.0])), Keyframe::linear(Time::from_seconds_f64(0.25), Value::Vec2([to, 0.0]))];
+            clip.params.set(schema::POSITION, ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, keys)));
+            if blur {
+                add_effect(clip, 70, oa_graph::registry::MOTION_BLUR, "samples", ParamSource::Static(Value::Float(16.0)));
+            }
+        })
+        .0
+    };
+    let mut row = |p: &Project| {
+        let plan = plan_frame(p, SeqId(1), Time::from_seconds_f64(0.125), &PlanOptions::default(), &registry).unwrap();
+        let img = r.render(&plan.graph, &registry, &mut TestPatternSource::default()).unwrap();
+        let px = read_linear(r.context(), &img).unwrap();
+        let w = img.size[0] as usize;
+        let y = img.size[1] as usize / 2;
+        (0..w).map(|x| px[y * w + x][0]).collect::<Vec<f32>>()
+    };
+    // Pixels part-way between black and white along the middle row: the edges' width.
+    let soft = |row: &[f32]| row.iter().filter(|v| **v > 0.05 && **v < 0.95).count();
+    let (sharp, blurred) = (row(&square(false, true)), row(&square(true, true)));
+    assert!(soft(&sharp) <= 4, "without blur the edges are sharp: {}", soft(&sharp));
+    // Half a frame's travel at 640 px wide: about 43 px each side.
+    assert!(soft(&blurred) > 40, "with blur they smear along the path: {}", soft(&blurred));
+    // The same amount of square either way (averaging moves it, doesn't add or lose it).
+    let sum = |row: &[f32]| row.iter().sum::<f32>();
+    assert!((sum(&sharp) - sum(&blurred)).abs() / sum(&sharp) < 0.03, "{} vs {}", sum(&sharp), sum(&blurred));
+    // Still: nothing to smear.
+    let (still, still_blurred) = (row(&square(false, false)), row(&square(true, false)));
+    assert!(still.iter().zip(&still_blurred).all(|(a, b)| (a - b).abs() < 0.01), "a clip that doesn't move stays sharp");
+}
+
+/// Luma Key takes out the dark parts (or the bright ones) by brightness.
+#[test]
+fn luma_key_keys_out_by_brightness() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let mut through = |color: [f32; 4], brights: bool| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let s = solid(&mut b, color, 8.0);
+        // key out (0 darks, 1 brights), threshold, softness
+        let e = effect(&mut b, &registry, s, "oa.key.luma", vec![brights as u8 as f32, 0.3, 0.1], 0.0);
+        let out = composite(&mut b, 8, [0.0; 4], &[(e, BlendMode::Normal)]);
+        render_with(&mut r, &b.finish(out), &registry)[36]
+    };
+    let dark = [0.01, 0.01, 0.01, 1.0];
+    let bright = [0.8, 0.8, 0.8, 1.0];
+    assert!(through(dark, false)[3] < 0.02, "darks keyed out");
+    assert!(through(bright, false)[3] > 0.98, "brights kept");
+    assert!(through(bright, true)[3] < 0.02, "with brights keyed out, brights go");
+    assert!(through(dark, true)[3] > 0.98, "and darks stay");
+}
+
+/// Shatter: at no travel the picture is whole; flown apart, shards leave gaps where they
+/// were and land past the picture's edge; the seed picks another break; rotating shards
+/// land differently.
+#[test]
+fn shatter_breaks_the_picture_apart() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    // A 64-px white square in a 160-px frame; its shards may fly 40 px.
+    let mut run = |seed: f32, travel: f32, rotate: bool| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let s = solid(&mut b, [1.0, 1.0, 1.0, 1.0], 64.0);
+        // seed, parts, size, center (x, y), travel, rotate
+        let e = effect(&mut b, &registry, s, "oa.stylize.shatter", vec![seed, 16.0, 1.0, 0.5, 0.5, travel, rotate as u8 as f32], travel as f64);
+        let m = Affine2::translate(48.0, 48.0);
+        let placed = b.add(NodeOp::Transform { matrix: m }, vec![e], m.map_rect(b.node(e).bounds), false);
+        let out = composite(&mut b, 160, [0.0; 4], &[(placed, BlendMode::Normal)]);
+        render_with(&mut r, &b.finish(out), &registry)
+    };
+    let covered = |px: &[[f32; 4]], x0: usize, x1: usize, y0: usize, y1: usize| {
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                n += (px[y * 160 + x][3] > 0.5) as usize;
+            }
+        }
+        n
+    };
+    let whole = run(1.0, 0.0, false);
+    assert_eq!(covered(&whole, 48, 112, 48, 112), 64 * 64, "no travel: whole");
+    assert_eq!(covered(&whole, 0, 160, 0, 48), 0);
+    let flown = run(1.0, 40.0, false);
+    let inside = covered(&flown, 48, 112, 48, 112);
+    assert!(inside < 64 * 64 * 3 / 4, "gaps where the shards were: {inside} of {}", 64 * 64);
+    let outside = covered(&flown, 0, 160, 0, 160) - inside;
+    assert!(outside > 400, "shards landed outside the picture: {outside}");
+    let other_seed = run(7.0, 40.0, false);
+    let differs = flown.iter().zip(&other_seed).filter(|(a, b)| (a[3] - b[3]).abs() > 0.5).count();
+    assert!(differs > 200, "another seed breaks it another way: {differs}");
+    let turned = run(1.0, 40.0, true);
+    let differs = flown.iter().zip(&turned).filter(|(a, b)| (a[3] - b[3]).abs() > 0.5).count();
+    assert!(differs > 100, "rotating shards land differently: {differs}");
+}
+
+/// Blend modes that read what's under the layer: white text set to Invert (or
+/// Difference) shows the picture behind it inverted, display-referred; the rest of the
+/// frame is untouched.
+#[test]
+fn text_can_invert_what_is_behind_it() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let encode = |c: f32| if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    // `invert`: the Invert effect too, listed before the Blend (false) or after it (true).
+    let frame_with = |r: &mut Renderer, mode: Option<&str>, invert: Option<bool>| {
+        let (mut p, seq) = text_project(|title| {
+            title.params.set(schema::TEXT_COLOR, ParamSource::Static(Value::Color([1.0, 1.0, 1.0, 1.0])));
+            if let Some(mode) = mode {
+                add_effect(title, 20, oa_graph::registry::BLEND, schema::BLEND_MODE, ParamSource::Static(Value::Enum(mode.into())));
+            }
+            if let Some(after) = invert {
+                add_effect(title, 21, "oa.color.invert", "amount", ParamSource::Static(Value::Float(1.0)));
+                if !after {
+                    title.effects.rotate_right(1);
+                }
+            }
+        });
+        // An orange solid under the title.
+        let s = Arc::make_mut(p.sequences.get_mut(&seq).unwrap());
+        let mut under = Track::new(TrackId(7), "V0", TrackKind::Video);
+        let mut solid = Item::new(ItemId(8), "under", ItemKind::Solid, TimeRange::new(Time::ZERO, Time::from_seconds(10)));
+        solid.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color([0.8, 0.3, 0.05, 1.0])));
+        under.items.push(solid);
+        s.tracks.insert(0, Arc::new(under));
+        render_project(r, &p, Time::from_seconds(1))
+    };
+    let frame = |r: &mut Renderer, mode: Option<&str>| frame_with(r, mode, None);
+    let normal = frame(&mut r, None);
+    let inverted = frame(&mut r, Some("invert"));
+    let difference = frame(&mut r, Some("difference"));
+    let backdrop = normal[0];
+    let display = |p: [f32; 4]| [encode(p[0]), encode(p[1]), encode(p[2])];
+    let flipped = display(backdrop).map(|c| 1.0 - c);
+    // Away from the letters: the solid as it was.
+    assert!(close(inverted[0], backdrop, 2e-3) && close(difference[0], backdrop, 2e-3), "{:?} {:?}", inverted[0], backdrop);
+    // Inside them (where the plain title is solid white): the solid, inverted.
+    let inside: Vec<usize> = (0..normal.len()).filter(|&i| normal[i][..3].iter().all(|c| *c > 0.99995)).collect();
+    assert!(inside.len() > 500, "only {} pixels inside the letters", inside.len());
+    for &i in &inside {
+        for (got, name) in [(inverted[i], "invert"), (difference[i], "difference")] {
+            let d = display(got);
+            assert!((0..3).all(|c| (d[c] - flipped[c]).abs() < 4e-3), "{name} at {i}: {d:?} != {flipped:?}");
+        }
+    }
+    // In the order they're listed: inverting the white title first makes it black, which
+    // Invert mode doesn't mind; inverting what the Blend made turns it back.
+    let invert_first = frame_with(&mut r, Some("invert"), Some(false));
+    let invert_after = frame_with(&mut r, Some("invert"), Some(true));
+    let original = display(backdrop);
+    for &i in &inside {
+        let (first, after) = (display(invert_first[i]), display(invert_after[i]));
+        assert!((0..3).all(|c| (first[c] - flipped[c]).abs() < 4e-3), "invert first at {i}: {first:?} != {flipped:?}");
+        assert!((0..3).all(|c| (after[c] - original[c]).abs() < 4e-3), "invert after at {i}: {after:?} != {original:?}");
+    }
 }

@@ -17,11 +17,40 @@ pub const SQUASH: &str = "transform.squash";
 pub const ROTATION: &str = "transform.rotation";
 pub const ANCHOR: &str = "transform.anchor";
 pub const OPACITY: &str = "transform.opacity";
-/// How the layer mixes with what's under it: `normal`, `add`, `multiply`, `screen`,
-/// `darken`, `lighten`. On an effect container: how its result mixes over the picture it
-/// took (with its opacity, so an intro fade fades the effect in).
+/// The old blend property. Blending is the **Blend** effect now ([`BLEND_EFFECT`]);
+/// loading a project moves this into one (`validate::repair`).
 pub const BLEND: &str = "transform.blend";
+/// The Blend effect: its `mode` ([`BLEND_MODE`]) is how the layer mixes with what's under
+/// it — `normal`, `add`, `multiply`, `screen`, `darken`, `lighten`. On an effect
+/// container: how its result mixes over the picture it took (with its opacity, so an
+/// intro fade fades the effect in). Same id as `oa_graph::registry::BLEND`.
+pub const BLEND_EFFECT: &str = "oa.composite.blend";
+pub const BLEND_MODE: &str = "mode";
+/// The modes the compositor draws directly (`oa_graph::BlendMode`).
 pub const BLEND_MODES: [&str; 6] = ["normal", "add", "multiply", "screen", "darken", "lighten"];
+/// The modes that read the picture under the layer: it's flattened first, then mixed
+/// with the layer in a pass of its own (display-referred, like other editors' modes).
+/// `invert` inverts what's under the layer's shape, whatever the layer's colors.
+pub const BACKDROP_BLEND_MODES: [&str; 8] = ["difference", "exclusion", "invert", "overlay", "soft light", "hard light", "color dodge", "color burn"];
+
+/// Which [`BACKDROP_BLEND_MODES`] `mode` is, if it's one.
+pub fn backdrop_blend(mode: &str) -> Option<usize> {
+    BACKDROP_BLEND_MODES.iter().position(|m| *m == mode)
+}
+
+/// Every mode's number in the backdrop blend pass (`oa_graph::registry::BACKDROP_BLEND`):
+/// [`BLEND_MODES`], then [`BACKDROP_BLEND_MODES`]. Unknown: normal.
+pub fn blend_index(mode: &str) -> usize {
+    BLEND_MODES.iter().position(|m| *m == mode).or_else(|| backdrop_blend(mode).map(|i| BLEND_MODES.len() + i)).unwrap_or(0)
+}
+
+/// The blend mode the item's Blend effect sets at `ctx` (the last one on, if several);
+/// `normal` without one.
+pub fn blend_mode(item: &crate::Item, ctx: &oa_params::EvalContext) -> String {
+    let Some(fx) = item.effects.iter().rev().find(|e| e.enabled && e.type_id == BLEND_EFFECT) else { return "normal".into() };
+    // Unset: the effect's default.
+    fx.params.get(BLEND_MODE).and_then(|s| s.eval(ctx).as_enum().map(str::to_string)).unwrap_or_else(|| "add".into())
+}
 /// Crop: how much of each edge of the picture is cut away, as a fraction of its width or
 /// height. The layer keeps its place; the cut parts are transparent.
 pub const CROP_LEFT: &str = "crop.left";
@@ -39,6 +68,18 @@ pub const AUDIO_GAIN: &str = "audio.gain";
 pub const AUDIO_KEEP_PITCH: &str = "audio.keep_pitch";
 /// Off when the clip's sound has been extracted to its own clip on an audio track.
 pub const AUDIO_ENABLED: &str = "audio.enabled";
+/// A clip's speed, keyframed: a **speed ramp** (`Item::source_time_at` integrates it). Only
+/// its keys count — without any, the clip plays at its time map's steady speed. Kept
+/// within [`MIN_SPEED`, `MAX_SPEED`]; on the clip's clock.
+pub const SPEED: &str = "time.speed";
+/// The slowest and fastest a speed ramp goes.
+pub const MIN_SPEED: f64 = 0.01;
+pub const MAX_SPEED: f64 = 100.0;
+
+/// The speed ramp's schema (edited in the speed row, not as an ordinary property).
+pub fn speed() -> ParamSchema {
+    ParamSchema::new(SPEED, Value::Float(1.0), Unit::None).range(MIN_SPEED, MAX_SPEED)
+}
 
 pub fn visual() -> &'static [ParamSchema] {
     static S: OnceLock<Vec<ParamSchema>> = OnceLock::new();
@@ -50,7 +91,6 @@ pub fn visual() -> &'static [ParamSchema] {
             ParamSchema::new(ROTATION, Value::Float(0.0), Unit::Degrees),
             ParamSchema::new(ANCHOR, Value::Vec2([0.5, 0.5]), Unit::SourceFraction),
             ParamSchema::new(OPACITY, Value::Float(1.0), Unit::None).range(0.0, 1.0),
-            ParamSchema::new(BLEND, Value::Enum("normal".into()), Unit::None).options(&BLEND_MODES),
             ParamSchema::new(FIT, Value::Enum(FitMode::Fill.as_str().into()), Unit::None).static_only(),
             ParamSchema::new(FOCUS, Value::Vec2([0.5, 0.5]), Unit::SourceFraction).anchored_to_source(),
             ParamSchema::new(CROP_LEFT, Value::Float(0.0), Unit::None).range(0.0, 1.0),

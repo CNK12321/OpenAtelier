@@ -14,6 +14,7 @@ mod ffmpeg;
 #[cfg(windows)]
 mod mf;
 mod mixdown;
+pub mod otio;
 mod wav;
 pub use mixdown::AudioTarget;
 /// Renders a sound source to a 16-bit WAV (used for export, and for transcribing captions).
@@ -209,6 +210,17 @@ fn collect_audio(
                 clip.range = oa_time::TimeRange::new(clip.range.start, clip.range.duration + tail);
                 clip.fade_out = w.duration;
             }
+            // A speed ramp: the file read as the ramp goes, over everything the clip sounds
+            // for (transition handles included), counted the way the mixer reads it
+            // (forwards, or in reversed time from the pivot).
+            if item.speed_ramp().is_some() {
+                let from = clip.range.start - item.range.start;
+                let base = item.source_time_at(from);
+                clip.source_in = if signed < 0.0 { item.time_map.source_in - base } else { base };
+                clip.ramp = Some(std::sync::Arc::new(oa_audio::SpeedRamp::sample(clip.range.duration.as_seconds_f64(), |x| {
+                    (item.source_time_at(from + Time::from_seconds_f64(x)) - base).as_seconds_f64().abs()
+                })));
+            }
             clips.push(clip);
         }
     }
@@ -277,6 +289,11 @@ fn nested_audio(
         let mut end = outer(c.range.end());
         if k != 1.0 {
             c.speed *= k;
+            // A ramp inside runs k times as fast too.
+            if let Some(r) = c.ramp.take() {
+                let dur = c.range.duration.as_seconds_f64() / k;
+                c.ramp = Some(std::sync::Arc::new(oa_audio::SpeedRamp::sample(dur, |x| r.offset_at(x * k))));
+            }
             c.keep_pitch = keep_pitch;
             c.fade_in = squeeze(c.fade_in);
             c.fade_out = squeeze(c.fade_out);
@@ -297,7 +314,17 @@ fn nested_audio(
             c.outer.push(own.clone());
         }
         if start < lo {
-            c.source_in += Time::from_seconds_f64((lo - start).as_seconds_f64() * c.speed);
+            let cut = (lo - start).as_seconds_f64();
+            match c.ramp.take() {
+                // A ramp: in from where it had got to, and on from there.
+                Some(r) => {
+                    let at = r.offset_at(cut);
+                    c.source_in += Time::from_seconds_f64(at);
+                    let rest = (end - lo).as_seconds_f64();
+                    c.ramp = Some(std::sync::Arc::new(oa_audio::SpeedRamp::sample(rest, |x| r.offset_at(cut + x) - at)));
+                }
+                None => c.source_in += Time::from_seconds_f64(cut * c.speed),
+            }
             c.fade_in = Time::ZERO;
             start = lo;
         }

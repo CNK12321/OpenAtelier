@@ -6,6 +6,7 @@
 //! the timeline starts playing — the sequence always wins, since that's the thing being
 //! edited.
 
+use crate::i18n::trf;
 use crate::App;
 use oa_audio::{AudioClip, AudioEngine, TimelineAudio};
 use oa_time::{Time, TimeRange};
@@ -42,7 +43,7 @@ impl App {
                 engine.set_playing(true);
                 self.audition = Some(Audition { engine, path: path.to_path_buf() });
             }
-            Err(e) => self.report_error(format!("can't play that: {e}")),
+            Err(e) => self.report_error(trf("can't play that: {e}", &[("e", &e.to_string())])),
         }
     }
 

@@ -5,6 +5,7 @@
 //! on a machine with a thousand fonts doesn't stall. A family whose sample isn't ready
 //! (or which can't draw its own name — symbol fonts) shows as plain text.
 
+use crate::i18n::tr;
 use crate::App;
 use eframe::egui;
 use std::collections::HashMap;
@@ -56,7 +57,7 @@ impl App {
         egui::ComboBox::from_id_salt(id).selected_text(shown).width(190.0).height(420.0).show_ui(ui, |ui| {
             let search_id = id.with("search");
             let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
-            let r = ui.add(egui::TextEdit::singleline(&mut search).hint_text("🔍 Search fonts").desired_width(170.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut search).hint_text(tr("🔍 Search fonts")).desired_width(170.0));
             r.request_focus();
             let needle = search.trim().to_lowercase();
             ui.data_mut(|d| d.insert_temp(search_id, search));
@@ -69,7 +70,7 @@ impl App {
             let families: Vec<&String> =
                 oa_text::families().iter().filter(|f| needle.is_empty() || f.to_lowercase().contains(&needle)).collect();
             if families.is_empty() {
-                ui.label(egui::RichText::new("No font by that name.").weak());
+                ui.label(egui::RichText::new(tr("No font by that name.")).weak());
             }
             // Only rows in view are drawn, so the samples are made for those.
             let row_height = SAMPLE_PX + 10.0;

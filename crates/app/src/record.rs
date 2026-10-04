@@ -3,6 +3,7 @@
 //! remove it, or split at the pauses — name them, listen to each, and add the ones you
 //! keep to the media bin (as WAV files in a "Recordings" folder, next to the project).
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_audio::{Recorder, Take};
@@ -106,7 +107,7 @@ impl App {
         let mut open = true;
         let mut action: Option<&str> = None;
         let mut play: Option<(PathBuf, Time)> = None;
-        crate::widgets::on_screen(egui::Window::new("Record audio"), ctx).open(&mut open).collapsible(false).resizable(true).default_width(560.0).show(ctx, |ui| {
+        crate::widgets::on_screen(egui::Window::new(tr("Record audio")), ctx).open(&mut open).collapsible(false).resizable(true).default_width(560.0).show(ctx, |ui| {
             let r = &mut self.recording;
             let recording = r.recorder.is_some();
 
@@ -122,7 +123,7 @@ impl App {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if recording {
-                        if ui.add(egui::Button::new(egui::RichText::new("■  Stop").strong())).clicked() {
+                        if ui.add(egui::Button::new(egui::RichText::new(tr("■  Stop")).strong())).clicked() {
                             action = Some("stop");
                         }
                         let paused = r.recorder.as_ref().is_some_and(|x| x.is_paused());
@@ -132,7 +133,7 @@ impl App {
                     } else {
                         let label = if r.take.samples.is_empty() { "●  Record" } else { "●  Record again" };
                         let button = egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE)).fill(RED).corner_radius(14.0);
-                        let hint = if r.take.samples.is_empty() { "Start recording" } else { "Start over (this take is replaced)" };
+                        let hint = if r.take.samples.is_empty() { "Start recording" } else { tr("Start over (this take is replaced)") };
                         if ui.add(button).on_hover_text(hint).clicked() {
                             action = Some("record");
                         }
@@ -143,7 +144,7 @@ impl App {
             // Time and level.
             ui.horizontal(|ui| {
                 let dot = if recording && (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0 { RED } else { ui.visuals().weak_text_color() };
-                ui.label(egui::RichText::new("●").color(if recording { dot } else { ui.visuals().weak_text_color() }));
+                ui.label(egui::RichText::new(tr("●")).color(if recording { dot } else { ui.visuals().weak_text_color() }));
                 ui.label(egui::RichText::new(clock(r.take.seconds())).size(crate::style::TEXT_L).monospace());
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width() - 8.0, 8.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
@@ -226,20 +227,20 @@ impl App {
                     r.sync_parts();
                 }
             } else {
-                painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Press Record and talk", egui::FontId::proportional(14.0), ui.visuals().weak_text_color());
+                painter.text(rect.center(), egui::Align2::CENTER_CENTER, tr("Press Record and talk"), egui::FontId::proportional(14.0), ui.visuals().weak_text_color());
             }
 
             if !recording && frames > 0 {
-                ui.label(egui::RichText::new("Click the waveform to cut · drag a cut to move it · right-click a cut to remove it").small().weak());
+                ui.label(egui::RichText::new(tr("Click the waveform to cut · drag a cut to move it · right-click a cut to remove it")).small().weak());
                 ui.horizontal(|ui| {
-                    if ui.button("✂ Split at pauses").on_hover_text("Cut in the middle of every quiet stretch").clicked() {
+                    if ui.button(tr("✂ Split at pauses")).on_hover_text(tr("Cut in the middle of every quiet stretch")).clicked() {
                         let threshold = 10f32.powf(r.threshold_db / 20.0);
                         r.cuts = r.take.pauses(threshold, r.gap);
                         r.sync_parts();
                     }
-                    ui.add(egui::Slider::new(&mut r.threshold_db, -60.0..=-15.0).suffix(" dB").text("quiet below"));
-                    ui.add(egui::DragValue::new(&mut r.gap).range(0.1..=3.0).speed(0.02).suffix(" s")).on_hover_text("Shortest pause that counts");
-                    if !r.cuts.is_empty() && ui.button("Clear cuts").clicked() {
+                    ui.add(egui::Slider::new(&mut r.threshold_db, -60.0..=-15.0).suffix(" dB").text(tr("quiet below")));
+                    ui.add(egui::DragValue::new(&mut r.gap).range(0.1..=3.0).speed(0.02).suffix(" s")).on_hover_text(tr("Shortest pause that counts"));
+                    if !r.cuts.is_empty() && ui.button(tr("Clear cuts")).clicked() {
                         r.cuts.clear();
                         r.sync_parts();
                     }
@@ -252,10 +253,10 @@ impl App {
                     for (i, (a, b)) in bounds.iter().enumerate() {
                         let Some(part) = r.parts.get_mut(i) else { continue };
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut part.keep, "").on_hover_text("Add this part to the bin");
+                            ui.checkbox(&mut part.keep, tr("")).on_hover_text(tr("Add this part to the bin"));
                             ui.add(egui::TextEdit::singleline(&mut part.name).desired_width(200.0));
-                            ui.label(egui::RichText::new(format!("{} – {} · {:.1} s", clock(*a), clock(*b), b - a)).small().weak());
-                            if ui.small_button("▶").on_hover_text("Listen (click again to stop)").clicked() {
+                            ui.label(egui::RichText::new(trf("{0} – {1} · {2} s", &[("0", &(clock(*a)).to_string()), ("1", &(clock(*b)).to_string()), ("2", &format!("{:.1}", b - a))])).small().weak());
+                            if ui.small_button(tr("▶")).on_hover_text(tr("Listen (click again to stop)")).clicked() {
                                 let path = std::env::temp_dir().join(format!("oa-recording-preview-{i}.wav"));
                                 if r.take.write_wav(&path, *a, *b).is_ok() {
                                     play = Some((path, Time::from_seconds_f64(b - a)));
@@ -267,12 +268,12 @@ impl App {
                 ui.separator();
                 let kept = r.parts.iter().filter(|p| p.keep).count();
                 ui.horizontal(|ui| {
-                    let label = if kept == 1 { "Add 1 clip to the media bin".to_string() } else { format!("Add {kept} clips to the media bin") };
+                    let label = if kept == 1 { tr("Add 1 clip to the media bin").to_string() } else { trf("Add {kept} clips to the media bin", &[("kept", &(kept).to_string())]) };
                     let button = egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE)).fill(crate::style::ACCENT).corner_radius(8.0);
                     if ui.add_enabled(kept > 0, button).clicked() {
                         action = Some("add");
                     }
-                    if ui.button("Discard").clicked() {
+                    if ui.button(tr("Discard")).clicked() {
                         action = Some("discard");
                     }
                 });
@@ -298,7 +299,7 @@ impl App {
                         r.level = 0.0;
                         r.recorder = Some(rec);
                     }
-                    Err(e) => r.error = Some(format!("Couldn't start recording: {e}")),
+                    Err(e) => r.error = Some(trf("Couldn't start recording: {e}", &[("e", &(e).to_string())])),
                 }
             }
             Some("pause") => {
@@ -362,7 +363,7 @@ impl App {
         }
         let count = files.len();
         self.import_paths(&files, false, "Recordings");
-        self.notify(format!("{count} recording{} added to the media bin (Recordings).", if count == 1 { "" } else { "s" }));
+        self.notify(trf("{count} recording{0} added to the media bin (Recordings).", &[("count", &(count).to_string()), ("0", (if count == 1 { "" } else { "s" }))]));
         let r = &mut self.recording;
         r.takes += 1;
         r.take = Take::default();

@@ -3,6 +3,7 @@
 //! they come from the system. Checked once at start, on a thread; if one is missing, a
 //! bar says so and how to get it, instead of imports failing with a puzzling error.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use std::sync::mpsc::{channel, Receiver};
@@ -18,11 +19,11 @@ fn missing_tools() -> Vec<&'static str> {
 /// How to get them on this system.
 fn how_to_install() -> &'static str {
     if cfg!(windows) {
-        "Reinstall OpenAtelier with its installer (it includes them), or put ffmpeg.exe and ffprobe.exe next to OpenAtelier.exe."
+        tr("Reinstall OpenAtelier with its installer (it includes them), or put ffmpeg.exe and ffprobe.exe next to OpenAtelier.exe.")
     } else if cfg!(target_os = "macos") {
-        "Install them with Homebrew: brew install ffmpeg"
+        tr("Install them with Homebrew: brew install ffmpeg")
     } else {
-        "Install them with your package manager, e.g. sudo apt install ffmpeg (Debian, Ubuntu) or sudo dnf install ffmpeg (Fedora)."
+        tr("Install them with your package manager, e.g. sudo apt install ffmpeg (Debian, Ubuntu) or sudo dnf install ffmpeg (Fedora).")
     }
 }
 
@@ -57,12 +58,12 @@ impl App {
         egui::Panel::top("deps-banner").show(root, |ui| {
             ui.add_space(3.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(format!("⚠ {names} can't be found: importing, playing and exporting video need it.")).color(crate::style::WARNING));
+                ui.label(egui::RichText::new(trf("⚠ {names} can't be found: importing, playing and exporting video need it.", &[("names", &names.to_string())])).color(crate::style::WARNING));
                 ui.label(how_to_install());
-                if ui.button("Check again").clicked() {
+                if ui.button(tr("Check again")).clicked() {
                     self.check_deps();
                 }
-                if ui.button("Dismiss").clicked() {
+                if ui.button(tr("Dismiss")).clicked() {
                     self.deps.dismissed = true;
                 }
             });

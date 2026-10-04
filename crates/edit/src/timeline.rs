@@ -48,7 +48,9 @@ pub fn media_limits(p: &Project, item: &Item) -> (Option<Time>, Option<Time>) {
         return (None, None);
     };
     let speed = item.time_map.speed;
-    if speed.is_zero() {
+    // Frozen, or ramped (where the file runs out depends on the whole ramp): the clip
+    // holds its last frame past the end rather than stopping the trim.
+    if speed.is_zero() || item.speed_ramp().is_some() {
         return (None, None);
     }
     // Clip-local times where the source clock hits 0 and the end of the media.
@@ -94,7 +96,17 @@ pub fn trim(p: &Project, seq: SeqId, item: ItemId, edge: Edge, to: Time) -> R<Ve
     if range == it.range && time_map == it.time_map {
         return Ok(Vec::new());
     }
-    Ok(vec![Op::SetItemTiming { seq, item, range, time_map }])
+    let mut ops = vec![Op::SetItemTiming { seq, item, range, time_map }];
+    // A speed ramp stays where it was on the timeline: its keys move with the head, so
+    // the footage after the trim plays as it did.
+    if let Some(ramp) = it.speed_ramp()
+        && range.start != it.range.start
+    {
+        let mut ramp = ramp.clone();
+        ramp.shift_clip_clock(range.start - it.range.start);
+        ops.push(Op::SetParam { seq, item, target: ParamTarget::Item, param: oa_params::ParamId::new(oa_doc::schema::SPEED), source: Some(ramp) });
+    }
+    Ok(ops)
 }
 
 /// The clip's timing played the other way (`reverse`: backwards) — the same part of its

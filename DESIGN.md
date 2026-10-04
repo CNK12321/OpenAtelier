@@ -502,7 +502,7 @@ network, or see anything but what its host hands it — the confirmation is for 
 from someone else running at all, and for what actions and overlays are handed.
 Atelier Core is part of the editor.
 
-## 9. Color ✅ (8-bit decode ⏳)
+## 9. Color ✅
 
 * **Working space**: scene-linear Rec.709 primaries in `Rgba16Float`, premultiplied. 1.0 is
   SDR reference white — HDR sources map 203 nits there (BT.2408) — and log footage lands
@@ -600,7 +600,9 @@ sees pixels at explicit edges (`readback`: tests, stills, thumbnails; later the 
   fixed-function (Normal, Add, Screen; Multiply exact over opaque backdrops; Darken and
   Lighten as a per-channel min/max, the layer laid over white or black first so its
   transparent parts change nothing — exact where it's opaque, approximate at partial
-  opacity). A clip picks one with its `transform.blend` property (Properties → blend).
+  opacity). A clip picks one with the **Blend** effect (`oa.composite.blend`): no shader
+  pass, the planner reads its `mode` into the layer. Older projects' `transform.blend`
+  property becomes that effect on load.
 * **Texture pool**: reuse is decided by reference count (a texture is free when only the
   pool holds it), idle textures are released after a few frames. 60 frames of playback
   stay within 8 textures in tests.
@@ -632,11 +634,23 @@ Memory & robustness ✅ / ⏳ (`health.rs`):
   back once there's real room again. An allocation the driver refuses (`OutOfMemory`)
   drops the whole cache at once. Degrading beats failing.
 * ✅ **The device going away** is noticed (`set_device_lost_callback`,
-  `on_uncaptured_error`): the app autosaves the project *first*, stops rendering rather
-  than looping on failed frames, and tells the user to restart. Errors the driver
-  reports are counted and shown in the Performance panel.
-* ⏳ Rebuilding a lost device in place (eframe shares one device with the UI, so today
-  this means restarting), and loop bounds and time limits for plugin shaders.
+  `on_uncaptured_error`) and **the app comes back** (`app/gpu_reset.rs`, 2026-09-28):
+  eframe draws the window with the same device, so nothing in the process can draw
+  again — the work is saved (the project if nothing was unsaved, else an autosave), a
+  new process starts with `--after-gpu-reset` (or `--after-gpu-reset-open`) and
+  `--playhead`, reopens it where it was and says what happened, and the old one exits.
+  A second loss within three minutes of such a restart stops there instead (an
+  environment variable counts them) and points at Settings → Graphics. Scripted runs
+  just stop. Errors the driver reports are counted and shown in the Performance panel.
+* ✅ **Plugin shaders can't take the GPU down unnoticed** (2026-09-28): on load, another
+  plugin's shader is at most 64 KB and declares at most 32 passes (the renderer runs 32
+  at most either way, `plugin::MAX_PASSES`). At run time `app/gpu_watch.rs` notes the
+  effects of each viewer frame handed to the GPU (`Graph::effect_types`) until
+  `on_submitted_work_done`; a frame still unfinished after 1.2 s (under Windows' two-
+  second driver reset) that uses effects of plugins other than Atelier Core turns
+  those plugins off at once. A loss with such a frame on the GPU turns them off before
+  restarting, and the restarted editor names them. Atelier Core is never blamed.
+* ⏳ A GPU-time budget per effect (timestamp queries), for slow-but-finishing shaders.
 * ⏳ Hardware decode → GPU textures: ship the copy path first, add zero-copy per platform.
 
 ## 11. Media ✅ (Windows, Linux; macOS untried)
@@ -727,8 +741,27 @@ backwards. Frames cross as `Surface`s (NV12 texture + lease); conversion to the 
 format stays in the render graph. Measured in the app: 161 of 162 frames during playback
 were already waiting, 0 seeks; export went from 102 to 113 fps (now bound by x264).
 
-**Gaps** ⏳: no decoder budget (threads per open file), no proxies; 8-bit NV12 only (P010/10-bit, 4:2:2 and HDR transfer conversion are
-rejected or flagged, not converted); VideoToolbox (macOS) and VA-API zero-copy decoders.
+**10-bit and deeper** ✅ (2026-09-28): `VideoTrack::bit_depth` reads the pixel format
+(`yuv420p10le`, `p010le`, `yuv422p12le`…). Where the device takes 16-bit normalized
+textures (`TEXTURE_FORMAT_16BIT_NORM`, requested when the adapter has it), such files
+go to the ffmpeg decoder (Media Foundation's shared surfaces are 8-bit NV12), which asks
+for `p016le` (`yuva420p16le` with transparency) and uploads R16 + RG16 planes; the YUV
+pass takes video range at the 16-bit codes (black at 16 << 8). Tested with a lossless
+10-bit gradient: 40 codes in, 40 steps out, at the right level. Without the feature
+they decode at 8 bits as before.
+
+**Proxies** ✅ (`app/proxies.rs`, 2026-09-28): small copies the viewer plays instead of
+heavy files — H.264 at most 540 px on the short side, a keyframe every 12 frames, no
+B-frames, in Matroska with the original's timestamps (`-copyts`, `-fps_mode
+passthrough`), so a time in the file is the same time in the proxy. Named by the
+file's content fingerprint in `<app dir>/proxies`, shared by every project. Made on one
+thread (progress from `-progress`), by themselves for files over 1440p or deeper than 8
+bits (a setting), or from the bin's menu. Only the viewer's decoders get them (`App::
+viewer_entries`, switched with a full reset when one is ready or the viewer's Proxies
+toggle changes); previews, scopes and exports read the files.
+
+**Gaps** ⏳: no decoder budget (threads per open file); 4:2:2 is converted to 4:2:0;
+VideoToolbox (macOS) and VA-API zero-copy decoders.
 
 **The portable decoder** ✅ (`oa_media::ffmpeg`, 2026-09-24): an `ffmpeg` process
 decodes (`-hwaccel auto`: VA-API, NVDEC, D3D11VA, VideoToolbox when there is one; the CPU
@@ -896,7 +929,7 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
 * **Viewer (direct manipulation)**: click a layer to select it, drag to move (snapping
   to the canvas center and edges with guides), corner handles scale about the anchor
   (Shift: free aspect), edge handles scale one axis, the knob above rotates (Ctrl: 15°
-  steps), the center dot moves the anchor without moving the picture, Ctrl+arrows nudge.
+  steps), the center dot moves the anchor without moving the picture, Alt+arrows nudge.
   In a secondary format, edits go to that format's override unless "edit all formats"
   is on. Hover outlines the layer a click would pick.
 * **Speed belongs to the clip** (`Properties`): footage and compound clips carry a speed
@@ -1123,11 +1156,24 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
   hovering holds them, a click dismisses — and also goes to the Messages list, so nothing
   is lost. Typed names go through `check_name` (non-empty, sane length) and say what is
   wrong instead of being dropped.
-* **Localization** (`i18n.rs`, `crates/app/locales/en.json`): `t("key")` / `args("key",
-  ...)`, English embedded as the fallback, extra languages as JSON in `<config>/locales`
-  (no rebuild needed), chosen by the settings file, `OA_LANG` or the system locale, with
-  a picker on the start page. The start page, notifications and error messages are
-  translated; the editor's labels are moving over key by key.
+* **Localization** (`i18n.rs`, `crates/app/locales/`; the whole editor 2026-09-29): **the
+  English text is the key** — `tr("Save")` for text in the code (no copy; free in
+  English), `trf("{n} clips", &[("n", …)])` for text with values (every `format!` handed
+  to the UI was moved over, each value a named placeholder so a language can reorder
+  them), `t(&text)` for text that isn't a literal (effect and parameter names, choice
+  options), `tx` for text that may hold a user's name (never kept). The start page's older
+  named keys (`home.new_project`) stay, with English in `en.json`. Atelier Core's effect
+  names, descriptions and categories are translated as the registry is built
+  (`plugins::translated`); icon buttons translate their own tooltips; enum labels
+  translate where they're defined. **Spanish** is built in (`locales/es.json`, ~1,350
+  strings); a file in `<config>/locales/<code>.json` adds a language or corrects one
+  without a rebuild. Chosen by the settings file, `OA_LANG` or the system locale, from
+  the start page or Settings → Interface (applies on restart). `i18n::tests::
+  every_ui_string_is_translatable` scans the source: a string literal handed straight to
+  the UI without `tr` fails it, and so does one `tr` is given that Spanish lacks;
+  `the_catalog_is_sound` checks each translation keeps its `{placeholders}`. Not
+  translated: text from other crates' engines (setup step names, their errors), camera
+  and codec names, and what users name things.
 * **Menus that stay put** (`widgets::context_menu`, `widgets::sticky_menu`): menus close
   on a click *outside* them, so one can hold a search box, filter chips or a text field —
   picking a category in the effect browser no longer shuts the browser.
@@ -1257,22 +1303,14 @@ A window for exercising the engine end to end: `oa-app [video]`, or drop a file 
 * **Effect order by drag**: each effect card has a grip (⋮⋮); drag it and a line shows where it
   lands among the other effects (intros/outros and sound effects keep their places in
   the same list — `move_target`); one undo step per move. The ↑/↓ buttons are gone.
-* **Track picking, reordering and dividers** ✅ (2026-09-21, `oa_edit::sections`,
-  `timeline.rs`): double-click a track's header (or empty space on it) to pick it: Ctrl+V
-  and Ctrl+D then place the clips in its **first free space at or after the playhead**
-  (`free_spot` / `paste_into_track` — keeping their spacing, or one after another if they
-  came from several tracks), and Alt+↑/↓ moves it; any header can be dragged up or down
-  to reorder. **Dividers** (`Sequence::dividers`, `Op::SetDividers`) run across
-  **every track** and cut the timeline into **sections**: from each divider to the next,
-  a clip belonging to the one its start is in; a divider placed across clips splits them.
-  Each section is tinted its divider's color over all tracks; the flag sits in the
-  ruler. Drag the divider's line (in the ruler, or a track's upper half) to move it
-  alone, or its flag to move the whole section — its clips on every track — among the
-  others (`move_section`: sections laid end to end in the new order, clips taken out and
-  put back so none collide midway, the first stretch gets a divider if it moves off the
-  start). Right-click: name, color, select its clips, move earlier/later, clear its
-  clips, delete it (`delete_section`: everything after, on every track, moves back to
-  close the gap), remove the divider. (They were per track for one day.)
+* **Track picking and reordering** ✅ (2026-09-21, `oa_edit::paste`, `timeline.rs`):
+  click a track's header to pick it (Ctrl+click for more, Shift+click for a run; since
+  2026-09-30): Ctrl+V and Ctrl+D then place the clips in the first picked track's
+  **first free space at or after the playhead** (`free_spot` / `paste_into_track` —
+  keeping their spacing, or one after another if they came from several tracks), and
+  Alt+↑/↓ moves the picked tracks together; any header can be dragged up or down to
+  reorder. (Timeline-wide dividers cutting it into sections were removed on
+  2026-09-30; older projects' dividers are ignored.)
 * **Layouts and remembered views** ✅ (2026-09-21, `layout.rs`): *Standard* (viewer in
   the middle, properties in the tall right column) or *Vertical* for 9:16 work, which
   swaps them so the tall column holds the viewer; *Auto* picks Vertical while the format
@@ -1933,6 +1971,17 @@ with proxies off — that is what makes what you saw what you get.
   looping, no sound. Tested end to end (`gif_of_a_range`).
 * ⏳ Gaps: frames still cross to the CPU (NV12 readback), no image-sequence or audio-only
   output, no resuming a canceled export.
+* ✅ **OpenTimelineIO** (`oa_export::otio`, 2026-09-28; OpenAtelier menu → Export timeline
+  for another editor): the main timeline as a `.otio` file for DaVinci Resolve,
+  Kdenlive and OTIO's adapters. The edit carries over — each clip's file (a `file://`
+  URL to the original, never a proxy or conformed copy), its place and track, the part
+  of the file it plays (`source_range` in file time, at the timeline's rate), gaps,
+  speed (`LinearTimeWarp`, `FreezeFrame`), dissolves at cuts (`Transition` centered on
+  the cut), compound clips as nested stacks, muted clips and tracks. A video clip's
+  sound gets a matching clip on an audio track. Titles and solids become generator
+  clips; effects, keyframes, masks and color are OpenAtelier's alone, listed in
+  `metadata.openatelier`. Not yet checked against OTIO's own library or imported into
+  Resolve; no import yet.
 
 ## 16. Transitions ✅
 
@@ -2136,7 +2185,27 @@ Settings → Editing → **Masking** turns on a **Masks** tab for clips with a p
   click (tolerance, contiguous or everywhere); **Import picture** renders a bin picture
   stretched to the clip and takes its brightness or its opacity. Pixel masks are made at
   the clip's full resolution (≤ 8192 px); strokes stay vectors, drawn at whatever
-  resolution renders them. Automatic rotoscoping is shown as coming soon.
+  resolution renders them.
+
+**Automatic rotoscoping** (2026-09-29; `oa_track::roto`, `oa_roto.py`, `app/roto.rs`; the
+bridge not yet run against the real model): the **Rotoscope** tool — click the thing on
+one frame, Alt-click what to leave out — runs **SAM 2** (Meta, Apache-2.0) over the
+clip, or a stretch around the frame, every frame or every 2nd/4th, into a
+[`MaskShape::Matte`]: one RLE bitmap per footage frame at clip times, each shown until
+the next (`matte_at`), stretched over the layer like a bitmap. Its **softness** is the
+shape's feather (px of the clip, a setting; editable after under Shapes); the matte
+itself is SAM's probability × 255, so its edge is already a little soft. It goes into
+the selected mask (a new one when that mask was refit to another shape). SAM 2 is set
+up into the AI engine folder the tracker uses, on the same Python and PyTorch
+(`Tracker::base_steps`, shared; torchvision from PyTorch's own index so it matches), with
+its code from its repository (the PyPI package is source that builds a CUDA extension)
+and the **model chosen**: Tiny, Small (default), Base+ or Large (156–898 MB, each its own
+download from Meta, added or removed in Settings → AI tracker). ffmpeg hands over ≤ 900
+frames at ≤ 768 px; the bridge feeds SAM 2 64 at a time, each chunk starting from the
+mask the last ended on, so memory stays flat — forward from the clicked frame, then
+backward. Masks made only of pictures (mattes, magic selections, imports) are
+rasterized at the pictures' own size (`Mask::raster_cap`; the GPU stretches them): a
+768 × 432 matte frame takes 3.7 ms, 11 ms softened, instead of 22 and 71 at 1080p.
 
 ## 18. Releases and updates ✅ (2026-09-24; the first release not yet made)
 
@@ -2165,14 +2234,21 @@ says how to get them if not, instead of imports failing with a puzzling error.
 `curl`, at every start and every few hours while open, or Settings → Updates → Check now) and compares by semantic
 versioning (`0.1.0-beta.2` > `beta.1`; a release above its pre-releases). The **Beta**
 channel (the default for beta builds) also offers pre-releases; **Stable** only full
-releases; only releases with a package for this platform count. A bar at the top offers
-**Update**, **What's new** (the release page) and **Later**. Update downloads the package
+releases; only releases with a package for this platform count. A dialog says so plainly
+("Beta 5 is available!"), lists what's new (the bullet points of the release notes, which
+the release workflow takes from the version's section of `CHANGELOG.md`; the download
+help and GitHub's commit list left out: `release_features`), and offers **Restart and
+Update Now** or **Later** (gone for the session; an update installed meanwhile leaves a
+small "restart to use it" bar). Update downloads the package
 and the checksums (the engines' step runner, with progress), checks the SHA-256, unpacks
 with `tar` (zips too), and puts the files next to the running program — a file in the way
 is renamed aside (`*.old`; Windows lets a running program be renamed, not overwritten),
-cleared at the next start. **Restart now** closes the normal way (unsaved work is asked
-about) and `on_exit` starts the new version. Builds run from a `target` folder, or
-installs in a folder the app can't write, get the download page instead. `OA_UPDATE_REPO`
+cleared at the next start. Once installed it restarts: it closes the normal way (unsaved
+work is asked about) and `on_exit` starts the new version. Installed from the `.deb`
+(dpkg lists the running program), it downloads the new `.deb` instead and installs it
+with `pkexec apt-get install` (the system's password prompt; dpkg where there's no apt).
+Builds run from a `target` folder, or installs in a folder the app can't write, get
+the download page instead. `OA_UPDATE_REPO`
 points it at another repository. Tested: version ordering, channels, GitHub's answers
 (and its error messages), checksums, an end-to-end install from a real package (and a
 damaged one refused), files set aside and cleared.

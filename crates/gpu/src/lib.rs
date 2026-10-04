@@ -24,7 +24,7 @@ mod test_pattern;
 pub mod text;
 mod yuv;
 
-pub use context::{GpuContext, GpuPreference};
+pub use context::{deep_video, GpuContext, GpuPreference};
 /// Choosing and describing adapters (shared with the window, which makes its own device).
 pub mod select {
     pub use crate::context::{choose, describe, device_descriptor, parse_backend, shortcomings};

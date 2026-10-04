@@ -227,6 +227,26 @@ impl Graph {
         &self.nodes[id.0 as usize]
     }
 
+    /// Every effect, transition and text effect the graph runs, by type id, each once —
+    /// for telling which plugins a frame depends on (a GPU that stalls on one).
+    pub fn effect_types(&self) -> Vec<Arc<str>> {
+        let mut out: Vec<Arc<str>> = Vec::new();
+        let mut add = |t: &Arc<str>| {
+            if !out.contains(t) {
+                out.push(t.clone());
+            }
+        };
+        for n in &self.nodes {
+            match &n.op {
+                NodeOp::Effect { type_id, .. } | NodeOp::Transition { type_id, .. } => add(type_id),
+                NodeOp::FusedPointOps { chain, .. } | NodeOp::FusedUvWarps { chain, .. } => chain.iter().for_each(|c| add(&c.0)),
+                NodeOp::Text { chain, .. } => chain.iter().for_each(|e| add(&e.type_id)),
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// Nodes reachable from the output.
     pub fn live_count(&self) -> usize {
         let mut seen = vec![false; self.nodes.len()];

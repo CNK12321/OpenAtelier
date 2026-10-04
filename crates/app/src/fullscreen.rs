@@ -4,6 +4,7 @@
 //! Everything else keeps running as usual — the frame is rendered at the screen's size
 //! (Auto resolution follows what's shown), sound plays, edits made elsewhere show.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_time::Time;
@@ -113,7 +114,7 @@ impl App {
                     let s = t.as_seconds_f64().max(0.0);
                     format!("{}:{:05.2}", (s / 60.0).floor() as u64, s % 60.0)
                 };
-                ui.label(egui::RichText::new(format!("{} / {}", clock(self.playhead), clock(duration))).color(egui::Color32::WHITE).monospace());
+                ui.label(egui::RichText::new(trf("{0} / {1}", &[("0", &(clock(self.playhead)).to_string()), ("1", &(clock(duration)).to_string())])).color(egui::Color32::WHITE).monospace());
                 // The scrub bar fills what's left, before the way out.
                 let width = (ui.available_width() - 110.0).max(40.0);
                 let (track, r) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::click_and_drag());
@@ -135,7 +136,7 @@ impl App {
                 if r.drag_stopped() {
                     self.end_scrub();
                 }
-                if ui.button("Leave fullscreen").on_hover_text("F, Esc or double-click").clicked() {
+                if ui.button(tr("Leave fullscreen")).on_hover_text(tr("F, Esc or double-click")).clicked() {
                     let ctx = ui.ctx().clone();
                     self.set_fullscreen(&ctx, false);
                 }

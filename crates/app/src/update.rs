@@ -10,12 +10,17 @@
 //!   channel, Check now).
 //! * Installing replaces files in the app's own folder: a file in use (the running
 //!   program) is renamed aside (`*.old`) first — Windows allows that — and the leftovers
-//!   are cleared at the next start. A build run from a `target` folder (a developer's), or
-//!   an install the app can't write to, gets a link to the download page instead.
+//!   are cleared at the next start. Installed from the `.deb`, it installs the new `.deb`
+//!   with apt behind the system's password prompt (`pkexec`). A build run from a
+//!   `target` folder (a developer's), or an install the app can't write to, gets a link
+//!   to the download page instead.
+//! * News comes as a dialog: "Beta 5 is available!", the release notes' points
+//!   (`release_features`), **Restart and Update Now** or **Later**.
 //!
 //! Packages are what `.github/workflows/release.yml` makes:
 //! `OpenAtelier-<version>-<platform>.zip|.tar.gz`, one folder inside with the programs.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_captions::engine::{Engine, Job, Msg, Step};
@@ -252,18 +257,69 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 
 // ---- installing ----
 
-/// Where the running app lives, if it can update itself there: not a developer build
-/// (run from a `target` folder) and a folder it can write to.
-pub fn install_dir() -> Option<PathBuf> {
+/// How this copy updates itself (in the folder it runs from, which the variants carry).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Method {
+    /// The new files put in place of the old ones: the Windows install, an unpacked zip
+    /// or tarball, `install.sh`'s `~/.local`.
+    Folder(PathBuf),
+    /// Installed from the `.deb` (apt owns `/opt/openatelier`): the new `.deb`, installed
+    /// by apt behind the system's password prompt (`pkexec`).
+    Deb(PathBuf),
+}
+
+impl Method {
+    pub fn dir(&self) -> &Path {
+        match self {
+            Method::Folder(d) | Method::Deb(d) => d,
+        }
+    }
+}
+
+/// How the running app can update itself, if it can: not a developer build (run from a
+/// `target` folder), and either installed by the `.deb` or in a folder it can write to.
+/// Worked out once (it writes a file to find out), not on every frame the dialog shows.
+pub fn install_method() -> Option<Method> {
+    static METHOD: std::sync::OnceLock<Option<Method>> = std::sync::OnceLock::new();
+    METHOD.get_or_init(find_install_method).clone()
+}
+
+fn find_install_method() -> Option<Method> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
     if dir.components().any(|c| c.as_os_str() == "target") {
         return None;
     }
+    if cfg!(target_os = "linux") && dpkg_owns(&exe) {
+        return Some(Method::Deb(dir));
+    }
     let probe = dir.join(".oa-write-test");
     std::fs::write(&probe, b"").ok()?;
     let _ = std::fs::remove_file(&probe);
-    Some(dir)
+    Some(Method::Folder(dir))
+}
+
+/// Whether `exe` is one of the files the `openatelier` package installed.
+fn dpkg_owns(exe: &Path) -> bool {
+    let Ok(list) = std::fs::read_to_string("/var/lib/dpkg/info/openatelier.list") else { return false };
+    let exe = exe.to_string_lossy();
+    list.lines().any(|l| l == exe)
+}
+
+/// The folder the running app can replace its own files in (not a `.deb` install's).
+pub fn install_dir() -> Option<PathBuf> {
+    match install_method()? {
+        Method::Folder(dir) => Some(dir),
+        Method::Deb(_) => None,
+    }
+}
+
+/// The file in `release` that `method` installs: the `.deb`, or the zip/tarball.
+pub fn package_for_method<'a>(release: &'a Release, method: &Method) -> Option<&'a Asset> {
+    match method {
+        Method::Deb(_) => release.assets.iter().find(|a| a.name.ends_with(&format!("-{}.deb", platform()))),
+        Method::Folder(_) => package_for(release, platform()),
+    }
 }
 
 /// The program to start after updating, in `dir`.
@@ -347,11 +403,13 @@ pub struct Updater {
     /// Installed; the program to start when the app closes (Restart now).
     installed: bool,
     relaunch: Option<PathBuf>,
+    /// "Restart and Update Now": restart as soon as it's installed.
+    restart_when_done: bool,
 }
 
 enum Install {
     /// Downloading the package and the checksums.
-    Download { job: Job, step: String, progress: Option<f32>, archive: PathBuf, sums: PathBuf, dir: PathBuf },
+    Download { job: Job, step: String, progress: Option<f32>, archive: PathBuf, sums: PathBuf, method: Method },
     /// Checking, unpacking and putting in place, on a thread.
     Place(Receiver<Result<usize, String>>),
     Failed(String),
@@ -373,7 +431,7 @@ fn fetch_releases() -> Result<Vec<Release>, String> {
     let body = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         let why = parse_releases(&body).err().unwrap_or_else(|| String::from_utf8_lossy(&out.stderr).trim().to_string());
-        return Err(if why.is_empty() { "GitHub didn't answer".into() } else { why });
+        return Err(if why.is_empty() { tr("GitHub didn't answer").into() } else { why });
     }
     parse_releases(&body)
 }
@@ -440,10 +498,10 @@ impl App {
                             self.updater.available = newer(&releases, &current, self.beta_channel()).cloned();
                             Ok(match &self.updater.available {
                                 Some(r) => format!("{} is available.", r.name),
-                                None => "You have the latest version.".into(),
+                                None => tr("You have the latest version.").into(),
                             })
                         }
-                        Err(e) => Err(format!("Couldn't check for updates: {e}")),
+                        Err(e) => Err(trf("Couldn't check for updates: {e}", &[("e", &(e).to_string())])),
                     });
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
@@ -452,7 +510,7 @@ impl App {
         }
         let mut next = None;
         match &mut self.updater.install {
-            Some(Install::Download { job, step, progress, archive, sums, dir }) => {
+            Some(Install::Download { job, step, progress, archive, sums, method }) => {
                 while let Ok(m) = job.rx.try_recv() {
                     match m {
                         Msg::Step { label, .. } => {
@@ -463,10 +521,10 @@ impl App {
                         Msg::Failed(e) => next = Some(Install::Failed(e)),
                         Msg::Finished => {
                             // Checked, unpacked and put in place off the UI thread.
-                            let (archive, sums, dir) = (archive.clone(), sums.clone(), dir.clone());
+                            let (archive, sums, method) = (archive.clone(), sums.clone(), method.clone());
                             let (tx, rx) = channel();
                             std::thread::spawn(move || {
-                                let _ = tx.send(verify_and_place(&archive, &sums, &dir));
+                                let _ = tx.send(verify_and_install(&archive, &sums, &method));
                             });
                             next = Some(Install::Place(rx));
                         }
@@ -479,6 +537,10 @@ impl App {
                 Ok(Ok(_)) => {
                     self.updater.installed = true;
                     self.updater.install = None;
+                    // "Restart and Update Now" was asked for: that's the restart.
+                    if self.updater.restart_when_done {
+                        self.restart_into_update(ctx);
+                    }
                 }
                 Ok(Err(e)) => next = Some(Install::Failed(e)),
                 Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
@@ -495,8 +557,12 @@ impl App {
     /// update itself, opens the release's page.
     fn start_install(&mut self, ctx: &egui::Context) {
         let Some(release) = self.updater.available.clone() else { return };
-        let (Some(dir), Some(package)) = (install_dir(), package_for(&release, platform()).cloned()) else {
+        let Some(method) = install_method() else {
             ctx.open_url(egui::OpenUrl::new_tab(release.page));
+            return;
+        };
+        let Some(package) = package_for_method(&release, &method).cloned() else {
+            self.updater.install = Some(Install::Failed(format!("{} has no package for this install", release.name)));
             return;
         };
         let Some(sums_asset) = release.assets.iter().find(|a| a.name == SUMS).cloned() else {
@@ -511,14 +577,14 @@ impl App {
             Step::Download { what: "the checksums".into(), url: sums_asset.url.clone(), to: sums.clone() },
         ];
         let job = oa_captions::engine::run(&Engine::new(work), steps);
-        self.updater.install = Some(Install::Download { job, step: "Starting".into(), progress: None, archive, sums, dir });
+        self.updater.install = Some(Install::Download { job, step: "Starting".into(), progress: None, archive, sums, method });
     }
 
     /// Restart now: close the normal way (unsaved work is asked about), then start the
     /// new version.
     fn restart_into_update(&mut self, ctx: &egui::Context) {
-        if let Some(dir) = install_dir() {
-            self.updater.relaunch = Some(main_program(&dir));
+        if let Some(method) = install_method() {
+            self.updater.relaunch = Some(main_program(method.dir()));
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
@@ -532,78 +598,145 @@ impl App {
         }
     }
 
-    /// The bar across the top when there's news: a newer version, the download, done.
+    /// When a newer version is out: a dialog that says so plainly — "Beta 5 is
+    /// available!", what's in it, and two choices: restart and update now, or later.
+    /// After "Later" it stays away for this session (Settings → Updates → Check now
+    /// brings it back); an update installed but not yet restarted into keeps a small bar
+    /// at the top.
     pub(crate) fn update_banner(&mut self, root: &mut egui::Ui) {
         let u = &self.updater;
-        let offer = u.available.as_ref().filter(|r| u.dismissed.as_deref() != Some(r.tag.as_str()) || u.install.is_some() || u.installed);
-        let Some(release) = offer.cloned() else { return };
+        let Some(release) = u.available.clone() else { return };
         let ctx = root.ctx().clone();
-        egui::Panel::top("update-banner").show(root, |ui| {
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("⬆").color(crate::style::ACCENT));
-                match &self.updater.install {
-                    _ if self.updater.installed => {
-                        ui.label(format!("{} is installed. Restart to use it.", release.name));
-                        if ui.button("Restart now").on_hover_text("Closes (asking about unsaved work first) and opens the new version").clicked() {
+        let dismissed = u.dismissed.as_deref() == Some(release.tag.as_str());
+        if dismissed {
+            if self.updater.installed {
+                egui::Panel::top("update-banner").show(root, |ui| {
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(trf("{0} is installed. Restart to use it.", &[("0", &(release.name).to_string())])).color(crate::style::ACCENT));
+                        if ui.button(tr("Restart now")).on_hover_text(tr("Closes (asking about unsaved work first) and opens the new version")).clicked() {
                             self.restart_into_update(&ctx);
                         }
+                    });
+                    ui.add_space(3.0);
+                });
+            }
+            return;
+        }
+        // Closing asks about unsaved work in its own dialog: that one goes on top.
+        if self.closing {
+            return;
+        }
+        let can = install_method().is_some();
+        let busy = matches!(self.updater.install, Some(Install::Download { .. } | Install::Place(_)));
+        let lines = release_features(&release.notes);
+        let mut later = false;
+        egui::Modal::new(egui::Id::new("update-available")).show(&ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading(egui::RichText::new(trf("{0} is available!", &[("0", &(release.name).to_string())])).strong());
+            ui.label(egui::RichText::new(trf("You have {0}.", &[("0", &(short_version(VERSION)).to_string())])).weak());
+            ui.add_space(crate::style::GAP);
+            if lines.is_empty() {
+                ui.label(tr("New features and fixes."));
+                if ui.link(tr("See what's new")).clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(release.page.clone()));
+                }
+            } else {
+                egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                    for line in &lines {
+                        match line {
+                            Feature::Heading(h) => {
+                                ui.add_space(crate::style::GAP_S);
+                                ui.label(egui::RichText::new(h).strong());
+                            }
+                            Feature::Item(text, depth) => {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add_space(8.0 + 16.0 * *depth as f32);
+                                    ui.label(if *depth == 0 { "•" } else { "◦" });
+                                    ui.label(text);
+                                });
+                            }
+                        }
                     }
-                    Some(Install::Download { step, progress, .. }) => {
-                        ui.label(format!("{step}…"));
-                        ui.add(egui::ProgressBar::new(progress.unwrap_or(0.0)).desired_width(180.0).show_percentage().animate(progress.is_none()));
-                    }
-                    Some(Install::Place(_)) => {
+                });
+            }
+            ui.add_space(crate::style::GAP_L);
+            match &self.updater.install {
+                Some(Install::Download { step, progress, .. }) => {
+                    ui.label(trf("{step}…", &[("step", &step.to_string())]));
+                    ui.add(egui::ProgressBar::new(progress.unwrap_or(0.0)).show_percentage().animate(progress.is_none()));
+                }
+                Some(Install::Place(_)) => {
+                    ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Checking and installing…");
-                    }
-                    Some(Install::Failed(e)) => {
-                        ui.label(egui::RichText::new(format!("The update didn't install: {e}")).color(crate::style::ERROR));
-                        if ui.button("Download page").clicked() {
-                            ctx.open_url(egui::OpenUrl::new_tab(release.page.clone()));
-                        }
-                        if ui.button("Try again").clicked() {
-                            self.start_install(&ctx);
-                        }
-                    }
-                    None => {
-                        let kind = if release.prerelease { "beta" } else { "version" };
-                        ui.label(format!("A new {kind} is out: {} — you have {}.", release.name, short_version(VERSION)));
-                        let can = install_dir().is_some();
-                        let tip = if can { "Download it, check it and install it; then restart" } else { "Opens the download page (this copy can't update itself: it's a developer build, or its folder isn't writable)" };
-                        if ui.add(egui::Button::new(egui::RichText::new("Update").strong()).fill(crate::style::ACCENT.gamma_multiply(0.35))).on_hover_text(tip).clicked() {
-                            self.start_install(&ctx);
-                        }
-                        if ui.button("What's new").on_hover_text(release.notes.chars().take(600).collect::<String>()).clicked() {
-                            ctx.open_url(egui::OpenUrl::new_tab(release.page.clone()));
-                        }
-                        if ui.button("Later").clicked() {
-                            self.updater.dismissed = Some(release.tag.clone());
-                        }
+                        ui.label(if matches!(install_method(), Some(Method::Deb(_))) {
+                            tr("Installing — your system may ask for your password…")
+                        } else {
+                            tr("Checking and installing…")
+                        });
+                    });
+                }
+                Some(Install::Failed(e)) => {
+                    ui.label(egui::RichText::new(trf("The update didn't install: {e}", &[("e", &e.to_string())])).color(crate::style::ERROR));
+                }
+                None if self.updater.installed => {
+                    ui.label(tr("Installed. Restarting…"));
+                }
+                None => {}
+            }
+            ui.add_space(crate::style::GAP_S);
+            ui.horizontal(|ui| {
+                let failed = matches!(self.updater.install, Some(Install::Failed(_)));
+                let label = match () {
+                    _ if !can => tr("Open the Download Page"),
+                    _ if failed => "Try Again",
+                    _ => tr("Restart and Update Now"),
+                };
+                let tip = if can {
+                    tr("Downloads it, checks it and installs it, then restarts (asking about unsaved work first)")
+                } else {
+                    tr("This copy can't update itself (a developer build, or its folder isn't writable): opens the download page")
+                };
+                let button = egui::Button::new(egui::RichText::new(label).strong()).fill(crate::style::ACCENT.gamma_multiply(0.45));
+                if ui.add_enabled(!busy, button).on_hover_text(tip).clicked() {
+                    if self.updater.installed {
+                        self.restart_into_update(&ctx);
+                    } else {
+                        self.updater.restart_when_done = true;
+                        self.start_install(&ctx);
                     }
                 }
+                if failed && ui.button(tr("Download Page")).clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(release.page.clone()));
+                }
+                if ui.button(tr("Later")).on_hover_text(tr("Keeps working with this version; the download, if it started, finishes in the background")).clicked() {
+                    later = true;
+                }
             });
-            ui.add_space(3.0);
         });
+        if later {
+            self.updater.dismissed = Some(release.tag.clone());
+            self.updater.restart_when_done = false;
+        }
     }
 
     /// Settings → Updates.
     pub(crate) fn update_settings(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new(format!("OpenAtelier {} · {}", short_version(VERSION), platform())).small());
+        ui.label(egui::RichText::new(trf("OpenAtelier {0} · {1}", &[("0", &(short_version(VERSION)).to_string()), ("1", (platform()))])).small());
         let s = &mut self.settings;
         ui.horizontal(|ui| {
-            ui.label("Channel");
+            ui.label(tr("Channel"));
             let before = s.update_channel.clone();
-            ui.selectable_value(&mut s.update_channel, "stable".to_string(), "Stable").on_hover_text("Full releases only");
-            ui.selectable_value(&mut s.update_channel, "beta".to_string(), "Beta").on_hover_text("Pre-releases too: new features sooner, less tested");
+            ui.selectable_value(&mut s.update_channel, "stable".to_string(), "Stable").on_hover_text(tr("Full releases only"));
+            ui.selectable_value(&mut s.update_channel, "beta".to_string(), "Beta").on_hover_text(tr("Pre-releases too: new features sooner, less tested"));
             if s.update_channel != before {
                 s.update_checked_at = 0;
             }
         });
-        ui.checkbox(&mut s.check_updates, "Check for updates").on_hover_text("At start and every few hours while open, from the project's GitHub releases");
+        ui.checkbox(&mut s.check_updates, tr("Check for updates")).on_hover_text(tr("At start and every few hours while open, from the project's GitHub releases"));
         ui.horizontal(|ui| {
             let checking = self.updater.checking.is_some();
-            if ui.add_enabled(!checking, egui::Button::new("Check now")).clicked() {
+            if ui.add_enabled(!checking, egui::Button::new(tr("Check now"))).clicked() {
                 self.updater.dismissed = None;
                 self.check_for_updates();
             }
@@ -624,8 +757,9 @@ impl App {
     }
 }
 
-/// The downloaded package against its listed checksum, then unpacked and put in place.
-fn verify_and_place(archive: &Path, sums: &Path, dir: &Path) -> Result<usize, String> {
+/// The downloaded package against its listed checksum, then installed the way `method`
+/// says.
+fn verify_and_install(archive: &Path, sums: &Path, method: &Method) -> Result<usize, String> {
     let name = archive.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let listed = std::fs::read_to_string(sums).map_err(|e| e.to_string())?;
     let want = checksum_in(&listed, name).ok_or_else(|| format!("{name} isn't in the release's checksums"))?;
@@ -633,6 +767,45 @@ fn verify_and_place(archive: &Path, sums: &Path, dir: &Path) -> Result<usize, St
     if got != want {
         return Err("the download is damaged (its checksum doesn't match); try again".into());
     }
+    match method {
+        Method::Folder(dir) => place(archive, dir),
+        Method::Deb(dir) => install_deb(archive, dir),
+    }
+}
+
+/// Installs a downloaded `.deb` with apt (dpkg if there's no apt), as root through
+/// `pkexec`, which puts up the system's own password prompt.
+fn install_deb(deb: &Path, dir: &Path) -> Result<usize, String> {
+    let deb = std::fs::canonicalize(deb).map_err(|e| e.to_string())?;
+    let has = |program: &str| std::process::Command::new(program).arg("--version").output().is_ok();
+    if !has("pkexec") {
+        return Err(format!("this system can't ask for your password to install it (no pkexec) — in a terminal: sudo apt install {}", deb.display()));
+    }
+    let mut command = std::process::Command::new("pkexec");
+    if has("apt-get") {
+        command.args(["apt-get", "install", "-y", "--allow-downgrades"]).arg(&deb);
+    } else {
+        command.args(["dpkg", "-i"]).arg(&deb);
+    }
+    let out = command.output().map_err(|e| format!("couldn't run pkexec: {e}"))?;
+    match out.status.code() {
+        Some(0) => {}
+        // pkexec: the prompt was closed, or the password wasn't accepted.
+        Some(126 | 127) => return Err("installing needs your password, and the prompt was closed".into()),
+        _ => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("apt failed").trim().to_string();
+            return Err(format!("apt couldn't install it: {last}"));
+        }
+    }
+    if !main_program(dir).exists() {
+        return Err("the package has no program in it".into());
+    }
+    Ok(1)
+}
+
+/// Unpacks a package and puts its files in place of the ones in `dir`.
+fn place(archive: &Path, dir: &Path) -> Result<usize, String> {
     let staging = archive.with_extension("unpacked");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
@@ -649,9 +822,122 @@ fn verify_and_place(archive: &Path, sums: &Path, dir: &Path) -> Result<usize, St
     Ok(n)
 }
 
+/// A line of a release's feature list.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Feature {
+    /// A section ("New", "Fixed").
+    Heading(String),
+    /// A point, and how far it's nested.
+    Item(String, usize),
+}
+
+/// What's in a release, from its notes (Markdown): the bullet points and the headings over
+/// them, as plain text. The download instructions and GitHub's generated list of changes
+/// (commits and contributors) are left out.
+pub fn release_features(notes: &str) -> Vec<Feature> {
+    // `**x**`, `` `x` ``, `[x](url)` → x.
+    fn plain(s: &str) -> String {
+        let mut out = String::new();
+        let mut rest = s;
+        while let Some(i) = rest.find('[') {
+            out.push_str(&rest[..i]);
+            let after = &rest[i + 1..];
+            match after.find("](").and_then(|close| after[close..].find(')').map(|end| (close, close + end))) {
+                Some((close, end)) => {
+                    out.push_str(&after[..close]);
+                    rest = &after[end + 1..];
+                }
+                None => {
+                    out.push('[');
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out.replace("**", "").replace("__", "").replace('`', "").trim().to_string()
+    }
+    let skipped = |heading: &str| {
+        let h = heading.to_lowercase();
+        ["which file", "what's changed", "what’s changed", "new contributors", "download", "install"].iter().any(|s| h.contains(s))
+    };
+    let mut out = Vec::new();
+    let mut skipping = false;
+    // Whether the next plain line carries on the last point (wrapped in the source).
+    let mut open = false;
+    for line in notes.lines() {
+        let trimmed = line.trim_start();
+        if let Some(h) = trimmed.strip_prefix('#') {
+            let h = plain(h.trim_start_matches('#'));
+            skipping = skipped(&h);
+            open = false;
+            if !skipping && !h.is_empty() {
+                out.push(Feature::Heading(h));
+            }
+            continue;
+        }
+        if skipping || trimmed.starts_with("**Full Changelog**") {
+            open = false;
+            continue;
+        }
+        let Some(text) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) else {
+            match out.last_mut() {
+                Some(Feature::Item(text, _)) if open && !trimmed.is_empty() => {
+                    text.push(' ');
+                    text.push_str(&plain(trimmed));
+                }
+                _ => open = false,
+            }
+            continue;
+        };
+        let indent = line.len() - trimmed.len();
+        let text = plain(text);
+        open = !text.is_empty();
+        if open {
+            out.push(Feature::Item(text, indent / 2));
+        }
+    }
+    // Headings with nothing under them go.
+    let mut kept: Vec<Feature> = Vec::new();
+    for f in out {
+        if matches!(f, Feature::Heading(_)) && matches!(kept.last(), Some(Feature::Heading(_))) {
+            kept.pop();
+        }
+        kept.push(f);
+    }
+    if matches!(kept.last(), Some(Feature::Heading(_))) {
+        kept.pop();
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dialog lists what's new from the release notes, without the download help or
+    /// GitHub's list of commits.
+    #[test]
+    fn features_come_from_the_notes() {
+        let notes = "## Beta 5\n### New\n- **Masks.** Turn on under Settings.\n  - Draw with a `brush`.\n* Tabs in the [bin](https://x.y/z).\n### Fixed\n- Flicker\n\n### Which file?\n- **Windows:** the setup.exe\n\n## What's Changed\n* Fix a thing by @someone in https://github.com/a/b/pull/1\n\n**Full Changelog**: https://github.com/a/b/compare/v1...v2\n### Empty\n";
+        let f = release_features(notes);
+        let item = |s: &str, d: usize| Feature::Item(s.into(), d);
+        let head = |s: &str| Feature::Heading(s.into());
+        assert_eq!(
+            f,
+            vec![head("New"), item("Masks. Turn on under Settings.", 0), item("Draw with a brush.", 1), item("Tabs in the bin.", 0), head("Fixed"), item("Flicker", 0)]
+        );
+        assert!(release_features("").is_empty());
+        // A point wrapped over lines is one point; a paragraph after a blank line isn't
+        // part of it.
+        let wrapped = release_features("- **Masks:** rectangle,\n  ellipse and `paths`.\n\nSome words.\n- Next");
+        assert_eq!(wrapped, vec![item("Masks: rectangle, ellipse and paths.", 0), item("Next", 0)]);
+        // This repository's own changelog reads as a list.
+        let changelog = include_str!("../../../CHANGELOG.md");
+        let beta5 = changelog.split("\n## ").find(|s| s.starts_with("0.1-beta.5")).expect("a Beta 5 section");
+        let points = release_features(beta5);
+        assert!(points.iter().filter(|f| matches!(f, Feature::Item(..))).count() >= 10, "{points:?}");
+        assert!(points.contains(&head("Fixed")));
+    }
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
@@ -763,14 +1049,14 @@ mod tests {
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(main_program(&app), b"old program").unwrap();
 
-        assert_eq!(verify_and_place(&archive, &sums, &app), Ok(2));
+        assert_eq!(verify_and_install(&archive, &sums, &Method::Folder(app.clone())), Ok(2));
         assert_eq!(std::fs::read(main_program(&app)).unwrap(), b"new program");
         assert!(app.join("plugins").join("README.md").exists());
 
         // A download that doesn't match its checksum is refused before anything moves.
         std::fs::write(&sums, format!("{}  {name}\n", "0".repeat(64))).unwrap();
         std::fs::write(main_program(&app), b"current").unwrap();
-        assert!(verify_and_place(&archive, &sums, &app).unwrap_err().contains("damaged"));
+        assert!(verify_and_install(&archive, &sums, &Method::Folder(app.clone())).unwrap_err().contains("damaged"));
         assert_eq!(std::fs::read(main_program(&app)).unwrap(), b"current");
         let _ = std::fs::remove_dir_all(&root);
     }

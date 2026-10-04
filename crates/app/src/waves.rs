@@ -4,6 +4,7 @@
 //! how quickly it settles down (decay), with the result drawn over the clip. Opened from
 //! a property's right-click menu ("Edit wave…"), below "Edit curve…".
 
+use crate::i18n::{tr, trf};
 use crate::band::Band;
 use crate::App;
 use eframe::egui;
@@ -49,7 +50,7 @@ impl App {
             return;
         };
         let mut open = true;
-        let title = format!("Wave — {} · {}", it.name, band.param.rsplit('.').next().unwrap_or(&band.param));
+        let title = trf("Wave — {0} · {1}", &[("0", &(it.name).to_string()), ("1", (band.param.rsplit('.').next().unwrap_or(&band.param)))]);
         crate::widgets::on_screen(egui::Window::new(title), ctx)
             .id(egui::Id::new("wave-editor"))
             .open(&mut open)
@@ -67,8 +68,8 @@ impl App {
         let current = self.editor.param_value(item, &band.target, &band.param, it.range.start).unwrap_or(Value::Float(band.lo.max(0.0)));
         let source = self.editor.param_source(item, &band.target, &band.param).unwrap_or(ParamSource::Static(current.clone()));
         let Some((base, Modulator::Lfo { wave, amplitude, frequency, phase, decay, .. })) = source.find_lfo().map(|(b, m)| (b.clone(), m.clone())) else {
-            ui.label("Makes this value swing back and forth on its own — a pulse, a bob, a flicker.");
-            if ui.button("Add a wave").clicked() {
+            ui.label(tr("Makes this value swing back and forth on its own — a pulse, a bob, a flicker."));
+            if ui.button(tr("Add a wave")).clicked() {
                 let swing = ((band.hi - band.lo) * 0.1).abs().max(1e-3);
                 let src = source.lfo(LfoWave::Sine, swing, 1.0);
                 self.editor.set_param(item, band.target.clone(), &band.param, src, "wave-editor");
@@ -103,31 +104,31 @@ impl App {
         });
         ui.add_space(4.0);
         egui::Grid::new("wave-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            ui.label("Frequency");
+            ui.label(tr("Frequency"));
             let r = ui.add(egui::Slider::new(&mut freq, 0.01..=30.0).logarithmic(true).suffix(" Hz").clamping(egui::SliderClamping::Edits));
             track(&r, &mut changed, &mut finished);
             ui.end_row();
             if plain.is_some() {
-                ui.label("Min");
+                ui.label(tr("Min"));
                 let r = ui.add(egui::DragValue::new(&mut lo).speed((band.hi - band.lo).abs() * 0.005 + 1e-3).max_decimals(3));
                 track(&r, &mut changed, &mut finished);
                 ui.end_row();
-                ui.label("Max");
+                ui.label(tr("Max"));
                 let r = ui.add(egui::DragValue::new(&mut hi).speed((band.hi - band.lo).abs() * 0.005 + 1e-3).max_decimals(3));
                 track(&r, &mut changed, &mut finished);
                 ui.end_row();
             } else {
-                ui.label("Gain");
+                ui.label(tr("Gain"));
                 let r = ui.add(egui::DragValue::new(&mut amp).speed((band.hi - band.lo).abs() * 0.005 + 1e-3).range(0.0..=f64::MAX).max_decimals(3))
-                    .on_hover_text("How far it swings either side of its keyframed value");
+                    .on_hover_text(tr("How far it swings either side of its keyframed value"));
                 track(&r, &mut changed, &mut finished);
                 ui.end_row();
             }
-            ui.label("Phase");
+            ui.label(tr("Phase"));
             let r = ui.add(egui::Slider::new(&mut deg, 0.0..=360.0).suffix("°"));
             track(&r, &mut changed, &mut finished);
             ui.end_row();
-            ui.label("Decay");
+            ui.label(tr("Decay"));
             ui.horizontal(|ui| {
                 let r = ui.add(egui::Slider::new(&mut dec, 0.0..=5.0).suffix(" /s").clamping(egui::SliderClamping::Edits));
                 track(&r, &mut changed, &mut finished);
@@ -164,12 +165,12 @@ impl App {
         painter.line_segment([egui::pos2(px, outer.top()), egui::pos2(px, outer.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 70, 70)));
 
         ui.horizontal(|ui| {
-            if ui.button("Remove wave").clicked() {
+            if ui.button(tr("Remove wave")).clicked() {
                 let src = source.clone().remove_lfo();
                 self.editor.set_param(item, band.target.clone(), &band.param, src, "wave-editor");
                 self.editor.doc.seal();
             }
-            ui.label(egui::RichText::new("Keyframes still work: the wave rides on top of them.").small().weak());
+            ui.label(egui::RichText::new(tr("Keyframes still work: the wave rides on top of them.")).small().weak());
         });
 
         if changed {

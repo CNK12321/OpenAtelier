@@ -1,7 +1,7 @@
 //! Editing commands — the layer between user gestures and document [`Op`]s.
 //!
 //! * [`timeline`]: trim, split, ripple delete, move, slip, snapping.
-//! * [`sections`]: timeline dividers and their sections; pasting into a track's free space.
+//! * [`paste`]: pasting into a track's free space.
 //! * [`compound`]: breaking a compound clip apart onto the timeline.
 //! * [`swap`]: putting other media in a clip, keeping everything done to it.
 //! * [`stress`]: a stand-in project for measuring export speed.
@@ -15,7 +15,7 @@
 //! [`Op`]: oa_doc::Op
 
 pub mod compound;
-pub mod sections;
+pub mod paste;
 pub mod stress;
 pub mod swap;
 pub mod timeline;

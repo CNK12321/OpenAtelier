@@ -2,7 +2,9 @@
 //! which are uploaded into two plain textures (R8 luma, RG8 chroma) that every GPU
 //! backend can sample — Vulkan, Metal, OpenGL and DX12 alike. It is the decoder on Linux
 //! and macOS, and on Windows it takes over whenever Media Foundation can't (no DX12
-//! device to share frames with, or a codec the system can't hardware-decode).
+//! device to share frames with, or a codec the system can't hardware-decode) and for
+//! video deeper than 8 bits, which it hands over as 16-bit planes (R16, RG16) where the GPU
+//! takes them — Media Foundation's shared surfaces are 8-bit NV12.
 //!
 //! ffmpeg itself uses the platform's hardware decoder when it can (`-hwaccel auto`: VA-API,
 //! NVDEC, D3D11VA, VideoToolbox) and the CPU otherwise. Each frame's exact presentation
@@ -55,6 +57,10 @@ pub struct FfmpegDecoder {
     /// hands over YUV with an alpha plane (`yuva420p`, BT.709 video range, whatever the
     /// file was) instead of NV12, and the alpha plane is uploaded too.
     alpha: bool,
+    /// Deeper than 8 bits (10-bit HEVC, ProRes, AV1…) and the GPU takes 16-bit textures:
+    /// ffmpeg hands over 16 bits a sample (`p016le`, or `yuva420p16le` with transparency)
+    /// and the planes are uploaded as R16 and RG16, so nothing is cut down to 8 bits.
+    deep: bool,
     /// A decoder to ask for by name: VP8/VP9 keep their transparency in a layer of their
     /// own that only libvpx decodes (ffmpeg's built-in decoder and hardware drop it,
     /// and the picture flickers between transparent and not).
@@ -81,6 +87,7 @@ impl FfmpegDecoder {
         if w == 0 || h == 0 {
             return Err(MediaError::Unsupported("the video has no size".into()));
         }
+        let deep = video.bit_depth() > 8 && oa_gpu::deep_video(&device);
         let mut d = FfmpegDecoder {
             path: path.to_path_buf(),
             device,
@@ -94,6 +101,7 @@ impl FfmpegDecoder {
             // that's what the frames then are.
             color: if video.has_alpha { VideoColor { matrix: oa_gpu::YuvMatrix::Bt709, full_range: false, ..video.color } } else { video.color },
             alpha: video.has_alpha,
+            deep,
             decoder: match (video.has_alpha, video.codec.as_str()) {
                 (true, "vp9") => Some("libvpx-vp9"),
                 (true, "vp8") => Some("libvpx"),
@@ -120,10 +128,15 @@ impl FfmpegDecoder {
         Ok(d)
     }
 
+    /// Bytes a sample: 2 for deep video, 1 otherwise.
+    fn sample_bytes(&self) -> usize {
+        if self.deep { 2 } else { 1 }
+    }
+
     /// One frame as ffmpeg writes it: luma and chroma (then alpha, as big as luma).
     fn frame_bytes(&self) -> usize {
         let luma = (self.size[0] * self.size[1]) as usize;
-        luma + (2 * self.chroma[0] * self.chroma[1]) as usize + if self.alpha { luma } else { 0 }
+        (luma + (2 * self.chroma[0] * self.chroma[1]) as usize + if self.alpha { luma } else { 0 }) * self.sample_bytes()
     }
 
     /// (Re)starts ffmpeg, from the keyframe at or before `from` (decoder time) if given.
@@ -159,14 +172,20 @@ impl FfmpegDecoder {
             (false, false) => {}
         }
         if self.alpha {
-            filters.push("format=yuva420p".into());
+            filters.push(if self.deep { "format=yuva420p16le" } else { "format=yuva420p" }.into());
         }
         filters.push("showinfo".into());
         let filter = filters.join(",");
         c.args(["-map", "0:v:0", "-an", "-sn", "-dn", "-vf", &filter]);
         // One frame out per frame decoded: no duplicates or drops to fit a frame rate.
         c.args(passthrough_args());
-        c.args(["-pix_fmt", if self.alpha { "yuva420p" } else { "nv12" }, "-f", "rawvideo", "-"]);
+        let pix_fmt = match (self.alpha, self.deep) {
+            (true, true) => "yuva420p16le",
+            (true, false) => "yuva420p",
+            (false, true) => "p016le",
+            (false, false) => "nv12",
+        };
+        c.args(["-pix_fmt", pix_fmt, "-f", "rawvideo", "-"]);
         c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = c.spawn().map_err(|e| MediaError::Decode(format!("could not run ffmpeg: {e}")))?;
         let stdout = child.stdout.take();
@@ -221,10 +240,15 @@ impl FfmpegDecoder {
                 view_formats: &[],
             }))
         };
+        let (one, two) = if self.deep {
+            (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
+        } else {
+            (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
+        };
         self.slots.push(Slot {
-            luma: make("oa-ffmpeg-luma", self.size, wgpu::TextureFormat::R8Unorm),
-            chroma: make("oa-ffmpeg-chroma", self.chroma, wgpu::TextureFormat::Rg8Unorm),
-            alpha: self.alpha.then(|| make("oa-ffmpeg-alpha", self.size, wgpu::TextureFormat::R8Unorm)),
+            luma: make("oa-ffmpeg-luma", self.size, one),
+            chroma: make("oa-ffmpeg-chroma", self.chroma, two),
+            alpha: self.alpha.then(|| make("oa-ffmpeg-alpha", self.size, one)),
             free: Arc::new(AtomicBool::new(true)),
         });
         Ok(self.slots.len() - 1)
@@ -312,8 +336,11 @@ impl VideoDecoder for FfmpegDecoder {
         let i = self.free_slot()?;
         let slot = &self.slots[i];
         let lease = Lease::take(&slot.free);
-        let luma_len = (self.size[0] * self.size[1]) as usize;
-        let upload = |texture: &wgpu::Texture, data: &[u8], size: [u32; 2], bpp: u32| {
+        // Byte lengths and sizes below are per sample: 2 bytes each for deep video.
+        let s = self.sample_bytes();
+        let luma_len = (self.size[0] * self.size[1]) as usize * s;
+        let upload = |texture: &wgpu::Texture, data: &[u8], size: [u32; 2], samples: u32| {
+            let bpp = samples * s as u32;
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 data,
@@ -326,10 +353,10 @@ impl VideoDecoder for FfmpegDecoder {
             // yuva420p: planar U, then V, then alpha — the chroma texture wants them
             // interleaved.
             Some(alpha) => {
-                let n = (self.chroma[0] * self.chroma[1]) as usize;
+                let n = (self.chroma[0] * self.chroma[1]) as usize * s;
                 let (u, rest) = frame.0[luma_len..].split_at(n);
                 let (v, a) = rest.split_at(n);
-                let uv: Vec<u8> = u.iter().zip(v).flat_map(|(u, v)| [*u, *v]).collect();
+                let uv: Vec<u8> = u.chunks_exact(s).zip(v.chunks_exact(s)).flat_map(|(u, v)| u.iter().chain(v).copied()).collect();
                 upload(&slot.chroma, &uv, self.chroma, 2);
                 upload(alpha, &a[..luma_len], self.size, 1);
             }

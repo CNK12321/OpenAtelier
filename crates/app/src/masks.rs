@@ -8,6 +8,7 @@
 //! position, scale, turn, softness and harshness are ordinary keyframable properties.
 //! A mask copied to a clip of another shape asks whether to fit or crop it.
 
+use crate::i18n::{tr, trf};
 use crate::preview_worker::FramePixels;
 use crate::App;
 use eframe::egui;
@@ -39,10 +40,12 @@ pub enum Tool {
     Eraser,
     Magic,
     Fill,
+    /// Click the thing: SAM 2 finds its outline on every frame (`roto.rs`).
+    Rotoscope,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, &'static str); 9] = [
+    const ALL: [(Tool, &'static str, &'static str); 10] = [
         (Tool::Select, "Select", "The viewer works as usual: select and move clips. The mask stays shown."),
         (Tool::Edit, "Edit", "Drag a rectangle, ellipse or path to move it; drag its corners or points to reshape it. With “Keyframe points” on, a moved path point gets a key at the playhead."),
         (Tool::Rect, "Rectangle", "Drag a rectangle on the clip"),
@@ -52,6 +55,7 @@ impl Tool {
         (Tool::Eraser, "Eraser", "Paint the mask away"),
         (Tool::Magic, "Magic select", "Click a color in the clip: everything of about that color is selected"),
         (Tool::Fill, "Fill", "Click inside an outline drawn in the mask to fill it (or click the mask to empty that part, with Erase on)"),
+        (Tool::Rotoscope, "Rotoscope", "Click what to cut out on one frame (Alt-click what to leave out): SAM 2 finds its outline on every frame"),
     ];
 }
 
@@ -96,6 +100,8 @@ pub struct Masks {
     /// A paste waiting for "fit or crop?".
     paste: Option<Vec<ItemId>>,
     pub(crate) job: Option<Job>,
+    /// The Rotoscope tool (`roto.rs`).
+    pub roto: crate::roto::RotoState,
 }
 
 impl Default for Masks {
@@ -118,6 +124,7 @@ impl Default for Masks {
             clipboard: None,
             paste: None,
             job: None,
+            roto: Default::default(),
         }
     }
 }
@@ -248,7 +255,7 @@ impl App {
         self.poll_mask_job();
         let Some(it) = self.editor.item(item).cloned() else { return };
         ui.label(
-            egui::RichText::new("Masks are drawn on the clip and move with it. Right-click a property (Opacity…) → With mask, or an effect's name → Use with mask. Bounded text effects can't be masked.")
+            egui::RichText::new(tr("Masks are drawn on the clip and move with it. Right-click a property (Opacity…) → With mask, or an effect's name → Use with mask. Bounded text effects can't be masked."))
                 .small()
                 .weak(),
         );
@@ -257,7 +264,7 @@ impl App {
             self.masks.selected = it.masks.first().map(|m| m.id);
         }
         ui.horizontal(|ui| {
-            if ui.button("+ New mask").on_hover_text("An empty mask; draw it with the tools below").clicked() {
+            if ui.button(tr("+ New mask")).on_hover_text(tr("An empty mask; draw it with the tools below")).clicked() {
                 let id = self.editor.doc.alloc_id();
                 let n = it.masks.len() + 1;
                 let mut masks = it.masks.clone();
@@ -269,7 +276,7 @@ impl App {
                 }
             }
             let pastable = self.masks.clipboard.is_some();
-            if ui.add_enabled(pastable, egui::Button::new("Paste mask")).on_hover_text("The copied mask, onto the selected clips").clicked() {
+            if ui.add_enabled(pastable, egui::Button::new(tr("Paste mask"))).on_hover_text(tr("The copied mask, onto the selected clips")).clicked() {
                 let targets = self.selected_clips();
                 self.paste_mask(targets);
             }
@@ -279,7 +286,7 @@ impl App {
         for m in &it.masks {
             ui.horizontal(|ui| {
                 let mut on = m.enabled;
-                if ui.checkbox(&mut on, "").on_hover_text(if on { "Turn off" } else { "Turn on" }).changed() {
+                if ui.checkbox(&mut on, tr("")).on_hover_text(if on { "Turn off" } else { "Turn on" }).changed() {
                     self.edit_mask(item, m.id, "Toggle mask", None, |m| m.enabled = on);
                 }
                 let chosen = self.masks.selected == Some(m.id);
@@ -296,29 +303,29 @@ impl App {
                     self.masks.selected = Some(m.id);
                 }
                 let mut invert = m.invert;
-                if ui.checkbox(&mut invert, "invert").on_hover_text("Everything outside what's drawn instead").changed() {
+                if ui.checkbox(&mut invert, tr("invert")).on_hover_text(tr("Everything outside what's drawn instead")).changed() {
                     self.edit_mask(item, m.id, "Invert mask", None, |m| m.invert = invert);
                 }
                 // How it joins the masks above it (the first has none above).
                 if it.masks.first().map(|f| f.id) != Some(m.id) || m.mode != MaskMode::Add {
                     let mut mode = m.mode;
-                    egui::ComboBox::from_id_salt(("mask-mode", m.id)).width(84.0).selected_text(mode.name()).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt(("mask-mode", m.id)).width(84.0).selected_text(tr(mode.name())).show_ui(ui, |ui| {
                         for option in MaskMode::ALL {
-                            ui.selectable_value(&mut mode, option, option.name());
+                            ui.selectable_value(&mut mode, option, tr(option.name()));
                         }
                     })
                     .response
-                    .on_hover_text("How it joins the masks above it where several are used together: added, taken away, only where both are, or where just one is");
+                    .on_hover_text(tr("How it joins the masks above it where several are used together: added, taken away, only where both are, or where just one is"));
                     if mode != m.mode {
                         self.edit_mask(item, m.id, "Mask mode", None, |m| m.mode = mode);
                     }
                 }
-                ui.label(egui::RichText::new(format!("{} shapes", m.shapes.len())).small().weak());
+                ui.label(egui::RichText::new(trf("{0} shapes", &[("0", &(m.shapes.len()).to_string())])).small().weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("✕").on_hover_text("Delete this mask").clicked() {
+                    if ui.button(tr("✕")).on_hover_text(tr("Delete this mask")).clicked() {
                         remove = Some(m.id);
                     }
-                    if ui.small_button("Copy").on_hover_text("Copy this mask (and its keyframes) to paste on other clips").clicked() {
+                    if ui.small_button(tr("Copy")).on_hover_text(tr("Copy this mask (and its keyframes) to paste on other clips")).clicked() {
                         copy = Some(m.id);
                     }
                 });
@@ -332,55 +339,53 @@ impl App {
         }
         let Some(id) = self.masks.selected.filter(|s| it.masks.iter().any(|m| m.id == *s)) else {
             if it.masks.is_empty() {
-                ui.label(egui::RichText::new("No masks yet.").weak());
+                ui.label(egui::RichText::new(tr("No masks yet.")).weak());
             }
             return;
         };
         let native = self.mask_placement(item, t).map_or([1920.0, 1080.0], |p| p.native);
 
-        crate::inspector::section(ui, "Draw", "Pick a tool, then draw on the clip in the viewer.");
+        crate::inspector::section(ui, tr("Draw"), tr("Pick a tool, then draw on the clip in the viewer."));
         ui.horizontal_wrapped(|ui| {
             for (tool, name, tip) in Tool::ALL {
-                if ui.selectable_label(self.masks.tool == tool, name).on_hover_text(tip).clicked() {
+                if ui.selectable_label(self.masks.tool == tool, tr(name)).on_hover_text(tr(tip)).clicked() {
                     self.masks.tool = tool;
                 }
             }
-            ui.add_enabled(false, egui::Button::new("Rotoscope")).on_disabled_hover_text(
-                "Coming soon: a path that follows what it outlines by itself. For now, draw a path with the Pen and key its points by hand (Edit, with Keyframe points on).",
-            );
         });
         match self.masks.tool {
             Tool::Rect | Tool::Ellipse | Tool::Magic | Tool::Fill => {
-                ui.checkbox(&mut self.masks.erase, "Erase").on_hover_text("Take this away from the mask instead of adding it (or hold Alt while drawing)");
+                ui.checkbox(&mut self.masks.erase, tr("Erase")).on_hover_text(tr("Take this away from the mask instead of adding it (or hold Alt while drawing)"));
             }
+            Tool::Rotoscope => self.roto_panel(ui, item, id, native),
             _ => {}
         }
         if matches!(self.masks.tool, Tool::Brush | Tool::Eraser) {
             let mut px = self.masks.brush * native[1];
-            ui.add(egui::Slider::new(&mut px, 1.0..=(native[1] * 0.5).max(2.0)).logarithmic(true).text("brush size").suffix(" px"));
+            ui.add(egui::Slider::new(&mut px, 1.0..=(native[1] * 0.5).max(2.0)).logarithmic(true).text(tr("brush size")).suffix(" px"));
             self.masks.brush = (px / native[1].max(1.0)).max(1e-4);
-            ui.add(egui::Slider::new(&mut self.masks.brush_softness, 0.0..=1.0).text("brush softness"));
+            ui.add(egui::Slider::new(&mut self.masks.brush_softness, 0.0..=1.0).text(tr("brush softness")));
         }
         if self.masks.tool == Tool::Magic {
-            ui.add(egui::Slider::new(&mut self.masks.tolerance, 0.0..=1.0).text("tolerance"));
-            ui.checkbox(&mut self.masks.contiguous, "Only what touches the clicked color").on_hover_text("Off: that color everywhere in the clip");
+            ui.add(egui::Slider::new(&mut self.masks.tolerance, 0.0..=1.0).text(tr("tolerance")));
+            ui.checkbox(&mut self.masks.contiguous, tr("Only what touches the clicked color")).on_hover_text(tr("Off: that color everywhere in the clip"));
             if matches!(self.masks.job, Some(Job::Magic { .. })) {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Selecting…");
+                    ui.label(tr("Selecting…"));
                 });
             }
         }
         ui.horizontal(|ui| {
             let options: Vec<(oa_doc::MediaId, String)> =
                 self.editor.pool.iter().filter(|m| !m.missing && m.probe.video.is_some()).map(|m| (m.id, m.name.clone())).collect();
-            ui.menu_button("Import picture…", |ui| {
-                ui.label(egui::RichText::new("Stretched over the clip, added to the mask:").small().weak());
-                ui.radio_value(&mut self.masks.import_mode, ImportMode::Brightness, "Brightness (white in, black out)");
-                ui.radio_value(&mut self.masks.import_mode, ImportMode::Opacity, "Opacity (opaque in, see-through out)");
+            ui.menu_button(tr("Import picture…"), |ui| {
+                ui.label(egui::RichText::new(tr("Stretched over the clip, added to the mask:")).small().weak());
+                ui.radio_value(&mut self.masks.import_mode, ImportMode::Brightness, tr("Brightness (white in, black out)"));
+                ui.radio_value(&mut self.masks.import_mode, ImportMode::Opacity, tr("Opacity (opaque in, see-through out)"));
                 ui.separator();
                 if options.is_empty() {
-                    ui.label(egui::RichText::new("Import a picture into the media bin first.").weak());
+                    ui.label(egui::RichText::new(tr("Import a picture into the media bin first.")).weak());
                 }
                 for (media, name) in &options {
                     if ui.button(name).clicked() {
@@ -392,10 +397,10 @@ impl App {
             if matches!(self.masks.job, Some(Job::Import { .. })) {
                 ui.spinner();
             }
-            if ui.button("Clear drawing").on_hover_text("Everything drawn in this mask (its settings stay)").clicked() {
+            if ui.button(tr("Clear drawing")).on_hover_text(tr("Everything drawn in this mask (its settings stay)")).clicked() {
                 self.edit_mask(item, id, "Clear mask", None, |m| m.shapes.clear());
             }
-            if ui.button("Undo last shape").clicked() {
+            if ui.button(tr("Undo last shape")).clicked() {
                 self.edit_mask(item, id, "Remove shape", None, |m| {
                     m.shapes.pop();
                 });
@@ -404,13 +409,13 @@ impl App {
 
         self.mask_shapes_section(ui, item, id, native, t);
 
-        crate::inspector::section(ui, "Mask", "Where it sits, how big, turned, how soft its edge and how strongly it applies — all keyframable.");
+        crate::inspector::section(ui, tr("Mask"), tr("Where it sits, how big, turned, how soft its edge and how strongly it applies — all keyframable."));
         for s in mask::params(id) {
             self.param_widget(ui, item, &ParamTarget::Item, &s, t, "mask");
         }
         self.mask_tracking_section(ui, item, id, native, t);
 
-        crate::inspector::section(ui, "Used by", "What this clip's masks change.");
+        crate::inspector::section(ui, tr("Used by"), tr("What this clip's masks change."));
         let ctx = it.eval_context(t);
         let props = it.params.get(mask::PROPS_USE).and_then(|s| s.eval(&ctx).as_float()).unwrap_or(mask::ALL);
         let name_of = |choice: f64| -> String {
@@ -420,10 +425,10 @@ impl App {
             it.masks.iter().find(|m| m.id as f64 == choice).map_or("every mask".into(), |m| m.name.clone())
         };
         ui.horizontal(|ui| {
-            ui.label("Properties “on mask” use");
+            ui.label(tr("Properties “on mask” use"));
             let mut chosen = props;
             egui::ComboBox::from_id_salt(("mask-props", item.0)).selected_text(name_of(props)).show_ui(ui, |ui| {
-                ui.selectable_value(&mut chosen, mask::ALL, "every mask");
+                ui.selectable_value(&mut chosen, mask::ALL, tr("every mask"));
                 for m in &it.masks {
                     ui.selectable_value(&mut chosen, m.id as f64, &m.name);
                 }
@@ -471,7 +476,7 @@ impl App {
         let params = it.params.0.iter().filter_map(|(k, v)| Some((k.as_str().strip_prefix(&prefix)?.to_string(), v.clone()))).collect();
         let aspect = self.mask_placement(item, it.range.start).map_or(16.0 / 9.0, |p| p.native[0] / p.native[1].max(1.0));
         self.masks.clipboard = Some(Copied { mask: m, params, aspect });
-        self.notify("Mask copied — select other clips and press Paste mask".to_string());
+        self.notify(tr("Mask copied — select other clips and press Paste mask"));
     }
 
     /// Pastes the copied mask onto `targets`, asking first when any is another shape.
@@ -526,17 +531,17 @@ impl App {
         let mut choice = None;
         egui::Modal::new(egui::Id::new("mask-paste")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("A different shape");
-            ui.label("The mask was drawn on a clip of another shape. How should it go on?");
+            ui.heading(tr("A different shape"));
+            ui.label(tr("The mask was drawn on a clip of another shape. How should it go on?"));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Fit").on_hover_text("All of the mask shows, its shapes kept; the clip's extra room stays empty").clicked() {
+                if ui.button(tr("Fit")).on_hover_text(tr("All of the mask shows, its shapes kept; the clip's extra room stays empty")).clicked() {
                     choice = Some(Some(true));
                 }
-                if ui.button("Crop").on_hover_text("The mask covers the whole clip, its shapes kept; what doesn't fit is cut off").clicked() {
+                if ui.button(tr("Crop")).on_hover_text(tr("The mask covers the whole clip, its shapes kept; what doesn't fit is cut off")).clicked() {
                     choice = Some(Some(false));
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(tr("Cancel")).clicked() {
                     choice = Some(None);
                 }
             });
@@ -567,12 +572,12 @@ impl App {
         clip.masks.clear();
         (clip.transition_in, clip.transition_out) = (None, None);
         // Its own picture: nothing that moves, turns or fades it, nothing inside masks.
-        for p in [schema::POSITION, schema::SCALE, schema::SQUASH, schema::ROTATION, schema::ANCHOR, schema::OPACITY, schema::BLEND] {
+        for p in [schema::POSITION, schema::SCALE, schema::SQUASH, schema::ROTATION, schema::ANCHOR, schema::OPACITY] {
             clip.params.0.remove(&ParamId::new(p));
             clip.params.0.remove(&ParamId::new(&mask::on_mask(p)));
         }
         clip.params.set(schema::FIT, ParamSource::Static(Value::Enum(oa_doc::FitMode::Stretch.as_str().into())));
-        clip.effects.retain(|e| self.registry.effect(&e.type_id).is_none_or(|d| d.kind != oa_graph::EffectKind::Motion));
+        clip.effects.retain(|e| e.type_id != oa_graph::registry::BLEND && self.registry.effect(&e.type_id).is_none_or(|d| d.kind != oa_graph::EffectKind::Motion));
         track.items.push(clip);
         s.tracks.push(Arc::new(track));
         project.sequences.insert(seq_id, Arc::new(s));
@@ -644,7 +649,7 @@ impl App {
         let Some(frame) = done else { return };
         let job = self.masks.job.take().expect("checked");
         let Some(frame) = frame else {
-            self.error = Some("Couldn't read the picture for the mask".into());
+            self.error = Some(tr("Couldn't read the picture for the mask").into());
             return;
         };
         match job {
@@ -686,7 +691,7 @@ impl App {
                     })
                     .collect();
                 if coverage.len() == w * h {
-                    self.add_shape(item, id, MaskShape::Bitmap { bitmap: Bitmap::encode([w as u32, h as u32], &coverage), expand: 0.0, feather: 0.0, erase: false }, "Import mask picture");
+                    self.add_shape(item, id, MaskShape::Bitmap { bitmap: Bitmap::encode([w as u32, h as u32], &coverage), expand: 0.0, feather: 0.0, erase: false }, tr("Import mask picture"));
                 }
             }
         }
@@ -698,26 +703,26 @@ impl App {
     /// and rotation on two (how far apart they are, which way the line between them
     /// points).
     fn mask_tracking_section(&mut self, ui: &mut egui::Ui, item: ItemId, id: u64, native: [f64; 2], t: Time) {
-        crate::inspector::section(ui, "Tracking", "Make the mask follow something in the picture: its center one tracked point, its scale and rotation two.");
+        crate::inspector::section(ui, tr("Tracking"), tr("Make the mask follow something in the picture: its center one tracked point, its scale and rotation two."));
         let center = mask::param_id(id, mask::CENTER);
         let following = self.editor.param_source(item, &ParamTarget::Item, &center).and_then(|s| s.find_track().map(|(tr, _)| tr.name.clone()));
         ui.horizontal(|ui| {
-            let label = if following.is_some() { "Edit center track…" } else { "Track center…" };
-            if ui.button(label).on_hover_text("The mask's center follows a point in the picture: have the tracker follow it, click it in by hand, or record it with the mouse").clicked() {
+            let label = if following.is_some() { tr("Edit center track…") } else { "Track center…" };
+            if ui.button(label).on_hover_text(tr("The mask's center follows a point in the picture: have the tracker follow it, click it in by hand, or record it with the mouse")).clicked() {
                 self.edit_track(item, ParamTarget::Item, &center, crate::tracks::Purpose::Track);
             }
             if let Some(name) = following {
-                ui.label(egui::RichText::new(format!("follows “{name}”")).small().color(crate::style::GOLD));
+                ui.label(egui::RichText::new(trf("follows “{name}”", &[("name", &name.to_string())])).small().color(crate::style::GOLD));
             }
         });
         let tracks: Vec<(u64, String)> = self.editor.doc.project().tracks.values().map(|tr| (tr.id, tr.name.clone())).collect();
         if tracks.len() < 2 {
-            ui.label(egui::RichText::new("Scale and rotation follow two tracked points on the clip: track two points first (Track center… makes one).").small().weak());
+            ui.label(egui::RichText::new(tr("Scale and rotation follow two tracked points on the clip: track two points first (Track center… makes one).")).small().weak());
             return;
         }
         let name = |id: Option<u64>| id.and_then(|id| tracks.iter().find(|t| t.0 == id)).map_or("pick a track".to_string(), |t| t.1.clone());
         ui.horizontal(|ui| {
-            ui.label("Points");
+            ui.label(tr("Points"));
             for (k, salt) in [(0, "pair-a"), (1, "pair-b")] {
                 let mut chosen = self.masks.pair[k];
                 egui::ComboBox::from_id_salt((salt, id)).width(110.0).selected_text(name(chosen)).show_ui(ui, |ui| {
@@ -735,8 +740,8 @@ impl App {
             let linked = source.as_ref().and_then(|s| s.track_pair()).map(|(a, b)| format!("{} – {}", a.name, b.name));
             ui.horizontal(|ui| match (&linked, &source) {
                 (Some(names), Some(source)) => {
-                    ui.label(egui::RichText::new(format!("{what} follows {names}")).small().color(crate::style::GOLD));
-                    if ui.small_button("Unlink").on_hover_text("Back to its own value (and keyframes)").clicked() {
+                    ui.label(egui::RichText::new(trf("{what} follows {names}", &[("what", what), ("names", &names.to_string())])).small().color(crate::style::GOLD));
+                    if ui.small_button(tr("Unlink")).on_hover_text(tr("Back to its own value (and keyframes)")).clicked() {
                         self.editor.set_param(item, ParamTarget::Item, &pid, source.clone().without_track_pair(), &pid);
                         self.editor.doc.seal();
                     }
@@ -744,8 +749,8 @@ impl App {
                 _ => {
                     let [a, b] = self.masks.pair;
                     let ready = a.is_some() && b.is_some() && a != b;
-                    let tip = format!("From here on the {what} changes as the two points move apart or turn, from its value now");
-                    if ui.add_enabled(ready, egui::Button::new(format!("Link {what}"))).on_hover_text(tip).on_disabled_hover_text("Pick two different tracks").clicked() {
+                    let tip = trf("From here on the {what} changes as the two points move apart or turn, from its value now", &[("what", (what))]);
+                    if ui.add_enabled(ready, egui::Button::new(trf("Link {what}", &[("what", what)]))).on_hover_text(tip).on_disabled_hover_text(tr("Pick two different tracks")).clicked() {
                         let project = self.editor.doc.project();
                         let (Some(a), Some(b)) = (a.and_then(|a| project.tracks.get(&a).cloned()), b.and_then(|b| project.tracks.get(&b).cloned())) else { return };
                         let aspect = native[0] / native[1].max(1.0);
@@ -755,7 +760,7 @@ impl App {
                                 self.editor.set_param(item, ParamTarget::Item, &pid, base.with_track_pair(pair), &pid);
                                 self.editor.doc.seal();
                             }
-                            None => self.error = Some("The two tracks need points at the playhead, apart from each other".into()),
+                            None => self.error = Some(tr("The two tracks need points at the playhead, apart from each other").into()),
                         }
                     }
                 }
@@ -774,7 +779,7 @@ impl App {
         if let Some(base) = param.strip_suffix(mask::ON_MASK_SUFFIX) {
             if mask::MASKABLE.contains(&base) {
                 ui.separator();
-                if ui.button("Remove with mask").on_hover_text("The same value inside the mask as outside").clicked() {
+                if ui.button(tr("Remove with mask")).on_hover_text(tr("The same value inside the mask as outside")).clicked() {
                     self.remove_on_mask(item, param);
                     ui.close();
                 }
@@ -788,15 +793,15 @@ impl App {
         let key = mask::on_mask(param);
         let has_masks = self.editor.item(item).is_some_and(|i| !i.masks.is_empty());
         if self.editor.param_source(item, target, &key).is_none() {
-            let r = ui.add_enabled(has_masks, egui::Button::new("With mask"));
-            let r = r.on_hover_text("Give it its own value inside the clip's masks, set just below (keyframable)").on_disabled_hover_text("Draw a mask in the Masks tab first");
+            let r = ui.add_enabled(has_masks, egui::Button::new(tr("With mask")));
+            let r = r.on_hover_text(tr("Give it its own value inside the clip's masks, set just below (keyframable)")).on_disabled_hover_text(tr("Draw a mask in the Masks tab first"));
             if r.clicked() {
                 let now = self.editor.param_value(item, target, param, t).unwrap_or_else(|| default.clone());
                 self.editor.set_param(item, ParamTarget::Item, &key, ParamSource::Static(now), &key);
                 self.editor.doc.seal();
                 ui.close();
             }
-        } else if ui.button("Remove with mask").clicked() {
+        } else if ui.button(tr("Remove with mask")).clicked() {
             self.remove_on_mask(item, &key);
             ui.close();
         }
@@ -811,8 +816,8 @@ impl App {
         }
         let Some(mut s) = schema::visual().iter().find(|s| s.id.as_str() == param).cloned() else { return };
         s.id = ParamId::new(&key);
-        ui.label("");
-        ui.label(egui::RichText::new("↳ mask").color(crate::style::ACCENT)).on_hover_text("Its value inside the clip's masks — right-click the value to remove it");
+        ui.label(tr(""));
+        ui.label(egui::RichText::new(tr("↳ mask")).color(crate::style::ACCENT)).on_hover_text(tr("Its value inside the clip's masks — right-click the value to remove it"));
         ui.vertical(|ui| self.param_widget(ui, item, &ParamTarget::Item, &s, t, "on-mask"));
         ui.end_row();
     }
@@ -824,7 +829,7 @@ impl App {
             .filter(|i| self.editor.param_source(*i, &ParamTarget::Item, key).is_some())
             .map(|item| Op::SetParam { seq, item, target: ParamTarget::Item, param: ParamId::new(key), source: None })
             .collect();
-        self.apply_or_report("Remove with mask", ops);
+        self.apply_or_report(tr("Remove with mask"), ops);
     }
 
     /// "Use with mask" in an effect's menu: run it inside one of the clip's masks (or all
@@ -844,20 +849,20 @@ impl App {
         }
         ui.separator();
         if bounded || text_only {
-            let why = if bounded { "Bounded text effects can't be masked (turn Bounded off first)" } else { "Per-letter text effects can't be masked" };
-            ui.add_enabled(false, egui::Button::new("Use with mask")).on_disabled_hover_text(why);
+            let why = if bounded { tr("Bounded text effects can't be masked (turn Bounded off first)") } else { tr("Per-letter text effects can't be masked") };
+            ui.add_enabled(false, egui::Button::new(tr("Use with mask"))).on_disabled_hover_text(why);
             return;
         }
         let current = fx.params.get(mask::EFFECT_USE).and_then(|s| s.eval(&at).as_float()).unwrap_or(0.0);
         let invert = matches!(fx.params.get(mask::EFFECT_INVERT).map(|s| s.eval(&at)), Some(Value::Bool(true)));
-        ui.menu_button("Use with mask", |ui| {
+        ui.menu_button(tr("Use with mask"), |ui| {
             if it.masks.is_empty() {
-                ui.label(egui::RichText::new("Draw a mask in the Masks tab first.").weak());
+                ui.label(egui::RichText::new(tr("Draw a mask in the Masks tab first.")).weak());
                 return;
             }
             let mut chosen = current;
-            ui.radio_value(&mut chosen, 0.0, "The whole clip (no mask)");
-            ui.radio_value(&mut chosen, mask::ALL, "Every mask");
+            ui.radio_value(&mut chosen, 0.0, tr("The whole clip (no mask)"));
+            ui.radio_value(&mut chosen, mask::ALL, tr("Every mask"));
             for m in &it.masks {
                 ui.radio_value(&mut chosen, m.id as f64, &m.name);
             }
@@ -867,7 +872,7 @@ impl App {
             }
             ui.separator();
             let mut outside = invert;
-            if ui.add_enabled(current != 0.0 || chosen != 0.0, egui::Checkbox::new(&mut outside, "Outside the mask instead")).changed() {
+            if ui.add_enabled(current != 0.0 || chosen != 0.0, egui::Checkbox::new(&mut outside, tr("Outside the mask instead"))).changed() {
                 self.editor.set_param(item, ParamTarget::Effect(fx.id), mask::EFFECT_INVERT, ParamSource::Static(Value::Bool(outside)), mask::EFFECT_INVERT);
                 self.editor.doc.seal();
             }

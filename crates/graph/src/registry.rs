@@ -290,7 +290,7 @@ impl EffectDescriptor {
                 Some(Value::Vec2(v)) => out.extend(v.iter().map(|x| (x * k) as f32)),
                 Some(Value::Vec3(v)) => out.extend(v.iter().map(|x| *x as f32)),
                 Some(Value::Color(v)) => out.extend(v.iter().map(|x| *x as f32)),
-                Some(v @ Value::Enum(_)) => out.push(schema.option_index(v).unwrap_or(0) as f32),
+                Some(v @ Value::Enum(_)) => out.push(schema.enum_uniform(v)),
                 // Whether a media input is connected; the picture itself arrives as the
                 // effect's second input (`sample_media`).
                 Some(Value::Media(m)) => out.push(m.is_some() as u8 as f32),
@@ -360,6 +360,13 @@ pub const TILE_EFFECT: &str = "oa.warp.tile";
 pub const SCROLL: &str = "oa.warp.scroll";
 /// **Glow**: light leaking out around the picture (a jump flood finds the nearest edge).
 pub const GLOW: &str = "oa.light.glow";
+/// **Motion Blur**: not a shader pass — the planner builds the clip at moments across its
+/// shutter and averages them (`samples`, `shutter_angle`).
+pub const MOTION_BLUR: &str = "oa.motion.motion-blur";
+/// **Blend**: not a shader pass — its `mode` is how the compositor lays the clip's layer
+/// (or an effect container's result) over what's under it.
+/// (Also `oa_doc::schema::BLEND_EFFECT`, which old projects' blend property becomes.)
+pub const BLEND: &str = "oa.composite.blend";
 /// **Drop Shadow**: the silhouette offset and softened behind the picture.
 pub const SHADOW: &str = "oa.light.shadow";
 /// **Depth**: the picture as a sheet with thickness, turned in 3D.
@@ -445,6 +452,9 @@ pub const MASK_COMBINE: &str = "oa.internal.mask_combine";
 /// The picture × its opacity outside the mask (uniform 0) and inside it (uniform 1); the
 /// second input is the mask.
 pub const MASK_ALPHA: &str = "oa.internal.mask_alpha";
+/// A layer (second input) mixed into what's under it (first input), flattened: uniform 0
+/// the mode (`oa_doc::schema::blend_index`), uniform 1 whether to keep only the layer's area.
+pub const BACKDROP_BLEND: &str = "oa.internal.backdrop_blend";
 
 /// Effects the host uses itself, never offered in the effects lists.
 pub fn is_internal_effect(type_id: &str) -> bool {
@@ -875,6 +885,67 @@ pub(crate) fn host_effects() -> Vec<EffectDescriptor> {
                 }",
             ),
             ..descriptor(MASK_ALPHA, "Mask Opacity", EffectKind::Spatial { expand: None }, vec![])
+        },
+        // What's under a layer (input) and the layer (second input, both the canvas) mixed
+        // by blend mode u0 — `oa_doc::schema::blend_index`: the compositor's six on linear
+        // light as it draws them, the ones that read the backdrop on display-referred
+        // colors — composited as the W3C spec does: where nothing is under it, the layer
+        // shows as itself. With u1 = 1, only the layer's area of the result (to lay over
+        // the input normally, so effects can run on it first).
+        EffectDescriptor {
+            shader: wgsl(
+                "oa_internal_backdrop_blend",
+                1,
+                "fn oa_internal_backdrop_blend(pos: vec2f, base: u32) -> vec4f {
+                    let b = sample_input(pos);
+                    let s = sample_media(pos);
+                    let cut = u(base + 1u) > 0.5;
+                    if (s.a <= 0.0) { return select(b, vec4f(0.0), cut); }
+                    let lb = select(vec3f(0.0), b.rgb / b.a, b.a > 0.0);
+                    let ls = s.rgb / s.a;
+                    let mode = u32(u(base) + 0.5);
+                    var mixed: vec3f;
+                    if (mode < 6u) {
+                        var m = ls;
+                        switch mode {
+                            case 1u: { m = lb + ls; }
+                            case 2u: { m = lb * ls; }
+                            case 3u: { m = lb + ls - lb * ls; }
+                            case 4u: { m = min(lb, ls); }
+                            case 5u: { m = max(lb, ls); }
+                            default: {}
+                        }
+                        mixed = mix(ls, m, b.a);
+                    } else {
+                        let cb = clamp(srgb_encode(lb), vec3f(0.0), vec3f(1.0));
+                        let cs = clamp(srgb_encode(ls), vec3f(0.0), vec3f(1.0));
+                        let one = vec3f(1.0);
+                        // Hard light of cs over cb (overlay is it with the two swapped).
+                        let hard = select(one - 2.0 * (one - cs) * (one - cb), 2.0 * cs * cb, cs <= vec3f(0.5));
+                        let over = select(one - 2.0 * (one - cb) * (one - cs), 2.0 * cb * cs, cb <= vec3f(0.5));
+                        let d = select(sqrt(cb), ((16.0 * cb - 12.0) * cb + 4.0) * cb, cb <= vec3f(0.25));
+                        let soft = select(cb + (2.0 * cs - one) * (d - cb), cb - (one - 2.0 * cs) * cb * (one - cb), cs <= vec3f(0.5));
+                        let dodge = select(min(one, cb / max(one - cs, vec3f(1e-5))), one, cs >= one);
+                        let burn = select(one - min(one, (one - cb) / max(cs, vec3f(1e-5))), vec3f(0.0), cs <= vec3f(0.0));
+                        var m = cs;
+                        switch mode {
+                            case 6u: { m = abs(cb - cs); }
+                            case 7u: { m = cb + cs - 2.0 * cb * cs; }
+                            case 8u: { m = one - cb; }
+                            case 9u: { m = over; }
+                            case 10u: { m = soft; }
+                            case 11u: { m = hard; }
+                            case 12u: { m = select(dodge, vec3f(0.0), cb <= vec3f(0.0)); }
+                            case 13u: { m = select(burn, one, cb >= one); }
+                            default: {}
+                        }
+                        mixed = srgb_decode(mix(cs, m, b.a));
+                    }
+                    if (cut) { return vec4f(mixed * s.a, s.a); }
+                    return vec4f(s.a * mixed + (1.0 - s.a) * b.rgb, s.a + b.a * (1.0 - s.a));
+                }",
+            ),
+            ..descriptor(BACKDROP_BLEND, "Backdrop Blend", EffectKind::Spatial { expand: None }, vec![])
         },
         // The blurred-picture background (a copy of Atelier Core's Blur, which may be off).
         EffectDescriptor {

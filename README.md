@@ -12,8 +12,7 @@ export all running through the same render engine the preview uses.
 ## What it does
 
 - **Timeline editing**: tracks, trim, split, ripple, slip, snapping, groups, compound
-  clips, track reordering, and dividers that cut the timeline into colored sections you
-  can move, empty or delete.
+  clips, track reordering, and picking several tracks to paste into or move together.
 - **Formats**: one sequence, several canvas sizes; each clip can be reframed per format.
   A vertical layout puts the viewer in a tall column for 9:16 work.
 - **Direct manipulation**: move, scale, rotate and crop clips in the viewer, with
@@ -92,23 +91,26 @@ Ready-to-run builds are on the [Releases page](https://github.com/CNK12321/OpenA
   `./install.sh --uninstall` removes it. Or just run `./openatelier` from the folder.
   Install `ffmpeg` from your package manager too (the app tells you if it can't find it).
 
-The app checks the releases at start (and every few hours while open) and offers newer versions in a bar at the top:
-**Update** downloads the package, checks it against the release's `SHA256SUMS.txt`,
-installs it in place and restarts (installed from the `.deb`, it points to the download
-instead: apt owns `/opt/openatelier`). Settings → Updates picks the channel (Stable, or Beta
+The app checks the releases at start (and every few hours while open). When there's a
+newer one it says so ("Beta 6 is available!") with what's new, and offers **Restart and
+Update Now** or **Later**. Updating downloads the package, checks it against the
+release's `SHA256SUMS.txt`, installs it and restarts (installed from the `.deb`, it
+installs the new `.deb` through apt, and your system asks for your password). Settings → Updates picks the channel (Stable, or Beta
 for pre-releases too), turns the check off, or checks now.
 
 ### Making a release
 
-The version lives in the workspace `Cargo.toml` (`0.1.0-beta.5`). Its tag leaves a patch
-of 0 off (`v0.1-beta.5`; the full form works too), and tagging publishes the release:
+The version lives in the workspace `Cargo.toml` (`0.1.0-beta.6`). Rename `CHANGELOG.md`'s
+**Unreleased** section to the version first: it becomes the release's description and the
+list in the app's update dialog. Its tag leaves a patch
+of 0 off (`v0.1-beta.6`; the full form works too), and tagging publishes the release:
 
 ```bash
-git tag v0.1-beta.5
+git tag v0.1-beta.6
 ```
 
 ```bash
-git push origin v0.1-beta.5
+git push origin v0.1-beta.6
 ```
 
 `.github/workflows/release.yml` builds Windows and Linux packages, writes the checksums

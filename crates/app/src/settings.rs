@@ -101,6 +101,19 @@ pub struct Settings {
     /// drivers whose decoder misbehaves).
     #[serde(default)]
     pub decode_with_ffmpeg: bool,
+    /// The viewer plays proxies (small copies) of files that have one; exports always
+    /// read the files themselves.
+    #[serde(default = "yes")]
+    pub use_proxies: bool,
+    /// Make proxies by themselves for heavy footage (bigger than 1440p, or 10-bit).
+    #[serde(default = "yes")]
+    pub auto_proxies: bool,
+    /// Clips snap to each other's edges and the playhead while dragged (Ctrl flips it).
+    #[serde(default = "yes")]
+    pub snapping: bool,
+    /// How tall the timeline's tracks are: a step of `timeline::ROW_HEIGHTS`.
+    #[serde(default = "second_step")]
+    pub track_height: usize,
     /// Updates: "stable" (full releases) or "beta" (pre-releases too).
     #[serde(default = "default_channel")]
     pub update_channel: String,
@@ -112,6 +125,12 @@ pub struct Settings {
     pub update_checked_at: u64,
     /// The caption generator's last choices.
     pub captions: CaptionPrefs,
+    /// The SAM 2 model rotoscoping uses ("tiny", "small", "base_plus", "large").
+    #[serde(default = "small")]
+    pub sam_model: String,
+    /// How soft a rotoscoped edge is made (the matte's feather), in clip px.
+    #[serde(default = "two")]
+    pub roto_softness_px: f64,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -197,12 +216,24 @@ fn yes() -> bool {
     true
 }
 
+fn second_step() -> usize {
+    1
+}
+
 fn one() -> f32 {
     1.0
 }
 
 fn five() -> f64 {
     5.0
+}
+
+fn two() -> f64 {
+    2.0
+}
+
+fn small() -> String {
+    "small".into()
 }
 
 fn full_hd() -> u32 {
@@ -322,10 +353,16 @@ impl Default for Settings {
             gpu_backend: auto(),
             gpu_adapter: String::new(),
             decode_with_ffmpeg: false,
+            use_proxies: true,
+            auto_proxies: true,
+            snapping: true,
+            track_height: 1,
             update_channel: default_channel(),
             check_updates: true,
             update_checked_at: 0,
             captions: CaptionPrefs::default(),
+            sam_model: small(),
+            roto_softness_px: 2.0,
             path: None,
         }
     }

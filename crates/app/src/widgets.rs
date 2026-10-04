@@ -1,6 +1,7 @@
 //! Editors for property types that need more than a slider: a direction dial (a pinwheel
 //! you spin) and a directional gradient (color stops on a bar, plus a dial).
 
+use crate::i18n::tr;
 use eframe::egui;
 use oa_params::{Gradient, GradientStop};
 
@@ -149,6 +150,89 @@ pub fn tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T,
     changed
 }
 
+/// The same tabs standing on their side, down the left edge of a panel (the media bin):
+/// labels reading upwards, the open one raised and joined to the page on its right, with
+/// the accent along its outer edge. Each tab is (value, label, tooltip). Returns true when
+/// the open tab changed.
+pub fn side_tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T, String, &str)]) -> bool {
+    let font = egui::FontId::proportional(crate::style::TEXT);
+    let width = crate::style::ICON + 2.0;
+    let full = ui.available_rect_before_wrap();
+    let strip = egui::Rect::from_min_max(full.min, egui::pos2(full.left() + width, full.bottom()));
+    ui.allocate_rect(strip, egui::Sense::hover());
+    let painter = ui.painter_at(strip.expand(1.0));
+    let visuals = ui.visuals().clone();
+    let stroke = egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color);
+    let base = strip.right() - 0.5;
+    let mut changed = false;
+    let mut gap = None;
+    let mut y = strip.top();
+    for (i, (tab, label, tip)) in tabs.iter().enumerate() {
+        let galley = ui.painter().layout_no_wrap(label.clone(), font.clone(), egui::Color32::PLACEHOLDER);
+        let h = galley.size().x + 2.0 * crate::style::GAP_L;
+        let rect = egui::Rect::from_min_max(egui::pos2(strip.left() + 3.0, y), egui::pos2(base, y + h));
+        let r = ui.interact(rect, ui.id().with(("side-tab", i)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(*tip);
+        let on = *current == *tab;
+        if r.clicked() && !on {
+            *current = *tab;
+            changed = true;
+        }
+        let left = egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 };
+        let color = if on {
+            painter.rect_filled(rect, left, visuals.faint_bg_color.lerp_to_gamma(visuals.widgets.inactive.bg_fill, 0.5));
+            painter.add(egui::Shape::line(
+                vec![rect.right_top(), rect.left_top() + egui::vec2(6.0, 0.0), rect.left_top() + egui::vec2(0.0, 6.0), rect.left_bottom() - egui::vec2(0.0, 6.0), rect.left_bottom() + egui::vec2(6.0, 0.0), rect.right_bottom()],
+                stroke,
+            ));
+            painter.rect_filled(egui::Rect::from_min_max(rect.left_top() + egui::vec2(0.0, 5.0), egui::pos2(rect.left() + 2.0, rect.bottom() - 5.0)), 1.0, crate::style::ACCENT);
+            gap = Some((rect.top(), rect.bottom()));
+            visuals.strong_text_color()
+        } else {
+            if r.hovered() {
+                painter.rect_filled(rect.shrink2(egui::vec2(0.0, 1.0)), left, visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.5));
+            }
+            if r.hovered() { visuals.text_color() } else { visuals.weak_text_color() }
+        };
+        // Turned a quarter left: the text runs up from its start, its top facing left.
+        let s = galley.size();
+        let at = egui::pos2(rect.center().x - s.y * 0.5, rect.center().y + s.x * 0.5);
+        painter.add(egui::epaint::TextShape::new(at, galley, color).with_angle(-std::f32::consts::FRAC_PI_2));
+        y += h + 2.0;
+    }
+    // The edge against the page, open beside the raised tab.
+    match gap {
+        Some((t, b)) => {
+            painter.line_segment([egui::pos2(base, strip.top()), egui::pos2(base, t)], stroke);
+            painter.line_segment([egui::pos2(base, b), egui::pos2(base, strip.bottom())], stroke);
+        }
+        None => {
+            painter.line_segment([egui::pos2(base, strip.top()), egui::pos2(base, strip.bottom())], stroke);
+        }
+    }
+    changed
+}
+
+/// A compact button for toolbars: its text in a small rounded box, lit with the accent
+/// when `on` (a toggle that's on, or a menu that's open).
+pub fn chip(ui: &mut egui::Ui, on: bool, text: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(crate::style::TEXT_S + 0.5), egui::Color32::PLACEHOLDER);
+    let size = egui::vec2(galley.size().x + 14.0, 22.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let (fill, stroke, color) = if on {
+            (crate::style::ACCENT.gamma_multiply(0.22), egui::Stroke::new(1.0, crate::style::ACCENT.gamma_multiply(0.8)), visuals.strong_text_color())
+        } else if response.hovered() {
+            (visuals.widgets.hovered.weak_bg_fill, egui::Stroke::new(1.0, visuals.widgets.hovered.bg_stroke.color), visuals.text_color())
+        } else {
+            (egui::Color32::TRANSPARENT, egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color), visuals.text_color())
+        };
+        ui.painter().rect(rect, 5.0, fill, stroke, egui::StrokeKind::Inside);
+        ui.painter().galley(rect.center() - galley.size() * 0.5, galley, color);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// A small rounded label ("Built-in", "v1.2").
 pub fn pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     let galley = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(crate::style::TEXT_S), color);
@@ -210,6 +294,60 @@ pub fn color_swatch(ui: &mut egui::Ui, color: &mut [f64; 4]) -> (egui::Response,
     (response, changed)
 }
 
+/// A small pipette button (the eyedropper: Material's `colorize`), lit while `armed`.
+pub fn eyedropper(ui: &mut egui::Ui, armed: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        if armed {
+            ui.painter().rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
+        } else if response.hovered() {
+            ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+        }
+        let color = if armed { ui.visuals().selection.stroke.color } else { visuals.fg_stroke.color };
+        crate::icons::paint(ui.painter(), egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(17.0)), crate::icons::COLORIZE, color);
+    }
+    response
+}
+
+/// How many columns a list of `n` choices is laid out in: one for a few, up to three.
+pub fn choice_columns(n: usize) -> usize {
+    match n {
+        0..=4 => 1,
+        5..=8 => 2,
+        _ => 3,
+    }
+}
+
+/// Choices as a grid of buttons (`choice_columns` across, each as wide as the widest),
+/// for a dropdown's contents. `chosen` lights the ones in force. Returns the clicked one.
+pub fn choice_grid(ui: &mut egui::Ui, id: egui::Id, options: &[(String, String)], chosen: &dyn Fn(&str) -> bool) -> Option<String> {
+    let columns = choice_columns(options.len());
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widest = options.iter().map(|(_, text)| ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE).size().x)).fold(0.0f32, f32::max);
+    let width = widest + ui.spacing().button_padding.x * 2.0 + 4.0;
+    let mut picked = None;
+    egui::Grid::new(id).num_columns(columns).spacing([4.0, 4.0]).show(ui, |ui| {
+        for (i, (key, text)) in options.iter().enumerate() {
+            let button = egui::Button::selectable(chosen(key), text).min_size(egui::vec2(width, 0.0));
+            if ui.add(button).clicked() {
+                picked = Some(key.clone());
+            }
+            if (i + 1) % columns == 0 {
+                ui.end_row();
+            }
+        }
+    });
+    picked
+}
+
+/// A vertical scroll area for a menu whose contents change size (search, category
+/// tabs): up to `max` tall, and at least as tall as `content` (up to `max`). Without
+/// the floor it can only shrink: a menu is laid out within its size the frame before.
+pub fn fitted_scroll(max: f32, content: f32) -> egui::ScrollArea {
+    egui::ScrollArea::vertical().max_height(max).min_scrolled_height(content.min(max)).auto_shrink([false, true])
+}
+
 /// Within this many degrees of a right angle, the dial snaps to it.
 const RIGHT_ANGLE_SNAP: f64 = 10.0;
 
@@ -261,7 +399,7 @@ pub fn dial(ui: &mut egui::Ui, degrees: &mut f64) -> egui::Response {
     painter.line_segment([c, tip], egui::Stroke::new(1.5, accent));
     painter.add(egui::Shape::convex_polygon(vec![tip, at(a + 0.45, r - 5.5), at(a - 0.45, r - 5.5)], accent, egui::Stroke::NONE));
     painter.circle_filled(c, 1.8, accent);
-    response.on_hover_text("Drag to point it (snaps to right angles; Shift: 15° steps) · scroll to spin")
+    response.on_hover_text(tr("Drag to point it (snaps to right angles; Shift: 15° steps) · scroll to spin"))
 }
 
 /// A dial plus a 0–360° field. Returns (changed, finished) — finished when a drag or edit
@@ -364,7 +502,7 @@ pub fn gradient(ui: &mut egui::Ui, id: egui::Id, g: &mut Gradient) -> (bool, boo
                     egui::Stroke::new(if selected { 1.5 } else { 1.0 }, outline),
                 ));
             }
-            response.on_hover_text("Click to add a color · drag a marker to move it");
+            response.on_hover_text(tr("Click to add a color · drag a marker to move it"));
 
             let (c, f) = direction(ui, &mut g.angle);
             changed |= c;
@@ -387,13 +525,13 @@ pub fn gradient(ui: &mut egui::Ui, id: egui::Id, g: &mut Gradient) -> (bool, boo
                 changed = true;
             }
             finished |= p.drag_stopped() || p.lost_focus();
-            if g.stops.len() > 1 && ui.small_button("✕").on_hover_text("Remove this color").clicked() {
+            if g.stops.len() > 1 && ui.small_button(tr("✕")).on_hover_text(tr("Remove this color")).clicked() {
                 g.stops.remove(state.selected);
                 state.selected = state.selected.saturating_sub(1);
                 changed = true;
                 finished = true;
             }
-            if g.stops.len() < Gradient::MAX_STOPS && ui.small_button("+").on_hover_text("Add a color").clicked() {
+            if g.stops.len() < Gradient::MAX_STOPS && ui.small_button(tr("+")).on_hover_text(tr("Add a color")).clicked() {
                 // Between the selected stop and the next one along.
                 let here = g.stops[state.selected].pos;
                 let next = g.stops.iter().map(|s| s.pos).filter(|p| *p > here).fold(1.0f64, f64::min);

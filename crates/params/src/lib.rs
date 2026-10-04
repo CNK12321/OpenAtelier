@@ -85,6 +85,11 @@ pub struct ParamSchema {
     /// Choices for `Enum` params, in order. The index is what shaders receive.
     #[serde(default)]
     pub options: Vec<String>,
+    /// An `Enum` whose value is any number of its options (none to all), kept as their
+    /// keys joined by commas in option order ("red,green,blue"); shaders receive a
+    /// bitmask (bit `i` for option `i`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multiple: bool,
     /// Default clock for new keyframes on this parameter.
     pub default_anchor: KeyframeAnchor,
 }
@@ -99,6 +104,7 @@ impl ParamSchema {
             animatable: true,
             range: None,
             options: Vec::new(),
+            multiple: false,
             default_anchor: KeyframeAnchor::ClipStart,
         }
     }
@@ -113,6 +119,37 @@ impl ParamSchema {
     pub fn option_index(&self, value: &Value) -> Option<usize> {
         let key = value.as_enum()?;
         self.options.iter().position(|o| o == key)
+    }
+
+    /// Makes an `Enum` parameter take any number of its options (see [`Self::multiple`]).
+    pub fn multiple(mut self) -> Self {
+        self.multiple = true;
+        self
+    }
+
+    /// The options a many-option enum value has chosen, in option order (unknown keys
+    /// left out).
+    pub fn chosen<'a>(&'a self, value: &Value) -> Vec<&'a str> {
+        let keys: Vec<&str> = value.as_enum().map(|s| s.split(',').map(str::trim).collect()).unwrap_or_default();
+        self.options.iter().filter(|o| keys.contains(&o.as_str())).map(String::as_str).collect()
+    }
+
+    /// A many-option enum value with `chosen` (in option order, whatever order given).
+    pub fn choose(&self, chosen: &[&str]) -> Value {
+        Value::Enum(self.options.iter().filter(|o| chosen.contains(&o.as_str())).cloned().collect::<Vec<_>>().join(","))
+    }
+
+    /// What a shader receives for an enum value: its option's index, or for a
+    /// many-option one the bitmask of what's chosen.
+    pub fn enum_uniform(&self, value: &Value) -> f32 {
+        if self.multiple {
+            // (24 options at most: a float holds whole numbers exactly up to 2^24.)
+            let chosen = self.chosen(value);
+            let bits = self.options.iter().take(24).enumerate().filter(|(_, o)| chosen.contains(&o.as_str())).fold(0u32, |m, (i, _)| m | (1 << i));
+            bits as f32
+        } else {
+            self.option_index(value).unwrap_or(0) as f32
+        }
     }
 
     pub fn range(mut self, lo: f64, hi: f64) -> Self {
@@ -1127,6 +1164,22 @@ impl Evaluated {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A many-option enum keeps what's chosen in option order, ignores what it doesn't
+    /// know, and hands shaders a bitmask; a plain enum still hands over its index.
+    #[test]
+    fn many_option_enums() {
+        let s = ParamSchema::new("channels", Value::Enum("red,green,blue".into()), Unit::None).options(&["red", "green", "blue", "alpha"]).multiple();
+        assert_eq!(s.chosen(&s.default), vec!["red", "green", "blue"]);
+        assert_eq!(s.enum_uniform(&s.default), 7.0);
+        let v = s.choose(&["alpha", "red", "purple"]);
+        assert_eq!(v, Value::Enum("red,alpha".into()), "option order, unknown left out");
+        assert_eq!(s.enum_uniform(&v), 9.0);
+        assert_eq!(s.enum_uniform(&s.choose(&[])), 0.0);
+        assert_eq!(s.chosen(&Value::Enum(" blue , purple".into())), vec!["blue"]);
+        let plain = ParamSchema::new("mode", Value::Enum("over".into()), Unit::None).options(&["behind", "over"]);
+        assert_eq!(plain.enum_uniform(&plain.default), 1.0);
+    }
 
     fn secs(s: f64) -> Time {
         Time::from_seconds_f64(s)

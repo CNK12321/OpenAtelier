@@ -63,6 +63,40 @@ pub struct AudioClip {
     /// The compound clips it's inside (innermost first): their volume and fades apply
     /// to it too.
     pub outer: Vec<OuterGain>,
+    /// A speed ramp: where in the file (past `source_in`) the clip is at each moment. `speed`
+    /// is then ignored; each block plays at the ramp's average speed across it.
+    pub ramp: Option<Arc<SpeedRamp>>,
+}
+
+/// A speed ramp's path through a file, sampled: seconds of file past the clip's in point
+/// at every `step` seconds of timeline time from its start.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeedRamp {
+    pub step: f64,
+    pub offsets: Vec<f64>,
+}
+
+impl SpeedRamp {
+    /// Samples `offset` (timeline seconds from the clip's start → file seconds past its in
+    /// point) every 10 ms over `duration` seconds.
+    pub fn sample(duration: f64, offset: impl Fn(f64) -> f64) -> SpeedRamp {
+        let step = 0.01;
+        let n = (duration.max(0.0) / step).ceil() as usize + 2;
+        SpeedRamp { step, offsets: (0..n).map(|i| offset(i as f64 * step)).collect() }
+    }
+
+    /// File seconds past the in point at `local` timeline seconds (straight lines between
+    /// samples; past the ends, on at the end's speed).
+    pub fn offset_at(&self, local: f64) -> f64 {
+        let n = self.offsets.len();
+        if n < 2 {
+            return self.offsets.first().copied().unwrap_or(0.0) + local;
+        }
+        let x = local / self.step;
+        let i = (x.floor().max(0.0) as usize).min(n - 2);
+        let (a, b) = (self.offsets[i], self.offsets[i + 1]);
+        a + (b - a) * (x - i as f64)
+    }
 }
 
 /// A compound clip's say over the sound inside it: its volume (keyframable, on its own
@@ -200,6 +234,7 @@ impl AudioClip {
             reverse: None,
             clock_rate: 1.0,
             outer: Vec::new(),
+            ramp: None,
             range,
         }
     }
@@ -225,8 +260,21 @@ impl AudioClip {
     }
 
     /// Where in the file timeline time `t` falls.
-    pub(crate) fn source_at(&self, t: Time) -> Time {
-        self.source_in + Time::from_seconds_f64((t - self.range.start).as_seconds_f64() * self.speed)
+    /// Its speed where the file is at `source` (for positioning effects that look ahead):
+    /// the steady speed, or near enough on a ramp (the ramp's at the clip's start).
+    fn speed_near(&self, _source: Time) -> f64 {
+        match &self.ramp {
+            Some(r) => ((r.offset_at(r.step) - r.offset_at(0.0)) / r.step).abs().max(1e-6),
+            None => self.speed,
+        }
+    }
+
+    pub fn source_at(&self, t: Time) -> Time {
+        let local = (t - self.range.start).as_seconds_f64();
+        match &self.ramp {
+            Some(r) => self.source_in + Time::from_seconds_f64(r.offset_at(local)),
+            None => self.source_in + Time::from_seconds_f64(local * self.speed),
+        }
     }
 
     /// The clip's clocks at timeline time `t` (for keyframed effect params).
@@ -449,14 +497,14 @@ impl Decoder {
     /// Fills `out` with the clip's next samples at its speed: straight from the file at
     /// speed 1; time-stretched at its own pitch when the clip keeps it (`stretch`);
     /// otherwise resampled (linear), the pitch following the speed like tape.
-    fn pull(&mut self, out: &mut [f32], format: AudioFormat, clip: &AudioClip) {
+    fn pull(&mut self, out: &mut [f32], format: AudioFormat, clip: &AudioClip, speed: f64) {
         let ch = format.channels as usize;
         let Some(source) = self.source.as_mut() else {
             out.fill(0.0);
             return;
         };
         let frames = out.len() / ch;
-        let speed = clip.speed;
+        let speed = speed.max(1e-6);
         if (speed - 1.0).abs() < 1e-9 {
             let mut got = 0;
             while got < out.len() {
@@ -683,8 +731,8 @@ impl TimelineAudio {
             let latency = d.chain.latency() * format.channels as usize;
             if latency > 0 {
                 let mut prime = vec![0.0f32; latency];
-                d.pull(&mut prime, format, clip);
-                let t = clip.range.start + Time::from_seconds_f64((want_time - clip.source_in).as_seconds_f64() / clip.speed);
+                d.pull(&mut prime, format, clip, clip.speed_near(want_time));
+                let t = clip.range.start + Time::from_seconds_f64((want_time - clip.source_in).as_seconds_f64() / clip.speed_near(want_time));
                 d.chain.process(&clip.owner(t), &mut prime, t, format);
                 // The output continues from `want`; the file is read that far ahead.
                 d.pos = want as f64;
@@ -707,12 +755,27 @@ impl TimelineAudio {
             return;
         }
         if a < ce {
-            let want = self.frame_of(clip.source_in) + ((a - cs) as f64 * clip.speed).round() as i64;
+            let want = match &clip.ramp {
+                Some(_) => self.frame_of(clip.source_at(self.time_of(a))),
+                None => self.frame_of(clip.source_in) + ((a - cs) as f64 * clip.speed).round() as i64,
+            };
             self.prepare(clip, want);
         } else if !self.decoders.contains_key(&clip.id) {
             return; // a tail of nothing that played: nothing to ring
         }
         let (format, block_time) = (self.format, self.time_of(a));
+        // A speed ramp: this block at the ramp's average speed across it, so the file is
+        // read exactly as far as the ramp goes by the block's end.
+        let block_speed = match &clip.ramp {
+            Some(r) => {
+                let sr = format.sample_rate as f64;
+                let frames = (stop.min(ce) - a).max(1) as f64;
+                let t0 = (a - cs) as f64 / sr;
+                let t1 = t0 + frames / sr;
+                ((r.offset_at(t1) - r.offset_at(t0)) / (t1 - t0)).abs()
+            }
+            None => clip.speed,
+        };
         let Some(d) = self.decoders.get_mut(&clip.id) else { return };
         if d.source.is_none() {
             return;
@@ -722,7 +785,7 @@ impl TimelineAudio {
         let decoded = (stop.min(ce) - a).max(0) as usize * ch;
         self.scratch.resize(n, 0.0);
         if decoded > 0 {
-            d.pull(&mut self.scratch[..decoded], format, clip);
+            d.pull(&mut self.scratch[..decoded], format, clip, block_speed);
         }
         self.scratch[decoded..n].fill(0.0);
         if !clip.effects.is_empty() {
@@ -1305,6 +1368,24 @@ mod tests {
             let expect = 3.0 + (1.0 + 0.5 * speed as f32) / 100.0;
             assert!((s[500] - expect).abs() < 2e-4, "speed {speed}: {} vs {expect}", s[500]);
         }
+    }
+
+    /// A speed ramp reads the file as the ramp goes: from 1× to 3× over the clip, it's at
+    /// 1 s + 0.5 × 1.5 s of file (the ramp's integral) a quarter of the way… and the
+    /// positions keep rising at the ramp's pace, without a seek's jump.
+    #[test]
+    fn a_speed_ramp_reads_the_file_as_it_goes() {
+        let mut c = clip(1, 3, 0.0, 1.0, 1.0);
+        // 1× → 3× linearly over the clip's 1 s: offset(x) = x + x².
+        c.ramp = Some(Arc::new(SpeedRamp::sample(1.0, |x| x + x * x)));
+        let mut m = mixer(vec![c], 1.0, Default::default());
+        let s = drain(&mut m);
+        let at = |i: usize| (s[i] - 3.0) * 100.0;
+        for (i, x) in [(250usize, 0.25f32), (500, 0.5), (900, 0.9)] {
+            let want = 1.0 + x + x * x;
+            assert!((at(i) - want).abs() < 0.02, "at {x} s: {} vs {want}", at(i));
+        }
+        assert!(s.windows(2).skip(10).take(980).all(|w| w[1] >= w[0] - 1e-5), "only ever forward");
     }
 
     #[test]

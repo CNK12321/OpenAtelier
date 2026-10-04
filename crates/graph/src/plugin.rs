@@ -29,6 +29,11 @@ use std::path::{Path, PathBuf};
 /// Atelier Core's id. It's built in, always present and on by default.
 pub const CORE_ID: &str = "com.openatelier.core";
 
+/// The largest shader another plugin may carry (Atelier Core's biggest is a few KB).
+pub const MAX_SHADER_BYTES: usize = 64 * 1024;
+/// The most passes an effect may declare (what the renderer runs at most, too).
+pub const MAX_PASSES: u32 = 32;
+
 /// The manifest file inside a plugin folder.
 pub const MANIFEST: &str = "plugin.json";
 
@@ -327,6 +332,10 @@ struct ParamDef {
     /// The value can't be keyframed (a mode the shader compiles against).
     #[serde(default)]
     static_only: bool,
+    /// An enum that takes any number of its options (the default: a list of them);
+    /// the shader gets a bitmask, bit i for option i.
+    #[serde(default)]
+    multiple: bool,
 }
 
 fn unit_of(name: Option<&str>) -> Result<Unit, String> {
@@ -374,6 +383,18 @@ impl ParamDef {
             },
             "media" => Value::Media(None),
             "text" => Value::Text(d.and_then(|v| v.as_str()).unwrap_or_default().into()),
+            "enum" if self.multiple => {
+                if self.options.is_empty() || self.options.len() > 24 {
+                    return Err(format!("enum parameter \"{}\" takes several options: it needs 1 to 24", self.id));
+                }
+                // A list of options (or one), kept in option order.
+                let listed: Vec<&str> = match d {
+                    Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect(),
+                    Some(serde_json::Value::String(s)) => s.split(',').map(str::trim).collect(),
+                    _ => Vec::new(),
+                };
+                Value::Enum(self.options.iter().filter(|o| listed.contains(&o.as_str())).cloned().collect::<Vec<_>>().join(","))
+            }
             "enum" => {
                 let first = self.options.first().ok_or_else(|| format!("enum parameter \"{}\" has no options", self.id))?;
                 Value::Enum(d.and_then(|v| v.as_str()).unwrap_or(first).into())
@@ -385,6 +406,7 @@ impl ParamDef {
             schema.range = Some((lo, hi));
         }
         schema.options = self.options;
+        schema.multiple = self.multiple;
         schema.animatable = !self.static_only;
         Ok(schema)
     }
@@ -447,6 +469,14 @@ impl EffectDef {
                 if kind != EffectKind::Sound && (s.entry.is_empty() || !source.contains(&s.entry)) {
                     return Err(format!("{where_}: the shader has no function called \"{}\"", s.entry));
                 }
+                // Limits on what another plugin's shader may be: it runs on the GPU the
+                // editor draws with (a stalled GPU resets the driver).
+                if !builtin && source.len() > MAX_SHADER_BYTES {
+                    return Err(format!("{where_}: the shader is {} KB; plugins' shaders can be {} KB at most", source.len() / 1024, MAX_SHADER_BYTES / 1024));
+                }
+                if !builtin && s.passes > MAX_PASSES {
+                    return Err(format!("{where_}: {} passes; {MAX_PASSES} at most", s.passes));
+                }
                 Some(EffectShader { entry: s.entry.clone(), source: source.into(), passes: s.passes.max(1) })
             }
         };
@@ -461,7 +491,7 @@ impl EffectDef {
         let mut preview = Vec::new();
         for (id, v) in self.preview {
             let Some(p) = params.iter().find(|p| p.id.as_str() == id) else { return Err(format!("{where_}: \"preview\" sets \"{id}\", which isn't one of its parameters")) };
-            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, unit: None, options: p.options.clone(), static_only: false };
+            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
             preview.push((ParamId::new(&id), def.into_schema().map_err(|e| format!("{where_}: preview: {e}"))?.default));
         }
         if let Some(e) = &self.editor
@@ -741,6 +771,33 @@ mod tests {
         let (registry, issues) = crate::registry::Registry::from_plugins([&p]);
         assert!(issues.is_empty() && registry.is_sound("com.example.tremolo") && !registry.is_sound("com.example.vignette"));
         assert!(registry.offered(EffectUsage::Passive).is_empty(), "sound effects aren't offered as picture effects");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another plugin's shader has limits: a size, and the passes it may ask for.
+    #[test]
+    fn plugin_shaders_have_limits() {
+        let dir = temp("limits");
+        let huge = format!("fn big() {{}}\n{}", "// padding\n".repeat(MAX_SHADER_BYTES / 11 + 1));
+        let manifest = serde_json::json!({
+            "id": "com.example.limits", "name": "Limits",
+            "effects": [
+                {"id": "com.example.big", "name": "Big", "kind": "point", "shader": {"entry": "big", "source": huge}},
+                {"id": "com.example.many", "name": "Many", "kind": "spatial", "shader": {"entry": "many", "source": "fn many() {}", "passes": 1000}},
+                {"id": "com.example.fine", "name": "Fine", "kind": "spatial", "shader": {"entry": "fine", "source": "fn fine() {}", "passes": 4}}
+            ]
+        });
+        let path = write(&dir, "limits.plugin.json", &manifest.to_string());
+        let p = load(&path).expect("manifest parses");
+        assert_eq!(p.effects.iter().map(|e| e.type_id.as_ref()).collect::<Vec<_>>(), vec!["com.example.fine"], "{:?}", p.issues);
+        assert!(p.issues[0].contains("KB at most"), "{:?}", p.issues);
+        assert!(p.issues[1].contains("32 at most"), "{:?}", p.issues);
+        // Atelier Core is held to them too, in effect: it fits.
+        for e in &core().effects {
+            if let Some(s) = &e.shader {
+                assert!(s.source.len() <= MAX_SHADER_BYTES && s.passes <= MAX_PASSES, "{}", e.type_id);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

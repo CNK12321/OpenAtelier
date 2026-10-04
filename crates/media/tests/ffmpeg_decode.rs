@@ -534,3 +534,64 @@ fn the_app_decoder_forwards_everything() {
     assert!((8..=240).contains(&d.seek_cost()), "a seek costs frames: {}", d.seek_cost());
     assert!(d.set_scale_divisor(2), "a smaller size is taken");
 }
+
+/// 10-bit video keeps its 10 bits: a gentle gradient (40 ten-bit codes across the
+/// picture, only 10 at 8 bits) decodes into as many distinct steps, at the right level.
+/// Only where the GPU takes 16-bit textures; elsewhere it's decoded at 8 bits as before.
+#[test]
+fn ten_bit_video_keeps_its_steps() {
+    if !tool_available("ffmpeg") || !tool_available("ffprobe") {
+        return;
+    }
+    let Ok(ctx) = GpuContext::new_headless() else { return };
+    if !ctx.supports_deep_video() {
+        eprintln!("skipping: no 16-bit textures on this GPU");
+        return;
+    }
+    let ctx = Arc::new(ctx);
+    let dir = std::env::temp_dir().join("oa-media-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!("gradient_10bit-{}.mkv", std::process::id()));
+    // Lossless (FFV1), luma 400 → 440 in 10-bit codes left to right, neutral chroma.
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "nullsrc=s=1024x16:r=10:d=0.5,format=yuv420p10le,geq=lum='400+floor(X*40/W)':cb=512:cr=512"])
+        .args(["-c:v", "ffv1", "-pix_fmt", "yuv420p10le"])
+        .arg(&file)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !made {
+        return;
+    }
+    let probe = probe(&file).expect("probe");
+    let video = probe.video.clone().expect("video");
+    assert_eq!(video.bit_depth(), 10, "{}", video.pixel_format);
+    let mut source = ffmpeg_source(&ctx);
+    source.add(1, &file, video);
+    let mut renderer = Renderer::new(ctx.clone(), RenderOptions { fusion: FusionMode::Blocking, cache_budget: 0, ..Default::default() });
+    let size = [1024u32, 16];
+    let mut b = GraphBuilder::new(KeyContext::default());
+    let src = b.add(
+        NodeOp::Source { media: 1, fingerprint: None, source_time: Time::ZERO, rep: Representation::Original, decode_scale: 1.0, size, yuv: [0, 0] },
+        vec![],
+        Rect::from_size(1024.0, 16.0),
+        true,
+    );
+    let out = b.add(
+        NodeOp::Composite { size, background: [0.0, 0.0, 0.0, 1.0], layers: vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false }] },
+        vec![src],
+        Rect::from_size(1024.0, 16.0),
+        true,
+    );
+    let img = renderer.render(&b.finish(out), &Registry::with_builtins(), &mut source).expect("render");
+    let px = oa_gpu::readback::read_linear(&ctx, &img).unwrap();
+    let _ = std::fs::remove_file(&file);
+    let row: Vec<f32> = (0..1024).map(|x| px[8 * 1024 + x][0]).collect();
+    let mut levels: Vec<u32> = row.iter().map(|v| (v * 1e5).round() as u32).collect();
+    levels.dedup();
+    assert!(levels.len() >= 35, "40 ten-bit steps survive, not 10 eight-bit ones: {} distinct", levels.len());
+    // Code 400 in video range is (400 - 64) / 876 of the way to white, sRGB-encoded.
+    let srgb = (400.0f32 - 64.0) / 876.0;
+    let linear = ((srgb + 0.055) / 1.055).powf(2.4);
+    assert!((row[2] - linear).abs() < 0.003, "the level is right: {} vs {linear}", row[2]);
+    assert!(row.windows(2).all(|w| w[1] >= w[0] - 1e-4), "and it only rises");
+}

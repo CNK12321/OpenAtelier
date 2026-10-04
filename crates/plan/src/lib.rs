@@ -101,6 +101,7 @@ pub fn plan_frame(
         opts,
         b: GraphBuilder::new(opts.key_context),
         report: PlanReport::default(),
+        frame: 1.0 / sequence.rate.as_f64().max(1.0),
     };
     let out = p.sequence(seq, Some(variant), t, opts.render_scale, 0);
     let out = p.output_transform(sequence, seq, t, out);
@@ -219,6 +220,9 @@ struct Planner<'a> {
     opts: &'a PlanOptions,
     b: GraphBuilder,
     report: PlanReport,
+    /// How long a frame of the timeline being planned lasts (seconds): what a motion
+    /// blur's shutter is a share of.
+    frame: f64,
 }
 
 impl Planner<'_> {
@@ -274,8 +278,21 @@ impl Planner<'_> {
                     canvas_rect,
                     top && background[3] >= 1.0,
                 );
-                let (node, _) = self.effect_chain(item, &ctx, below, canvas_rect, scale, [canvas_rect.x1, canvas_rect.y1], false, depth, None);
-                let blend = blend_of(&vis);
+                // Effects after its Blend run on the blended picture.
+                let split = self.blend_split(item);
+                let (node, _) = self.effect_chain(split.as_ref().map_or(item, |s| &s.0), &ctx, below, canvas_rect, scale, [canvas_rect.x1, canvas_rect.y1], false, depth, None);
+                let mode = schema::blend_mode(item, &ctx);
+                if split.is_some() || schema::backdrop_blend(&mode).is_some() {
+                    let info = LayerInfo { opacity: mix as f32, blend: BlendMode::Normal, pixelated: false };
+                    let Some(mut node) = self.backdrop_blend(schema::blend_index(&mode), below, node, info, size, false) else { continue };
+                    if let Some((_, after)) = &split {
+                        node = self.effect_chain(after, &ctx, node, canvas_rect, scale, [canvas_rect.x1, canvas_rect.y1], false, depth, None).0;
+                    }
+                    inputs.push(node);
+                    layers.push(LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false });
+                    continue;
+                }
+                let blend = blend_of(item, &ctx);
                 if mix < 1.0 || blend != BlendMode::Normal {
                     // The untouched picture, with the result laid over it.
                     inputs.push(below);
@@ -293,9 +310,38 @@ impl Planner<'_> {
                 continue;
             }
             let Some(item) = track.item_at(t).filter(|i| i.enabled) else { continue };
-            if let Some((node, info)) = self.layer(item, v, t, scale, depth) {
+            // Effects listed after its Blend run on what it blended into, so the clip is
+            // built with only those before it.
+            let split = self.blend_split(item);
+            let Some((node, info)) = self.layer(split.as_ref().map_or(item, |s| &s.0), v, t, scale, depth) else { continue };
+            let ctx = item.eval_context(t);
+            let mode = schema::blend_mode(item, &ctx);
+            if split.is_none() && schema::backdrop_blend(&mode).is_none() {
                 inputs.push(node);
                 layers.push(info);
+                continue;
+            }
+            // Mixed with what's under it, flattened: by a mode that reads it, or with
+            // effects to run on the result.
+            let base = if top && !blurred { background } else { [0.0; 4] };
+            let below = self.b.add(NodeOp::Composite { size, background: base, layers: std::mem::take(&mut layers) }, std::mem::take(&mut inputs), canvas_rect, base[3] >= 1.0);
+            let mode = schema::blend_index(&mode);
+            inputs.push(below);
+            layers.push(LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false });
+            match split {
+                // The clip's area of the blended picture, as a layer of its own for the
+                // effects after the Blend — a glow or shadow can still reach past it.
+                Some((_, after)) => {
+                    let Some(cut) = self.backdrop_blend(mode, below, node, info, size, true) else { continue };
+                    let (node, _) = self.effect_chain(&after, &ctx, cut, canvas_rect, scale, [canvas_rect.x1, canvas_rect.y1], false, depth, None);
+                    inputs.push(node);
+                    layers.push(LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false });
+                }
+                None => {
+                    if let Some(node) = self.backdrop_blend(mode, below, node, info, size, false) {
+                        *inputs.last_mut().expect("pushed") = node;
+                    }
+                }
             }
         }
         let canvas = Rect::from_size(size[0] as f64, size[1] as f64);
@@ -315,6 +361,39 @@ impl Planner<'_> {
         }
         let op = NodeOp::Composite { size, background, layers };
         self.b.add(op, inputs, canvas, top && background[3] >= 1.0)
+    }
+
+    /// `layer` (placed, with `info`'s opacity) mixed into `below` (the canvas) by blend
+    /// mode `mode` (`schema::blend_index`): the whole canvas, mixed — or with `cut`, only
+    /// the layer's area of it (laid over `below` normally, the same picture).
+    #[allow(clippy::too_many_arguments)]
+    fn backdrop_blend(&mut self, mode: usize, below: NodeId, layer: NodeId, info: LayerInfo, size: [u32; 2], cut: bool) -> Option<NodeId> {
+        let canvas = Rect::from_size(size[0] as f64, size[1] as f64);
+        let layers = vec![LayerInfo { blend: BlendMode::Normal, ..info }];
+        let layer = self.b.add(NodeOp::Composite { size, background: [0.0; 4], layers }, vec![layer], canvas, false);
+        self.two_input(oa_graph::registry::BACKDROP_BLEND, vec![mode as f32, if cut { 1.0 } else { 0.0 }], below, layer, canvas)
+    }
+
+    /// With picture effects listed after its (last) Blend: the clip with only what comes
+    /// before them, and a copy holding just them — they run on what the Blend made.
+    /// Intros, outros, motion and text effects stay with the clip.
+    fn blend_split(&self, item: &Item) -> Option<(Item, Item)> {
+        let passive = |e: &oa_doc::EffectInstance| e.role == oa_doc::EffectRole::Passive;
+        let at = item.effects.iter().rposition(|e| e.enabled && passive(e) && e.type_id == oa_graph::registry::BLEND)?;
+        let later = |i: usize, e: &oa_doc::EffectInstance| {
+            i > at
+                && passive(e)
+                && !self.registry.is_sound(&e.type_id)
+                && self.registry.effect(&e.type_id).is_some_and(|d| d.kind != oa_graph::EffectKind::Motion && !d.kind.text_only())
+        };
+        if !item.effects.iter().enumerate().any(|(i, e)| e.enabled && later(i, e)) {
+            return None;
+        }
+        let (mut before, mut after) = (item.clone(), item.clone());
+        before.effects = item.effects.iter().enumerate().filter(|(i, e)| !later(*i, e)).map(|(_, e)| e.clone()).collect();
+        after.effects = item.effects.iter().enumerate().filter(|(i, e)| later(*i, e)).map(|(_, e)| e.clone()).collect();
+        after.masks.clear();
+        Some((before, after))
     }
 
     /// Whether the sequence's background has picture effects to run.
@@ -541,6 +620,9 @@ impl Planner<'_> {
             if d.kind == oa_graph::EffectKind::Motion || d.kind.text_only() {
                 continue; // folded into the layer's transform above / run in the text pass
             }
+            if fx.type_id == oa_graph::registry::MOTION_BLUR || fx.type_id == oa_graph::registry::BLEND {
+                continue; // the whole layer sampled across its shutter (`Planner::layer`) / how the compositor lays it down (`blend_of`)
+            }
             // In/out effects only run inside their windows.
             let Some(clock) = fx.role.clock(ctx.clip_time, item.range.duration) else { continue };
             let clock = if fx.role == oa_doc::EffectRole::Passive && !d.time_varying {
@@ -653,7 +735,12 @@ impl Planner<'_> {
         for m in oa_doc::mask::chosen(&item.masks, choice) {
             let v = oa_doc::mask::MaskValues::eval(item, m.id, ctx);
             // The drawing at the layer's raster size (within limits); the GPU places it.
-            let k = (MAX_MASK_SIDE / raster_size[0].max(raster_size[1]).max(1.0)).min(1.0);
+            let mut k = (MAX_MASK_SIDE / raster_size[0].max(raster_size[1]).max(1.0)).min(1.0);
+            // Only pictures in it (a rotoscoped matte, a magic selection): no bigger than
+            // they are — the GPU stretches it over the layer either way.
+            if let Some(cap) = m.raster_cap() {
+                k = k.min((cap[0] as f64 / raster_size[0].max(1.0)).max(cap[1] as f64 / raster_size[1].max(1.0)));
+            }
             let size = [(raster_size[0] * k).round().max(1.0) as u32, (raster_size[1] * k).round().max(1.0) as u32];
             let pixels = mask_pixels(m, size, ctx.clip_time);
             // Subtracting with nothing above it takes it out of the whole clip.
@@ -865,7 +952,56 @@ impl Planner<'_> {
         (self.b.add(op, vec![], bounds, false), bounds, spec)
     }
 
-    fn layer(
+    /// A clip's layer on the canvas at `t` — with Motion Blur on it, built at moments
+    /// across its shutter and averaged (see [`Planner::motion_blurred`]).
+    fn layer(&mut self, item: &Item, variant: &oa_doc::FormatVariant, t: Time, out_scale: f64, depth: usize) -> Option<(NodeId, LayerInfo)> {
+        match self.motion_blur(item, t) {
+            Some((samples, shutter)) => self.motion_blurred(item, variant, t, out_scale, depth, samples, shutter),
+            None => self.layer_at(item, variant, t, out_scale, depth),
+        }
+    }
+
+    /// Motion Blur's settings on `item` at `t`, if it has it on: (samples, shutter as a
+    /// share of a frame).
+    fn motion_blur(&self, item: &Item, t: Time) -> Option<(usize, f64)> {
+        let fx = item.effects.iter().find(|e| e.enabled && e.type_id == oa_graph::registry::MOTION_BLUR)?;
+        let d = self.registry.effect(&fx.type_id)?;
+        let ctx = item.eval_context(t);
+        let values = fx.params.eval(&d.params, None, &ctx);
+        let samples = values.float("samples").round().clamp(2.0, 32.0) as usize;
+        let shutter = values.float("shutter_angle").clamp(0.0, 720.0) / 360.0;
+        (shutter > 0.0).then_some((samples, shutter))
+    }
+
+    /// The layer built at `samples` moments spread across the shutter (centered on `t`:
+    /// `shutter` frames wide) and averaged: each added in at 1/N of its opacity over a clear
+    /// canvas, so what moves — its transform, keyframed effects, the footage between
+    /// frames — smears along its path. Premultiplied, the sum is the average, edges and
+    /// see-through parts included.
+    #[allow(clippy::too_many_arguments)]
+    fn motion_blurred(&mut self, item: &Item, variant: &oa_doc::FormatVariant, t: Time, out_scale: f64, depth: usize, samples: usize, shutter: f64) -> Option<(NodeId, LayerInfo)> {
+        let span = shutter * self.frame;
+        let mut inputs = Vec::new();
+        let mut layers = Vec::new();
+        let mut blend = BlendMode::Normal;
+        for i in 0..samples {
+            let offset = span * (i as f64 / (samples - 1) as f64 - 0.5);
+            let at = (t + Time::from_seconds_f64(offset)).clamp(item.range.start, item.range.end() - Time(1));
+            let Some((node, info)) = self.layer_at(item, variant, at, out_scale, depth) else { continue };
+            blend = info.blend;
+            inputs.push(node);
+            layers.push(LayerInfo { opacity: info.opacity / samples as f32, blend: BlendMode::Add, pixelated: info.pixelated });
+        }
+        if inputs.is_empty() {
+            return None;
+        }
+        let size = [((variant.size.width as f64 * out_scale).round() as u32).max(1), ((variant.size.height as f64 * out_scale).round() as u32).max(1)];
+        let canvas = Rect::from_size(size[0] as f64, size[1] as f64);
+        let node = self.b.add(NodeOp::Composite { size, background: [0.0; 4], layers }, inputs, canvas, false);
+        Some((node, LayerInfo { opacity: 1.0, blend, pixelated: false }))
+    }
+
+    fn layer_at(
         &mut self,
         item: &Item,
         variant: &oa_doc::FormatVariant,
@@ -1040,7 +1176,7 @@ impl Planner<'_> {
                 let node = self.two_input(oa_graph::registry::MASK_ALPHA, vec![opacity as f32, opacity_in as f32], node, mask, bounds)?;
                 let matrix = to_layer.then(&full);
                 let node = self.b.add(NodeOp::Transform { matrix }, vec![node], matrix.map_rect(bounds), false);
-                return Some((node, LayerInfo { opacity: 1.0, blend: blend_of(&vis), pixelated }));
+                return Some((node, LayerInfo { opacity: 1.0, blend: blend_of(item, &ctx), pixelated }));
             };
             let outside = self.two_input(oa_graph::registry::MASK_ALPHA, vec![opacity as f32, 0.0], node, mask, bounds)?;
             let inside = self.two_input(oa_graph::registry::MASK_ALPHA, vec![0.0, opacity_in as f32], node, mask, bounds)?;
@@ -1053,20 +1189,20 @@ impl Planner<'_> {
                 layers.push(LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated });
             }
             let both = self.b.add(NodeOp::Composite { size, background: [0.0; 4], layers }, inputs, canvas, false);
-            return Some((both, LayerInfo { opacity: 1.0, blend: blend_of(&vis), pixelated: false }));
+            return Some((both, LayerInfo { opacity: 1.0, blend: blend_of(item, &ctx), pixelated: false }));
         }
 
         let matrix = Affine2::scale(1.0 / raster, 1.0 / raster).then(&full);
         let opaque = self.b.node(node).opaque && matrix.is_axis_aligned();
         let node = self.b.add(NodeOp::Transform { matrix }, vec![node], matrix.map_rect(bounds), opaque);
         // Pixel art (or media set to pixel scaling) stays crisp when enlarged.
-        Some((node, LayerInfo { opacity: opacity as f32, blend: blend_of(&vis), pixelated }))
+        Some((node, LayerInfo { opacity: opacity as f32, blend: blend_of(item, &ctx), pixelated }))
     }
 }
 
-/// A clip's (or container's) blend mode, from its evaluated visual params.
-fn blend_of(vis: &oa_params::Evaluated) -> BlendMode {
-    vis.get(schema::BLEND).and_then(|v| v.as_enum()).map_or(BlendMode::Normal, BlendMode::from_name)
+/// A clip's (or container's) blend mode: its Blend effect's, or normal.
+fn blend_of(item: &Item, ctx: &oa_params::EvalContext) -> BlendMode {
+    BlendMode::from_name(&schema::blend_mode(item, ctx))
 }
 
 #[cfg(test)]

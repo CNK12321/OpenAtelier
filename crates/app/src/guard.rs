@@ -5,6 +5,7 @@
 //! If frames keep failing, the editor steps back to the start page (the project stays
 //! recoverable from the autosave).
 
+use crate::i18n::trf;
 use crate::App;
 use eframe::egui;
 
@@ -62,9 +63,9 @@ impl App {
         if self.failed_frames >= MAX_FAILED_FRAMES {
             self.failed_frames = 0;
             self.go_home();
-            self.report_error(format!("The editor kept failing ({why}). Your work was autosaved — reopen the project to continue."));
+            self.report_error(trf("The editor kept failing ({why}). Your work was autosaved — reopen the project to continue.", &[("why", why)]));
         } else {
-            self.report_error(format!("Something went wrong ({why}). Your work was autosaved and the editor recovered."));
+            self.report_error(trf("Something went wrong ({why}). Your work was autosaved and the editor recovered.", &[("why", why)]));
         }
     }
 }

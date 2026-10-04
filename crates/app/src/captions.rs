@@ -16,6 +16,7 @@
 //! 5. **Add**: the captions go on a new "Captions" track above everything, as title
 //!    clips that know when each of their words is spoken, and the window closes.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_captions::engine::{self, Engine, Job, Msg};
@@ -205,7 +206,7 @@ impl CaptionsUi {
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.render = None;
-                    self.error = Some("mixing the sound down stopped unexpectedly".into());
+                    self.error = Some(tr("mixing the sound down stopped unexpectedly").into());
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -257,7 +258,7 @@ impl CaptionsUi {
                     _ => None,
                 });
                 if words.is_empty() {
-                    self.error = Some("No speech was heard in that stretch.".into());
+                    self.error = Some(tr("No speech was heard in that stretch.").into());
                 } else {
                     let colors = vec![None; words.len()];
                     self.transcript = Some(Transcript { words, colors, language: language.unwrap_or_default() });
@@ -394,13 +395,13 @@ fn timing_menu(ui: &mut egui::Ui, c: &mut CaptionsUi, captions: &[(oa_captions::
     let frame = 1.0 / rate.as_f64().max(1.0);
     let (mut start, mut end) = (cap.start, cap.end);
     let at = c.offset.as_seconds_f64();
-    ui.label(egui::RichText::new("Timing").strong());
+    ui.label(egui::RichText::new(tr("Timing")).strong());
     ui.label(egui::RichText::new(cap.text.chars().take(40).collect::<String>()).small().weak());
     let row = |ui: &mut egui::Ui, label: &str, value: &mut f64| -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(label);
-            if ui.small_button("−").on_hover_text("A frame earlier").clicked() {
+            if ui.small_button(tr("−")).on_hover_text(tr("A frame earlier")).clicked() {
                 *value -= frame;
                 changed = true;
             }
@@ -410,15 +411,15 @@ fn timing_menu(ui: &mut egui::Ui, c: &mut CaptionsUi, captions: &[(oa_captions::
                 *value = *shown - at;
                 changed = true;
             }
-            if ui.small_button("+").on_hover_text("A frame later").clicked() {
+            if ui.small_button(tr("+")).on_hover_text(tr("A frame later")).clicked() {
                 *value += frame;
                 changed = true;
             }
         });
         changed
     };
-    let moved_start = row(ui, "Start", &mut start);
-    let moved_end = row(ui, "End  ", &mut end);
+    let moved_start = row(ui, tr("Start"), &mut start);
+    let moved_end = row(ui, tr("End  "), &mut end);
     if moved_start || moved_end {
         // Never inside out, never before the recording.
         start = start.max(0.0);
@@ -443,10 +444,10 @@ fn timing_menu(ui: &mut egui::Ui, c: &mut CaptionsUi, captions: &[(oa_captions::
         }
     }
     ui.horizontal(|ui| {
-        if ui.small_button("By the words").on_hover_text("Back to the times the transcript gives").clicked() {
+        if ui.small_button(tr("By the words")).on_hover_text(tr("Back to the times the transcript gives")).clicked() {
             c.times.remove(&cap.words.start);
         }
-        if ui.small_button("Close the gap").on_hover_text("Start where the line above ends").clicked()
+        if ui.small_button(tr("Close the gap")).on_hover_text(tr("Start where the line above ends")).clicked()
             && let Some((above, _)) = i.checked_sub(1).and_then(|p| captions.get(p))
         {
             c.times.insert(cap.words.start, (above.end, end.max(above.end + frame)));
@@ -576,7 +577,7 @@ impl App {
         let mut open = true;
         let mut close = false;
         let setting_up = !c.engine.is_installed() || c.job.as_ref().is_some_and(|(w, _)| *w == Work::Install);
-        let window = crate::widgets::on_screen(egui::Window::new("Captions").open(&mut open).collapsible(false).resizable(true), ctx);
+        let window = crate::widgets::on_screen(egui::Window::new(tr("Captions")).open(&mut open).collapsible(false).resizable(true), ctx);
         let window = if setting_up {
             window.default_size(crate::widgets::fit_screen(ctx, [560.0, 480.0]))
         } else {
@@ -645,7 +646,7 @@ impl App {
             && let Some(c) = self.captions_added.take()
         {
             self.captions = Some(c);
-            self.notify("The captions came off the timeline — the Captions window is back as you left it.");
+            self.notify(tr("The captions came off the timeline — the Captions window is back as you left it."));
         }
     }
 
@@ -665,33 +666,29 @@ impl App {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
             crate::icons::paint(ui.painter(), rect, crate::icons::CAPTIONS, crate::style::ACCENT);
             ui.vertical(|ui| {
-                ui.label(egui::RichText::new("Captions from speech").strong().size(crate::style::TITLE));
-                ui.label(egui::RichText::new("Made on this computer by faster-whisper, an open-source speech recognizer.").weak());
+                ui.label(egui::RichText::new(tr("Captions from speech")).strong().size(crate::style::TITLE));
+                ui.label(egui::RichText::new(tr("Made on this computer by faster-whisper, an open-source speech recognizer.")).weak());
             });
         });
         ui.add_space(8.0);
         if c.job.is_none() {
             panel(ui, |ui| {
-                ui.label("It isn't included with OpenAtelier, to keep the editor small for people who don't need it. Pick a model and it's downloaded once, then works offline.");
+                ui.label(tr("It isn't included with OpenAtelier, to keep the editor small for people who don't need it. Pick a model and it's downloaded once, then works offline."));
                 ui.add_space(6.0);
                 let prefs = &mut self.settings.captions;
                 for m in MODELS {
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut prefs.model, m.name.to_string(), egui::RichText::new(m.name).strong());
-                        ui.label(egui::RichText::new(format!("~{} MB", m.size_mb)).monospace().weak());
+                        ui.label(egui::RichText::new(trf("~{0} MB", &[("0", &(m.size_mb).to_string())])).monospace().weak());
                         ui.label(egui::RichText::new(m.about).weak());
                     });
                 }
             });
             let chosen = oa_captions::model(&self.settings.captions.model).copied().unwrap_or(MODELS[2]);
-            ui.label(egui::RichText::new(format!(
-                "About {} MB in all: uv (a small Python installer), Python, faster-whisper and its libraries, and the {} model. It all goes in one folder — nothing is installed anywhere else, and Remove deletes it:",
-                200 + chosen.size_mb,
-                chosen.name
-            )).small());
+            ui.label(egui::RichText::new(trf("About {0} MB in all: uv (a small Python installer), Python, faster-whisper and its libraries, and the {1} model. It all goes in one folder — nothing is installed anywhere else, and Remove deletes it:", &[("0", &(200 + chosen.size_mb).to_string()), ("1", (chosen.name))])).small());
             ui.label(egui::RichText::new(c.engine.root().display().to_string()).monospace().small().weak());
             ui.add_space(8.0);
-            if primary(ui, true, &format!("Download and set up  (~{} MB)", 200 + chosen.size_mb)).clicked() {
+            if primary(ui, true, &trf("Download and set up  (~{0} MB)", &[("0", &(200 + chosen.size_mb).to_string())])).clicked() {
                 let steps = c.engine.install_steps(chosen.name);
                 c.start(Work::Install, steps);
             }
@@ -708,9 +705,9 @@ impl App {
                 let what = if c.step.is_empty() { "Starting…".to_string() } else { c.step.clone() };
                 match work {
                     Work::Listen => {
-                        ui.label(egui::RichText::new(format!("{what}…")).strong());
+                        ui.label(egui::RichText::new(trf("{what}…", &[("what", &what.to_string())])).strong());
                         bar(ui, c.progress.filter(|p| *p > 0.0), 10.0);
-                        ui.label(egui::RichText::new(if c.progress.is_some() { "Transcribing: captions arrive as it goes." } else { "Loading the model…" }).small().weak());
+                        ui.label(egui::RichText::new(if c.progress.is_some() { tr("Transcribing: captions arrive as it goes.") } else { tr("Loading the model…") }).small().weak());
                     }
                     _ => {
                         // Overall, counting a step's own progress when it reports one.
@@ -718,7 +715,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(what).strong());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new(format!("step {} of {total}", c.step_index + 1)).weak());
+                                ui.label(egui::RichText::new(trf("step {0} of {total}", &[("0", &(c.step_index + 1).to_string()), ("total", &(total).to_string())])).weak());
                             });
                         });
                         bar(ui, Some(overall), 10.0);
@@ -728,7 +725,7 @@ impl App {
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(tr("Cancel")).clicked() {
                         job.cancel();
                     }
                     egui::CollapsingHeader::new("Details").id_salt("caption-job-log").default_open(false).show(ui, |ui| {
@@ -742,7 +739,7 @@ impl App {
             });
         } else if c.render.is_some() {
             panel(ui, |ui| {
-                ui.label(egui::RichText::new("Mixing the sound down…").strong());
+                ui.label(egui::RichText::new(tr("Mixing the sound down…")).strong());
                 bar(ui, None, 10.0);
             });
         }
@@ -750,7 +747,7 @@ impl App {
             panel(ui, |ui| {
                 ui.colored_label(crate::style::ERROR, format!("⚠ {e}"));
                 if !c.log.is_empty() {
-                    egui::CollapsingHeader::new("What the tools said").id_salt("caption-error-log").show(ui, |ui| {
+                    egui::CollapsingHeader::new(tr("What the tools said")).id_salt("caption-error-log").show(ui, |ui| {
                         egui::ScrollArea::vertical().max_height(140.0).stick_to_bottom(true).show(ui, |ui| {
                             for line in c.log.iter().rev().take(40).rev() {
                                 ui.label(egui::RichText::new(line).monospace().small().weak());
@@ -766,25 +763,25 @@ impl App {
     fn caption_engine_info(&mut self, ui: &mut egui::Ui, c: &mut CaptionsUi) {
         ui.add_space(8.0);
         let usage = *c.usage.get_or_insert_with(|| c.engine.disk_usage());
-        egui::CollapsingHeader::new(egui::RichText::new(format!("Caption engine · {} on disk", megabytes(usage))).weak()).id_salt("caption-engine").show(ui, |ui| {
+        egui::CollapsingHeader::new(egui::RichText::new(trf("Caption engine · {0} on disk", &[("0", &(megabytes(usage)).to_string())])).weak()).id_salt("caption-engine").show(ui, |ui| {
             ui.label(egui::RichText::new(c.engine.root().display().to_string()).monospace().small());
             if !c.confirm_remove {
-                if ui.add_enabled(!c.busy(), egui::Button::new("Remove engine and models…")).clicked() {
+                if ui.add_enabled(!c.busy(), egui::Button::new(tr("Remove engine and models…"))).clicked() {
                     c.confirm_remove = true;
                 }
             } else {
-                ui.label("Delete the caption engine and every downloaded model? Captions already on timelines stay.");
+                ui.label(tr("Delete the caption engine and every downloaded model? Captions already on timelines stay."));
                 ui.horizontal(|ui| {
-                    if ui.button("Remove").clicked() {
+                    if ui.button(tr("Remove")).clicked() {
                         match c.engine.remove() {
-                            Ok(()) => self.notify("Removed the caption engine."),
+                            Ok(()) => self.notify(tr("Removed the caption engine.")),
                             Err(e) => c.error = Some(format!("couldn't remove it all: {e}")),
                         }
                         c.confirm_remove = false;
                         c.usage = None;
                         c.transcript = None;
                     }
-                    if ui.button("Keep it").clicked() {
+                    if ui.button(tr("Keep it")).clicked() {
                         c.confirm_remove = false;
                     }
                 });
@@ -796,28 +793,28 @@ impl App {
     fn captions_listen(&mut self, ui: &mut egui::Ui, c: &mut CaptionsUi) {
         let busy = c.busy();
         let has_model = c.engine.has_model(&self.settings.captions.model);
-        heading(ui, "Listen");
+        heading(ui, tr("Listen"));
         ui.add_enabled_ui(!busy, |ui| {
             panel(ui, |ui| {
                 egui::Grid::new("caption-listen").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                     let prefs = &mut self.settings.captions;
-                    ui.label("Listen to");
+                    ui.label(tr("Listen to"));
                     ui.vertical(|ui| {
-                        ui.radio_value(&mut c.whole_timeline, true, "The whole timeline");
+                        ui.radio_value(&mut c.whole_timeline, true, tr("The whole timeline"));
                         ui.add_enabled_ui(!self.selected.is_empty(), |ui| {
-                            ui.radio_value(&mut c.whole_timeline, false, "The selected clips' stretch").on_disabled_hover_text("Select clips on the timeline first");
+                            ui.radio_value(&mut c.whole_timeline, false, tr("The selected clips' stretch")).on_disabled_hover_text(tr("Select clips on the timeline first"));
                         });
                     });
                     ui.end_row();
-                    ui.label("Language");
-                    let current = LANGUAGES.iter().find(|l| l.0 == prefs.language).map_or(prefs.language.clone(), |l| l.1.to_string());
+                    ui.label(tr("Language"));
+                    let current = LANGUAGES.iter().find(|l| l.0 == prefs.language).map_or(prefs.language.clone(), |l| tr(l.1).to_string());
                     egui::ComboBox::from_id_salt("caption-language").selected_text(current).width(200.0).show_ui(ui, |ui| {
                         for (code, name) in LANGUAGES {
-                            ui.selectable_value(&mut prefs.language, code.to_string(), name);
+                            ui.selectable_value(&mut prefs.language, code.to_string(), tr(name));
                         }
                     });
                     ui.end_row();
-                    ui.label("Model");
+                    ui.label(tr("Model"));
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("caption-model").selected_text(prefs.model.clone()).width(200.0).show_ui(ui, |ui| {
                             for m in MODELS {
@@ -828,21 +825,21 @@ impl App {
                         });
                         if !has_model {
                             let size = oa_captions::model(&prefs.model).map_or(0, |m| m.size_mb);
-                            if ui.button(format!("Download (~{size} MB)")).clicked() {
+                            if ui.button(trf("Download (~{size} MB)", &[("size", &size.to_string())])).clicked() {
                                 let steps = c.engine.model_steps(&prefs.model);
                                 c.start(Work::Model, steps);
                             }
                         }
                     });
                     ui.end_row();
-                    ui.label("Clean up");
-                    ui.checkbox(&mut prefs.enhance_voice, "Enhance voices and reduce background noise first")
-                        .on_hover_text("Before listening: cuts rumble and steady noise (hiss, hum, fans), lifts speech clarity and evens out loud and quiet speakers. Helps with noisy or quiet recordings; your timeline's sound isn't changed.");
+                    ui.label(tr("Clean up"));
+                    ui.checkbox(&mut prefs.enhance_voice, tr("Enhance voices and reduce background noise first"))
+                        .on_hover_text(tr("Before listening: cuts rumble and steady noise (hiss, hum, fans), lifts speech clarity and evens out loud and quiet speakers. Helps with noisy or quiet recordings; your timeline's sound isn't changed."));
                     ui.end_row();
                 });
             });
             ui.add_space(4.0);
-            if primary(ui, has_model && !busy, "Generate captions").on_disabled_hover_text("Download the model first").clicked() {
+            if primary(ui, has_model && !busy, tr("Generate captions")).on_disabled_hover_text(tr("Download the model first")).clicked() {
                 self.start_listening(c);
             }
         });
@@ -860,7 +857,7 @@ impl App {
             }
         }
         if clips.is_empty() {
-            c.error = Some("There's no sound on this timeline to listen to.".into());
+            c.error = Some(tr("There's no sound on this timeline to listen to.").into());
             return;
         }
         let range = if c.whole_timeline || self.selected.is_empty() {
@@ -870,7 +867,7 @@ impl App {
             items.iter().map(|r| r.start).min().zip(items.iter().map(|r| r.end()).max())
         };
         let Some((start, end)) = range.filter(|(a, b)| b > a) else {
-            c.error = Some("That stretch is empty.".into());
+            c.error = Some(tr("That stretch is empty.").into());
             return;
         };
         c.offset = start;
@@ -917,35 +914,35 @@ impl App {
         let word_count = c.transcript.as_ref().map_or(0, |t| t.words.len());
         let rate = self.editor.sequence().rate;
 
-        heading(ui, "Group");
+        heading(ui, tr("Group"));
         panel(ui, |ui| {
             let g = &mut self.settings.captions.grouping;
             ui.horizontal_wrapped(|ui| {
                 for (mode, name, tip) in [
-                    (Mode::Phrases, "Phrases", "Break at commas and sentence ends, and at the limits below"),
-                    (Mode::Sentences, "Sentences", "Break at sentence ends, and at the limits below"),
-                    (Mode::Words, "By count", "Break only at the limits below"),
-                    (Mode::Single, "One word", "One word at a time"),
+                    (Mode::Phrases, "Phrases", tr("Break at commas and sentence ends, and at the limits below")),
+                    (Mode::Sentences, "Sentences", tr("Break at sentence ends, and at the limits below")),
+                    (Mode::Words, "By count", tr("Break only at the limits below")),
+                    (Mode::Single, "One word", tr("One word at a time")),
                 ] {
-                    ui.selectable_value(&mut g.mode, mode, name).on_hover_text(tip);
+                    ui.selectable_value(&mut g.mode, mode, tr(name)).on_hover_text(tr(tip));
                 }
             });
             ui.add_space(4.0);
             egui::Grid::new("caption-rules").num_columns(4).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label("Max words");
+                ui.label(tr("Max words"));
                 ui.add_enabled(g.mode != Mode::Single, egui::DragValue::new(&mut g.max_words).range(1..=30));
-                ui.label("Max length");
+                ui.label(tr("Max length"));
                 ui.add(egui::DragValue::new(&mut g.max_seconds).range(0.3..=15.0).speed(0.05).max_decimals(2).suffix(" s"));
                 ui.end_row();
-                ui.label("Pause breaks after").on_hover_text("A pause this long ends a caption; shorter gaps between captions are closed");
+                ui.label(tr("Pause breaks after")).on_hover_text(tr("A pause this long ends a caption; shorter gaps between captions are closed"));
                 ui.add(egui::DragValue::new(&mut g.silence).range(0.05..=5.0).speed(0.02).max_decimals(2).suffix(" s"));
-                ui.label("Shortest");
+                ui.label(tr("Shortest"));
                 ui.add(egui::DragValue::new(&mut g.min_seconds).range(0.0..=3.0).speed(0.02).max_decimals(2).suffix(" s"));
                 ui.end_row();
             });
             ui.horizontal(|ui| {
-                ui.checkbox(&mut g.uppercase, "UPPERCASE");
-                ui.checkbox(&mut g.strip_punctuation, "No commas or periods");
+                ui.checkbox(&mut g.uppercase, tr("UPPERCASE"));
+                ui.checkbox(&mut g.strip_punctuation, tr("No commas or periods"));
             });
         });
         if self.settings.captions.grouping != before {
@@ -970,14 +967,14 @@ impl App {
         }
         ui.horizontal(|ui| {
             heading(ui, &format!("{} captions", captions.len()));
-            ui.label(egui::RichText::new(format!("from {word_count} words{}", if language.is_empty() { String::new() } else { format!(" · {language}") })).weak());
+            ui.label(egui::RichText::new(trf("from {word_count} words{0}", &[("word_count", &(word_count).to_string()), ("0", &(if language.is_empty() { String::new() } else { format!(" · {language}") }).to_string())])).weak());
             // Lines taken out: how many, and a way back without reaching for undo.
             if !c.removed.is_empty() {
                 let gone = c.transcript.as_ref().map_or(0, |t| {
                     oa_captions::group_with(&t.words, &self.settings.captions.grouping, &c.manual).iter().filter(|cap| cap.words.clone().all(|w| c.removed.contains(&w))).count()
                 });
-                ui.label(egui::RichText::new(format!("· {gone} removed")).weak());
-                if ui.small_button("Restore").on_hover_text("Put every removed line back").clicked() {
+                ui.label(egui::RichText::new(trf("· {gone} removed", &[("gone", &gone.to_string())])).weak());
+                if ui.small_button(tr("Restore")).on_hover_text(tr("Put every removed line back")).clicked() {
                     c.removed.clear();
                 }
             }
@@ -986,7 +983,7 @@ impl App {
             // Coloring: tick captions, then pick a color (one per speaker works well).
             ui.horizontal(|ui| {
                 let n = c.picked.len();
-                ui.label(egui::RichText::new(if n == 0 { "Tick captions, then pick their color:".to_string() } else { format!("Color the {n} ticked:") }).weak());
+                ui.label(egui::RichText::new(if n == 0 { tr("Tick captions, then pick their color:").to_string() } else { trf("Color the {n} ticked:", &[("n", &(n).to_string())]) }).weak());
                 for color in PALETTE {
                     let (rect, r) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
                     ui.painter().circle_filled(rect.center(), 8.0, crate::widgets::color32(color));
@@ -1004,10 +1001,10 @@ impl App {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("None").clicked() {
+                    if ui.small_button(tr("None")).clicked() {
                         c.picked.clear();
                     }
-                    if ui.small_button("All").clicked() {
+                    if ui.small_button(tr("All")).clicked() {
                         c.picked = (0..captions.len()).collect();
                     }
                 });
@@ -1035,7 +1032,7 @@ impl App {
                             }
                             ui.horizontal(|ui| {
                                 let mut ticked = c.picked.contains(&i);
-                                if ui.checkbox(&mut ticked, "").changed() {
+                                if ui.checkbox(&mut ticked, tr("")).changed() {
                                     if ticked {
                                         c.picked.insert(i);
                                     } else {
@@ -1044,12 +1041,12 @@ impl App {
                                 }
                                 let at = c.offset.as_seconds_f64();
                                 let by_hand = c.times.contains_key(&cap.words.start);
-                                let shown = egui::RichText::new(format!("{}–{}", clock(at + cap.start), clock(at + cap.end))).monospace().small();
+                                let shown = egui::RichText::new(trf("{0}–{1}", &[("0", &(clock(at + cap.start)).to_string()), ("1", &(clock(at + cap.end)).to_string())])).monospace().small();
                                 let time = ui.add(egui::Label::new(if by_hand { shown.color(crate::style::GOLD) } else { shown.weak() }).sense(egui::Sense::click()));
                                 if time.clicked() {
                                     c.focus = i;
                                 }
-                                let time = time.on_hover_text("Click: show it in the preview · right-click: set its timing");
+                                let time = time.on_hover_text(tr("Click: show it in the preview · right-click: set its timing"));
                                 crate::widgets::context_menu(&time, |ui| {
                                     c.focus = i;
                                     timing_menu(ui, c, &captions, i, rate);
@@ -1064,14 +1061,14 @@ impl App {
                                 // The buttons first (right to left), then the text fills the rest.
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     let last = i + 1 == captions.len();
-                                    if crate::icons::button(ui, crate::icons::DELETE, "Remove this line (Ctrl+Z puts it back)", "", true).clicked() {
+                                    if crate::icons::button(ui, crate::icons::DELETE, tr("Remove this line (Ctrl+Z puts it back)"), "", true).clicked() {
                                         remove = Some(i);
                                     }
-                                    if crate::icons::button(ui, crate::icons::GROUP, "Join with the caption below", "", !last).clicked() {
+                                    if crate::icons::button(ui, crate::icons::GROUP, tr("Join with the caption below"), "", !last).clicked() {
                                         join = Some(i);
                                     }
                                     let can_split = cap.words.len() > 1;
-                                    if crate::icons::button(ui, crate::icons::SPLIT, "Split at the text cursor (or press Enter while typing)", "", can_split).clicked() {
+                                    if crate::icons::button(ui, crate::icons::SPLIT, tr("Split at the text cursor (or press Enter while typing)"), "", can_split).clicked() {
                                         split = Some(i);
                                     }
                                     let mut text = cap.text.clone();
@@ -1217,16 +1214,16 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            if primary(ui, !captions.is_empty(), &format!("Add {} captions to the timeline", captions.len())).clicked() {
+            if primary(ui, !captions.is_empty(), &trf("Add {0} captions to the timeline", &[("0", &(captions.len()).to_string())])).clicked() {
                 match self.add_captions(c.offset, &captions, c.transcript.as_ref().map(|t| t.words.as_slice()).unwrap_or(&[])) {
                     Ok(n) => {
-                        self.notify(format!("Added {n} captions on a new Captions track."));
+                        self.notify(trf("Added {n} captions on a new Captions track.", &[("n", &n.to_string())]));
                         *close = true;
                     }
                     Err(e) => c.error = Some(e),
                 }
             }
-            if ui.button("Listen again").on_hover_text("Discard these captions and transcribe again (another model or language)").clicked() {
+            if ui.button(tr("Listen again")).on_hover_text(tr("Discard these captions and transcribe again (another model or language)")).clicked() {
                 c.transcript = None;
                 c.manual = oa_captions::Manual::default();
                 c.edits.clear();
@@ -1242,7 +1239,7 @@ impl App {
         let canvas = self.viewed_canvas();
         let mut style = self.settings.captions.style.clone().unwrap_or_else(|| default_style(canvas));
         let before = style.clone();
-        heading(ui, "Style");
+        heading(ui, tr("Style"));
         self.caption_preview(ui, c, &style);
 
         // Copy a title that's already in the project: its whole look, effects included.
@@ -1260,12 +1257,12 @@ impl App {
             })
             .collect();
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("caption-copy-title").selected_text("Copy a title's look…").width(210.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("caption-copy-title").selected_text(tr("Copy a title's look…")).width(210.0).show_ui(ui, |ui| {
                 if titles.is_empty() {
-                    ui.label(egui::RichText::new("No titles on this timeline yet").weak());
+                    ui.label(egui::RichText::new(tr("No titles on this timeline yet")).weak());
                 }
                 for (id, name) in &titles {
-                    if ui.selectable_label(false, name).on_hover_text("Its font, size, colors, outline, position, keyframes and effects").clicked()
+                    if ui.selectable_label(false, name).on_hover_text(tr("Its font, size, colors, outline, position, keyframes and effects")).clicked()
                         && let Some(src) = self.editor.item(*id)
                     {
                         style = src.clone();
@@ -1276,14 +1273,14 @@ impl App {
                     }
                 }
             });
-            if ui.button("Reset").on_hover_text("The default caption look").clicked() {
+            if ui.button(tr("Reset")).on_hover_text(tr("The default caption look")).clicked() {
                 style = default_style(canvas);
             }
         });
 
         panel(ui, |ui| {
             egui::Grid::new("caption-look").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Font");
+                ui.label(tr("Font"));
                 ui.horizontal(|ui| {
                     let family = value(&style, schema::TEXT_FONT).and_then(|v| v.as_text().map(str::to_string)).unwrap_or_default();
                     if let Some(f) = self.font_menu(ui, egui::Id::new("caption-font"), &family) {
@@ -1291,9 +1288,9 @@ impl App {
                     }
                 });
                 ui.end_row();
-                ui.label("");
+                ui.label(tr(""));
                 ui.horizontal(|ui| {
-                    for (id, label) in [(schema::TEXT_BOLD, egui::RichText::new("B").strong()), (schema::TEXT_ITALIC, egui::RichText::new("I").italics())] {
+                    for (id, label) in [(schema::TEXT_BOLD, egui::RichText::new(tr("B")).strong()), (schema::TEXT_ITALIC, egui::RichText::new(tr("I")).italics())] {
                         let on = matches!(value(&style, id), Some(Value::Bool(true)));
                         if ui.selectable_label(on, label).clicked() {
                             set(&mut style, id, Value::Bool(!on));
@@ -1305,13 +1302,13 @@ impl App {
                     }
                 });
                 ui.end_row();
-                ui.label("Color");
+                ui.label(tr("Color"));
                 let mut fill = color(&style, schema::TEXT_COLOR);
                 if crate::widgets::color_swatch(ui, &mut fill).1 {
                     set(&mut style, schema::TEXT_COLOR, Value::Gradient(Gradient::solid(fill)));
                 }
                 ui.end_row();
-                ui.label("Outline");
+                ui.label(tr("Outline"));
                 ui.horizontal(|ui| {
                     let mut width = float(&style, schema::TEXT_OUTLINE);
                     if ui.add(egui::Slider::new(&mut width, 0.0..=30.0).show_value(true).max_decimals(0)).changed() {
@@ -1323,10 +1320,10 @@ impl App {
                     }
                 });
                 ui.end_row();
-                ui.label("Height");
+                ui.label(tr("Height"));
                 let mut pos = value(&style, schema::POSITION).and_then(|v| v.as_vec2()).unwrap_or([0.0, 0.3]);
                 let mut pct = pos[1] * 100.0;
-                if ui.add(egui::Slider::new(&mut pct, -45.0..=45.0).suffix(" %").max_decimals(0)).on_hover_text("Up or down from the middle of the frame").changed() {
+                if ui.add(egui::Slider::new(&mut pct, -45.0..=45.0).suffix(" %").max_decimals(0)).on_hover_text(tr("Up or down from the middle of the frame")).changed() {
                     pos[1] = pct / 100.0;
                     set(&mut style, schema::POSITION, Value::Vec2(pos));
                 }
@@ -1338,7 +1335,7 @@ impl App {
         let bg = style.effects.iter().position(|e| e.type_id == BACKGROUND && e.role == oa_doc::EffectRole::Passive);
         panel(ui, |ui| {
             let mut on = bg.is_some();
-            if ui.checkbox(&mut on, egui::RichText::new("Background").strong()).on_hover_text("A rounded box behind the text").changed() {
+            if ui.checkbox(&mut on, egui::RichText::new(tr("Background")).strong()).on_hover_text(tr("A rounded box behind the text")).changed() {
                 if on {
                     let mut fx = EffectInstance::new(EffectId(1), BACKGROUND);
                     fx.params.set("shape", ParamSource::Static(Value::Enum("lines".into())));
@@ -1351,17 +1348,17 @@ impl App {
                 let fx = &mut style.effects[i];
                 let get = |fx: &EffectInstance, id: &str| fx.params.get(id).map(|s| s.eval(&oa_params::EvalContext::at(Time::ZERO, Time::ZERO)));
                 egui::Grid::new("caption-background").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                    ui.label("Shape");
+                    ui.label(tr("Shape"));
                     ui.horizontal(|ui| {
                         let shape = get(fx, "shape").and_then(|v| v.as_enum().map(str::to_string)).unwrap_or_else(|| "lines".into());
-                        for (s, name, tip) in [("text", "Whole", "One box behind all the text"), ("lines", "Each line", "A box behind each line"), ("words", "Each word", "A box behind each word")] {
-                            if ui.selectable_label(shape == s, name).on_hover_text(tip).clicked() {
+                        for (s, name, tip) in [("text", "Whole", tr("One box behind all the text")), ("lines", "Each line", tr("A box behind each line")), ("words", "Each word", tr("A box behind each word"))] {
+                            if ui.selectable_label(shape == s, tr(name)).on_hover_text(tr(tip)).clicked() {
                                 fx.params.set("shape", ParamSource::Static(Value::Enum(s.into())));
                             }
                         }
                     });
                     ui.end_row();
-                    ui.label("Color");
+                    ui.label(tr("Color"));
                     ui.horizontal(|ui| {
                         let mut c = match get(fx, "color") {
                             Some(Value::Color(c)) => c,
@@ -1373,17 +1370,17 @@ impl App {
                             c = [solid[0], solid[1], solid[2], c[3]];
                             fx.params.set("color", ParamSource::Static(Value::Color(c)));
                         }
-                        ui.label("Opacity");
+                        ui.label(tr("Opacity"));
                         let mut alpha = c[3] * 100.0;
-                        if ui.add(egui::DragValue::new(&mut alpha).range(0.0..=100.0).speed(0.5).max_decimals(0).suffix(" %")).on_hover_text("How solid the box is").changed() {
+                        if ui.add(egui::DragValue::new(&mut alpha).range(0.0..=100.0).speed(0.5).max_decimals(0).suffix(" %")).on_hover_text(tr("How solid the box is")).changed() {
                             c[3] = alpha / 100.0;
                             fx.params.set("color", ParamSource::Static(Value::Color(c)));
                         }
                     });
                     ui.end_row();
-                    ui.label("Corners");
+                    ui.label(tr("Corners"));
                     let mut round = get(fx, "roundness").and_then(|v| v.as_float()).unwrap_or(0.25) * 100.0;
-                    if ui.add(egui::Slider::new(&mut round, 0.0..=100.0).suffix(" %").max_decimals(0)).on_hover_text("0 % square, 100 % fully round").changed() {
+                    if ui.add(egui::Slider::new(&mut round, 0.0..=100.0).suffix(" %").max_decimals(0)).on_hover_text(tr("0 % square, 100 % fully round")).changed() {
                         fx.params.set("roundness", ParamSource::Static(Value::Float(round / 100.0)));
                     }
                     ui.end_row();
@@ -1393,11 +1390,11 @@ impl App {
 
         // The word being spoken: its own color, and a box behind it.
         panel(ui, |ui| {
-            ui.label(egui::RichText::new("Highlight the spoken word").strong());
+            ui.label(egui::RichText::new(tr("Highlight the spoken word")).strong());
             let key = schema::spoken(schema::TEXT_COLOR);
             ui.horizontal(|ui| {
                 let mut on = style.params.get(&key).is_some();
-                if ui.checkbox(&mut on, "Its color").changed() {
+                if ui.checkbox(&mut on, tr("Its color")).changed() {
                     if on {
                         style.params.set(&key, ParamSource::Static(Value::Gradient(Gradient::solid([1.0, 0.85, 0.2, 1.0]))));
                     } else {
@@ -1414,7 +1411,7 @@ impl App {
             let marker = style.effects.iter().position(|e| e.type_id == BACKGROUND && e.params.get(&schema::spoken("color")).is_some());
             ui.horizontal(|ui| {
                 let mut on = marker.is_some();
-                if ui.checkbox(&mut on, "A box behind it").changed() {
+                if ui.checkbox(&mut on, tr("A box behind it")).changed() {
                     if on {
                         let mut fx = EffectInstance::new(EffectId(2), BACKGROUND);
                         fx.params.set("shape", ParamSource::Static(Value::Enum("words".into())));
@@ -1437,7 +1434,7 @@ impl App {
                     }
                 }
             });
-            ui.label(egui::RichText::new("Each caption knows when its words are said; the preview plays it through.").small().weak());
+            ui.label(egui::RichText::new(tr("Each caption knows when its words are said; the preview plays it through.")).small().weak());
         });
 
         // Anything else copied from a title (animations, glows…).
@@ -1450,12 +1447,12 @@ impl App {
             .collect();
         if !others.is_empty() {
             panel(ui, |ui| {
-                ui.label(egui::RichText::new("Also copied").strong());
+                ui.label(egui::RichText::new(tr("Also copied")).strong());
                 let mut remove = None;
                 for (i, name) in &others {
                     ui.horizontal(|ui| {
                         ui.label(name);
-                        if ui.small_button("✕").on_hover_text("Leave it off the captions").clicked() {
+                        if ui.small_button(tr("✕")).on_hover_text(tr("Leave it off the captions")).clicked() {
                             remove = Some(*i);
                         }
                     });
@@ -1518,7 +1515,7 @@ impl App {
                 let times = words[cap.words.clone()].iter().filter(|w| !w.text.trim().is_empty()).map(|w| (w.start - cap.start, w.end - w.start)).collect::<Vec<_>>();
                 (cap.text.clone(), c.offset + Time::from_seconds_f64(cap.start), (cap.end - cap.start).max(0.4), times)
             }
-            None => ("Your captions will look like this".to_string(), self.playhead, 2.0, Vec::new()),
+            None => (tr("Your captions will look like this").to_string(), self.playhead, 2.0, Vec::new()),
         };
         let highlight = style.params.0.keys().any(|k| k.as_str().ends_with(schema::SPOKEN_SUFFIX))
             || style.effects.iter().any(|e| e.params.0.keys().any(|k| k.as_str().ends_with(schema::SPOKEN_SUFFIX)));
@@ -1586,7 +1583,7 @@ impl App {
                 painter.image(*id, shown, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
             }
             None => {
-                painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Preparing the preview…", egui::FontId::proportional(12.0), egui::Color32::from_gray(140));
+                painter.text(rect.center(), egui::Align2::CENTER_CENTER, tr("Preparing the preview…"), egui::FontId::proportional(12.0), egui::Color32::from_gray(140));
             }
         }
         // Under it: every line as a block along the stretch that was listened to, the
@@ -1613,22 +1610,22 @@ impl App {
             }
             let head = x_of((self.playhead - c.offset).as_seconds_f64());
             painter.line_segment([egui::pos2(head, bar.top()), egui::pos2(head, bar.bottom())], egui::Stroke::new(1.5, crate::style::GOLD));
-            drag.on_hover_text("Drag to move through the captions (the picture scrubs too)");
+            drag.on_hover_text(tr("Drag to move through the captions (the picture scrubs too)"));
         }
         // Play: the timeline plays with its sound from this caption, and the preview
         // follows it caption by caption.
         let any = !captions.is_empty();
         ui.horizontal(|ui| {
             if self.playing {
-                if crate::icons::text_button(ui, crate::icons::PAUSE, "Pause", true).clicked() {
+                if crate::icons::text_button(ui, crate::icons::PAUSE, tr("Pause"), true).clicked() {
                     self.set_playing(false);
                 }
             } else {
                 let mut from = None;
-                if crate::icons::text_button(ui, crate::icons::SKIP_START, "From the start", false).on_hover_text("Play every caption from the first, with the sound").clicked() {
+                if crate::icons::text_button(ui, crate::icons::SKIP_START, tr("From the start"), false).on_hover_text(tr("Play every caption from the first, with the sound")).clicked() {
                     from = captions.first().map(|(cap, _)| cap.start);
                 }
-                if crate::icons::text_button(ui, crate::icons::PLAY, "From the selected", true).on_hover_text("Play from the caption selected in the list, with the sound").clicked() {
+                if crate::icons::text_button(ui, crate::icons::PLAY, tr("From the selected"), true).on_hover_text(tr("Play from the caption selected in the list, with the sound")).clicked() {
                     from = captions.get(c.focus).map(|(cap, _)| cap.start);
                 }
                 if let Some(start) = from.filter(|_| any) {
@@ -1638,7 +1635,7 @@ impl App {
             }
         });
         if !any {
-            ui.label(egui::RichText::new("Generate captions to play them with the sound").small().weak());
+            ui.label(egui::RichText::new(tr("Generate captions to play them with the sound")).small().weak());
         }
         ui.add_space(4.0);
     }

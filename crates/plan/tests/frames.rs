@@ -888,3 +888,74 @@ fn cropped_bounds_shrink() {
     assert!(!placed.contains([full[0][0] + 1.0, full[0][1] + 1.0]));
     assert!(placed.contains([seen[0][0] + 1.0, seen[0][1] + 1.0]));
 }
+
+/// Blend is an effect: no shader pass of its own, just the mode the clip's layer is laid
+/// down with — keyframable like any effect parameter.
+#[test]
+fn the_blend_effect_sets_how_the_layer_mixes() {
+    let layer_blend = |p: &Project, s: i64| {
+        let g = plan(p, secs(s), PlanOptions::default()).graph;
+        assert!(find(&g, |op| matches!(op, NodeOp::Effect { .. })).is_empty(), "no pass for Blend");
+        match &find(&g, |op| matches!(op, NodeOp::Composite { .. }))[0].op {
+            NodeOp::Composite { layers, .. } => layers[0].blend,
+            _ => unreachable!(),
+        }
+    };
+    assert_eq!(layer_blend(&project(|_| {}), 1), oa_graph::BlendMode::Normal);
+    let p = project(|clip| {
+        let mut fx = EffectInstance::new(EffectId(9), oa_graph::registry::BLEND);
+        fx.params.set(
+            schema::BLEND_MODE,
+            ParamSource::Animated(Curve::new(
+                KeyframeAnchor::ClipStart,
+                vec![Keyframe::hold(secs(0), Value::Enum("screen".into())), Keyframe::hold(secs(5), Value::Enum("multiply".into()))],
+            )),
+        );
+        clip.effects.push(fx);
+    });
+    assert_eq!(layer_blend(&p, 1), oa_graph::BlendMode::Screen);
+    assert_eq!(layer_blend(&p, 6), oa_graph::BlendMode::Multiply);
+    // Turned off, it's back to normal.
+    let mut off = p.clone();
+    let s = Arc::make_mut(off.sequences.get_mut(&SEQ).unwrap());
+    Arc::make_mut(&mut s.tracks[0]).items[0].effects[0].enabled = false;
+    assert_eq!(layer_blend(&off, 1), oa_graph::BlendMode::Normal);
+}
+
+/// Effects run in their listed order around a Blend: those before it on the clip, those
+/// after it on what it blended into (the clip's area of it).
+#[test]
+fn effects_after_a_blend_run_on_what_it_made() {
+    let blend = || {
+        let mut fx = EffectInstance::new(EffectId(9), oa_graph::registry::BLEND);
+        fx.params.set(schema::BLEND_MODE, ParamSource::Static(Value::Enum("multiply".into())));
+        fx
+    };
+    let blur = || {
+        let mut fx = EffectInstance::new(EffectId(10), "oa.blur.gaussian");
+        fx.params.set("radius", ParamSource::Static(Value::Float(20.0)));
+        fx
+    };
+    // Whether the blur reads the blended picture (it has the blend pass among its inputs).
+    let blur_after_blend = |effects: Vec<EffectInstance>| {
+        let p = project(|clip| clip.effects = effects);
+        let g = plan(&p, secs(1), PlanOptions::default()).graph;
+        let is = |n: &oa_graph::Node, id: &str| matches!(&n.op, NodeOp::Effect { type_id, .. } if type_id.as_ref() == id);
+        let blurs: Vec<usize> = (0..g.nodes.len()).filter(|&i| is(&g.nodes[i], "oa.blur.gaussian")).collect();
+        assert_eq!(blurs.len(), 1);
+        let mut stack = vec![blurs[0]];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(i) = stack.pop() {
+            if !seen.insert(i) {
+                continue;
+            }
+            if is(&g.nodes[i], oa_graph::registry::BACKDROP_BLEND) {
+                return true;
+            }
+            stack.extend(g.nodes[i].inputs.iter().map(|n| n.0 as usize));
+        }
+        false
+    };
+    assert!(!blur_after_blend(vec![blur(), blend()]), "blurred first, then laid down by the compositor");
+    assert!(blur_after_blend(vec![blend(), blur()]), "blended first, then blurred");
+}

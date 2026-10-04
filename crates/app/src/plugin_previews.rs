@@ -9,6 +9,7 @@
 //! ones sweep from off to full. Transitions and sound effects list with an icon.
 //! Previews render on the preview thread like the pickers' do.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use eframe::egui;
 use oa_doc::{CanvasSize, EffectId, EffectInstance, EffectRole, FormatVariant, Item, ItemId, ItemKind, MediaId, MediaInfo, MediaRef, Project, SeqId, Sequence, Track, TrackId, TrackKind, VariantId};
@@ -63,7 +64,7 @@ fn kind_label(d: &EffectDescriptor) -> &'static str {
     match (&d.kind, d.usage) {
         (EffectKind::Sound, _) => "Sound",
         (EffectKind::Transition, _) | (_, EffectUsage::Cut) => "Transition",
-        (_, EffectUsage::InOut) => "Intro / outro",
+        (_, EffectUsage::InOut) => tr("Intro / outro"),
         (EffectKind::Motion, _) => "Motion",
         (k, _) if k.text_only() => "Text",
         _ => "Picture",
@@ -257,27 +258,27 @@ impl App {
                         if crate::widgets::toggle(ui, &mut on).changed() {
                             self.set_plugin_enabled(&plugin.id, on);
                         }
-                        ui.label(if enabled { "On" } else { "Off — its effects aren't offered, and clips using them skip them" });
+                        ui.label(if enabled { "On" } else { tr("Off — its effects aren't offered, and clips using them skip them") });
                     });
                     match scripts {
                         Some(false) => {
                             ui.add_space(crate::style::GAP_S);
-                            ui.label(egui::RichText::new("⚠ Carries scripts — none run until you allow them").small().color(crate::style::WARNING));
-                            if ui.small_button("Review and allow…").clicked() {
+                            ui.label(egui::RichText::new(tr("⚠ Carries scripts — none run until you allow them")).small().color(crate::style::WARNING));
+                            if ui.small_button(tr("Review and allow…")).clicked() {
                                 self.ask_script_consent(&plugin.id);
                             }
                         }
                         Some(true) => {
                             ui.add_space(crate::style::GAP_S);
-                            ui.label(egui::RichText::new("Scripts allowed").small().weak());
-                            if ui.small_button("Stop allowing").clicked() {
+                            ui.label(egui::RichText::new(tr("Scripts allowed")).small().weak());
+                            if ui.small_button(tr("Stop allowing")).clicked() {
                                 self.revoke_scripts(&plugin.id);
                             }
                         }
                         None => {}
                     }
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                        if ui.button("Close").on_hover_text("Esc, or click outside").clicked() {
+                        if ui.button(tr("Close")).on_hover_text(tr("Esc, or click outside")).clicked() {
                             close = true;
                         }
                     });
@@ -286,7 +287,7 @@ impl App {
                 // Right: its effects, in tabs.
                 ui.vertical(|ui| {
                     ui.horizontal_wrapped(|ui| {
-                        let all = format!("All · {}", effects.len());
+                        let all = trf("All · {n}", &[("n", &effects.len().to_string())]);
                         if ui.selectable_label(self.plugin_previews.tab.is_empty(), all).clicked() {
                             self.plugin_previews.tab.clear();
                         }
@@ -299,7 +300,7 @@ impl App {
                     });
                     ui.separator();
                     if !enabled {
-                        ui.label(egui::RichText::new("Turned off: its previews show once it's on.").small().weak());
+                        ui.label(egui::RichText::new(tr("Turned off: its previews show once it's on.")).small().weak());
                     }
                     let shown: Vec<&EffectDescriptor> = effects.iter().filter(|d| self.plugin_previews.tab.is_empty() || category(d) == self.plugin_previews.tab).collect();
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {

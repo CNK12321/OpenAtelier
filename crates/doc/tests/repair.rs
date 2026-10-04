@@ -163,3 +163,37 @@ fn dangling_references_are_reported_not_fatal() {
     assert_sound(&p);
     assert_eq!(report.warnings.len(), 2, "both clips name missing media: {report:?}");
 }
+
+/// The old blend property opens as a Blend effect with the same mode — keyframes too —
+/// and a plain "normal" just goes away.
+#[test]
+fn the_blend_property_becomes_a_blend_effect() {
+    let (p, report) = load_damaged(|v| {
+        let items = &mut v["sequences"]["1"]["tracks"][0]["items"];
+        items[0]["params"][schema::BLEND] = serde_json::to_value(ParamSource::Static(Value::Enum("screen".into()))).unwrap();
+        items[1]["params"][schema::BLEND] = serde_json::to_value(ParamSource::Static(Value::Enum("normal".into()))).unwrap();
+    });
+    assert!(report.repaired.is_empty(), "an upgrade, not damage: {:?}", report.repaired);
+    assert_sound(&p);
+    let s = p.sequence(SeqId(1)).unwrap();
+    let (a, b) = (&s.tracks[0].items[0], &s.tracks[0].items[1]);
+    assert!(a.params.get(schema::BLEND).is_none() && b.params.get(schema::BLEND).is_none());
+    assert_eq!(a.effects.len(), 1);
+    assert_eq!(a.effects[0].type_id, schema::BLEND_EFFECT);
+    assert!(a.effects[0].id.0 < p.next_id);
+    assert_eq!(schema::blend_mode(a, &a.eval_context(Time::ZERO)), "screen");
+    assert!(b.effects.is_empty());
+    assert_eq!(schema::blend_mode(b, &b.eval_context(Time::ZERO)), "normal");
+}
+
+/// Projects saved while the timeline had dividers still open; the dividers are dropped.
+#[test]
+fn old_dividers_are_ignored() {
+    let (p, report) = load_damaged(|v| {
+        v["sequences"]["1"]["dividers"] = json!([{ "id": 40, "at": 0, "color": [236, 170, 64], "name": "Intro" }]);
+    });
+    assert!(report.repaired.is_empty(), "{:?}", report.repaired);
+    assert_sound(&p);
+    let saved = ProjectFile::to_json(&p).unwrap();
+    assert!(!saved.contains("dividers"));
+}

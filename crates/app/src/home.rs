@@ -5,6 +5,7 @@
 //! in the editor's top bar comes back here; nothing is closed in the meantime, so the
 //! project you had is still there.
 
+use crate::i18n::{tr, trf};
 use crate::i18n::{args, t};
 use crate::App;
 use eframe::egui;
@@ -89,7 +90,7 @@ impl App {
     pub(crate) fn home(&mut self, ui: &mut egui::Ui) {
         ui.add_space(22.0);
         // The mark and the name, side by side, centered.
-        let title = egui::RichText::new("OpenAtelier").size(crate::style::TITLE * 1.5).strong();
+        let title = egui::RichText::new(tr("OpenAtelier")).size(crate::style::TITLE * 1.5).strong();
         let title_width = ui.painter().layout_no_wrap("OpenAtelier".into(), egui::FontId::proportional(crate::style::TITLE * 1.5), egui::Color32::WHITE).size().x;
         ui.horizontal(|ui| {
             ui.add_space(((ui.available_width() - title_width - 60.0) / 2.0).max(0.0));
@@ -151,13 +152,13 @@ impl App {
                 self.screen = Screen::Editor;
             }
             if tile(ui, crate::icons::FOLDER_OPEN, t("home.open"), t("home.open_hint"), false, tile_w).clicked()
-                && let Some(path) = rfd::FileDialog::new().add_filter("OpenAtelier project", &["json"]).pick_file()
+                && let Some(path) = rfd::FileDialog::new().add_filter(tr("OpenAtelier project"), &["json"]).pick_file()
             {
                 self.open_project(&path);
                 self.screen = Screen::Editor;
             }
             if tile(ui, crate::icons::IMPORT, t("home.import"), t("home.import_hint"), false, tile_w).clicked()
-                && let Some(files) = rfd::FileDialog::new().add_filter("Media", crate::MEDIA_EXTENSIONS).pick_files()
+                && let Some(files) = rfd::FileDialog::new().add_filter(tr("Media"), crate::MEDIA_EXTENSIONS).pick_files()
             {
                 self.open_paths(&files);
                 self.screen = Screen::Editor;
@@ -286,9 +287,9 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
             let langs = crate::i18n::available(&dir);
             let mut picked = self.settings.language.clone().unwrap_or_else(|| crate::i18n::language().to_string());
             let was = picked.clone();
-            egui::ComboBox::from_id_salt("home-language").selected_text(&picked).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("home-language").selected_text(crate::i18n::name_of(&picked)).show_ui(ui, |ui| {
                 for lang in &langs {
-                    ui.selectable_value(&mut picked, lang.clone(), lang);
+                    ui.selectable_value(&mut picked, lang.clone(), crate::i18n::name_of(lang));
                 }
             });
             if picked != was {
@@ -345,39 +346,39 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
                     crate::widgets::icon_badge(ui, if saved.is_some() { crate::icons::WARNING } else { crate::icons::HISTORY }, flag, 28.0);
                     ui.vertical(|ui| {
                         let title = match (saved, gone) {
-                            (Some(_), _) => format!("Unsaved changes to {}", r.name()),
-                            (None, true) => format!("Unsaved work from {} (its file is gone)", r.name()),
-                            (None, false) => "Unsaved work from an untitled project".to_string(),
+                            (Some(_), _) => trf("Unsaved changes to {0}", &[("0", &(r.name()).to_string())]),
+                            (None, true) => trf("Unsaved work from {0} (its file is gone)", &[("0", &(r.name()).to_string())]),
+                            (None, false) => tr("Unsaved work from an untitled project").to_string(),
                         };
                         ui.horizontal_wrapped(|ui| {
                             ui.label(egui::RichText::new(title).strong());
-                            ui.label(egui::RichText::new(format!("autosaved {}", r.age())).small().weak());
+                            ui.label(egui::RichText::new(trf("autosaved {0}", &[("0", &(r.age()).to_string())])).small().weak());
                         });
                         if let Some(p) = saved {
                             ui.label(egui::RichText::new(p.display().to_string()).small().monospace().weak());
-                            ui.label("Would you like to continue with the previous session, discard it, or move it to a new project and continue?");
+                            ui.label(tr("Would you like to continue with the previous session, discard it, or move it to a new project and continue?"));
                         } else {
-                            ui.label("The app didn't close normally. Continue with it, or discard it?");
+                            ui.label(tr("The app didn't close normally. Continue with it, or discard it?"));
                         }
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
                             if saved.is_some() {
-                                if crate::icons::text_button(ui, crate::icons::HISTORY, "Continue previous session", true)
-                                    .on_hover_text("Open it as the project's unsaved changes; saving writes the project's file")
+                                if crate::icons::text_button(ui, crate::icons::HISTORY, tr("Continue previous session"), true)
+                                    .on_hover_text(tr("Open it as the project's unsaved changes; saving writes the project's file"))
                                     .clicked()
                                 {
                                     self.recover(r.clone(), true);
                                 }
-                                if crate::icons::text_button(ui, crate::icons::ADD, "Move to new project", false)
-                                    .on_hover_text("Continue with it as a new, untitled project; the saved file stays as it is")
+                                if crate::icons::text_button(ui, crate::icons::ADD, tr("Move to new project"), false)
+                                    .on_hover_text(tr("Continue with it as a new, untitled project; the saved file stays as it is"))
                                     .clicked()
                                 {
                                     self.recover(r.clone(), false);
                                 }
-                            } else if crate::icons::text_button(ui, crate::icons::HISTORY, "Continue", true).on_hover_text("Open it as a new, untitled project").clicked() {
+                            } else if crate::icons::text_button(ui, crate::icons::HISTORY, tr("Continue"), true).on_hover_text(tr("Open it as a new, untitled project")).clicked() {
                                 self.recover(r.clone(), false);
                             }
-                            if crate::icons::text_button(ui, crate::icons::DELETE, t("action.discard"), false).on_hover_text("Delete the autosave").clicked() {
+                            if crate::icons::text_button(ui, crate::icons::DELETE, t("action.discard"), false).on_hover_text(tr("Delete the autosave")).clicked() {
                                 self.discard_recovery(r);
                             }
                         });
@@ -490,7 +491,7 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
                         let text_width = ui.available_width() - 52.0;
                         ui.allocate_ui_with_layout(egui::vec2(text_width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                if ui.add(egui::Button::new(egui::RichText::new(&card.name).size(crate::style::TEXT_L).strong()).frame(false)).on_hover_text("Open it: its effects, with previews").clicked() {
+                                if ui.add(egui::Button::new(egui::RichText::new(&card.name).size(crate::style::TEXT_L).strong()).frame(false)).on_hover_text(tr("Open it: its effects, with previews")).clicked() {
                                     self.plugin_previews.open = Some(card.id.clone());
                                 }
                                 crate::widgets::pill(ui, &format!("v{}", card.version), ui.visuals().weak_text_color());
@@ -513,7 +514,7 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                                 crate::icons::paint(ui.painter(), r, crate::icons::EFFECTS, ui.visuals().weak_text_color());
                                 // Opens the plugin's window: what it is, and its effects with previews.
-                                if ui.add(egui::Button::new(egui::RichText::new(format!("{} ▸", card.summary)).small()).frame(false)).on_hover_text("Open it: its effects, with previews").clicked() {
+                                if ui.add(egui::Button::new(egui::RichText::new(trf("{0} ▸", &[("0", &(card.summary).to_string())])).small()).frame(false)).on_hover_text(tr("Open it: its effects, with previews")).clicked() {
                                     self.plugin_previews.open = Some(card.id.clone());
                                 }
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
@@ -528,16 +529,16 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
                             match card.scripts {
                                 Some(false) => {
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.label(egui::RichText::new("⚠ Carries scripts — none run until you allow them").small().color(crate::style::WARNING));
-                                        if ui.small_button("Review and allow…").clicked() {
+                                        ui.label(egui::RichText::new(tr("⚠ Carries scripts — none run until you allow them")).small().color(crate::style::WARNING));
+                                        if ui.small_button(tr("Review and allow…")).clicked() {
                                             self.ask_script_consent(&card.id);
                                         }
                                     });
                                 }
                                 Some(true) => {
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.label(egui::RichText::new("Scripts allowed").small().weak());
-                                        if ui.small_button("Stop allowing").on_hover_text("Its scripts stop at once; it asks again next time").clicked() {
+                                        ui.label(egui::RichText::new(tr("Scripts allowed")).small().weak());
+                                        if ui.small_button(tr("Stop allowing")).on_hover_text(tr("Its scripts stop at once; it asks again next time")).clicked() {
                                             self.revoke_scripts(&card.id);
                                         }
                                     });

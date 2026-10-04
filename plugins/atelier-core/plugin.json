@@ -385,15 +385,16 @@
       "shader": {"entry": "oa_color_hue", "file": "color/hue.wgsl"}
     },
     {
-      "id": "oa.color.color-to", "name": "Color To", "kind": "point", "category": "Color",
-      "description": "Replaces one color with another: pixels within the tolerance of \"from\" become \"to\" (its opacity is how much). With \"offset from original\", each keeps its difference in hue, saturation and brightness from \"from\", so shading survives.",
+      "id": "oa.color.color-to", "name": "Color To", "kind": "point", "category": "Color", "preserves_opacity": false,
+      "description": "Replaces one color with another: pixels within the tolerance of \"from\" become \"to\" (its opacity is how much). With \"offset from original\", each keeps its difference in hue, saturation and brightness from \"from\", so shading survives. With \"include alpha\", transparency counts too: pixels match on \"from\"'s opacity as well, and take on \"to\"'s (turn a color see-through with a \"to\" at 0 opacity).",
       "preview": {"tolerance": 0.45},
       "params": [
         {"id": "from", "type": "color", "default": [1, 0, 0, 1]},
         {"id": "tolerance", "type": "float", "default": 0.15, "min": 0, "max": 1},
         {"id": "softness", "type": "float", "default": 0.05, "min": 0, "max": 0.5},
         {"id": "to", "type": "color", "default": [0, 0.2, 1, 1]},
-        {"id": "offset_from_original", "type": "bool", "default": true}
+        {"id": "offset_from_original", "type": "bool", "default": true},
+        {"id": "include_alpha", "type": "bool", "default": false}
       ],
       "shader": {"entry": "oa_color_to", "file": "color/color-to.wgsl"}
     },
@@ -408,9 +409,11 @@
       "shader": {"entry": "oa_color_contrast", "file": "color/contrast.wgsl"}
     },
     {
-      "id": "oa.color.invert", "name": "Invert", "kind": "point", "category": "Color", "space": "display",
+      "id": "oa.color.invert", "name": "Invert", "kind": "point", "category": "Color", "space": "display", "preserves_opacity": false,
+      "description": "Flips the channels chosen: red, green and blue by default. Magenta, cyan and yellow flip the two channels each is made of (magenta: red and blue; cyan: green and blue; yellow: red and green); alpha flips transparency.",
       "params": [
-        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1},
+        {"id": "channels", "type": "enum", "multiple": true, "options": ["red", "green", "blue", "magenta", "cyan", "yellow", "alpha"], "default": ["red", "green", "blue"]}
       ],
       "shader": {"entry": "oa_color_invert", "file": "color/invert.wgsl"}
     },
@@ -433,6 +436,47 @@
         {"id": "spill", "type": "float", "default": 0.7, "min": 0, "max": 1}
       ],
       "shader": {"entry": "oa_key_chroma", "file": "key/chroma.wgsl"}
+    },
+    {
+      "id": "oa.key.luma", "name": "Luma Key", "kind": "point", "category": "Keying", "space": "display", "preserves_opacity": false,
+      "description": "Keys out by brightness: the dark parts (smoke, fire or flares shot on black) or the bright ones (on white). Threshold is where it cuts; softness how gradually.",
+      "params": [
+        {"id": "key_out", "type": "enum", "options": ["darks", "brights"], "default": "darks"},
+        {"id": "threshold", "type": "float", "default": 0.2, "min": 0, "max": 1},
+        {"id": "softness", "type": "float", "default": 0.15, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_key_luma", "file": "key/luma.wgsl"}
+    },
+    {
+      "id": "oa.motion.motion-blur", "name": "Motion Blur", "kind": "point", "category": "Motion", "preserves_opacity": false,
+      "description": "Smears the clip along its own movement, as a camera's shutter would: its position, scale, rotation and keyframed effects are drawn at moments across the shutter and averaged. 180° is film's usual look; more samples are smoother and slower.",
+      "params": [
+        {"id": "shutter_angle", "type": "float", "default": 180, "min": 0, "max": 720, "unit": "degrees"},
+        {"id": "samples", "type": "float", "default": 8, "min": 2, "max": 32}
+      ],
+      "shader": {"entry": "oa_motion_blur", "file": "motion/motion-blur.wgsl"}
+    },
+    {
+      "id": "oa.composite.blend", "name": "Blend", "kind": "point", "category": "Compositing", "preserves_opacity": true,
+      "description": "How the clip mixes with what's under it. Add: its light added (glows, flares, fire). Multiply: darkens, white disappears (shadows, paper). Screen: lightens, black disappears (light leaks, smoke). Darken and Lighten keep the darker or lighter of the two. Invert: what's under its shape, inverted, whatever its colors (text that inverts the video behind it); Difference does it by its colors (white inverts, black leaves alone), Exclusion more softly. Overlay, Soft Light and Hard Light add contrast; Color Dodge and Color Burn brighten or darken by it. Effects above it run on the clip; effects below it, on what it blended into. On an effect container: how its result mixes over the picture it took.",
+      "params": [
+        {"id": "mode", "type": "enum", "options": ["normal", "add", "multiply", "screen", "darken", "lighten", "difference", "exclusion", "invert", "overlay", "soft light", "hard light", "color dodge", "color burn"], "default": "add"}
+      ],
+      "shader": {"entry": "oa_composite_blend", "file": "composite/blend.wgsl"}
+    },
+    {
+      "id": "oa.stylize.shatter", "name": "Shatter", "kind": "spatial", "category": "Stylize", "expand": "travel_distance", "preserves_opacity": false,
+      "description": "Breaks the picture into shards that fly out from the center point. Parts is how many; size how far from the center it breaks (1: all of it); travel distance how far they've flown — keyframe it from 0 to break it apart. Seed picks another way to break.",
+      "preview": {"travel_distance": 120},
+      "params": [
+        {"id": "seed", "type": "float", "default": 1, "min": 0, "max": 1000},
+        {"id": "parts", "type": "float", "default": 24, "min": 2, "max": 144},
+        {"id": "size", "type": "float", "default": 1, "min": 0, "max": 2},
+        {"id": "center_point", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"},
+        {"id": "travel_distance", "type": "float", "default": 0, "min": 0, "max": 3000, "unit": "layer_pixels"},
+        {"id": "shards_rotate", "type": "bool", "default": true}
+      ],
+      "shader": {"entry": "oa_stylize_shatter", "file": "stylize/shatter.wgsl"}
     },
     {
       "id": "oa.motion.shake", "name": "Camera Shake", "kind": "motion", "category": "Motion", "time_varying": true,
@@ -694,7 +738,7 @@
       "shader": {"entry": "oa_transition_blur", "file": "transition/blur.wgsl"}
     },
     {
-      "id": "oa.audio.bass", "name": "Bass Boost", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.bass", "name": "Bass Boost", "kind": "sound", "category": "EQ & Tone",
       "description": "Lifts the low end.",
       "params": [
         {"id": "boost", "type": "float", "default": 8, "min": 0, "max": 18, "unit": "decibels"},
@@ -703,7 +747,7 @@
       "shader": {"file": "sound/bass.oasound"}
     },
     {
-      "id": "oa.audio.pitch", "name": "Pitch Shift", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.pitch", "name": "Pitch Shift", "kind": "sound", "category": "Character",
       "description": "Higher or lower, same speed. Formant moves the voice's character (child to giant) on its own; \"keep voice\" holds it where it was while the pitch moves.",
       "params": [
         {"id": "semitones", "type": "float", "default": 5, "min": -12, "max": 12},
@@ -715,7 +759,7 @@
       "shader": {"file": "sound/pitch.oasound"}
     },
     {
-      "id": "oa.audio.echo", "name": "Echo", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.echo", "name": "Echo", "kind": "sound", "category": "Space",
       "description": "Repeats that fade away.",
       "params": [
         {"id": "delay", "type": "float", "default": 0.35, "min": 0.02, "max": 1.5, "unit": "seconds"},
@@ -726,7 +770,7 @@
       "shader": {"file": "sound/echo.oasound"}
     },
     {
-      "id": "oa.audio.reverb", "name": "Reverb", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.reverb", "name": "Reverb", "kind": "sound", "category": "Space",
       "description": "The sound of a room: pick a space, or set your own. It keeps ringing after the clip ends.",
       "params": [
         {"id": "space", "type": "enum", "options": ["custom", "small room", "studio", "hall", "cathedral", "plate", "cave"]},
@@ -739,7 +783,7 @@
       "shader": {"file": "sound/reverb.oasound"}
     },
     {
-      "id": "oa.audio.eq", "name": "Equalizer", "kind": "sound", "category": "Sound", "editor": "equalizer",
+      "id": "oa.audio.eq", "name": "Equalizer", "kind": "sound", "category": "EQ & Tone", "editor": "equalizer",
       "description": "Shape the tone: a low shelf, three bands and a high shelf. Drag the points on its curve.",
       "params": [
         {"id": "low_freq", "type": "float", "default": 100, "min": 20, "max": 600},
@@ -759,7 +803,7 @@
       "shader": {"file": "sound/eq.oasound"}
     },
     {
-      "id": "oa.audio.compressor", "name": "Compressor", "kind": "sound", "category": "Sound", "meter": "reduction",
+      "id": "oa.audio.compressor", "name": "Compressor", "kind": "sound", "category": "Dynamics", "meter": "reduction",
       "description": "Evens out the level: whatever goes over the threshold is turned down by the ratio.",
       "params": [
         {"id": "threshold", "type": "float", "default": -18, "min": -60, "max": 0, "unit": "decibels"},
@@ -773,7 +817,7 @@
       "shader": {"file": "sound/compressor.oasound"}
     },
     {
-      "id": "oa.audio.limiter", "name": "Limiter", "kind": "sound", "category": "Sound", "meter": "reduction",
+      "id": "oa.audio.limiter", "name": "Limiter", "kind": "sound", "category": "Dynamics", "meter": "reduction",
       "description": "Nothing gets past the ceiling — put it last, on the whole mix.",
       "params": [
         {"id": "ceiling", "type": "float", "default": -1, "min": -24, "max": 0, "unit": "decibels"},
@@ -784,7 +828,7 @@
       "shader": {"file": "sound/limiter.oasound"}
     },
     {
-      "id": "oa.audio.deess", "name": "De-esser", "kind": "sound", "category": "Sound", "meter": "reduction",
+      "id": "oa.audio.deess", "name": "De-esser", "kind": "sound", "category": "Dynamics", "meter": "reduction",
       "description": "Tames harsh s and sh sounds in a voice, leaving the rest alone.",
       "params": [
         {"id": "frequency", "type": "float", "default": 6500, "min": 2000, "max": 12000},
@@ -795,7 +839,7 @@
       "shader": {"file": "sound/deess.oasound"}
     },
     {
-      "id": "oa.audio.gate", "name": "Threshold", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.gate", "name": "Threshold", "kind": "sound", "category": "Dynamics",
       "description": "Mutes everything quieter than the threshold (a noise gate).",
       "params": [
         {"id": "threshold", "type": "float", "default": -40, "min": -80, "max": 0, "unit": "decibels"},
@@ -804,7 +848,7 @@
       "shader": {"file": "sound/gate.oasound"}
     },
     {
-      "id": "oa.audio.crush", "name": "Bit Crush", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.crush", "name": "Bit Crush", "kind": "sound", "category": "Character",
       "description": "Coarse and grainy: fewer bits, a lower sample rate, like old hardware.",
       "params": [
         {"id": "bits", "type": "float", "default": 6, "min": 1, "max": 16},
@@ -814,7 +858,7 @@
       "shader": {"file": "sound/crush.oasound"}
     },
     {
-      "id": "oa.audio.denoise", "name": "Denoise", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.denoise", "name": "Denoise", "kind": "sound", "category": "Cleanup",
       "description": "Removes steady background noise (hiss, hum, fans).",
       "params": [
         {"id": "reduction", "type": "float", "default": 18, "min": 0, "max": 40, "unit": "decibels"},
@@ -823,13 +867,13 @@
       "shader": {"file": "sound/denoise.oasound"}
     },
     {
-      "id": "oa.audio.fade", "name": "Fade", "kind": "sound", "category": "Sound", "usage": "in_out",
+      "id": "oa.audio.fade", "name": "Fade", "kind": "sound", "category": "Fades", "usage": "in_out",
       "description": "Fades the sound in as an intro, out as an outro.",
       "params": [{"id": "curve", "type": "float", "default": 1, "min": 0.25, "max": 4}],
       "shader": {"source": "out = in * pow(visibility, curve);"}
     },
     {
-      "id": "oa.audio.muffle", "name": "Muffle", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.muffle", "name": "Muffle", "kind": "sound", "category": "EQ & Tone",
       "description": "Dull and far away, as if through a wall. As an intro it opens up; as an outro it closes in.",
       "params": [
         {"id": "cutoff", "type": "float", "default": 600, "min": 80, "max": 8000},
@@ -838,7 +882,7 @@
       "shader": {"file": "sound/muffle.oasound"}
     },
     {
-      "id": "oa.audio.tone", "name": "Tone", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.tone", "name": "Tone", "kind": "sound", "category": "EQ & Tone",
       "description": "Adds a tone on top of the sound: a sine, square, triangle or saw wave (or noise) at a pitch, with its own attack, decay and repeats.",
       "params": [
         {"id": "wave", "type": "enum", "options": ["sine", "square", "triangle", "saw", "noise"]},
@@ -856,7 +900,7 @@
       "shader": {"file": "sound/tone.oasound"}
     },
     {
-      "id": "oa.audio.tremolo", "name": "Tremolo", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.tremolo", "name": "Tremolo", "kind": "sound", "category": "Character",
       "description": "The level swings up and down.",
       "params": [
         {"id": "speed", "type": "float", "default": 5, "min": 0.1, "max": 20},
@@ -865,7 +909,7 @@
       "shader": {"source": "let swing = 0.5 + 0.5 * sin(TAU * speed * time);\nout = in * (1 - depth * swing);"}
     },
     {
-      "id": "oa.audio.drive", "name": "Drive", "kind": "sound", "category": "Sound",
+      "id": "oa.audio.drive", "name": "Drive", "kind": "sound", "category": "Character",
       "description": "Warm saturation, up to a fuzzy distortion.",
       "params": [
         {"id": "drive", "type": "float", "default": 12, "min": 0, "max": 36, "unit": "decibels"},
@@ -874,7 +918,7 @@
       "shader": {"source": "let d = db(drive);\nout = mix(in, tanh(in * d) / tanh(d), mix);"}
     },
     {
-      "id": "oa.audio.width", "name": "Stereo Width", "kind": "sound", "category": "Sound", "meter": "correlation",
+      "id": "oa.audio.width", "name": "Stereo Width", "kind": "sound", "category": "Space", "meter": "correlation",
       "description": "Narrower (0 is mono) or wider than it was recorded.",
       "params": [{"id": "width", "type": "float", "default": 1.5, "min": 0, "max": 3}],
       "shader": {"source": "let mid = (left + right) * 0.5;\nlet side = (left - right) * 0.5 * width;\nout = select(channels < 2, in, select(channel == 0, mid + side, mid - side));"}

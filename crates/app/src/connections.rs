@@ -8,6 +8,7 @@
 //! (`oa_audio::envelope`); frames are planned with them installed
 //! (`oa_params::signal`), so the viewer and the export agree.
 
+use crate::i18n::{tr, trf};
 use crate::band::Band;
 use crate::App;
 use eframe::egui;
@@ -98,7 +99,7 @@ impl App {
             Some(_) => " Z",
             None => "",
         };
-        let title = format!("Connection — {} · {}{which}", it.name, band.param.rsplit('.').next().unwrap_or(&band.param));
+        let title = trf("Connection — {0} · {1}{which}", &[("0", &(it.name).to_string()), ("1", (band.param.rsplit('.').next().unwrap_or(&band.param))), ("which", (which))]);
         crate::widgets::on_screen(egui::Window::new(title), ctx)
             .id(egui::Id::new("connection-editor"))
             .open(&mut open)
@@ -116,8 +117,8 @@ impl App {
         let current = self.editor.param_value(item, &band.target, &band.param, it.range.start).unwrap_or(Value::Float(band.lo.max(0.0)));
         let source = self.editor.param_source(item, &band.target, &band.param).unwrap_or(ParamSource::Static(current));
         let Some((_, Modulator::Follow { source: from, band: which, amount, floor_db, .. })) = source.find_follow_on(axis).map(|(b, m)| (b.clone(), m.clone())) else {
-            ui.label("Connects this value to the sound: it's offset by how loud things are at each moment — all of it, or just the bass, mids or treble.");
-            if ui.button("Connect to the sound").clicked() {
+            ui.label(tr("Connects this value to the sound: it's offset by how loud things are at each moment — all of it, or just the bass, mids or treble."));
+            if ui.button(tr("Connect to the sound")).clicked() {
                 let reach = ((band.hi - band.lo) * 0.25).abs().max(1e-3);
                 let src = source.follow_on(axis, SoundSource::Mix, SoundBand::Loudness, reach, -48.0);
                 self.editor.set_param(item, band.target.clone(), &band.param, src, "connection-editor");
@@ -146,10 +147,10 @@ impl App {
         }
         let name_of = |s: SoundSource| match s {
             SoundSource::Mix => "Everything playing".to_string(),
-            SoundSource::Item(id) => heard.iter().find(|(i, _)| *i == id).map_or_else(|| "A clip that's gone".to_string(), |(_, n)| n.clone()),
+            SoundSource::Item(id) => heard.iter().find(|(i, _)| *i == id).map_or_else(|| tr("A clip that's gone").to_string(), |(_, n)| n.clone()),
         };
         egui::Grid::new("connection-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-            ui.label("Listens to");
+            ui.label(tr("Listens to"));
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("connection-source").selected_text(name_of(from)).show_ui(ui, |ui| {
                     for s in std::iter::once(SoundSource::Mix).chain(heard.iter().map(|(id, _)| SoundSource::Item(*id))) {
@@ -161,7 +162,7 @@ impl App {
                     }
                 });
                 let picked = self.selected.iter().copied().find(|id| *id != item && heard.iter().any(|(h, _)| *h == id.0));
-                if ui.add_enabled(picked.is_some(), egui::Button::new("Use selected").small()).on_hover_text("Listen to the other selected clip on the timeline").clicked()
+                if ui.add_enabled(picked.is_some(), egui::Button::new(tr("Use selected")).small()).on_hover_text(tr("Listen to the other selected clip on the timeline")).clicked()
                     && let Some(id) = picked
                 {
                     from = SoundSource::Item(id.0);
@@ -170,14 +171,14 @@ impl App {
                 }
             });
             ui.end_row();
-            ui.label("Part");
+            ui.label(tr("Part"));
             ui.horizontal(|ui| {
                 for b in SoundBand::ALL {
                     let tip = match b {
-                        SoundBand::Loudness => "The whole sound",
-                        SoundBand::Bass => "Below about 200 Hz: kicks, bass lines",
-                        SoundBand::Mids => "About 200 Hz to 4 kHz: voices, most instruments",
-                        SoundBand::Treble => "Above about 4 kHz: hi-hats, sibilance, sparkle",
+                        SoundBand::Loudness => tr("The whole sound"),
+                        SoundBand::Bass => tr("Below about 200 Hz: kicks, bass lines"),
+                        SoundBand::Mids => tr("About 200 Hz to 4 kHz: voices, most instruments"),
+                        SoundBand::Treble => tr("Above about 4 kHz: hi-hats, sibilance, sparkle"),
                     };
                     if ui.selectable_label(which == b, b.name()).on_hover_text(tip).clicked() && which != b {
                         which = b;
@@ -187,14 +188,14 @@ impl App {
                 }
             });
             ui.end_row();
-            ui.label("Offset");
+            ui.label(tr("Offset"));
             let r = ui
                 .add(egui::DragValue::new(&mut amt).speed((band.hi - band.lo).abs() * 0.005 + 1e-3).max_decimals(3))
-                .on_hover_text("Added at full level (negative pulls it the other way)");
+                .on_hover_text(tr("Added at full level (negative pulls it the other way)"));
             track(&r, &mut changed, &mut finished);
             ui.end_row();
-            ui.label("Ignore below");
-            let r = ui.add(egui::Slider::new(&mut floor, -80.0..=-12.0).suffix(" dB")).on_hover_text("Quieter than this counts as silence; raise it to react only to the loud parts");
+            ui.label(tr("Ignore below"));
+            let r = ui.add(egui::Slider::new(&mut floor, -80.0..=-12.0).suffix(" dB")).on_hover_text(tr("Quieter than this counts as silence; raise it to react only to the loud parts"));
             track(&r, &mut changed, &mut finished);
             ui.end_row();
         });
@@ -226,16 +227,16 @@ impl App {
         let px = rect.left() + at * rect.width();
         painter.line_segment([egui::pos2(px, outer.top()), egui::pos2(px, outer.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 70, 70)));
         if self.follower.as_ref().is_none_or(|f| f.is_empty()) {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Listening to the sound…", egui::FontId::proportional(12.0), ui.visuals().weak_text_color());
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, tr("Listening to the sound…"), egui::FontId::proportional(12.0), ui.visuals().weak_text_color());
         }
 
         ui.horizontal(|ui| {
-            if ui.button("Disconnect").clicked() {
+            if ui.button(tr("Disconnect")).clicked() {
                 let src = source.clone().remove_follow_on(axis);
                 self.editor.set_param(item, band.target.clone(), &band.param, src, "connection-editor");
                 self.editor.doc.seal();
             }
-            ui.label(egui::RichText::new("Keyframes and waves still work: the offset rides on top.").small().weak());
+            ui.label(egui::RichText::new(tr("Keyframes and waves still work: the offset rides on top.")).small().weak());
         });
 
         if changed {

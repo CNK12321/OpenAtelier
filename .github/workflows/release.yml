@@ -168,7 +168,7 @@ jobs:
           Priority: optional
           Architecture: amd64
           Installed-Size: $size
-          Depends: ffmpeg, libasound2 | libasound2t64, libvulkan1, libc6 (>= 2.35)
+          Depends: ffmpeg, curl, libasound2 | libasound2t64, libvulkan1, libc6 (>= 2.35)
           Recommends: mesa-vulkan-drivers, fontconfig
           Maintainer: OpenAtelier contributors <61389990+CNK12321@users.noreply.github.com>
           Homepage: https://github.com/CNK12321/OpenAtelier
@@ -197,10 +197,40 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      # Only the changelog (before the packages arrive: checking out clears the folder).
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      # The description: this version's section of CHANGELOG.md (what the app's update
+      # dialog lists), then which file to download. The section is named after the tag
+      # without its "v", a patch of 0 left off (v0.1.0-beta.5 → 0.1-beta.5).
+      - name: Notes
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          core=${tag%%-*}
+          short=${core%.0}${tag#"$core"}
+          notes="$RUNNER_TEMP/notes.md"
+          awk -v v="$short" '/^## / { if (on) exit; if ($2 == v) { on = 1; next } } on { print }' CHANGELOG.md > "$notes"
+          if [ ! -s "$notes" ]; then
+            echo "::warning::CHANGELOG.md has no section for $short: the release has no feature list"
+          fi
+          cat >> "$notes" <<'EOF'
+
+          ### Which file?
+          - **Windows:** `…-windows-x64-setup.exe` installs it (no administrator needed). Or unpack `…-windows-x64.zip` anywhere and run `OpenAtelier.exe`. Both include ffmpeg. Windows may warn that the program isn't signed: *More info → Run anyway*.
+          - **Ubuntu, Debian, Mint, Pop!_OS…:** `…-linux-x64.deb` — open it with your software installer, or `sudo apt install ./OpenAtelier-…-linux-x64.deb`. It brings ffmpeg with it.
+          - **Other Linux:** unpack `…-linux-x64.tar.gz` and run `./install.sh` inside it (installs for you, with a menu entry; `./install.sh --uninstall` removes it). Install `ffmpeg` from your package manager too.
+          - `SHA256SUMS.txt` has each file's checksum.
+          EOF
+          cat "$notes"
 
       - name: Checksums
         run: |
@@ -229,10 +259,5 @@ jobs:
           # "v0.1.0-beta.1" and the like are pre-releases (the Beta update channel).
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
-          body: |
-            ### Which file?
-            - **Windows:** `…-windows-x64-setup.exe` installs it (no administrator needed). Or unpack `…-windows-x64.zip` anywhere and run `OpenAtelier.exe`. Both include ffmpeg. Windows may warn that the program isn't signed: *More info → Run anyway*.
-            - **Ubuntu, Debian, Mint, Pop!_OS…:** `…-linux-x64.deb` — open it with your software installer, or `sudo apt install ./OpenAtelier-…-linux-x64.deb`. It brings ffmpeg with it.
-            - **Other Linux:** unpack `…-linux-x64.tar.gz` and run `./install.sh` inside it (installs for you, with a menu entry; `./install.sh --uninstall` removes it). Install `ffmpeg` from your package manager too.
-            - `SHA256SUMS.txt` has each file's checksum.
+          body_path: ${{ runner.temp }}/notes.md
           files: dist/*

@@ -90,6 +90,7 @@ impl Plugins {
         let usable: Vec<Plugin> = self
             .enabled()
             .map(|p| if Self::scripts_allowed(p, trusted) { p.clone() } else { p.without_scripts() })
+            .map(translated)
             .collect();
         let (registry, mut issues) = Registry::from_plugins(usable.iter());
         for p in self.enabled().filter(|p| !Self::scripts_allowed(p, trusted)) {
@@ -127,6 +128,22 @@ impl Plugins {
         }
         out
     }
+}
+
+/// A plugin's effects with their names, descriptions and categories in the language in
+/// force (`i18n::t`: the English is the key, so Atelier Core's are in the built-in
+/// catalogs, and another plugin's can be added to a language file). Ids stay as they are.
+fn translated(mut p: Plugin) -> Plugin {
+    for d in &mut p.effects {
+        d.name = crate::i18n::t(&d.name).to_string();
+        if !d.description.is_empty() {
+            d.description = crate::i18n::t(&d.description).to_string();
+        }
+        if let Some(c) = &d.category {
+            d.category = Some(crate::i18n::t(c).to_string());
+        }
+    }
+    p
 }
 
 #[cfg(test)]

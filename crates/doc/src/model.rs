@@ -1,6 +1,6 @@
 use crate::color::{ColorTags, InputColor, Transfer, Gamut};
 use crate::format::{CanvasSize, FormatVariant};
-use oa_params::{EvalContext, ParamSet};
+use oa_params::{EvalContext, ParamSet, ParamSource};
 use oa_time::{FrameRate, Rational, Time, TimeRange};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -110,11 +110,6 @@ pub struct Sequence {
     /// with the same ops and UI as any clip's.
     #[serde(default = "background_item", skip_serializing_if = "Item::is_plain_background")]
     pub background: Item,
-    /// Markers across every track (sorted by time) cutting the timeline into sections
-    /// that can be moved, emptied or deleted as a whole. Each starts a section and gives
-    /// it a color.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dividers: Vec<Divider>,
 }
 
 /// The id of every sequence's background pseudo-clip ([`Sequence::background`]). Real
@@ -138,7 +133,6 @@ impl Sequence {
             tracks: Vec::new(),
             params: ParamSet::default(),
             background: background_item(),
-            dividers: Vec::new(),
         }
     }
 
@@ -220,17 +214,6 @@ pub struct Track {
     pub effects: bool,
 }
 
-/// A mark across the whole timeline at `at`: the start of a section, colored `color`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Divider {
-    pub id: u64,
-    pub at: Time,
-    /// sRGB.
-    pub color: [u8; 3],
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub name: String,
-}
-
 impl Track {
     pub fn new(id: TrackId, name: &str, kind: TrackKind) -> Self {
         Track { id, name: name.into(), kind, enabled: true, items: Vec::new(), effects: false }
@@ -284,6 +267,63 @@ pub fn word_shift(old: &TimeMap, new: &TimeMap) -> Time {
     }
     let moved = new.source_in - old.source_in;
     -Time::from_rational_floor(moved.as_rational() * old.speed.recip())
+}
+
+/// A speed ramp's speed at clip time `s` (seconds): its value there, kept to
+/// [`crate::schema::MIN_SPEED`]–[`crate::schema::MAX_SPEED`].
+pub fn ramp_speed(ramp: &ParamSource, s: f64) -> f64 {
+    let ctx = EvalContext::at(Time::from_seconds_f64(s), Time::ZERO);
+    ramp.eval(&ctx).as_float().filter(|v| v.is_finite()).unwrap_or(1.0).clamp(crate::schema::MIN_SPEED, crate::schema::MAX_SPEED)
+}
+
+/// How much source a speed ramp plays from clip time 0 to `local` (seconds; negative
+/// before the clip starts): its speed added up. Piecewise between its keys — each piece
+/// is smooth (whatever its easing), so Simpson's rule on 16 steps is exact for linear
+/// keys and within a fraction of a frame for eased ones; modulation (a wave on the speed)
+/// is sampled every 1/120 s.
+pub fn ramp_integral(ramp: &ParamSource, local: f64) -> f64 {
+    if local == 0.0 || !local.is_finite() {
+        return 0.0;
+    }
+    let (a, b, sign) = if local > 0.0 { (0.0, local, 1.0) } else { (local, 0.0, -1.0) };
+    // The pieces: at every key between, and more often where a modulator moves it.
+    let mut cuts = vec![a, b];
+    let mut curve = ramp;
+    let mut modulated = false;
+    while let ParamSource::Modulated { base, .. } = curve {
+        modulated = true;
+        curve = base;
+    }
+    if let ParamSource::Animated(c) = curve {
+        cuts.extend(c.keys.iter().map(|k| k.t.as_seconds_f64()).filter(|t| *t > a && *t < b));
+    }
+    if modulated {
+        let steps = (((b - a) * 120.0).ceil() as usize).min(1_000_000);
+        cuts.extend((1..steps).map(|i| a + (b - a) * i as f64 / steps as f64));
+    }
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
+    const N: usize = 16;
+    let mut total = 0.0;
+    for w in cuts.windows(2) {
+        let (x0, x1) = (w[0], w[1]);
+        let h = (x1 - x0) / N as f64;
+        if h <= 0.0 {
+            continue;
+        }
+        // Just inside each end, so a hold key's jump lands in the right piece.
+        let at = |i: usize| {
+            let x = x0 + h * i as f64;
+            let x = if i == 0 { x + h * 1e-6 } else if i == N { x - h * 1e-6 } else { x };
+            ramp_speed(ramp, x)
+        };
+        let mut sum = at(0) + at(N);
+        for i in 1..N {
+            sum += at(i) * if i % 2 == 1 { 4.0 } else { 2.0 };
+        }
+        total += sum * h / 3.0;
+    }
+    sign * total
 }
 
 fn no_phase() -> Rational {
@@ -460,18 +500,52 @@ impl Item {
     /// Both keyframe clocks for timeline time `t`.
     pub fn eval_context(&self, t: Time) -> EvalContext {
         let local = t - self.range.start;
-        EvalContext::at(local, self.time_map.source_time(local))
+        EvalContext::at(local, self.source_time_at(local))
+    }
+
+    /// Its speed keyframed (a speed ramp), if it is: a curve (or modulation) on
+    /// [`crate::schema::SPEED`]. A steady speed is the time map's.
+    pub fn speed_ramp(&self) -> Option<&ParamSource> {
+        self.params.get(crate::schema::SPEED).filter(|s| matches!(s, ParamSource::Animated(_) | ParamSource::Modulated { .. }))
+    }
+
+    /// Where in its source clip time `local` falls: the time map, or with a speed ramp,
+    /// the in point plus the ramp's speed added up over the clip so far (the way it
+    /// plays; reversed clips run it backwards, frozen ones stay put).
+    pub fn source_time_at(&self, local: Time) -> Time {
+        let Some(ramp) = self.speed_ramp() else { return self.time_map.source_time(local) };
+        let dir = self.time_map.speed.num().signum() as f64;
+        if dir == 0.0 {
+            return self.time_map.source_in;
+        }
+        self.time_map.source_in + Time::from_seconds_f64(dir * ramp_integral(ramp, local.as_seconds_f64()))
+    }
+
+    /// How fast (and which way: negative is reversed) the source plays at clip time
+    /// `local`.
+    pub fn speed_at(&self, local: Time) -> f64 {
+        let steady = self.time_map.speed.num() as f64 / self.time_map.speed.den().max(1) as f64;
+        match self.speed_ramp() {
+            Some(ramp) if steady != 0.0 => steady.signum() * ramp_speed(ramp, local.as_seconds_f64()),
+            _ => steady,
+        }
     }
 
     /// Timing after moving the head to `new_start` while keeping the tail fixed and
     /// the footage in place (a head trim). Returns `None` if the item would vanish.
+    /// With a speed ramp, the in point is where the ramp had got to by then (the ramp's
+    /// keys move with the head: see `oa_edit::timeline::trim`).
     pub fn trimmed_head(&self, new_start: Time) -> Option<(TimeRange, TimeMap)> {
         let end = self.range.end();
         if new_start >= end {
             return None;
         }
         let delta = new_start - self.range.start;
-        let map = self.time_map.from(delta);
+        let mut map = self.time_map.from(delta);
+        if self.speed_ramp().is_some() {
+            map.source_in = self.source_time_at(delta);
+            map.phase = Rational::ZERO;
+        }
         Some((TimeRange::new(new_start, end - new_start), map))
     }
 }
@@ -672,5 +746,68 @@ impl MediaInfo {
     /// How long the media can play, or `None` if it has no inherent length (stills).
     pub fn playable_duration(&self) -> Option<Time> {
         (!self.still && self.duration > Time::ZERO).then_some(self.duration)
+    }
+}
+
+#[cfg(test)]
+mod speed_ramp_tests {
+    use super::*;
+    use oa_params::{Curve, Keyframe, KeyframeAnchor, Value};
+
+    fn secs(s: f64) -> Time {
+        Time::from_seconds_f64(s)
+    }
+
+    fn clip(keys: Vec<Keyframe>, speed: Rational) -> Item {
+        let mut it = Item::new(ItemId(1), "c", ItemKind::Solid, TimeRange::new(secs(5.0), secs(4.0)));
+        it.time_map = TimeMap::new(secs(10.0), speed);
+        it.params.set(crate::schema::SPEED, ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, keys)));
+        it
+    }
+
+    fn near(a: Time, b: f64) -> bool {
+        (a.as_seconds_f64() - b).abs() < 1e-6
+    }
+
+    /// A ramp adds its speed up over the clip: 1× to 3× over 2 s plays 4 s of source; a
+    /// held 4× from 1 s plays 1 + 4; reversed runs it backwards; the speed is kept to
+    /// 0.01–100×.
+    #[test]
+    fn a_speed_ramp_adds_up_its_speed() {
+        let linear = clip(vec![Keyframe::linear(secs(0.0), Value::Float(1.0)), Keyframe::linear(secs(2.0), Value::Float(3.0))], Rational::ONE);
+        assert!(near(linear.source_time_at(secs(1.0)), 10.0 + 1.5), "{:?}", linear.source_time_at(secs(1.0)));
+        assert!(near(linear.source_time_at(secs(2.0)), 10.0 + 4.0));
+        assert!(near(linear.source_time_at(secs(3.0)), 10.0 + 7.0), "3× after the last key");
+        assert!((linear.speed_at(secs(1.0)) - 2.0).abs() < 1e-9);
+        assert!(near(linear.eval_context(secs(6.0)).source_time, 11.5), "the clip's clocks follow it");
+        let held = clip(vec![Keyframe::hold(secs(0.0), Value::Float(1.0)), Keyframe::hold(secs(1.0), Value::Float(4.0))], Rational::ONE);
+        assert!(near(held.source_time_at(secs(2.0)), 10.0 + 1.0 + 4.0), "{:?}", held.source_time_at(secs(2.0)));
+        let reversed = clip(vec![Keyframe::linear(secs(0.0), Value::Float(1.0)), Keyframe::linear(secs(2.0), Value::Float(3.0))], Rational::new(-1, 1));
+        assert!(near(reversed.source_time_at(secs(1.0)), 10.0 - 1.5));
+        assert!(reversed.speed_at(secs(1.0)) < 0.0);
+        let wild = clip(vec![Keyframe::linear(secs(0.0), Value::Float(1000.0)), Keyframe::linear(secs(1.0), Value::Float(0.0))], Rational::ONE);
+        assert!((wild.speed_at(secs(0.0)) - 100.0).abs() < 1e-9 && (wild.speed_at(secs(1.0)) - 0.01).abs() < 1e-9);
+        let steady = Item { params: ParamSet::default(), ..linear.clone() };
+        assert!(near(steady.source_time_at(secs(1.0)), 11.0), "no keys: the steady speed");
+    }
+
+    /// Cut in two, the back half continues exactly where the front stops (its ramp's keys
+    /// moved to its own clock, its in point where the ramp had got to).
+    #[test]
+    fn a_split_ramp_continues_where_it_stopped() {
+        let front = clip(vec![Keyframe::linear(secs(0.0), Value::Float(0.5)), Keyframe::linear(secs(4.0), Value::Float(2.5))], Rational::ONE);
+        let cut = secs(1.5);
+        let (range, map) = front.trimmed_head(front.range.start + cut).unwrap();
+        let mut back = front.clone();
+        back.range = range;
+        back.time_map = map;
+        for src in back.params.0.values_mut() {
+            src.shift_clip_clock(cut);
+        }
+        for t in [0.0, 0.7, 2.5] {
+            let want = front.source_time_at(cut + secs(t));
+            let got = back.source_time_at(secs(t));
+            assert!((want - got).as_seconds_f64().abs() < 1e-6, "{t}: {want:?} vs {got:?}");
+        }
     }
 }

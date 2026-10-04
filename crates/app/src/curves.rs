@@ -4,6 +4,7 @@
 //! add a key, Delete to remove one. Opened from a property's right-click menu
 //! ("Edit curve…"); the keyframe line on the timeline shows the same curve.
 
+use crate::i18n::{tr, trf};
 use crate::band::Band;
 use crate::App;
 use eframe::egui;
@@ -103,7 +104,7 @@ impl App {
             return;
         };
         let mut open = true;
-        let title = format!("Curve — {} · {}", it.name, band.param.rsplit('.').next().unwrap_or(&band.param));
+        let title = trf("Curve — {0} · {1}", &[("0", &(it.name).to_string()), ("1", (band.param.rsplit('.').next().unwrap_or(&band.param)))]);
         let shown = crate::widgets::on_screen(egui::Window::new(title), ctx)
             .id(egui::Id::new("curve-editor"))
             .open(&mut open)
@@ -129,11 +130,11 @@ impl App {
         let curve = source.as_ref().and_then(|s| s.curve()).filter(|c| c.anchor == KeyframeAnchor::ClipStart).cloned();
         let Some(mut curve) = curve else {
             if source.as_ref().and_then(|s| s.curve()).is_some() {
-                ui.label("This property is keyed to the source media's clock; edit it on the timeline.");
+                ui.label(tr("This property is keyed to the source media's clock; edit it on the timeline."));
                 return;
             }
-            ui.label("Not animated yet.");
-            if ui.button("Animate: add a key at the playhead").clicked() {
+            ui.label(tr("Not animated yet."));
+            if ui.button(tr("Animate: add a key at the playhead")).clicked() {
                 let mut src = source.unwrap_or(ParamSource::Static(current.clone())).keyframed(&playhead_ctx, KeyframeAnchor::ClipStart);
                 src.set_at(&playhead_ctx, current);
                 self.editor.set_param(item, band.target.clone(), &band.param, src, "curve-editor");
@@ -149,11 +150,11 @@ impl App {
         // Toolbar: easing for the selected key's next segment, add/remove.
         ui.horizontal_wrapped(|ui| {
             let sel = ed.selected.filter(|i| *i + 1 < curve.keys.len());
-            ui.label(egui::RichText::new("Easing after the key:").small().weak());
+            ui.label(egui::RichText::new(tr("Easing after the key:")).small().weak());
             // The default curve (Settings), which removes the "custom" mark.
             let default = oa_params::default_interp();
             let on = sel.is_some_and(|i| curve.keys[i].interp == default);
-            if ui.add_enabled(sel.is_some(), egui::Button::selectable(on, "Default")).on_hover_text("The default curve from Settings").clicked()
+            if ui.add_enabled(sel.is_some(), egui::Button::selectable(on, "Default")).on_hover_text(tr("The default curve from Settings")).clicked()
                 && let Some(i) = sel
             {
                 curve.keys[i].interp = default;
@@ -172,7 +173,7 @@ impl App {
                 }
             }
             ui.separator();
-            if ui.button("Key at playhead").on_hover_text("Adds a key (or updates the one there) with the value at the playhead").clicked() {
+            if ui.button(tr("Key at playhead")).on_hover_text(tr("Adds a key (or updates the one there) with the value at the playhead")).clicked() {
                 let v = curve.eval_at(at);
                 curve.set_value_at(at, v);
                 ed.selected = curve.keys.iter().position(|k| k.t == at);
@@ -180,7 +181,7 @@ impl App {
                 finished = true;
             }
             let removable = ed.selected.is_some() && curve.keys.len() > 1;
-            if ui.add_enabled(removable, egui::Button::new("Delete key")).on_hover_text("Or press Delete").clicked()
+            if ui.add_enabled(removable, egui::Button::new(tr("Delete key"))).on_hover_text(tr("Or press Delete")).clicked()
                 && let Some(i) = ed.selected
             {
                 curve.keys.remove(i);
@@ -194,7 +195,7 @@ impl App {
                 ui.separator();
                 let (t, v) = (curve.keys[i].t, curve.keys[i].value.as_float());
                 if let Some(mut v) = v {
-                    ui.label(egui::RichText::new("value").small().weak());
+                    ui.label(egui::RichText::new(tr("value")).small().weak());
                     let r = ui.add(egui::DragValue::new(&mut v).speed(((band.hi - band.lo) / 200.0).max(1e-4)).max_decimals(4));
                     if r.changed() {
                         curve.keys[i].value = Value::Float(v);
@@ -203,7 +204,7 @@ impl App {
                     finished |= r.drag_stopped() || r.lost_focus();
                 }
                 let mut secs = t.as_seconds_f64();
-                ui.label(egui::RichText::new("at").small().weak());
+                ui.label(egui::RichText::new(tr("at")).small().weak());
                 let r = ui.add(egui::DragValue::new(&mut secs).speed(0.01).range(0.0..=it.range.duration.as_seconds_f64()).max_decimals(3).suffix(" s"));
                 let moved = Time::from_seconds_f64(secs);
                 // Not onto another key.

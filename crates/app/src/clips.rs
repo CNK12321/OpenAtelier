@@ -2,6 +2,7 @@
 //! (with groups), cut/copy/paste/duplicate, delete, group/ungroup, enable/disable, and
 //! track rename/reorder/delete. Each is one undo step.
 
+use crate::i18n::{tr, trf};
 use crate::App;
 use oa_doc::{schema, ItemId, ItemKind, Op, ParamTarget, TrackId, TrackKind};
 use oa_params::ParamSource;
@@ -12,20 +13,6 @@ use std::collections::BTreeSet;
 pub type Clipboard = Vec<(TrackId, oa_doc::Item)>;
 
 type Params = Vec<(String, Option<oa_params::ParamSource>)>;
-
-/// Something done to one section of the timeline (see `oa_edit::sections`).
-#[derive(Clone, Debug)]
-pub enum SectionCommand {
-    /// Select its clips.
-    Select(usize),
-    /// Remove its clips, keeping the space.
-    Clear(usize),
-    /// Remove it and close the gap.
-    Delete(usize),
-    Move { from: usize, to: usize },
-    /// Change (move, recolor, rename) or, with `None`, remove a divider.
-    Edit { divider: u64, change: Option<oa_doc::Divider> },
-}
 
 /// A copied transform: each transform parameter as the clip stored it (`None`: default),
 /// and the same for each format's override.
@@ -108,7 +95,7 @@ impl App {
         if !clips.is_empty() {
             let n = clips.len();
             self.clipboard = clips;
-            self.clipboard_note = Some(format!("OpenAtelier: {n} clip{}", if n == 1 { "" } else { "s" }));
+            self.clipboard_note = Some(trf("OpenAtelier: {n} clip{0}", &[("n", &(n).to_string()), ("0", (if n == 1 { "" } else { "s" }))]));
         }
     }
 
@@ -193,7 +180,7 @@ impl App {
                     self.error = Some(e.to_string());
                 }
             }
-            Err(oa_doc::EditError::Overlap) => self.notify(format!("{label}: another clip is in the way — nothing moved.")),
+            Err(oa_doc::EditError::Overlap) => self.notify(trf("{label}: another clip is in the way — nothing moved.", &[("label", label)])),
             Err(e) => self.error = Some(e.to_string()),
         }
     }
@@ -277,11 +264,11 @@ impl App {
             self.selection = placed.first().copied();
             self.sync_selection();
             if lost {
-                self.notify("Broken apart. The compound clip's own transform, effects and transitions applied to it as a whole, so the pieces don't have them.");
+                self.notify(tr("Broken apart. The compound clip's own transform, effects and transitions applied to it as a whole, so the pieces don't have them."));
             }
         }
         if retimed > 0 {
-            self.notify("A compound clip playing at another speed can't be broken apart yet — set it back to 1× first.");
+            self.notify(tr("A compound clip playing at another speed can't be broken apart yet — set it back to 1× first."));
         }
     }
 
@@ -338,19 +325,49 @@ impl App {
         }
     }
 
+    /// Menu entries for `media`'s proxy: make one (or again), or remove it.
+    pub(crate) fn proxy_menu(&mut self, ui: &mut eframe::egui::Ui, media: oa_doc::MediaId) {
+        use crate::proxies::State;
+        let Some(m) = self.editor.pool_item(media).filter(|m| !m.missing && m.kind == oa_media::MediaKind::Video) else { return };
+        if m.probe.video.as_ref().is_some_and(|v| v.has_alpha) {
+            return; // a proxy would lose the transparency
+        }
+        let file = m.decode_path.clone();
+        match self.proxies.state(&file).cloned() {
+            Some(State::Ready { .. }) => {
+                if ui.button(tr("Remove proxy")).on_hover_text(tr("The viewer plays the file itself again")).clicked() {
+                    self.proxies.remove(&file);
+                    ui.close();
+                }
+            }
+            Some(State::Making(p)) => {
+                ui.add_enabled(false, eframe::egui::Button::new(trf("Making a proxy… {p}%", &[("p", &format!("{:.0}", p * 100.0))])));
+            }
+            Some(State::Queued | State::Checking) => {
+                ui.add_enabled(false, eframe::egui::Button::new(tr("Proxy waiting…")));
+            }
+            _ => {
+                if ui.button(tr("Make proxy")).on_hover_text(tr("A small copy the viewer plays smoothly; exports use the file itself")).clicked() {
+                    self.proxies.make(&file);
+                    ui.close();
+                }
+            }
+        }
+    }
+
     /// Menu entries choosing how `media`'s pixels are scaled.
     pub(crate) fn scaling_menu(&mut self, ui: &mut eframe::egui::Ui, media: oa_doc::MediaId) {
         use oa_doc::MediaScaling;
         let Some(m) = self.editor.doc.project().media(media) else { return };
         let (current, pixel_now) = (m.scaling, m.pixelated());
-        ui.menu_button("Scale mode", |ui| {
-            let auto = format!("Automatic ({})", if pixel_now && current.is_auto() { "pixel" } else { "smooth" });
+        ui.menu_button(tr("Scale mode"), |ui| {
+            let auto = if pixel_now && current.is_auto() { tr("Automatic (pixel)") } else { tr("Automatic (smooth)") }.to_string();
             for (mode, label, hint) in [
-                (MediaScaling::Pixel, "Pixel scale (nearest neighbor)".to_string(), "Every pixel stays a crisp square — for pixel art"),
-                (MediaScaling::Smooth, "Smooth scale".to_string(), "Filtered — for photos and video"),
-                (MediaScaling::Auto, auto, "Pixel for pictures up to 32×32, smooth otherwise"),
+                (MediaScaling::Pixel, tr("Pixel scale (nearest neighbor)").to_string(), tr("Every pixel stays a crisp square — for pixel art")),
+                (MediaScaling::Smooth, tr("Smooth scale").to_string(), tr("Filtered — for photos and video")),
+                (MediaScaling::Auto, auto, tr("Pixel for pictures up to 32×32, smooth otherwise")),
             ] {
-                if ui.radio(current == mode, label).on_hover_text(hint).clicked() {
+                if ui.radio(current == mode, label).on_hover_text(tr(hint)).clicked() {
                     // Every selected picture clip's file, not just this one's.
                     let mut files = self.selected_picture_media();
                     if !files.contains(&media) {
@@ -509,7 +526,7 @@ impl App {
             }
         }
         if ops.is_empty() {
-            self.report_error("none of the copied effects fit the selected clips");
+            self.report_error(tr("none of the copied effects fit the selected clips"));
             return;
         }
         if let Err(e) = self.editor.apply("Paste effects", ops) {
@@ -530,7 +547,7 @@ impl App {
             let updated = oa_doc::EffectInstance { params: source.params.clone(), ..target.clone() };
             ops.extend([Op::RemoveEffect { seq, item, effect }, Op::InsertEffect { seq, item, index, effect: updated }]);
         }
-        if let Err(e) = self.editor.apply("Paste effect settings", ops) {
+        if let Err(e) = self.editor.apply(tr("Paste effect settings"), ops) {
             self.error = Some(e.to_string());
         }
     }
@@ -620,7 +637,7 @@ impl App {
         let Some(kind) = self.editor.sequence().track(track).map(|t| t.kind) else { return };
         let sound = self.registry.is_sound(&drag.effect.type_id);
         if sound != (kind == TrackKind::Audio) {
-            self.notify(format!("{name} is a {} effect: drop it on a {} effect track.", if sound { "sound" } else { "picture" }, if sound { "sound" } else { "picture" }));
+            self.notify(trf("{name} is a {0} effect: drop it on a {1} effect track.", &[("name", &(name).to_string()), ("0", (if sound { "sound" } else { "picture" })), ("1", (if sound { "sound" } else { "picture" }))]));
             return;
         }
         let at = oa_edit::timeline::snap_to_frame(self.editor.sequence(), at);
@@ -634,13 +651,13 @@ impl App {
         };
         let mut effect = drag.effect.clone();
         effect.role = oa_doc::EffectRole::Passive;
-        if self.apply_effect_to(&effect, &[container], "Add effect container") == 0 && self.editor.doc.undo_depth() > before {
+        if self.apply_effect_to(&effect, &[container], tr("Add effect container")) == 0 && self.editor.doc.undo_depth() > before {
             self.undo();
             return;
         }
         self.selection = Some(container);
         self.sync_selection();
-        self.notify(format!("{name} now runs over everything below that track, for as long as its container lasts."));
+        self.notify(trf("{name} now runs over everything below that track, for as long as its container lasts.", &[("name", &name.to_string())]));
     }
 
     /// An effect dragged out of the inspector and let go over clip `onto`: copied there.
@@ -652,13 +669,13 @@ impl App {
         let target = self.editor.item(onto).map(|i| i.name.clone()).unwrap_or_default();
         if !self.effect_fits(onto, &drag.effect.type_id) {
             let why = if self.registry.is_sound(&drag.effect.type_id) { "it has no sound" } else { "it doesn't take that kind of effect" };
-            self.report_error(format!("{name} can't go on {target}: {why}"));
+            self.report_error(trf("{name} can't go on {target}: {why}", &[("name", &name.to_string()), ("target", &target.to_string()), ("why", why)]));
             return;
         }
         if self.apply_effect_to(&drag.effect, &[onto], "Copy effect") > 0 {
-            self.notify(format!("Copied {name} onto {target}."));
+            self.notify(trf("Copied {name} onto {target}.", &[("name", &name.to_string()), ("target", &target.to_string())]));
         } else if self.error.is_none() {
-            self.notify(format!("{target} already has {name} with these settings."));
+            self.notify(trf("{target} already has {name} with these settings.", &[("target", &target.to_string()), ("name", &name.to_string())]));
         }
     }
 
@@ -694,12 +711,12 @@ impl App {
     }
 
     pub(crate) fn effect_menu(&mut self, ui: &mut eframe::egui::Ui, item: ItemId, effect: &oa_doc::EffectInstance) {
-        if ui.button("Copy effect").clicked() {
+        if ui.button(tr("Copy effect")).clicked() {
             self.copy_effects(item, Some(effect.id));
             ui.close();
         }
         let same_type = self.effect_clipboard.iter().any(|e| e.type_id == effect.type_id);
-        if ui.add_enabled(same_type, eframe::egui::Button::new("Paste settings")).on_hover_text("From the copied effect of the same kind").clicked() {
+        if ui.add_enabled(same_type, eframe::egui::Button::new(tr("Paste settings"))).on_hover_text(tr("From the copied effect of the same kind")).clicked() {
             self.paste_effect_settings(item, effect.id);
             ui.close();
         }
@@ -710,8 +727,8 @@ impl App {
             let mut on = matches!(effect.params.get(schema::BOUNDED).map(|s| s.eval(&at)), Some(oa_params::Value::Bool(true)));
             // A masked effect can't be bounded too (nor a bounded one masked).
             let masked = effect.params.get(oa_doc::mask::EFFECT_USE).and_then(|s| s.eval(&at).as_float()).is_some_and(|v| v != 0.0);
-            let tip = "Only some of the letters: from a start to an end, in letters or percent of the text, with a blend at the edges";
-            let r = ui.add_enabled(!masked || on, eframe::egui::Checkbox::new(&mut on, "Bounded")).on_hover_text(tip).on_disabled_hover_text("It uses a mask: a masked effect can't be bounded too");
+            let tip = tr("Only some of the letters: from a start to an end, in letters or percent of the text, with a blend at the edges");
+            let r = ui.add_enabled(!masked || on, eframe::egui::Checkbox::new(&mut on, tr("Bounded"))).on_hover_text(tip).on_disabled_hover_text(tr("It uses a mask: a masked effect can't be bounded too"));
             if r.clicked() {
                 self.editor.set_param(item, ParamTarget::Effect(effect.id), schema::BOUNDED, ParamSource::Static(oa_params::Value::Bool(on)), "bounded");
                 ui.close();
@@ -719,17 +736,17 @@ impl App {
         }
         self.effect_mask_menu(ui, item, effect);
         ui.separator();
-        if ui.button("Copy all effects").clicked() {
+        if ui.button(tr("Copy all effects")).clicked() {
             self.copy_effects(item, None);
             ui.close();
         }
-        if ui.add_enabled(!self.effect_clipboard.is_empty(), eframe::egui::Button::new("Paste effects")).clicked() {
+        if ui.add_enabled(!self.effect_clipboard.is_empty(), eframe::egui::Button::new(tr("Paste effects"))).clicked() {
             self.paste_effects(&[item]);
             ui.close();
         }
     }
 
-    // ---- a selected track: pasting into its free space, and its sections ----
+    // ---- a selected track: pasting into its free space ----
 
     /// Pastes the clipboard into `track`'s closest free space at or after the playhead.
     pub(crate) fn paste_into_track(&mut self, track: TrackId) {
@@ -752,59 +769,17 @@ impl App {
         let project = self.editor.doc.snapshot();
         let doc = &mut self.editor.doc;
         let mut alloc = || doc.alloc_id();
-        match oa_edit::sections::paste_into_track(&project, self.editor.seq, track, clips, self.playhead, &mut alloc) {
-            Ok((ops, _)) if ops.is_empty() => self.report_error("nothing to put there: those clips are the other kind (sound or picture) from this track"),
+        match oa_edit::paste::paste_into_track(&project, self.editor.seq, track, clips, self.playhead, &mut alloc) {
+            Ok((ops, _)) if ops.is_empty() => self.report_error(tr("nothing to put there: those clips are the other kind (sound or picture) from this track")),
             Ok((ops, ids)) => match self.editor.apply(label, ops) {
                 Ok(()) => {
                     self.selected = ids.iter().copied().collect();
                     self.selection = ids.last().copied();
                 }
-                Err(e) => self.report_error(format!("can't {}: {e}", label.to_lowercase())),
+                Err(e) => self.report_error(trf("can't {0}: {e}", &[("0", &(label.to_lowercase()).to_string()), ("e", &(e).to_string())])),
             },
-            Err(e) => self.report_error(format!("can't {}: {e}", label.to_lowercase())),
+            Err(e) => self.report_error(trf("can't {0}: {e}", &[("0", &(label.to_lowercase()).to_string()), ("e", &(e).to_string())])),
         }
-    }
-
-    /// A divider across the timeline at `at` (splitting clips it lands inside).
-    pub(crate) fn add_divider(&mut self, at: Time) {
-        let project = self.editor.doc.snapshot();
-        // Each new one takes the next color, so neighbors differ.
-        let count = project.sequence(self.editor.seq).map_or(0, |s| s.dividers.len());
-        let color = oa_edit::sections::COLORS[count % oa_edit::sections::COLORS.len()];
-        let doc = &mut self.editor.doc;
-        let mut alloc = || doc.alloc_id();
-        let result = oa_edit::sections::add_divider(&project, self.editor.seq, at, color, &mut alloc).and_then(|ops| self.editor.apply("Add divider", ops));
-        if let Err(e) = result {
-            self.report_error(format!("can't add a divider: {e}"));
-        }
-    }
-
-    /// One of the section commands, as one undo step.
-    pub(crate) fn section_command(&mut self, command: SectionCommand) {
-        use oa_edit::sections as sec;
-        let project = self.editor.doc.snapshot();
-        let seq = self.editor.seq;
-        let Some(s) = project.sequence(seq) else { return };
-        if let SectionCommand::Select(index) = command {
-            let ids: Vec<ItemId> = sec::members(s, index).iter().map(|(_, i)| i.id).collect();
-            self.selected = self.with_groups(ids.iter().copied());
-            self.selection = ids.last().copied();
-            return;
-        }
-        let doc = &mut self.editor.doc;
-        let mut alloc = || doc.alloc_id();
-        let (label, ops) = match command {
-            SectionCommand::Clear(i) => ("Clear section", sec::clear_section(&project, seq, i)),
-            SectionCommand::Delete(i) => ("Delete section", sec::delete_section(&project, seq, i)),
-            SectionCommand::Move { from, to } => ("Move section", sec::move_section(&project, seq, from, to, &mut alloc)),
-            SectionCommand::Edit { divider, change } => ("Edit divider", sec::edit_divider(&project, seq, divider, change)),
-            SectionCommand::Select(_) => unreachable!("handled above"),
-        };
-        let result = ops.and_then(|ops| if ops.is_empty() { Ok(()) } else { self.editor.apply(label, ops) });
-        if let Err(e) = result {
-            self.report_error(format!("{label}: {e}"));
-        }
-        self.sync_selection();
     }
 
     // ---- tracks ----
@@ -839,12 +814,44 @@ impl App {
         }
     }
 
+    /// Moves several tracks one place each, together: the one furthest along goes first so
+    /// they don't swap with each other, and if it's already at the end of its kind, none
+    /// of that kind move (they'd close up instead).
+    pub(crate) fn move_tracks(&mut self, tracks: &[TrackId], up: bool) {
+        let s = self.editor.sequence();
+        // (kind, index, step, track), furthest along first.
+        let mut order: Vec<(TrackKind, isize, isize, TrackId)> = tracks
+            .iter()
+            .filter_map(|t| {
+                let i = s.tracks.iter().position(|x| x.id == *t)?;
+                let kind = s.tracks[i].kind;
+                let step: isize = if matches!((kind, up), (TrackKind::Video, true) | (TrackKind::Audio, false)) { 1 } else { -1 };
+                Some((kind, i as isize, step, *t))
+            })
+            .collect();
+        order.sort_by_key(|o| std::cmp::Reverse(o.1 * o.2));
+        let stuck: Vec<TrackKind> = [TrackKind::Video, TrackKind::Audio]
+            .into_iter()
+            .filter(|k| {
+                order.iter().find(|o| o.0 == *k).is_some_and(|&(_, index, step, _)| {
+                    let to = index + step;
+                    to < 0 || to as usize >= s.tracks.len() || s.tracks[to as usize].kind != *k
+                })
+            })
+            .collect();
+        for (kind, _, _, track) in order {
+            if !stuck.contains(&kind) {
+                self.move_track(track, up);
+            }
+        }
+    }
+
     /// Deletes a track and its clips (undoable). The last track of a kind stays.
     pub(crate) fn delete_track(&mut self, track: TrackId) {
         let s = self.editor.sequence();
         let Some(t) = s.track(track) else { return };
         if s.tracks.iter().filter(|x| x.kind == t.kind).count() <= 1 {
-            self.error = Some("the last track of its kind can't be deleted".into());
+            self.error = Some(tr("the last track of its kind can't be deleted").into());
             return;
         }
         let op = Op::RemoveTrack { seq: self.editor.seq, track };

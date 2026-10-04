@@ -251,12 +251,39 @@ pub enum MaskShape {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         erase: bool,
     },
+    /// Coverage that changes frame by frame (automatic rotoscoping, SAM 2): a bitmap for
+    /// each moment, at clip times in order; each shows until the next one. Stretched over
+    /// the layer like [`MaskShape::Bitmap`].
+    Matte {
+        frames: Vec<MatteFrame>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        expand: f64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        feather: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        erase: bool,
+    },
+}
+
+/// One frame of a [`MaskShape::Matte`]: from clip time `t` on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MatteFrame {
+    pub t: Time,
+    #[serde(flatten)]
+    pub bitmap: Bitmap,
+}
+
+/// The frame of `frames` (in time order) showing at clip time `t`: the last at or before
+/// it, or the first before them all.
+pub fn matte_at(frames: &[MatteFrame], t: Time) -> Option<&MatteFrame> {
+    let i = frames.partition_point(|f| f.t <= t);
+    frames.get(i.saturating_sub(1))
 }
 
 impl MaskShape {
     pub fn erases(&self) -> bool {
         match self {
-            MaskShape::Rect { erase, .. } | MaskShape::Ellipse { erase, .. } | MaskShape::Stroke { erase, .. } | MaskShape::Path { erase, .. } | MaskShape::Bitmap { erase, .. } => *erase,
+            MaskShape::Rect { erase, .. } | MaskShape::Ellipse { erase, .. } | MaskShape::Stroke { erase, .. } | MaskShape::Path { erase, .. } | MaskShape::Bitmap { erase, .. } | MaskShape::Matte { erase, .. } => *erase,
         }
     }
 
@@ -267,7 +294,8 @@ impl MaskShape {
             | MaskShape::Ellipse { expand, feather, .. }
             | MaskShape::Stroke { expand, feather, .. }
             | MaskShape::Path { expand, feather, .. }
-            | MaskShape::Bitmap { expand, feather, .. } => (*expand, *feather),
+            | MaskShape::Bitmap { expand, feather, .. }
+            | MaskShape::Matte { expand, feather, .. } => (*expand, *feather),
         }
     }
 
@@ -277,13 +305,14 @@ impl MaskShape {
             | MaskShape::Ellipse { expand, feather, .. }
             | MaskShape::Stroke { expand, feather, .. }
             | MaskShape::Path { expand, feather, .. }
-            | MaskShape::Bitmap { expand, feather, .. } => (expand, feather),
+            | MaskShape::Bitmap { expand, feather, .. }
+            | MaskShape::Matte { expand, feather, .. } => (expand, feather),
         }
     }
 
     pub fn erase_mut(&mut self) -> &mut bool {
         match self {
-            MaskShape::Rect { erase, .. } | MaskShape::Ellipse { erase, .. } | MaskShape::Stroke { erase, .. } | MaskShape::Path { erase, .. } | MaskShape::Bitmap { erase, .. } => erase,
+            MaskShape::Rect { erase, .. } | MaskShape::Ellipse { erase, .. } | MaskShape::Stroke { erase, .. } | MaskShape::Path { erase, .. } | MaskShape::Bitmap { erase, .. } | MaskShape::Matte { erase, .. } => erase,
         }
     }
 
@@ -307,6 +336,7 @@ impl MaskShape {
             MaskShape::Stroke { .. } => "Brush stroke",
             MaskShape::Path { .. } => "Path",
             MaskShape::Bitmap { .. } => "Pixels",
+            MaskShape::Matte { .. } => "Rotoscoped",
         }
     }
 
@@ -600,27 +630,17 @@ impl Mask {
                     }
                     bx
                 }
-                MaskShape::Bitmap { bitmap, .. } => {
+                MaskShape::Bitmap { .. } | MaskShape::Matte { .. } => {
+                    let bitmap = match shape {
+                        MaskShape::Bitmap { bitmap, .. } => bitmap,
+                        MaskShape::Matte { frames, .. } => match matte_at(frames, t) {
+                            Some(f) => &f.bitmap,
+                            None => continue,
+                        },
+                        _ => unreachable!(),
+                    };
                     let Some(bytes) = bitmap.decode() else { continue };
-                    let (bw, bh) = (bitmap.size[0].max(1) as usize, bitmap.size[1].max(1) as usize);
-                    let tl = px([0.0, 0.0]);
-                    let br = px([1.0, 1.0]);
-                    let bx = bbox([tl[0], tl[1], br[0], br[1]], w, h);
-                    let (sw, sh) = ((br[0] - tl[0]).max(1e-9), (br[1] - tl[1]).max(1e-9));
-                    for y in bx.1..bx.3 {
-                        for x in bx.0..bx.2 {
-                            // Bilinear, pixel centers on pixel centers.
-                            let u = ((x as f64 + 0.5 - tl[0]) / sw * bw as f64 - 0.5).clamp(0.0, (bw - 1) as f64);
-                            let v = ((y as f64 + 0.5 - tl[1]) / sh * bh as f64 - 0.5).clamp(0.0, (bh - 1) as f64);
-                            let (x0, y0) = (u.floor() as usize, v.floor() as usize);
-                            let (x1, y1) = ((x0 + 1).min(bw - 1), (y0 + 1).min(bh - 1));
-                            let (fx, fy) = (u - x0 as f64, v - y0 as f64);
-                            let at = |x: usize, y: usize| bytes[y * bw + x] as f64 / 255.0;
-                            let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
-                            let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
-                            layer[y * w + x] = (top * (1.0 - fy) + bottom * fy) as f32;
-                        }
-                    }
+                    let bx = draw_bitmap(&bytes, bitmap.size, px([0.0, 0.0]), px([1.0, 1.0]), w, h, &mut layer);
                     if expand != 0.0 || feather > 0.0 {
                         soften(&mut layer, w, h, expand, ramp);
                         (0, 0, w, h)
@@ -668,24 +688,62 @@ impl Mask {
                     }
                 }
                 MaskShape::Bitmap { bitmap, .. } => (3u8, bitmap.size, &bitmap.data).hash(&mut h),
+                // The frame showing now (the same frame hashes the same all the while it shows).
+                MaskShape::Matte { frames, .. } => match matte_at(frames, t) {
+                    Some(f) => (5u8, f.t.0, f.bitmap.size, &f.bitmap.data).hash(&mut h),
+                    None => 6u8.hash(&mut h),
+                },
             }
         }
         h.finish()
     }
 
-    /// Whether its drawing changes over time (a path with keyframed points).
+    /// The most pixels its drawing can use, when it's only pictures (bitmaps, mattes):
+    /// the largest of them — drawn bigger they'd only be stretched, and the GPU stretches
+    /// it anyway. `None`: something drawn (a shape, a stroke, a path) wants the layer's
+    /// own resolution. A rotoscoped matte is redrawn every frame, so this matters.
+    pub fn raster_cap(&self) -> Option<[u32; 2]> {
+        let mut cap: Option<[u32; 2]> = None;
+        for s in &self.shapes {
+            let sizes: Vec<[u32; 2]> = match s {
+                MaskShape::Bitmap { bitmap, .. } => vec![bitmap.size],
+                MaskShape::Matte { frames, .. } => frames.iter().map(|f| f.bitmap.size).collect(),
+                _ => return None,
+            };
+            for size in sizes {
+                let c = cap.get_or_insert([0, 0]);
+                *c = [c[0].max(size[0]), c[1].max(size[1])];
+            }
+        }
+        cap
+    }
+
+    /// Whether its drawing changes over time (a path with keyframed points, a rotoscoped
+    /// matte).
     pub fn animated(&self) -> bool {
-        self.shapes.iter().any(|s| matches!(s, MaskShape::Path { points, .. } if points.iter().any(PathPoint::animated)))
+        self.shapes.iter().any(|s| match s {
+            MaskShape::Path { points, .. } => points.iter().any(PathPoint::animated),
+            MaskShape::Matte { frames, .. } => frames.len() > 1,
+            _ => false,
+        })
     }
 
     /// For a clip whose clock moved `delta` later (the back half of a split): its path
     /// keys keep their instants.
     pub fn shift_clip_clock(&mut self, delta: Time) {
         for s in &mut self.shapes {
-            if let MaskShape::Path { points, .. } = s {
-                for k in points.iter_mut().flat_map(|p| &mut p.keys) {
-                    k.t -= delta;
+            match s {
+                MaskShape::Path { points, .. } => {
+                    for k in points.iter_mut().flat_map(|p| &mut p.keys) {
+                        k.t -= delta;
+                    }
                 }
+                MaskShape::Matte { frames, .. } => {
+                    for f in frames {
+                        f.t -= delta;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -701,6 +759,28 @@ impl Mask {
         let (sx, sy) = if (from > to) == fit { (1.0, to / from) } else { (from / to, 1.0) };
         self.frame = [self.frame[0] * sx, self.frame[1] * sy];
     }
+}
+
+/// Draws coverage `bytes` (`size`) stretched from pixel `tl` to `br` into `layer`
+/// (`w` × `h`), bilinear with pixel centers on pixel centers. Returns the box it touched.
+fn draw_bitmap(bytes: &[u8], size: [u32; 2], tl: [f64; 2], br: [f64; 2], w: usize, h: usize, layer: &mut [f32]) -> (usize, usize, usize, usize) {
+    let (bw, bh) = (size[0].max(1) as usize, size[1].max(1) as usize);
+    let bx = bbox([tl[0], tl[1], br[0], br[1]], w, h);
+    let (sw, sh) = ((br[0] - tl[0]).max(1e-9), (br[1] - tl[1]).max(1e-9));
+    for y in bx.1..bx.3 {
+        for x in bx.0..bx.2 {
+            let u = ((x as f64 + 0.5 - tl[0]) / sw * bw as f64 - 0.5).clamp(0.0, (bw - 1) as f64);
+            let v = ((y as f64 + 0.5 - tl[1]) / sh * bh as f64 - 0.5).clamp(0.0, (bh - 1) as f64);
+            let (x0, y0) = (u.floor() as usize, v.floor() as usize);
+            let (x1, y1) = ((x0 + 1).min(bw - 1), (y0 + 1).min(bh - 1));
+            let (fx, fy) = (u - x0 as f64, v - y0 as f64);
+            let at = |x: usize, y: usize| bytes[y * bw + x] as f64 / 255.0;
+            let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
+            let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
+            layer[y * w + x] = (top * (1.0 - fy) + bottom * fy) as f32;
+        }
+    }
+    bx
 }
 
 fn bbox(b: [f64; 4], w: usize, h: usize) -> (usize, usize, usize, usize) {
@@ -955,6 +1035,33 @@ mod tests {
         Mask { id: 1, name: "Mask 1".into(), enabled: true, invert: false, mode: MaskMode::Add, shapes, frame: [1.0, 1.0] }
     }
 
+    /// A rotoscoped matte shows each frame from its time until the next, hashes by the
+    /// frame showing, keeps its instants when the clip's clock moves, and saves.
+    #[test]
+    fn mattes_change_frame_by_frame() {
+        let left = Bitmap::encode([2, 1], &[255, 0]);
+        let right = Bitmap::encode([2, 1], &[0, 255]);
+        let frames = vec![MatteFrame { t: Time::from_seconds(1), bitmap: left }, MatteFrame { t: Time::from_seconds(2), bitmap: right }];
+        let mut m = mask(vec![MaskShape::Matte { frames, expand: 0.0, feather: 0.0, erase: false }]);
+        let at = |m: &Mask, s: f64| {
+            let c = m.rasterize([4, 1], Time::from_seconds_f64(s));
+            (c[0], c[3])
+        };
+        assert_eq!(at(&m, 0.5), (255, 0), "before the first frame: the first");
+        assert_eq!(at(&m, 1.5), (255, 0));
+        assert_eq!(at(&m, 2.0), (0, 255), "the second from its own time on");
+        assert_eq!(at(&m, 9.0), (0, 255));
+        assert!(m.animated());
+        assert_eq!(m.raster_cap(), Some([2, 1]), "only pictures: drawn at their own size");
+        assert_eq!(mask(vec![MaskShape::boxed(false, [0.1, 0.1], [0.5, 0.5], false)]).raster_cap(), None, "a shape wants the layer's resolution");
+        assert_eq!(m.content_hash(Time::from_seconds_f64(1.2)), m.content_hash(Time::from_seconds_f64(1.8)), "one frame, one hash");
+        assert_ne!(m.content_hash(Time::from_seconds_f64(1.5)), m.content_hash(Time::from_seconds_f64(2.5)));
+        m.shift_clip_clock(Time::from_seconds(1));
+        assert_eq!(at(&m, 1.0), (0, 255), "a clock one second later: the second frame at 1 s");
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<Mask>(&json).unwrap(), m);
+    }
+
     #[test]
     fn bitmaps_round_trip() {
         let mut bytes = vec![0u8; 300 * 7];
@@ -1145,5 +1252,28 @@ mod tests {
         assert_eq!(all.iter().filter(|c| **c == 255).count(), 21);
         let filled = fill_region(&sel, [w, h], [0, 0]);
         assert_eq!(filled.iter().filter(|c| **c == 255).count(), 20, "the empty left half");
+    }
+}
+
+#[cfg(test)]
+mod matte_speed {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn a_soft_matte_frame() {
+        let (w, h) = (768usize, 432usize);
+        let cov: Vec<u8> = (0..w * h).map(|i| if (i % w) > w / 3 && (i % w) < 2 * w / 3 && (i / w) > h / 4 { 255 } else { 0 }).collect();
+        let frames = vec![MatteFrame { t: Time::ZERO, bitmap: Bitmap::encode([w as u32, h as u32], &cov) }];
+        for feather in [0.0, 2.0 / 1080.0] {
+            let m = Mask { id: 1, name: String::new(), enabled: true, invert: false, mode: MaskMode::Add, shapes: vec![MaskShape::Matte { frames: frames.clone(), expand: 0.0, feather, erase: false }], frame: [1.0, 1.0] };
+            // At the size the planner now draws it: the matte's own.
+            let size = m.raster_cap().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(m.rasterize(size, Time::ZERO));
+            }
+            eprintln!("feather {feather:.4}: {:.1} ms a frame", t0.elapsed().as_secs_f64() * 100.0);
+        }
     }
 }

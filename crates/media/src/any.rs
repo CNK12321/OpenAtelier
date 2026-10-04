@@ -108,8 +108,10 @@ pub fn frame_source(ctx: &oa_gpu::GpuContext, choice: DecoderChoice) -> MediaFra
     let (device, queue) = (ctx.device.clone(), ctx.queue.clone());
     MediaFrameSource::new(move |path, video| {
         #[cfg(windows)]
-        // Transparency goes to ffmpeg: Media Foundation hands over opaque NV12 only.
-        if let Some(bridge) = choice.bridge.clone().filter(|_| !choice.force_ffmpeg && !video.has_alpha)
+        // Transparency goes to ffmpeg: Media Foundation hands over opaque NV12 only. So
+        // does video deeper than 8 bits where the GPU takes 16-bit textures: NV12 would
+        // cut it to 8.
+        if let Some(bridge) = choice.bridge.clone().filter(|_| !choice.force_ffmpeg && !video.has_alpha && !(video.bit_depth() > 8 && oa_gpu::deep_video(&device)))
             && let Ok(d) = crate::windows::MfDecoder::open(bridge, path, video)
         {
             return Ok(AnyDecoder::Mf(d));

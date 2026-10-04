@@ -1,6 +1,7 @@
 //! The Settings window (OpenAtelier menu → Settings…, or Ctrl+,): preferences kept on
 //! this computer in `settings.json`, applied the moment they change.
 
+use crate::i18n::{tr, trf};
 use crate::settings::CurveShape;
 use crate::App;
 use eframe::egui;
@@ -40,7 +41,7 @@ impl App {
         let size = egui::vec2(620.0f32.min(screen.width() - 32.0), 440.0f32.min(screen.height() - 64.0)).max(egui::vec2(240.0, 160.0));
         let page_id = egui::Id::new("settings-page");
         let mut page: Page = ctx.data(|d| d.get_temp(page_id)).unwrap_or_default();
-        egui::Window::new("Settings")
+        egui::Window::new(tr("Settings"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -58,7 +59,7 @@ impl App {
                             }
                         }
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Kept on this computer; they apply to every project.").small().weak());
+                        ui.label(egui::RichText::new(tr("Kept on this computer; they apply to every project.")).small().weak());
                     });
                     ui.separator();
                     ui.vertical(|ui| {
@@ -69,9 +70,13 @@ impl App {
                             Page::Interface => self.settings_interface(ui),
                             Page::Performance => self.settings_performance(ui),
                             Page::Graphics => self.settings_graphics(ui),
-                            Page::Audio => self.settings_audio(ui),
+                            Page::Media => self.settings_media(ui),
                             Page::Updates => self.update_settings(ui),
-                            Page::Tracker => self.tracker_settings(ui),
+                            Page::Tracker => {
+                                self.tracker_settings(ui);
+                                ui.separator();
+                                self.roto_settings(ui);
+                            }
                         });
                     });
                 });
@@ -88,17 +93,15 @@ impl App {
 
     fn settings_editing(&mut self, ui: &mut egui::Ui) {
         let s = &mut self.settings;
-        ui.checkbox(&mut s.advanced_transform, "Advanced transformations")
-            .on_hover_text("Squash and the crop sliders in Transform. Cropping by double-clicking a clip in the viewer works either way.");
-        ui.checkbox(&mut s.advanced_color, "Advanced color")
-            .on_hover_text("Source color (log and HDR curves, gamut, levels) and the Output tone map. Off: files are read by their own tags.");
+        ui.checkbox(&mut s.advanced_transform, tr("Advanced transformations"))
+            .on_hover_text(tr("Squash and the crop sliders in Transform. Cropping by double-clicking a clip in the viewer works either way."));
+        ui.checkbox(&mut s.advanced_color, tr("Advanced color"))
+            .on_hover_text(tr("Source color (log and HDR curves, gamut, levels) and the Output tone map. Off: files are read by their own tags."));
         ui.add_space(6.0);
         ui.strong("Masking");
-        ui.checkbox(&mut s.masking, "Masks tab").on_hover_text(
-            "A Masks tab in the inspector: draw masks on a clip (rectangle, ellipse, brush, magic select, fill, or a black-and-white picture), then give properties their own value inside them or run effects only there.",
-        );
+        ui.checkbox(&mut s.masking, tr("Masks tab")).on_hover_text(tr("A Masks tab in the inspector: draw masks on a clip (rectangle, ellipse, brush, magic select, fill, or a black-and-white picture), then give properties their own value inside them or run effects only there."));
         ui.add_space(6.0);
-        ui.label("Default curve for new keyframes");
+        ui.label(tr("Default curve for new keyframes"));
         ui.horizontal(|ui| {
             let label = |c: CurveShape| match c {
                 CurveShape::Linear => "Linear",
@@ -113,26 +116,54 @@ impl App {
                 }
             });
             let powered = matches!(s.default_curve.shape, CurveShape::EaseIn | CurveShape::EaseOut | CurveShape::EaseInOut);
-            ui.add_enabled(powered, egui::Slider::new(&mut s.default_curve.power, 1.0..=5.0).step_by(0.1).text("power"));
+            ui.add_enabled(powered, egui::Slider::new(&mut s.default_curve.power, 1.0..=5.0).step_by(0.1).text(tr("power")));
         });
         curve_preview(ui, s.default_curve.interp());
         ui.add_space(6.0);
+        ui.strong(tr("Timeline"));
+        ui.checkbox(&mut s.snapping, tr("Snap to clip edges and the playhead")).on_hover_text(tr("While moving and trimming clips. Ctrl flips it while dragging."));
         ui.horizontal(|ui| {
-            ui.label("Pictures and titles last");
-            ui.add(egui::DragValue::new(&mut s.still_seconds).range(0.1..=3600.0).speed(0.1).suffix(" s"));
+            ui.label(tr("Track height"));
+            let heights = [tr("Small"), tr("Medium"), tr("Large"), tr("Extra large")];
+            let shown = heights.get(s.track_height).copied().unwrap_or(heights[1]);
+            egui::ComboBox::from_id_salt("track-height").selected_text(shown).show_ui(ui, |ui| {
+                for (i, name) in heights.iter().enumerate() {
+                    ui.selectable_value(&mut s.track_height, i, *name);
+                }
+            });
         });
-        ui.checkbox(&mut s.save_as_you_go, "Save as you go").on_hover_text("Keeps the project file up to date while you edit. The crash-recovery autosave happens either way.");
+        ui.add_space(6.0);
+        ui.checkbox(&mut s.save_as_you_go, tr("Save as you go")).on_hover_text(tr("Keeps the project file up to date while you edit. The crash-recovery autosave happens either way."));
     }
 
     fn settings_interface(&mut self, ui: &mut egui::Ui) {
+        // The language: built in (English, Spanish) or a file dropped into the locales
+        // folder. Strings are picked at startup, so it applies on the next one.
+        ui.horizontal(|ui| {
+            ui.label(tr("Language"));
+            let langs = crate::i18n::available(&crate::settings::config_dir().join("locales"));
+            let mut picked = self.settings.language.clone().unwrap_or_else(|| crate::i18n::language().to_string());
+            let was = picked.clone();
+            egui::ComboBox::from_id_salt("settings-language").selected_text(crate::i18n::name_of(&picked)).show_ui(ui, |ui| {
+                for lang in &langs {
+                    ui.selectable_value(&mut picked, lang.clone(), crate::i18n::name_of(lang));
+                }
+            });
+            if picked != was {
+                self.settings.set_language(Some(picked));
+            }
+        });
+        if self.settings.language.as_deref().is_some_and(|l| l != crate::i18n::language()) {
+            ui.label(egui::RichText::new(tr("Restart OpenAtelier to use the new language.")).small().color(crate::style::WARNING));
+        }
         let s = &mut self.settings;
         // Resizing the interface under the pointer mid-drag would move the slider away
         // from it: the size applies when you let go.
         let pending = egui::Id::new("ui-scale-pending");
         let mut scale: f32 = ui.data(|d| d.get_temp(pending)).unwrap_or(s.ui_scale);
         let r = ui
-            .add(egui::Slider::new(&mut scale, 0.6..=2.0).step_by(0.05).text("interface size").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)))
-            .on_hover_text("Applies when you let go");
+            .add(egui::Slider::new(&mut scale, 0.6..=2.0).step_by(0.05).text(tr("interface size")).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)))
+            .on_hover_text(tr("Applies when you let go"));
         if r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus()) {
             s.ui_scale = scale;
             ui.data_mut(|d| d.remove::<f32>(pending));
@@ -140,55 +171,86 @@ impl App {
             ui.data_mut(|d| d.insert_temp(pending, scale));
         }
         ui.horizontal(|ui| {
-            ui.label("Layout").on_hover_text("Where the viewer and the properties go. Each project can switch with the viewer's Vertical button, and remembers its choice.");
+            ui.label(tr("Layout")).on_hover_text(tr("Where the viewer and the properties go. Each project can switch with the viewer's Vertical button, and remembers its choice."));
             use crate::settings::Layout;
             for (l, name, tip) in [
-                (Layout::Standard, "Standard", "The viewer in the middle, the properties on the right"),
-                (Layout::Vertical, "Vertical", "For vertical video: the viewer in the tall column on the right, the properties in the middle"),
-                (Layout::Auto, "Auto", "Vertical while the format being edited is taller than it is wide"),
+                (Layout::Standard, "Standard", tr("The viewer in the middle, the properties on the right")),
+                (Layout::Vertical, "Vertical", tr("For vertical video: the viewer in the tall column on the right, the properties in the middle")),
+                (Layout::Auto, "Auto", tr("Vertical while the format being edited is taller than it is wide")),
             ] {
-                ui.selectable_value(&mut s.layout, l, name).on_hover_text(tip);
+                ui.selectable_value(&mut s.layout, l, tr(name)).on_hover_text(tr(tip));
             }
         });
-        ui.checkbox(&mut s.compact_properties, "Compact properties panel")
-            .on_hover_text("Tighter rows and smaller controls in the properties panel, so more fits without scrolling; section notes show on hover");
-        ui.checkbox(&mut s.show_performance, "Performance panel").on_hover_text("Frame times, GPU memory and renderer details under the inspector");
+        ui.checkbox(&mut s.compact_properties, tr("Compact properties panel"))
+            .on_hover_text(tr("Tighter rows and smaller controls in the properties panel, so more fits without scrolling; section notes show on hover"));
+        ui.checkbox(&mut s.show_performance, tr("Performance panel")).on_hover_text(tr("Frame times, GPU memory and renderer details under the inspector"));
     }
 
     fn settings_performance(&mut self, ui: &mut egui::Ui) {
         let s = &mut self.settings;
         let mut mb = s.vram_budget() >> 20;
-        if ui.add(egui::Slider::new(&mut mb, 256..=16384).logarithmic(true).text("GPU memory (MB)")).changed() {
+        if ui.add(egui::Slider::new(&mut mb, 256..=16384).logarithmic(true).text(tr("GPU memory (MB)"))).changed() {
             s.vram_budget_mb = Some(mb);
         }
         ui.horizontal(|ui| {
-            ui.label("Preview up to");
+            ui.label(tr("Preview up to"));
             let limits = [(720, "720p"), (1080, "1080p"), (1440, "1440p"), (2160, "4K"), (0, "Full size")];
             let shown = limits.iter().find(|l| l.0 == s.preview_limit).map_or("1080p", |l| l.1);
-            egui::ComboBox::from_id_salt("preview-limit").selected_text(shown).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("preview-limit").selected_text(tr(shown)).show_ui(ui, |ui| {
                 for (limit, name) in limits {
-                    ui.selectable_value(&mut s.preview_limit, limit, name);
+                    ui.selectable_value(&mut s.preview_limit, limit, tr(name));
                 }
             })
             .response
-            .on_hover_text("Large formats and 4K files preview at this size at most, so playback stays smooth. Exports always use the full size.");
+            .on_hover_text(tr("Large formats and 4K files preview at this size at most, so playback stays smooth. Exports always use the full size."));
+        });
+    }
+
+    /// Media: what's kept about pictures, video and sound, each in a section of its own.
+    fn settings_media(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new(tr("Images")).default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(tr("Pictures and titles last"));
+                ui.add(egui::DragValue::new(&mut self.settings.still_seconds).range(0.1..=3600.0).speed(0.1).suffix(" s"));
+            });
+        });
+        egui::CollapsingHeader::new(tr("Videos")).default_open(true).show(ui, |ui| self.settings_proxies(ui));
+        egui::CollapsingHeader::new(tr("Audio")).default_open(true).show(ui, |ui| self.settings_audio(ui));
+    }
+
+    /// Proxies: small copies of heavy footage for the viewer.
+    fn settings_proxies(&mut self, ui: &mut egui::Ui) {
+        let s = &mut self.settings;
+        ui.checkbox(&mut s.use_proxies, tr("Play proxies in the viewer"))
+            .on_hover_text(tr("Small copies of heavy footage play much more smoothly. Exports always use the original files. Turn off to judge fine detail or color."));
+        ui.checkbox(&mut s.auto_proxies, tr("Make proxies for 4K and 10-bit footage"))
+            .on_hover_text(tr("Made in the background after import (right-click a file in the media bin to make or remove one yourself)"));
+        let dir = oa_media::app_dir().join("proxies");
+        let bytes: u64 = std::fs::read_dir(&dir).map(|r| r.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(trf("Proxies on this computer: {0}", &[("0", &(crate::bytes(bytes)).to_string())])).small().weak());
+            if bytes > 0 && ui.small_button(tr("Delete all")).on_hover_text(tr("They're made again when needed")).clicked() {
+                let _ = std::fs::remove_dir_all(&dir);
+                self.proxies = crate::proxies::Proxies::default();
+                self.proxies_shown = !self.settings.use_proxies;
+            }
         });
     }
 
     fn settings_audio(&mut self, ui: &mut egui::Ui) {
         let device = self.audio.as_ref().map_or_else(|| "none open yet (it opens with the first sound)".to_string(), |a| a.device_name().to_string());
-        ui.label(egui::RichText::new(format!("Playing through: {device}")).small());
+        ui.label(egui::RichText::new(trf("Playing through: {device}", &[("device", &device.to_string())])).small());
         ui.add_space(4.0);
         let s = &mut self.settings;
-        ui.add(egui::Slider::new(&mut s.output_delay_ms, 0..=500).suffix(" ms").text("output delay"))
-            .on_hover_text("Bluetooth headphones and some TVs play sound later than they say: the picture waits this long so they line up. Wireless headphones: try 150–250 ms. Wired speakers: 0.");
-        ui.label(egui::RichText::new("If lips move before you hear the words, raise it; if the sound comes first, lower it.").small().weak());
+        ui.add(egui::Slider::new(&mut s.output_delay_ms, 0..=500).suffix(" ms").text(tr("output delay")))
+            .on_hover_text(tr("Bluetooth headphones and some TVs play sound later than they say: the picture waits this long so they line up. Wireless headphones: try 150–250 ms. Wired speakers: 0."));
+        ui.label(egui::RichText::new(tr("If lips move before you hear the words, raise it; if the sound comes first, lower it.")).small().weak());
     }
 
     fn settings_graphics(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new(format!("Using {}", self.gpu.describe())).small());
-        let video = if self.decoders.hardware() { "Media Foundation (hardware), ffmpeg for files it can't take" } else { "ffmpeg" };
-        ui.label(egui::RichText::new(format!("Video decoding: {video}")).small().weak());
+        ui.label(egui::RichText::new(trf("Using {0}", &[("0", &(self.gpu.describe()).to_string())])).small());
+        let video = if self.decoders.hardware() { tr("Media Foundation (hardware), ffmpeg for files it can't take") } else { "ffmpeg" };
+        ui.label(egui::RichText::new(trf("Video decoding: {video}", &[("video", video)])).small().weak());
         ui.add_space(4.0);
         let s = &mut self.settings;
         let apis: &[(&str, &str)] = if cfg!(windows) {
@@ -199,21 +261,21 @@ impl App {
             &[("auto", "Automatic"), ("vulkan", "Vulkan"), ("gl", "OpenGL")]
         };
         ui.horizontal(|ui| {
-            ui.label("Graphics API");
+            ui.label(tr("Graphics API"));
             let shown = apis.iter().find(|a| a.0 == s.gpu_backend).map_or("Automatic", |a| a.1);
-            egui::ComboBox::from_id_salt("gpu-api").selected_text(shown).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("gpu-api").selected_text(tr(shown)).show_ui(ui, |ui| {
                 for (id, name) in apis {
                     ui.selectable_value(&mut s.gpu_backend, id.to_string(), *name);
                 }
             })
             .response
-            .on_hover_text("Automatic picks the best one this computer has. Try another if the picture is wrong or the app won't start.");
+            .on_hover_text(tr("Automatic picks the best one this computer has. Try another if the picture is wrong or the app won't start."));
         });
         ui.horizontal(|ui| {
-            ui.label("Graphics card");
+            ui.label(tr("Graphics card"));
             let shown = if s.gpu_adapter.is_empty() { "The fastest".to_string() } else { s.gpu_adapter.clone() };
             egui::ComboBox::from_id_salt("gpu-card").selected_text(shown).width(240.0).show_ui(ui, |ui| {
-                ui.selectable_value(&mut s.gpu_adapter, String::new(), "The fastest");
+                ui.selectable_value(&mut s.gpu_adapter, String::new(), tr("The fastest"));
                 let mut seen = std::collections::BTreeSet::new();
                 for (name, _) in &self.gpu_names {
                     if seen.insert(name.clone()) {
@@ -222,16 +284,16 @@ impl App {
                 }
             })
             .response
-            .on_hover_text("On laptops with two GPUs, the dedicated one is used unless you pick another here");
+            .on_hover_text(tr("On laptops with two GPUs, the dedicated one is used unless you pick another here"));
         });
-        ui.checkbox(&mut s.decode_with_ffmpeg, "Decode video with ffmpeg")
-            .on_hover_text("Instead of the system's hardware decoder. For drivers that show glitches, green frames or wrong colors.");
+        ui.checkbox(&mut s.decode_with_ffmpeg, tr("Decode video with ffmpeg"))
+            .on_hover_text(tr("Instead of the system's hardware decoder. For drivers that show glitches, green frames or wrong colors."));
         let running = oa_gpu::GpuPreference::new(&s.gpu_backend, &s.gpu_adapter);
         let pending = running.backend.is_some_and(|b| b != self.gpu.info.backend)
             || running.adapter.as_ref().is_some_and(|a| !self.gpu.info.name.to_lowercase().contains(&a.to_lowercase()))
             || (cfg!(windows) && s.decode_with_ffmpeg != self.decoders.force_ffmpeg);
         if pending {
-            ui.label(egui::RichText::new("Restart OpenAtelier to use these.").small().color(crate::style::WARNING));
+            ui.label(egui::RichText::new(tr("Restart OpenAtelier to use these.")).small().color(crate::style::WARNING));
         }
     }
 }
@@ -244,23 +306,23 @@ enum Page {
     Interface,
     Performance,
     Graphics,
-    Audio,
+    Media,
     Updates,
     Tracker,
 }
 
 impl Page {
-    const ALL: [Page; 7] = [Page::Editing, Page::Interface, Page::Performance, Page::Graphics, Page::Audio, Page::Updates, Page::Tracker];
+    const ALL: [Page; 7] = [Page::Editing, Page::Interface, Page::Media, Page::Performance, Page::Graphics, Page::Updates, Page::Tracker];
 
     fn name(self) -> &'static str {
         match self {
-            Page::Editing => "Editing",
-            Page::Interface => "Interface",
-            Page::Performance => "Performance",
-            Page::Graphics => "Graphics",
-            Page::Audio => "Audio",
-            Page::Updates => "Updates",
-            Page::Tracker => "AI tracker",
+            Page::Editing => tr("Editing"),
+            Page::Interface => tr("Interface"),
+            Page::Performance => tr("Performance"),
+            Page::Graphics => tr("Graphics"),
+            Page::Media => tr("Media"),
+            Page::Updates => tr("Updates"),
+            Page::Tracker => tr("AI tracker"),
         }
     }
 }

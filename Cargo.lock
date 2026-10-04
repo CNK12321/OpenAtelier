@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "oa-app"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "eframe",
  "oa-audio",
@@ -2352,12 +2352,13 @@ dependencies = [
  "sha2",
  "wgpu",
  "windows",
+ "windows-core",
  "winresource",
 ]
 
 [[package]]
 name = "oa-audio"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "cpal",
  "oa-doc",
@@ -2369,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "oa-captions"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2377,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "oa-cli"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "oa-audio",
  "oa-doc",
@@ -2396,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "oa-doc"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "oa-params",
  "oa-time",
@@ -2406,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "oa-edit"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "oa-doc",
  "oa-graph",
@@ -2417,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "oa-export"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "oa-audio",
  "oa-doc",
@@ -2427,13 +2428,14 @@ dependencies = [
  "oa-params",
  "oa-plan",
  "oa-time",
+ "serde_json",
  "wgpu",
  "windows",
 ]
 
 [[package]]
 name = "oa-gpu"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "bytemuck",
  "oa-doc",
@@ -2448,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "oa-graph"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "oa-params",
  "oa-script",
@@ -2461,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "oa-media"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "oa-gpu",
  "oa-graph",
@@ -2476,7 +2478,7 @@ dependencies = [
 
 [[package]]
 name = "oa-params"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "oa-time",
  "serde",
@@ -2485,7 +2487,7 @@ dependencies = [
 
 [[package]]
 name = "oa-plan"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "oa-doc",
  "oa-graph",
@@ -2496,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "oa-script"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -2508,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "oa-text"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "ab_glyph",
  "epaint_default_fonts",
@@ -2519,14 +2521,14 @@ dependencies = [
 
 [[package]]
 name = "oa-time"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "oa-track"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "oa-captions",
  "serde",
