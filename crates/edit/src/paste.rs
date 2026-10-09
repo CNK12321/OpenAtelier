@@ -48,9 +48,7 @@ pub fn paste_into_track(p: &Project, seq: SeqId, track_id: TrackId, clips: &[(Tr
         let mut copy = item.clone();
         copy.id = ItemId(alloc());
         copy.range = TimeRange::new(at + offset, len);
-        for fx in &mut copy.effects {
-            fx.id = oa_doc::EffectId(alloc());
-        }
+        copy.renumber_effects(alloc);
         copy.group = item.group.map(|g| *groups.entry(g).or_insert_with(&mut *alloc));
         ids.push(copy.id);
         ops.push(Op::InsertItem { seq, track: track_id, item: copy });

@@ -29,11 +29,16 @@ pub struct RotoClick {
     pub t: Time,
     pub at: [f64; 2],
     pub include: bool,
+    /// The document's undo depth when it was placed: Ctrl+Z takes clicks back only while
+    /// nothing was edited since (after a run, it undoes the run first).
+    pub depth: usize,
 }
 
 /// The tool's state.
 pub struct RotoState {
     pub clicks: Vec<RotoClick>,
+    /// Clicks taken back with Ctrl+Z, for Ctrl+Shift+Z.
+    pub undone: Vec<RotoClick>,
     /// The whole clip, or `before`/`after` seconds around the clicked frame.
     pub whole: bool,
     pub before: f64,
@@ -52,6 +57,7 @@ impl Default for RotoState {
     fn default() -> Self {
         RotoState {
             clicks: Vec::new(),
+            undone: Vec::new(),
             whole: true,
             before: 2.0,
             after: 2.0,
@@ -89,30 +95,112 @@ impl App {
     /// `at` (a fraction of its picture). Clicks on another frame start over.
     pub(crate) fn roto_click(&mut self, item: ItemId, at: [f64; 2], include: bool) {
         let t = self.playhead;
+        let depth = self.editor.doc.undo_depth();
         let r = &mut self.masks.roto;
         r.clicks.retain(|c| c.item == item && c.t == t);
-        r.clicks.push(RotoClick { item, t, at, include });
+        r.clicks.push(RotoClick { item, t, at, include, depth });
+        r.undone.clear();
         r.note = None;
     }
 
-    /// The clicks drawn over the picture (green: the thing; red: not it), while the
-    /// playhead is on their frame.
+    /// Whether the Rotoscope tool is the one in use (the Masks tab open).
+    fn rotoscoping(&self) -> bool {
+        self.settings.masking && self.inspector_tab == crate::inspector::Tab::Masks && self.masks.tool == crate::masks::Tool::Rotoscope
+    }
+
+    /// Ctrl+Z with the Rotoscope tool: its last click goes, if nothing was edited since
+    /// it was placed (otherwise the edit is undone, as usual). Returns whether it took one.
+    pub(crate) fn undo_roto_click(&mut self) -> bool {
+        let depth = self.editor.doc.undo_depth();
+        let r = &self.masks.roto;
+        if !self.rotoscoping() || r.run.is_some() || r.clicks.last().is_none_or(|c| c.depth != depth) {
+            return false;
+        }
+        if let Some(c) = self.masks.roto.clicks.pop() {
+            self.set_playhead(c.t);
+            self.masks.roto.undone.push(c);
+        }
+        true
+    }
+
+    /// Ctrl+Shift+Z after [`App::undo_roto_click`]: the click comes back, if nothing was
+    /// edited since. Returns whether it brought one.
+    pub(crate) fn redo_roto_click(&mut self) -> bool {
+        let depth = self.editor.doc.undo_depth();
+        if !self.rotoscoping() || self.masks.roto.undone.last().is_none_or(|c| c.depth != depth) {
+            return false;
+        }
+        if let Some(c) = self.masks.roto.undone.pop() {
+            self.set_playhead(c.t);
+            self.masks.roto.clicks.push(c);
+        }
+        true
+    }
+
+    /// The clicks drawn over the picture, while the playhead is on their frame: a green
+    /// dot with a + on the thing to cut out, a red one with a − on what to leave out.
     pub(crate) fn paint_roto_clicks(&self, painter: &egui::Painter, item: ItemId, screen_of: &dyn Fn([f64; 2]) -> egui::Pos2) {
         for c in self.masks.roto.clicks.iter().filter(|c| c.item == item && c.t == self.playhead) {
             let at = screen_of(c.at);
-            let color = if c.include { egui::Color32::from_rgb(80, 220, 120) } else { egui::Color32::from_rgb(240, 80, 80) };
-            painter.circle(at, 6.0, color, egui::Stroke::new(1.5, egui::Color32::BLACK));
-            let s = egui::Stroke::new(1.5, egui::Color32::BLACK);
-            painter.line_segment([at - egui::vec2(3.0, 0.0), at + egui::vec2(3.0, 0.0)], s);
+            let color = if c.include { egui::Color32::from_rgb(52, 199, 89) } else { egui::Color32::from_rgb(235, 72, 72) };
+            painter.circle_filled(at + egui::vec2(0.0, 1.5), 9.5, egui::Color32::from_black_alpha(90));
+            painter.circle(at, 8.0, color, egui::Stroke::new(2.0, egui::Color32::WHITE));
+            let s = egui::Stroke::new(2.0, egui::Color32::WHITE);
+            painter.line_segment([at - egui::vec2(3.5, 0.0), at + egui::vec2(3.5, 0.0)], s);
             if c.include {
-                painter.line_segment([at - egui::vec2(0.0, 3.0), at + egui::vec2(0.0, 3.0)], s);
+                painter.line_segment([at - egui::vec2(0.0, 3.5), at + egui::vec2(0.0, 3.5)], s);
             }
         }
     }
 
-    /// The tool's panel in the Masks tab: setup, the model, how long, softness, and
-    /// the run.
-    pub(crate) fn roto_panel(&mut self, ui: &mut egui::Ui, item: ItemId, mask: u64, native: [f64; 2]) {
+    /// Over the viewer while rotoscoping: what to do next, and the button that does it —
+    /// or, while SAM 2 runs, how far along it is.
+    pub(crate) fn roto_banner(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        if !self.rotoscoping() {
+            return;
+        }
+        let Some(item) = self.selection.filter(|i| self.maskable(*i)) else { return };
+        let width = (area.width() - 120.0).clamp(220.0, 460.0);
+        let rect = egui::Rect::from_min_size(egui::pos2(area.center().x - width / 2.0, area.top() + 8.0), egui::vec2(width, 36.0));
+        let v = ui.visuals().clone();
+        ui.painter().add(egui::epaint::Shadow { offset: [0, 2], blur: 10, spread: 0, color: egui::Color32::from_black_alpha(90) }.as_shape(rect, 8.0));
+        ui.painter().rect(rect, 8.0, v.window_fill.gamma_multiply(0.96), egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
+        // The banner takes the pointer: clicking it doesn't place a point.
+        ui.interact(rect, ui.id().with("roto-banner"), egui::Sense::click_and_drag());
+        let inner = rect.shrink2(egui::vec2(10.0, 4.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+            crate::icons::paint(ui.painter(), r, crate::icons::TOOL_ROTO, crate::style::ACCENT);
+            if let Some(run) = &self.masks.roto.run {
+                ui.add(egui::ProgressBar::new(run.progress.unwrap_or(0.0)).desired_width(inner.width() - 120.0).text(run.step.clone()).animate(run.progress.is_none()));
+                if ui.small_button(tr("Cancel")).clicked() {
+                    run.job.cancel();
+                }
+                return;
+            }
+            let here: Vec<&RotoClick> = self.masks.roto.clicks.iter().filter(|c| c.item == item && c.t == self.playhead).collect();
+            let ready = here.iter().any(|c| c.include);
+            let text = if here.is_empty() {
+                tr("Click what to cut out · Alt-click what to leave out").to_string()
+            } else {
+                let (yes, no) = (here.iter().filter(|c| c.include).count(), here.iter().filter(|c| !c.include).count());
+                trf("{yes} on it · {no} left out · Ctrl+Z takes one back", &[("yes", &yes.to_string()), ("no", &no.to_string())])
+            };
+            ui.label(egui::RichText::new(text).small());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let go = ui.add_enabled(ready, egui::Button::new(egui::RichText::new(tr("Rotoscope")).strong().color(egui::Color32::WHITE)).fill(crate::style::ACCENT));
+                if go.on_hover_text(tr("Find its outline on every frame, into the selected mask")).on_disabled_hover_text(tr("Click on the thing to cut out first")).clicked() {
+                    let native = self.mask_placement(item, self.playhead).map_or([1920.0, 1080.0], |p| p.native);
+                    let mask = self.masks.selected.unwrap_or(0);
+                    self.start_roto(item, mask, native);
+                }
+            });
+        });
+    }
+
+    /// The tool's panel in the Masks tab: setup, then the model, how long, how much
+    /// detail and how soft. The clicks and the run are in the viewer's banner.
+    pub(crate) fn roto_panel(&mut self, ui: &mut egui::Ui, item: ItemId) {
         let roto = roto();
         let model = self.sam_model();
         if !roto.is_installed() || !roto.has_model(model) || self.masks.roto.setup.is_some() {
@@ -139,7 +227,8 @@ impl App {
         let rate = self.editor.sequence().rate.as_f64();
         let clip_len = self.editor.item(item).map_or(0.0, |i| i.range.duration.as_seconds_f64());
         let installed = roto.models();
-        ui.horizontal(|ui| {
+        let compact = self.settings.compact_properties;
+        egui::Grid::new("roto-settings").num_columns(2).spacing([10.0, if compact { 3.0 } else { 6.0 }]).show(ui, |ui| {
             ui.label(tr("Model"));
             let mut chosen = model;
             egui::ComboBox::from_id_salt("sam-model").selected_text(chosen.name()).show_ui(ui, |ui| {
@@ -152,53 +241,65 @@ impl App {
                 self.settings.sam_model = chosen.key().into();
                 self.settings.save();
             }
-        });
-        let r = &mut self.masks.roto;
-        ui.checkbox(&mut r.whole, tr("The whole clip")).on_hover_text(tr("Off: only a stretch around the clicked frame"));
-        if !r.whole {
+            ui.end_row();
+
+            let r = &mut self.masks.roto;
+            ui.label(tr("Range"));
             ui.horizontal(|ui| {
-                ui.label(tr("Before"));
-                ui.add(egui::DragValue::new(&mut r.before).range(0.0..=600.0).speed(0.05).suffix(" s"));
-                ui.label(tr("After"));
-                ui.add(egui::DragValue::new(&mut r.after).range(0.0..=600.0).speed(0.05).suffix(" s"));
+                if crate::widgets::chip(ui, r.whole, tr("Whole clip")).clicked() {
+                    r.whole = true;
+                }
+                if crate::widgets::chip(ui, !r.whole, tr("Around here")).on_hover_text(tr("Only a stretch around the clicked frame")).clicked() {
+                    r.whole = false;
+                }
             });
-        }
-        ui.horizontal(|ui| {
-            ui.label(tr("Detail"));
-            for (k, name, tip) in [(1, "Every frame", tr("Most exact, slowest")), (2, "Every 2nd", tr("About twice as fast; each outline holds for two frames")), (4, "Every 4th", tr("Fastest; for slow movement"))] {
-                ui.selectable_value(&mut r.detail, k, tr(name)).on_hover_text(tr(tip));
+            ui.end_row();
+            if !r.whole {
+                ui.label("");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut r.before).range(0.0..=600.0).speed(0.05).prefix(tr("before ")).suffix(" s"));
+                    ui.add(egui::DragValue::new(&mut r.after).range(0.0..=600.0).speed(0.05).prefix(tr("after ")).suffix(" s"));
+                });
+                ui.end_row();
             }
+
+            ui.label(tr("Detail"));
+            ui.horizontal(|ui| {
+                for (k, name, tip) in [(1, "Every frame", tr("Most exact, slowest")), (2, "Every 2nd", tr("About twice as fast; each outline holds for two frames")), (4, "Every 4th", tr("Fastest; for slow movement"))] {
+                    if crate::widgets::chip(ui, r.detail == k, tr(name)).on_hover_text(tr(tip)).clicked() {
+                        r.detail = k;
+                    }
+                }
+            });
+            ui.end_row();
+
+            ui.label(tr("Softness"));
+            let mut px = self.settings.roto_softness_px;
+            ui.add(egui::Slider::new(&mut px, 0.0..=40.0).suffix(" px"))
+                .on_hover_text(tr("How far the edge fades out. It's the shape's feather, so it can be changed after, under Shapes."));
+            if (px - self.settings.roto_softness_px).abs() > 1e-9 {
+                self.settings.roto_softness_px = px;
+                self.settings.save();
+            }
+            ui.end_row();
         });
+        let r = &self.masks.roto;
         let seconds = if r.whole { clip_len } else { r.before + r.after };
         let frames = (seconds * rate / r.detail.max(1) as f64).ceil() as usize + 1;
         if frames > MAX_FRAMES {
             ui.label(egui::RichText::new(trf("That's {frames} frames; up to {MAX_FRAMES} are done, spread over it. Less time or less detail keeps every one.", &[("frames", &frames.to_string()), ("MAX_FRAMES", &MAX_FRAMES.to_string())])).small().color(crate::style::WARNING));
         }
-        let mut px = self.settings.roto_softness_px;
-        ui.add(egui::Slider::new(&mut px, 0.0..=40.0).text(tr("softness")).suffix(" px"))
-            .on_hover_text(tr("How far the edge fades out. It's the shape's feather, so it can be changed after, under Shapes."));
-        if (px - self.settings.roto_softness_px).abs() > 1e-9 {
-            self.settings.roto_softness_px = px;
-            self.settings.save();
-        }
-        let r = &self.masks.roto;
-        let here: Vec<&RotoClick> = r.clicks.iter().filter(|c| c.item == item && c.t == self.playhead).collect();
-        if here.is_empty() {
-            ui.label(egui::RichText::new(tr("Click what to cut out in the picture (Alt-click what to leave out). The outline is found from this frame, forward and back.")).small());
-        } else {
-            let (yes, no) = (here.iter().filter(|c| c.include).count(), here.iter().filter(|c| !c.include).count());
-            ui.label(egui::RichText::new(trf("{yes} point{0} on it, {no} left out.", &[("yes", &(yes).to_string()), ("0", (if yes == 1 { "" } else { "s" })), ("no", &(no).to_string())])).small());
-        }
         if let Some(note) = &r.note {
             ui.label(egui::RichText::new(note).small().color(crate::style::WARNING));
         }
-        let (ready, any) = (here.iter().any(|c| c.include), !here.is_empty());
+        let any = r.clicks.iter().any(|c| c.item == item && c.t == self.playhead);
         ui.horizontal(|ui| {
-            if ui.add_enabled(ready, egui::Button::new(tr("Rotoscope"))).on_hover_text(tr("Find its outline on every frame, into this mask")).clicked() {
-                self.start_roto(item, mask, native);
+            if !compact {
+                ui.label(egui::RichText::new(tr("Click on the picture, then Rotoscope in the bar over the viewer.")).small().weak());
             }
             if any && ui.small_button(tr("Clear points")).clicked() {
                 self.masks.roto.clicks.clear();
+                self.masks.roto.undone.clear();
             }
         });
     }
@@ -412,7 +513,7 @@ impl App {
             }
         }
         self.editor.apply("Rotoscope", vec![Op::SetMasks { seq: self.editor.seq, item: run.clip, masks }]).map_err(|e| e.to_string())?;
-        self.masks.roto.clicks.clear();
+        // The clicks stay: undo the result, and they're there to change and run again.
         Ok(n)
     }
 

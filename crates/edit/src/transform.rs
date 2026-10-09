@@ -418,6 +418,16 @@ fn param_home<'a>(p: &'a Project, seq: SeqId, it: &'a Item, viewed: VariantId, s
     }
 }
 
+/// Where `param` of `item` is edited from format `viewed` — the same place
+/// [`write_param`] writes to: its override there, or as `scope` says. Its keyframe
+/// diamond and menu work on this, so keys go where the edits go.
+pub fn param_target(p: &Project, seq: SeqId, item: ItemId, viewed: VariantId, scope: Scope, param: &str) -> ParamTarget {
+    match locate(p, seq, item) {
+        Ok((it, _)) => param_home(p, seq, it, viewed, scope, param).0,
+        Err(_) => ParamTarget::Item,
+    }
+}
+
 /// Sets `param` to `value` at timeline time `t`, keyframe-aware, writing to wherever the
 /// value seen in `viewed` comes from:
 /// * if `viewed` already overrides the param, that override is edited;
@@ -440,6 +450,8 @@ pub fn write_param(
     let source = match existing {
         Some(src) => {
             let mut src = src.clone();
+            // Keys left outside the clip (by a split) don't pull on this one.
+            src.confine(it.range.duration);
             src.set_at(&ctx, value);
             src
         }

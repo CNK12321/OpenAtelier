@@ -186,7 +186,8 @@ impl App {
             let here = self.bin.folder.clone();
             cards.retain(|c| c.folder == here);
         } else {
-            cards.retain(|c| c.name.to_lowercase().contains(&needle));
+            // Every word somewhere in its name or what it is ("mp4", "4K", "0:12").
+            cards.retain(|c| matches(&needle, &[&c.name, &c.detail]));
         }
         let kind_rank = |c: &Card| if c.compound { 3 } else { c.kind as u8 as i32 };
         match self.bin.sort {
@@ -528,23 +529,27 @@ impl App {
                 }
             });
         });
-        // One row: the order on the right, the search filling the rest (it used to wrap
-        // the arrow onto a line of its own).
+        // One row: the search filling what the order (on the right) leaves.
+        ui.add_space(crate::style::GAP_S);
         ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let arrow = if self.bin.descending { "↓" } else { "↑" };
-                if crate::widgets::chip(ui, false, arrow).on_hover_text(tr("Reverse the order")).clicked() {
-                    self.bin.descending = !self.bin.descending;
+            let sort_width = 76.0 + 26.0 + 2.0 * ui.spacing().item_spacing.x;
+            let hint = match self.bin.tab {
+                BinTab::Project => tr("Search media"),
+                BinTab::Compounds => tr("Search compound clips"),
+                BinTab::Assets => tr("Search assets"),
+            };
+            crate::widgets::search_field(ui, &mut self.bin.search, hint, ui.available_width() - sort_width);
+            egui::ComboBox::from_id_salt("bin-sort").width(70.0).selected_text(self.bin.sort.label()).show_ui(ui, |ui| {
+                for s in BinSort::ALL {
+                    ui.selectable_value(&mut self.bin.sort, s, s.label());
                 }
-                egui::ComboBox::from_id_salt("bin-sort").width(70.0).selected_text(self.bin.sort.label()).show_ui(ui, |ui| {
-                    for s in BinSort::ALL {
-                        ui.selectable_value(&mut self.bin.sort, s, s.label());
-                    }
-                });
-                ui.add(egui::TextEdit::singleline(&mut self.bin.search).hint_text(tr("Search")).desired_width(ui.available_width()));
             });
+            let arrow = if self.bin.descending { "↓" } else { "↑" };
+            if crate::widgets::chip(ui, false, arrow).on_hover_text(tr("Reverse the order")).clicked() {
+                self.bin.descending = !self.bin.descending;
+            }
         });
-        ui.separator();
+        ui.add_space(crate::style::GAP_S);
         if self.bin.tab == BinTab::Assets {
             self.assets_panel(ui);
             return;
@@ -568,7 +573,7 @@ impl App {
         let cards = self.bin_cards();
         if cards.is_empty() && loading.is_empty() {
             let text = match (self.bin.search.trim().is_empty(), compounds) {
-                (false, _) => "Nothing matches.",
+                (false, _) => tr("Nothing matches."),
                 (true, true) => tr("No compound clips yet — select clips on the timeline and group them into one."),
                 (true, false) => tr("Nothing imported yet — drop files or folders here, or use Import."),
             };
@@ -913,8 +918,16 @@ impl App {
             );
         }
 
-        let folders = self.assets.child_folders(&here);
-        let items: Vec<crate::assets::Asset> = self.assets.in_folder(&here).cloned().collect();
+        // Searching looks through the whole library; otherwise the folder you're in.
+        let needle = self.bin.search.trim().to_lowercase();
+        let (folders, items): (Vec<(String, usize)>, Vec<crate::assets::Asset>) = if needle.is_empty() {
+            (self.assets.child_folders(&here), self.assets.in_folder(&here).cloned().collect())
+        } else {
+            (Vec::new(), self.assets.items.iter().filter(|a| matches(&needle, &[&a.name, &a.folder])).cloned().collect())
+        };
+        if !needle.is_empty() && items.is_empty() {
+            ui.label(egui::RichText::new(tr("Nothing matches.")).weak());
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
@@ -1088,6 +1101,12 @@ impl App {
 /// How wide the bin's column of tabs is.
 const TAB_STRIP: f32 = crate::style::ICON + 2.0;
 
+/// Whether every word of `needle` (already lowercase) is in one of `fields`.
+fn matches(needle: &str, fields: &[&str]) -> bool {
+    let fields: Vec<String> = fields.iter().map(|f| f.to_lowercase()).collect();
+    needle.split_whitespace().all(|word| fields.iter().any(|f| f.contains(word)))
+}
+
 /// The media in `dir` and the folders inside it, to import into the bin folder
 /// `parent`: (bin folder, its files), the folder named after `dir` first. Hidden files
 /// and folders are skipped, and it goes no more than eight folders deep.
@@ -1120,6 +1139,16 @@ pub(crate) fn media_in_folder(dir: &std::path::Path, parent: &str) -> Vec<(Strin
 
 #[cfg(test)]
 mod tests {
+    /// Every word typed has to be somewhere: in the name, or in what the file is.
+    #[test]
+    fn search_matches_every_word_anywhere() {
+        let card = ["Beach Trip.mp4", "video · 3840×2160 · 0:12"];
+        assert!(super::matches("beach", &card));
+        assert!(super::matches("trip 3840", &card), "words in different places");
+        assert!(super::matches("", &card));
+        assert!(!super::matches("beach wav", &card));
+    }
+
     /// A folder comes in as a bin folder of its name, its folders inside it; only media
     /// is taken, and hidden things are left alone.
     #[test]

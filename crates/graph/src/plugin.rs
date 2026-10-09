@@ -241,6 +241,10 @@ struct EffectDef {
     /// Settings for its preview in the picker, by parameter id.
     #[serde(default)]
     preview: serde_json::Map<String, serde_json::Value>,
+    /// Its off state, by parameter id ({"radius": 0}): where it does nothing. An effect
+    /// with one is offered as an intro and an outro too, easing from full to off.
+    #[serde(default)]
+    off: serde_json::Map<String, serde_json::Value>,
     /// A host editor: "surface", "equalizer" or "color".
     #[serde(default)]
     editor: Option<String>,
@@ -494,8 +498,14 @@ impl EffectDef {
             let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
             preview.push((ParamId::new(&id), def.into_schema().map_err(|e| format!("{where_}: preview: {e}"))?.default));
         }
+        let mut off = Vec::new();
+        for (id, v) in self.off {
+            let Some(p) = params.iter().find(|p| p.id.as_str() == id) else { return Err(format!("{where_}: \"off\" sets \"{id}\", which isn't one of its parameters")) };
+            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
+            off.push((ParamId::new(&id), def.into_schema().map_err(|e| format!("{where_}: off: {e}"))?.default));
+        }
         if let Some(e) = &self.editor
-            && ![crate::registry::EDITOR_SURFACE, crate::registry::EDITOR_EQUALIZER, crate::registry::EDITOR_COLOR].contains(&e.as_str())
+            && ![crate::registry::EDITOR_SURFACE, crate::registry::EDITOR_EQUALIZER, crate::registry::EDITOR_COLOR, crate::registry::EDITOR_LINE].contains(&e.as_str())
         {
             return Err(format!("{where_}: unknown editor \"{e}\""));
         }
@@ -548,6 +558,7 @@ impl EffectDef {
         d.description = self.description;
         d.category = self.category;
         d.preview = preview;
+        d.off = off;
         d.editor = self.editor;
         d.meter = self.meter;
         d.latency = self.latency.max(0.0);

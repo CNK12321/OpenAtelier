@@ -102,6 +102,8 @@ pub struct Masks {
     pub(crate) job: Option<Job>,
     /// The Rotoscope tool (`roto.rs`).
     pub roto: crate::roto::RotoState,
+    /// Each mask's preview, and what it was made from (`App::mask_thumb`).
+    pub(crate) thumbs: std::collections::HashMap<u64, (u64, egui::TextureHandle)>,
 }
 
 impl Default for Masks {
@@ -125,6 +127,7 @@ impl Default for Masks {
             paste: None,
             job: None,
             roto: Default::default(),
+            thumbs: Default::default(),
         }
     }
 }
@@ -254,26 +257,17 @@ impl App {
     pub(crate) fn masks_tab(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
         self.poll_mask_job();
         let Some(it) = self.editor.item(item).cloned() else { return };
-        ui.label(
-            egui::RichText::new(tr("Masks are drawn on the clip and move with it. Right-click a property (Opacity…) → With mask, or an effect's name → Use with mask. Bounded text effects can't be masked."))
-                .small()
-                .weak(),
-        );
-        ui.add_space(crate::style::GAP_S);
+        let compact = crate::inspector::compact(ui);
+        if !compact {
+            ui.label(egui::RichText::new(tr("Masks are drawn on the clip and move with it. Right-click a property (Opacity…) → With mask, or an effect's name → Use with mask. Bounded text effects can't be masked.")).small().weak());
+            ui.add_space(crate::style::GAP_S);
+        }
         if self.masks.selected.is_none_or(|s| !it.masks.iter().any(|m| m.id == s)) {
             self.masks.selected = it.masks.first().map(|m| m.id);
         }
         ui.horizontal(|ui| {
-            if ui.button(tr("+ New mask")).on_hover_text(tr("An empty mask; draw it with the tools below")).clicked() {
-                let id = self.editor.doc.alloc_id();
-                let n = it.masks.len() + 1;
-                let mut masks = it.masks.clone();
-                masks.push(Mask { id, name: format!("Mask {n}"), enabled: true, invert: false, mode: MaskMode::Add, shapes: Vec::new(), frame: [1.0, 1.0] });
-                self.apply_or_report("New mask", vec![Op::SetMasks { seq: self.editor.seq, item, masks }]);
-                self.masks.selected = Some(id);
-                if self.masks.tool == Tool::Select {
-                    self.masks.tool = Tool::Rect;
-                }
+            if crate::icons::text_button(ui, crate::icons::ADD, tr("New mask"), true).on_hover_text(tr("An empty mask; draw it with the tools on the left of the viewer")).clicked() {
+                self.new_mask(item);
             }
             let pastable = self.masks.clipboard.is_some();
             if ui.add_enabled(pastable, egui::Button::new(tr("Paste mask"))).on_hover_text(tr("The copied mask, onto the selected clips")).clicked() {
@@ -281,55 +275,95 @@ impl App {
                 self.paste_mask(targets);
             }
         });
+        ui.add_space(crate::style::GAP_S);
+        // One card per mask: its preview, name and how it joins the ones above; the one
+        // being drawn is lit. Click a card's preview or name to draw in it.
         let mut remove = None;
         let mut copy = None;
-        for m in &it.masks {
-            ui.horizontal(|ui| {
-                let mut on = m.enabled;
-                if ui.checkbox(&mut on, tr("")).on_hover_text(if on { "Turn off" } else { "Turn on" }).changed() {
-                    self.edit_mask(item, m.id, "Toggle mask", None, |m| m.enabled = on);
-                }
-                let chosen = self.masks.selected == Some(m.id);
-                let mut name = m.name.clone();
-                if chosen {
-                    let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(120.0));
-                    if r.changed() {
-                        self.edit_mask(item, m.id, "Rename mask", Some("mask-rename"), |m| m.name = name);
+        for (index, m) in it.masks.iter().enumerate() {
+            let chosen = self.masks.selected == Some(m.id);
+            let v = ui.visuals().clone();
+            let (fill, stroke) = if chosen {
+                (crate::style::ACCENT.gamma_multiply(0.14), egui::Stroke::new(1.5, crate::style::ACCENT))
+            } else {
+                (v.faint_bg_color, egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color))
+            };
+            let card = egui::Frame::NONE.fill(fill).stroke(stroke).corner_radius(if compact { 6.0 } else { 8.0 }).inner_margin(if compact { egui::Margin::symmetric(6, 3) } else { egui::Margin::symmetric(8, 6) }).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (area, r) = ui.allocate_exact_size(egui::vec2(if compact { THUMB_W * 0.75 } else { THUMB_W }, if compact { 28.0 } else { 40.0 }), egui::Sense::click());
+                    let thumb = self.thumb_rect(item, egui::pos2(area.left(), area.center().y), area.height(), area.width());
+                    self.paint_mask_thumb(ui, thumb, item, m, chosen);
+                    if r.on_hover_text(tr("Draw in this mask")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.masks.selected = Some(m.id);
                     }
-                    if r.lost_focus() {
-                        self.editor.doc.seal();
-                    }
-                } else if ui.selectable_label(false, &m.name).clicked() {
-                    self.masks.selected = Some(m.id);
-                }
-                let mut invert = m.invert;
-                if ui.checkbox(&mut invert, tr("invert")).on_hover_text(tr("Everything outside what's drawn instead")).changed() {
-                    self.edit_mask(item, m.id, "Invert mask", None, |m| m.invert = invert);
-                }
-                // How it joins the masks above it (the first has none above).
-                if it.masks.first().map(|f| f.id) != Some(m.id) || m.mode != MaskMode::Add {
-                    let mut mode = m.mode;
-                    egui::ComboBox::from_id_salt(("mask-mode", m.id)).width(84.0).selected_text(tr(mode.name())).show_ui(ui, |ui| {
-                        for option in MaskMode::ALL {
-                            ui.selectable_value(&mut mode, option, tr(option.name()));
+                    ui.vertical(|ui| {
+                        let mut name = m.name.clone();
+                        if chosen {
+                            let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(130.0));
+                            if r.changed() {
+                                self.edit_mask(item, m.id, "Rename mask", Some("mask-rename"), |m| m.name = name);
+                            }
+                            if r.lost_focus() {
+                                self.editor.doc.seal();
+                            }
+                        } else {
+                            let color = if m.enabled { v.text_color() } else { v.weak_text_color() };
+                            let r = ui.add(egui::Label::new(egui::RichText::new(&m.name).strong().color(color)).sense(egui::Sense::click()));
+                            if r.on_hover_text(tr("Draw in this mask")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                self.masks.selected = Some(m.id);
+                            }
                         }
-                    })
-                    .response
-                    .on_hover_text(tr("How it joins the masks above it where several are used together: added, taken away, only where both are, or where just one is"));
-                    if mode != m.mode {
-                        self.edit_mask(item, m.id, "Mask mode", None, |m| m.mode = mode);
-                    }
-                }
-                ui.label(egui::RichText::new(trf("{0} shapes", &[("0", &(m.shapes.len()).to_string())])).small().weak());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(tr("✕")).on_hover_text(tr("Delete this mask")).clicked() {
-                        remove = Some(m.id);
-                    }
-                    if ui.small_button(tr("Copy")).on_hover_text(tr("Copy this mask (and its keyframes) to paste on other clips")).clicked() {
-                        copy = Some(m.id);
-                    }
+                        ui.horizontal(|ui| {
+                            if chosen {
+                                ui.label(egui::RichText::new(tr("Drawing")).small().color(crate::style::ACCENT));
+                            }
+                            ui.label(egui::RichText::new(trf("{0} shapes", &[("0", &(m.shapes.len()).to_string())])).small().weak());
+                            // How it joins the masks above it (the first has none above).
+                            if index > 0 || m.mode != MaskMode::Add {
+                                let mut mode = m.mode;
+                                egui::ComboBox::from_id_salt(("mask-mode", m.id))
+                                    .width(76.0)
+                                    .selected_text(tr(mode.name()))
+                                    .show_ui(ui, |ui| {
+                                        for option in MaskMode::ALL {
+                                            ui.selectable_value(&mut mode, option, tr(option.name()));
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(tr("How it joins the masks above it where several are used together: added, taken away, only where both are, or where just one is"));
+                                if mode != m.mode {
+                                    self.edit_mask(item, m.id, "Mask mode", None, |m| m.mode = mode);
+                                }
+                            }
+                        });
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if crate::icons::button(ui, crate::icons::DELETE, tr("Delete this mask"), "", true).clicked() {
+                            remove = Some(m.id);
+                        }
+                        if crate::icons::button(ui, crate::icons::DUPLICATE, tr("Copy this mask (and its keyframes) to paste on other clips"), "", true).clicked() {
+                            copy = Some(m.id);
+                        }
+                        let tip = if m.invert { tr("Inverted: everything outside what's drawn. Click to use what's drawn.") } else { tr("Invert: everything outside what's drawn instead") };
+                        if lit_icon(ui, crate::icons::INVERT, m.invert, tip).clicked() {
+                            let invert = !m.invert;
+                            self.edit_mask(item, m.id, "Invert mask", None, |m| m.invert = invert);
+                        }
+                        let (icon, tip) = if m.enabled { (crate::icons::VISIBLE, tr("On. Click to turn this mask off.")) } else { (crate::icons::HIDDEN, tr("Off. Click to turn this mask on.")) };
+                        if lit_icon(ui, icon, false, tip).clicked() {
+                            let on = !m.enabled;
+                            self.edit_mask(item, m.id, "Toggle mask", None, |m| m.enabled = on);
+                        }
+                    });
                 });
             });
+            if chosen {
+                // The one being drawn: an accent bar down its left edge.
+                let r = card.response.rect;
+                ui.painter().rect_filled(egui::Rect::from_min_max(r.left_top() + egui::vec2(0.0, 6.0), egui::pos2(r.left() + 3.0, r.bottom() - 6.0)), 1.5, crate::style::ACCENT);
+            }
+            ui.add_space(if compact { 2.0 } else { 4.0 });
         }
         if let Some(id) = copy {
             self.copy_mask(item, id);
@@ -339,25 +373,23 @@ impl App {
         }
         let Some(id) = self.masks.selected.filter(|s| it.masks.iter().any(|m| m.id == *s)) else {
             if it.masks.is_empty() {
-                ui.label(egui::RichText::new(tr("No masks yet.")).weak());
+                ui.label(egui::RichText::new(tr("No masks yet. Pick a drawing tool on the left of the viewer to start one.")).weak());
             }
             return;
         };
         let native = self.mask_placement(item, t).map_or([1920.0, 1080.0], |p| p.native);
 
-        crate::inspector::section(ui, tr("Draw"), tr("Pick a tool, then draw on the clip in the viewer."));
-        ui.horizontal_wrapped(|ui| {
-            for (tool, name, tip) in Tool::ALL {
-                if ui.selectable_label(self.masks.tool == tool, tr(name)).on_hover_text(tr(tip)).clicked() {
-                    self.masks.tool = tool;
-                }
-            }
+        crate::inspector::section(ui, tr("Tool"), tr("Pick a tool on the left of the viewer, then draw on the clip there."));
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+            crate::icons::paint(ui.painter(), r, self.masks.tool.icon(), crate::style::ACCENT);
+            ui.label(egui::RichText::new(tr(self.masks.tool.name())).strong());
         });
         match self.masks.tool {
             Tool::Rect | Tool::Ellipse | Tool::Magic | Tool::Fill => {
                 ui.checkbox(&mut self.masks.erase, tr("Erase")).on_hover_text(tr("Take this away from the mask instead of adding it (or hold Alt while drawing)"));
             }
-            Tool::Rotoscope => self.roto_panel(ui, item, id, native),
+            Tool::Rotoscope => self.roto_panel(ui, item),
             _ => {}
         }
         if matches!(self.masks.tool, Tool::Brush | Tool::Eraser) {
@@ -426,17 +458,18 @@ impl App {
         };
         ui.horizontal(|ui| {
             ui.label(tr("Properties “on mask” use"));
-            let mut chosen = props;
-            egui::ComboBox::from_id_salt(("mask-props", item.0)).selected_text(name_of(props)).show_ui(ui, |ui| {
-                ui.selectable_value(&mut chosen, mask::ALL, tr("every mask"));
-                for m in &it.masks {
-                    ui.selectable_value(&mut chosen, m.id as f64, &m.name);
+            // Chosen from the masks' previews.
+            let r = ui.button(format!("{}  ▾", name_of(props)));
+            egui::Popup::menu(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.set_min_width(240.0);
+                if let Some(chosen) = self.mask_choices(ui, item, props, None)
+                    && chosen != props
+                {
+                    self.editor.set_param(item, ParamTarget::Item, mask::PROPS_USE, ParamSource::Static(Value::Float(chosen)), mask::PROPS_USE);
+                    self.editor.doc.seal();
+                    ui.close();
                 }
             });
-            if chosen != props {
-                self.editor.set_param(item, ParamTarget::Item, mask::PROPS_USE, ParamSource::Static(Value::Float(chosen)), mask::PROPS_USE);
-                self.editor.doc.seal();
-            }
         });
         let on_mask: Vec<&str> = mask::MASKABLE.into_iter().filter(|p| it.params.get(&mask::on_mask(p)).is_some()).collect();
         let effects: Vec<String> = it
@@ -717,7 +750,9 @@ impl App {
         });
         let tracks: Vec<(u64, String)> = self.editor.doc.project().tracks.values().map(|tr| (tr.id, tr.name.clone())).collect();
         if tracks.len() < 2 {
-            ui.label(egui::RichText::new(tr("Scale and rotation follow two tracked points on the clip: track two points first (Track center… makes one).")).small().weak());
+            if !crate::inspector::compact(ui) {
+                ui.label(egui::RichText::new(tr("Scale and rotation follow two tracked points on the clip: track two points first (Track center… makes one).")).small().weak());
+            }
             return;
         }
         let name = |id: Option<u64>| id.and_then(|id| tracks.iter().find(|t| t.0 == id)).map_or("pick a track".to_string(), |t| t.1.clone());
@@ -833,49 +868,357 @@ impl App {
     }
 
     /// "Use with mask" in an effect's menu: run it inside one of the clip's masks (or all
-    /// of them), or outside. Not for bounded or per-letter text effects.
+    /// of them), or outside — the same choices, with previews, as the mask button after
+    /// its name. Not for bounded or per-letter text effects.
     pub(crate) fn effect_mask_menu(&mut self, ui: &mut egui::Ui, item: ItemId, fx: &oa_doc::EffectInstance) {
-        if !self.settings.masking || !self.maskable(item) {
-            return;
-        }
-        let Some(it) = self.editor.item(item).cloned() else { return };
-        let at = oa_params::EvalContext::at(Time::ZERO, Time::ZERO);
-        let bounded = matches!(fx.params.get(schema::BOUNDED).map(|s| s.eval(&at)), Some(Value::Bool(true)));
-        let kind = self.registry.effect(&fx.type_id).map(|d| d.kind.clone());
-        let text_only = kind.as_ref().is_some_and(|k| k.text_only());
-        // Motion moves the whole clip, and sound isn't a picture: nothing to mask.
-        if self.registry.is_sound(&fx.type_id) || kind == Some(oa_graph::EffectKind::Motion) {
-            return;
+        match self.effect_maskable(item, fx) {
+            Err(None) => return,
+            Err(Some(why)) => {
+                ui.separator();
+                ui.add_enabled(false, egui::Button::new(tr("Use with mask"))).on_disabled_hover_text(why);
+                return;
+            }
+            Ok(()) => {}
         }
         ui.separator();
-        if bounded || text_only {
-            let why = if bounded { tr("Bounded text effects can't be masked (turn Bounded off first)") } else { tr("Per-letter text effects can't be masked") };
-            ui.add_enabled(false, egui::Button::new(tr("Use with mask"))).on_disabled_hover_text(why);
-            return;
-        }
+        let at = oa_params::EvalContext::at(Time::ZERO, Time::ZERO);
         let current = fx.params.get(mask::EFFECT_USE).and_then(|s| s.eval(&at).as_float()).unwrap_or(0.0);
         let invert = matches!(fx.params.get(mask::EFFECT_INVERT).map(|s| s.eval(&at)), Some(Value::Bool(true)));
+        let empty = self.masks_of(item).is_empty();
         ui.menu_button(tr("Use with mask"), |ui| {
-            if it.masks.is_empty() {
+            if empty {
                 ui.label(egui::RichText::new(tr("Draw a mask in the Masks tab first.")).weak());
                 return;
             }
-            let mut chosen = current;
-            ui.radio_value(&mut chosen, 0.0, tr("The whole clip (no mask)"));
-            ui.radio_value(&mut chosen, mask::ALL, tr("Every mask"));
-            for m in &it.masks {
-                ui.radio_value(&mut chosen, m.id as f64, &m.name);
-            }
-            if chosen != current {
+            if let Some(chosen) = self.mask_choices(ui, item, current, Some(tr("The whole clip (no mask)"))) {
                 self.editor.set_param(item, ParamTarget::Effect(fx.id), mask::EFFECT_USE, ParamSource::Static(Value::Float(chosen)), mask::EFFECT_USE);
                 self.editor.doc.seal();
             }
             ui.separator();
             let mut outside = invert;
-            if ui.add_enabled(current != 0.0 || chosen != 0.0, egui::Checkbox::new(&mut outside, tr("Outside the mask instead"))).changed() {
+            if ui.add_enabled(current != 0.0, egui::Checkbox::new(&mut outside, tr("Outside the mask instead"))).changed() {
                 self.editor.set_param(item, ParamTarget::Effect(fx.id), mask::EFFECT_INVERT, ParamSource::Static(Value::Bool(outside)), mask::EFFECT_INVERT);
                 self.editor.doc.seal();
             }
         });
+    }
+}
+
+// ---- previews, choosing a mask, and the viewer's tool strip ----
+
+/// A mask preview's width, px (its height follows the clip's shape).
+const THUMB_W: f32 = 56.0;
+
+impl Tool {
+    /// The viewer's tool strip, in groups: pointer · shapes · paint · smart.
+    pub const STRIP: [&'static [Tool]; 4] = [&[Tool::Select, Tool::Edit], &[Tool::Rect, Tool::Ellipse, Tool::Pen], &[Tool::Brush, Tool::Eraser], &[Tool::Magic, Tool::Fill, Tool::Rotoscope]];
+
+    /// Its icon in the viewer's tool strip.
+    pub fn icon(self) -> crate::icons::Icon {
+        use crate::icons;
+        match self {
+            Tool::Select => icons::TOOL_SELECT,
+            Tool::Edit => icons::TOOL_EDIT,
+            Tool::Rect => icons::TOOL_RECT,
+            Tool::Ellipse => icons::TOOL_ELLIPSE,
+            Tool::Pen => icons::TOOL_PEN,
+            Tool::Brush => icons::TOOL_BRUSH,
+            Tool::Eraser => icons::TOOL_ERASER,
+            Tool::Magic => icons::TOOL_MAGIC,
+            Tool::Fill => icons::TOOL_FILL,
+            Tool::Rotoscope => icons::TOOL_ROTO,
+        }
+    }
+
+    /// Its name, as the strip's tooltip and the tool settings show it.
+    pub fn name(self) -> &'static str {
+        Tool::ALL.iter().find(|(t, ..)| *t == self).map_or("", |(_, name, _)| *name)
+    }
+}
+
+impl App {
+    /// A small black-and-white picture of what `m` covers at the playhead (inverted when
+    /// it is), made again only when its drawing changes.
+    pub(crate) fn mask_thumb(&mut self, ctx: &egui::Context, item: ItemId, m: &Mask) -> Option<egui::TextureHandle> {
+        let it = self.editor.item(item)?;
+        let local = (self.playhead - it.range.start).clamp(Time::ZERO, it.range.duration);
+        let native = self.mask_placement(item, self.playhead).map_or([1920.0, 1080.0], |p| p.native);
+        let w = THUMB_W as u32 * 2;
+        let h = ((w as f64) * native[1] / native[0].max(1.0)).round().clamp(8.0, 160.0) as u32;
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            (m.content_hash(local), m.invert, w, h).hash(&mut hash);
+            hash.finish()
+        };
+        if let Some((k, tex)) = self.masks.thumbs.get(&m.id)
+            && *k == key
+        {
+            return Some(tex.clone());
+        }
+        let coverage = m.rasterize([w, h], local);
+        let pixels = coverage.iter().map(|c| if m.invert { 255 - *c } else { *c }).map(|c| egui::Color32::from_gray(c.max(24))).collect();
+        let image = egui::ColorImage { size: [w as usize, h as usize], pixels, source_size: egui::vec2(w as f32, h as f32) };
+        let tex = ctx.load_texture(format!("mask-thumb-{}", m.id), image, egui::TextureOptions::LINEAR);
+        self.masks.thumbs.insert(m.id, (key, tex.clone()));
+        Some(tex)
+    }
+
+    /// Draws a mask preview in `rect` (a frame around it, accent when `lit`).
+    fn paint_mask_thumb(&mut self, ui: &egui::Ui, rect: egui::Rect, item: ItemId, m: &Mask, lit: bool) {
+        ui.painter().rect_filled(rect, 3.0, egui::Color32::from_gray(12));
+        if let Some(tex) = self.mask_thumb(ui.ctx(), item, m) {
+            let size = tex.size_vec2();
+            let k = (rect.width() / size.x).min(rect.height() / size.y);
+            let fit = egui::Rect::from_center_size(rect.center(), size * k);
+            let tint = if m.enabled { egui::Color32::WHITE } else { egui::Color32::from_gray(110) };
+            ui.painter().image(tex.id(), fit, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+        }
+        let edge = if lit { crate::style::ACCENT } else { ui.visuals().widgets.noninteractive.bg_stroke.color };
+        ui.painter().rect_stroke(rect, 3.0, egui::Stroke::new(if lit { 1.5 } else { 1.0 }, edge), egui::StrokeKind::Inside);
+    }
+
+    /// Where a preview goes in a row: starting at `left_center`, `width` wide, the clip's
+    /// shape, at most `height` tall.
+    fn thumb_rect(&self, item: ItemId, left_center: egui::Pos2, height: f32, width: f32) -> egui::Rect {
+        let native = self.mask_placement(item, self.playhead).map_or([1920.0, 1080.0], |p| p.native);
+        let h = (width * (native[1] / native[0].max(1.0)) as f32).min(height);
+        egui::Rect::from_min_size(egui::pos2(left_center.x, left_center.y - h / 2.0), egui::vec2(width, h))
+    }
+
+    /// Rows to choose which of `item`'s masks something uses — `none` (when given), every
+    /// mask, or one — each shown with its preview. Returns the choice clicked (`0` none,
+    /// `mask::ALL`, or a mask's id), if one was.
+    pub(crate) fn mask_choices(&mut self, ui: &mut egui::Ui, item: ItemId, current: f64, none: Option<&str>) -> Option<f64> {
+        let masks = self.masks_of(item);
+        let mut picked = None;
+        let mut row = |app: &mut Self, ui: &mut egui::Ui, choice: f64, label: &str, mask: Option<&Mask>| {
+            let compact = crate::inspector::compact(ui);
+            let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(220.0), if compact { 30.0 } else { 40.0 }), egui::Sense::click());
+            let on = current == choice;
+            let v = ui.visuals().clone();
+            if on {
+                ui.painter().rect_filled(rect, 6.0, crate::style::ACCENT.gamma_multiply(0.18));
+                ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(1.0, crate::style::ACCENT), egui::StrokeKind::Inside);
+            } else if r.hovered() {
+                ui.painter().rect_filled(rect, 6.0, v.widgets.hovered.weak_bg_fill);
+            }
+            let thumb = app.thumb_rect(item, egui::pos2(rect.left() + 6.0, rect.center().y), rect.height() - 8.0, if compact { THUMB_W * 0.75 } else { THUMB_W });
+            match mask {
+                Some(m) => app.paint_mask_thumb(ui, thumb, item, m, on),
+                None => {
+                    // No mask: the whole clip (white); every mask: the masks' icon.
+                    let all = choice == mask::ALL;
+                    ui.painter().rect_filled(thumb, 3.0, if all { egui::Color32::from_gray(12) } else { egui::Color32::from_gray(200) });
+                    if all {
+                        crate::icons::paint(ui.painter(), thumb.shrink(4.0), crate::icons::MASK, egui::Color32::from_gray(220));
+                    }
+                    let edge = if on { crate::style::ACCENT } else { v.widgets.noninteractive.bg_stroke.color };
+                    ui.painter().rect_stroke(thumb, 3.0, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+                }
+            }
+            let color = if on { v.strong_text_color() } else { v.text_color() };
+            ui.painter().text(egui::pos2(thumb.right() + 10.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(crate::style::TEXT), color);
+            if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                picked = Some(choice);
+            }
+        };
+        if let Some(none) = none {
+            row(self, ui, 0.0, none, None);
+        }
+        if masks.len() > 1 || none.is_none() {
+            row(self, ui, mask::ALL, tr("Every mask"), None);
+        }
+        for m in &masks {
+            row(self, ui, m.id as f64, &m.name, Some(m));
+        }
+        picked
+    }
+
+    /// Why an effect can't run inside a mask, if it can't: `Err(None)` when masks don't
+    /// apply to it at all (sound, a whole-clip move), `Err(Some(reason))` when they could
+    /// but don't (bounded or per-letter text effects).
+    fn effect_maskable(&self, item: ItemId, fx: &oa_doc::EffectInstance) -> Result<(), Option<&'static str>> {
+        if !self.settings.masking || !self.maskable(item) {
+            return Err(None);
+        }
+        let kind = self.registry.effect(&fx.type_id).map(|d| d.kind.clone());
+        // Motion moves the whole clip, and sound isn't a picture: nothing to mask.
+        if self.registry.is_sound(&fx.type_id) || kind == Some(oa_graph::EffectKind::Motion) {
+            return Err(None);
+        }
+        let at = oa_params::EvalContext::at(Time::ZERO, Time::ZERO);
+        if matches!(fx.params.get(schema::BOUNDED).map(|s| s.eval(&at)), Some(Value::Bool(true))) {
+            return Err(Some(tr("Bounded text effects can't be masked (turn Bounded off first)")));
+        }
+        if kind.is_some_and(|k| k.text_only()) {
+            return Err(Some(tr("Per-letter text effects can't be masked")));
+        }
+        Ok(())
+    }
+
+    /// The mask button after an effect's name: lit when the effect runs inside a mask;
+    /// click to choose which (with previews), or outside it.
+    pub(crate) fn effect_mask_button(&mut self, ui: &mut egui::Ui, item: ItemId, fx: &oa_doc::EffectInstance) {
+        if self.effect_maskable(item, fx).is_err() {
+            return;
+        }
+        let at = oa_params::EvalContext::at(Time::ZERO, Time::ZERO);
+        let current = fx.params.get(mask::EFFECT_USE).and_then(|s| s.eval(&at).as_float()).unwrap_or(0.0);
+        let outside = matches!(fx.params.get(mask::EFFECT_INVERT).map(|s| s.eval(&at)), Some(Value::Bool(true)));
+        let masks = self.masks_of(item);
+        let name = if current == 0.0 {
+            tr("the whole clip").to_string()
+        } else {
+            masks.iter().find(|m| m.id as f64 == current).map_or_else(|| tr("every mask").to_string(), |m| m.name.clone())
+        };
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+        let lit = current != 0.0;
+        if lit {
+            ui.painter().rect_filled(rect, 4.0, crate::style::ACCENT.gamma_multiply(0.25));
+        } else if r.hovered() {
+            ui.painter().rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
+        }
+        let color = if lit {
+            crate::style::ACCENT
+        } else if r.hovered() {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        crate::icons::paint(ui.painter(), rect.shrink(2.0), crate::icons::MASK, color);
+        let tip = if outside && lit { trf("Runs outside {0} — click to change", &[("0", &name)]) } else { trf("Runs on {0} — click to choose a mask", &[("0", &name)]) };
+        let r = r.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+        egui::Popup::menu(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_min_width(240.0);
+            ui.label(egui::RichText::new(tr("Run this effect on")).strong());
+            if masks.is_empty() {
+                ui.label(egui::RichText::new(tr("No masks yet — draw one in the Masks tab.")).weak());
+            }
+            if let Some(chosen) = self.mask_choices(ui, item, current, Some(tr("The whole clip"))) {
+                self.editor.set_param(item, ParamTarget::Effect(fx.id), mask::EFFECT_USE, ParamSource::Static(Value::Float(chosen)), mask::EFFECT_USE);
+                self.editor.doc.seal();
+            }
+            ui.separator();
+            let mut out = outside;
+            if ui.add_enabled(lit, egui::Checkbox::new(&mut out, tr("Outside the mask instead"))).changed() {
+                self.editor.set_param(item, ParamTarget::Effect(fx.id), mask::EFFECT_INVERT, ParamSource::Static(Value::Bool(out)), mask::EFFECT_INVERT);
+                self.editor.doc.seal();
+            }
+        });
+    }
+
+    /// A new, empty mask on `item`, selected (and a drawing tool picked, if none was).
+    pub(crate) fn new_mask(&mut self, item: ItemId) {
+        let Some(it) = self.editor.item(item).cloned() else { return };
+        let id = self.editor.doc.alloc_id();
+        let mut masks = it.masks.clone();
+        masks.push(Mask { id, name: format!("Mask {}", it.masks.len() + 1), enabled: true, invert: false, mode: MaskMode::Add, shapes: Vec::new(), frame: [1.0, 1.0] });
+        self.apply_or_report("New mask", vec![Op::SetMasks { seq: self.editor.seq, item, masks }]);
+        self.masks.selected = Some(id);
+        if self.masks.tool == Tool::Select {
+            self.masks.tool = Tool::Rect;
+        }
+    }
+
+    /// The mask tools, standing down the left of the viewer while the Masks tab is open:
+    /// one icon each, grouped (pointer · shapes · paint · smart), the one in use lit.
+    /// Picking a drawing tool with no mask yet starts one.
+    pub(crate) fn mask_tool_strip(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        if !self.settings.masking || self.inspector_tab != crate::inspector::Tab::Masks {
+            return;
+        }
+        let Some(item) = self.selection.filter(|i| self.maskable(*i)) else { return };
+        const BUTTON: f32 = 30.0;
+        const PAD: f32 = 4.0;
+        const BREAK: f32 = 9.0;
+        let groups = Tool::STRIP;
+        let count: usize = groups.iter().map(|g| g.len()).sum();
+        let height = count as f32 * BUTTON + (groups.len() - 1) as f32 * BREAK + 2.0 * PAD;
+        let top = (area.center().y - height / 2.0).max(area.top() + 8.0);
+        let strip = egui::Rect::from_min_size(egui::pos2(area.left() + 8.0, top), egui::vec2(BUTTON + 2.0 * PAD, height));
+        let v = ui.visuals().clone();
+        ui.painter().add(egui::epaint::Shadow { offset: [0, 2], blur: 10, spread: 0, color: egui::Color32::from_black_alpha(90) }.as_shape(strip, 8.0));
+        ui.painter().rect(strip, 8.0, v.window_fill.gamma_multiply(0.96), egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
+        // The strip takes the pointer: a click between buttons doesn't reach the clip.
+        ui.interact(strip, ui.id().with("mask-tool-strip"), egui::Sense::click_and_drag());
+        let mut y = strip.top() + PAD;
+        for (gi, group) in groups.iter().enumerate() {
+            if gi > 0 {
+                let line_y = y + BREAK / 2.0 - 0.5;
+                ui.painter().line_segment([egui::pos2(strip.left() + 7.0, line_y), egui::pos2(strip.right() - 7.0, line_y)], egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color));
+                y += BREAK;
+            }
+            for tool in group.iter().copied() {
+                let rect = egui::Rect::from_min_size(egui::pos2(strip.left() + PAD, y), egui::vec2(BUTTON, BUTTON));
+                y += BUTTON;
+                let tip = Tool::ALL.iter().find(|(t, ..)| *t == tool).map_or("", |(_, _, tip)| *tip);
+                let r = ui.interact(rect, ui.id().with(("mask-tool", tool.name())), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                let on = self.masks.tool == tool;
+                if on {
+                    ui.painter().rect_filled(rect, 6.0, crate::style::ACCENT);
+                } else if r.hovered() {
+                    ui.painter().rect_filled(rect, 6.0, v.widgets.hovered.weak_bg_fill);
+                }
+                let color = if on {
+                    egui::Color32::WHITE
+                } else if r.hovered() {
+                    v.strong_text_color()
+                } else {
+                    v.text_color()
+                };
+                crate::icons::paint(ui.painter(), rect.shrink(6.0), tool.icon(), color);
+                let r = r.on_hover_ui(|ui| {
+                    ui.label(egui::RichText::new(tr(tool.name())).strong());
+                    ui.label(tr(tip));
+                });
+                if r.clicked() {
+                    if tool != Tool::Select && self.masks.selected.is_none_or(|s| !self.masks_of(item).iter().any(|m| m.id == s)) {
+                        self.new_mask(item);
+                    }
+                    self.masks.tool = tool;
+                }
+            }
+        }
+    }
+}
+
+/// A small icon button, lit (accent) when `on`.
+fn lit_icon(ui: &mut egui::Ui, icon: crate::icons::Icon, on: bool, tip: &str) -> egui::Response {
+    let side = if crate::inspector::compact(ui) { 18.0 } else { 22.0 };
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    let v = ui.visuals();
+    if on {
+        ui.painter().rect_filled(rect, 4.0, crate::style::ACCENT.gamma_multiply(0.25));
+    } else if r.hovered() {
+        ui.painter().rect_filled(rect, 4.0, v.widgets.hovered.weak_bg_fill);
+    }
+    let color = if on {
+        crate::style::ACCENT
+    } else if r.hovered() {
+        v.strong_text_color()
+    } else {
+        v.text_color()
+    };
+    crate::icons::paint(ui.painter(), rect.shrink(3.0), icon, color);
+    r.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::Tool;
+
+    /// The viewer's strip offers every tool, once each, each with its own icon.
+    #[test]
+    fn the_tool_strip_has_every_tool_once() {
+        let strip: Vec<Tool> = Tool::STRIP.iter().flat_map(|g| g.iter().copied()).collect();
+        assert_eq!(strip.len(), Tool::ALL.len());
+        for (tool, ..) in Tool::ALL {
+            assert_eq!(strip.iter().filter(|t| **t == tool).count(), 1, "{} once", tool.name());
+        }
+        let mut icons: Vec<char> = strip.iter().map(|t| t.icon().code).collect();
+        icons.sort();
+        icons.dedup();
+        assert_eq!(icons.len(), strip.len(), "each its own icon");
     }
 }

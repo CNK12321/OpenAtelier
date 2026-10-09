@@ -608,6 +608,14 @@ impl ParamSource {
         }
     }
 
+    /// Its keys kept within a clip `length` long (see [`Curve::confine`]): what an edit
+    /// does first, so keys out of sight don't pull on the one being set.
+    pub fn confine(&mut self, length: Time) {
+        if let Some(c) = self.curve_mut() {
+            c.confine(length);
+        }
+    }
+
     /// Re-expresses this source for a clip whose start moved `delta` later on the
     /// timeline, so every instant keeps its value: clip-anchored keyframes shift back by
     /// `delta`, clip-anchored modulators carry the offset. Source-anchored timing is

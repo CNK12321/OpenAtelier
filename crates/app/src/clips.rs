@@ -76,6 +76,47 @@ impl App {
         self.selection = self.selected.iter().next_back().copied();
     }
 
+    /// Picks every clip from the playhead on (`after`: those still playing there or
+    /// later) or up to it (those that have started by then), on every track.
+    pub(crate) fn select_around_playhead(&mut self, after: bool) {
+        let t = self.playhead;
+        let s = self.editor.sequence();
+        self.selected = s
+            .tracks
+            .iter()
+            .flat_map(|tr| tr.items.iter())
+            .filter(|i| if after { i.range.end() > t } else { i.range.start < t })
+            .map(|i| i.id)
+            .collect();
+        self.selection = self.selected.iter().next_back().copied();
+    }
+
+    /// Opens time at `at` on every track (`to` right of it: that much) or takes out the
+    /// stretch from `to` to `at` (`to` left of it), as one edit (double-click and drag
+    /// on an empty stretch of a track).
+    pub(crate) fn open_or_close_time(&mut self, at: Time, to: Time) {
+        if to == at {
+            return;
+        }
+        let project = self.editor.doc.snapshot();
+        let (seq, doc) = (self.editor.seq, &mut self.editor.doc);
+        let mut alloc = || doc.alloc_id();
+        let (label, ops) = if to > at {
+            (tr("Insert time"), oa_edit::timeline::insert_time(&project, seq, at, to - at, &mut alloc))
+        } else {
+            (tr("Remove time"), oa_edit::timeline::remove_time(&project, seq, to, at, &mut alloc))
+        };
+        match ops.and_then(|ops| self.editor.apply(label, ops)) {
+            Ok(()) => {
+                self.selected.retain(|id| self.editor.item(*id).is_some());
+                if self.selection.is_some_and(|id| self.editor.item(id).is_none()) {
+                    self.selection = None;
+                }
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
     /// The selected clips, in timeline order.
     pub(crate) fn selected_clips(&self) -> Vec<ItemId> {
         let s = self.editor.sequence();
@@ -182,6 +223,33 @@ impl App {
             }
             Err(oa_doc::EditError::Overlap) => self.notify(trf("{label}: another clip is in the way — nothing moved.", &[("label", label)])),
             Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Whether the selection is two or more clips all on one track (the arrange buttons
+    /// by playback show then).
+    pub(crate) fn arrangeable(&self) -> bool {
+        let clips = self.selected_clips();
+        let s = self.editor.sequence();
+        let mut tracks = clips.iter().filter_map(|id| s.find_item(*id).map(|(t, _)| t));
+        clips.len() >= 2 && tracks.next().is_some_and(|first| tracks.all(|t| t == first))
+    }
+
+    /// The arrange buttons (in the timeline's bar): close the gaps, space evenly, move
+    /// to the playhead.
+    pub(crate) fn arrange_buttons(&mut self, ui: &mut eframe::egui::Ui) {
+        use crate::icons;
+        use oa_edit::timeline::Arrange;
+        let at = self.playhead;
+        let choices = [
+            (icons::CLOSE_GAPS, "Close gaps: each starts where the one before ends", tr("Close gaps"), Arrange::Together),
+            (icons::SPACE_EVENLY, "Space evenly: the first and last stay, the ones between are spread out evenly", tr("Space evenly"), Arrange::SpaceEvenly),
+            (icons::TO_PLAYHEAD, "Move to playhead: the first starts at the playhead, the rest keep their spacing", tr("Move to playhead"), Arrange::StartAt(at)),
+        ];
+        for (icon, tip, label, how) in choices {
+            if icons::button(ui, icon, tip, "", true).clicked() {
+                self.arrange_selection(how, label);
+            }
         }
     }
 
@@ -521,7 +589,7 @@ impl App {
             // titles…): one that doesn't mustn't stop the rest.
             let fitting: Vec<oa_doc::EffectInstance> = self.effect_clipboard.clone().into_iter().filter(|fx| self.effect_fits(item, &fx.type_id)).collect();
             for (k, fx) in fitting.into_iter().enumerate() {
-                let effect = oa_doc::EffectInstance { id: oa_doc::EffectId(self.editor.doc.alloc_id()), ..fx };
+                let effect = oa_doc::EffectInstance { id: oa_doc::EffectId(self.editor.doc.alloc_id()), on_duplicate: None, ..fx };
                 ops.push(Op::InsertEffect { seq, item, index: n + k, effect });
             }
         }
@@ -614,7 +682,7 @@ impl App {
                         EffectRole::Passive => it.effects.len(),
                         _ => it.effects.iter().take_while(|e| e.role != EffectRole::Passive).count(),
                     };
-                    let copy = oa_doc::EffectInstance { id: oa_doc::EffectId(self.editor.doc.alloc_id()), ..effect.clone() };
+                    let copy = oa_doc::EffectInstance { id: oa_doc::EffectId(self.editor.doc.alloc_id()), on_duplicate: None, ..effect.clone() };
                     ops.push(Op::InsertEffect { seq, item, index, effect: copy });
                 }
             }

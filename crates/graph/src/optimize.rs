@@ -4,7 +4,13 @@
 //!
 //! Passes:
 //! * **Occlusion/visibility cull** in composites: drop layers under a full-canvas
-//!   opaque layer, fully transparent layers, and layers outside the canvas.
+//!   opaque layer, fully transparent layers, and layers outside the canvas. A composite
+//!   one of whose layers covers it opaquely counts as opaque itself, so what's under a
+//!   cut clip (the blurred-content backdrop) goes too.
+//! * **Composite pass-through**: a composite left with one layer that fills it exactly
+//!   and opaquely is that layer — a frame that's only a cut clip is copied once, not once
+//!   per level of nesting. Not for a source (it may lend a decoder's own texture, which
+//!   must be copied before it's reused) or a transform (drawn by the composite).
 //! * **Transform merge**: directly chained transforms become one matrix (one
 //!   resample). Never merged across effects — effects run in layer space — nor into
 //!   the shrink of supersampled (anti-aliased) text.
@@ -49,6 +55,24 @@ impl Rewriter<'_> {
     fn warp_in_place(&self, id: NodeId) -> bool {
         let node = self.old.node(id);
         node.inputs.len() == 1 && same_area(node.bounds, self.old.node(node.inputs[0]).bounds)
+    }
+
+    /// Whether `id` paints every pixel of `area` fully opaque: its own flag, or a
+    /// composite with an opaque background or a layer that does.
+    fn covers(&self, id: NodeId, area: Rect) -> bool {
+        let n = self.old.node(id);
+        if !n.bounds.contains_rect(&area) {
+            return false;
+        }
+        if n.opaque {
+            return true;
+        }
+        match &n.op {
+            NodeOp::Composite { background, layers, .. } => {
+                background[3] >= 1.0 || layers.iter().zip(&n.inputs).any(|(l, &input)| l.opacity >= 1.0 && l.blend == BlendMode::Normal && self.covers(input, area))
+            }
+            _ => false,
+        }
     }
 
     fn visit(&mut self, id: NodeId) -> NodeId {
@@ -150,15 +174,25 @@ impl Rewriter<'_> {
                         continue;
                     }
                     keep.push(i);
-                    if n.opaque && l.opacity >= 1.0 && l.blend == BlendMode::Normal && n.bounds.contains_rect(&canvas) {
+                    if l.opacity >= 1.0 && l.blend == BlendMode::Normal && self.covers(input, canvas) {
                         break; // everything below is hidden
                     }
                 }
                 keep.reverse();
+                // One layer filling it exactly and opaquely: it is the composite.
+                if let [only] = keep[..] {
+                    let (l, input) = (layers[only], node.inputs[only]);
+                    let n = self.old.node(input);
+                    let own_texture = !matches!(n.op, NodeOp::Source { .. } | NodeOp::Transform { .. });
+                    if own_texture && l.opacity >= 1.0 && l.blend == BlendMode::Normal && same_area(n.bounds, canvas) && self.covers(input, canvas) {
+                        return self.visit(input);
+                    }
+                }
+                let covered = node.opaque || keep.iter().any(|&i| layers[i].opacity >= 1.0 && layers[i].blend == BlendMode::Normal && self.covers(node.inputs[i], canvas));
                 let inputs = keep.iter().map(|&i| self.visit(node.inputs[i])).collect();
                 let layers = keep.iter().map(|&i| layers[i]).collect();
                 let op = NodeOp::Composite { size: *size, background: *background, layers };
-                self.out.add(op, inputs, node.bounds, node.opaque)
+                self.out.add(op, inputs, node.bounds, covered)
             }
             _ => self.copy(id),
         }
@@ -295,6 +329,36 @@ mod tests {
         match &o.node(o.output).op {
             // `full` hides `bottom`; the rotated layer covers the canvas's bounding box
             // but isn't axis-aligned, so it must not hide `full`.
+            NodeOp::Composite { layers, .. } => assert_eq!(layers.len(), 2),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A cut clip over the blurred-content backdrop: the clip's composite covers the
+    /// frame, so the backdrop goes; the frame is then that composite (the clip copied
+    /// once) — never the source itself, which may be a decoder's own texture.
+    #[test]
+    fn a_covered_backdrop_goes_and_nested_composites_collapse() {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let backdrop = src(&mut b, 100.0);
+        let backdrop = point(&mut b, backdrop, "a", WorkingSpace::Linear);
+        let clip = src(&mut b, 100.0);
+        let front = comp(&mut b, &[(clip, 1.0)]);
+        let out = comp(&mut b, &[(backdrop, 1.0), (front, 1.0)]);
+        let o = optimize(&b.finish(out), OptLevel::Full, KeyContext::default());
+        assert_eq!(o.nodes.len(), 2, "{:?}", o.nodes.iter().map(|n| &n.op).collect::<Vec<_>>());
+        match &o.node(o.output).op {
+            NodeOp::Composite { layers, .. } => assert_eq!(layers.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        // Half see-through, the clip doesn't cover: the backdrop stays.
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let backdrop = src(&mut b, 100.0);
+        let clip = src(&mut b, 100.0);
+        let front = comp(&mut b, &[(clip, 0.5)]);
+        let out = comp(&mut b, &[(backdrop, 1.0), (front, 1.0)]);
+        let o = optimize(&b.finish(out), OptLevel::Full, KeyContext::default());
+        match &o.node(o.output).op {
             NodeOp::Composite { layers, .. } => assert_eq!(layers.len(), 2),
             other => panic!("{other:?}"),
         }

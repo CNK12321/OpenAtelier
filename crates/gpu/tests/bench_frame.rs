@@ -29,7 +29,7 @@ pub fn big_project(layers: u64) -> (Project, SeqId) {
         for (k, (id, param, v)) in [("oa.color.exposure", "stops", 0.3), ("oa.color.saturation", "amount", 1.2), ("oa.warp.swirl", "angle", 40.0), ("oa.color.hue", "degrees", 20.0)].into_iter().enumerate() {
             let mut params = ParamSet::default();
             params.set(param, ParamSource::Static(Value::Float(v)));
-            item.effects.push(EffectInstance { id: EffectId(l * 10 + k as u64), type_id: id.into(), type_version: 1, enabled: true, params, role: Default::default() });
+            item.effects.push(EffectInstance { id: EffectId(l * 10 + k as u64), type_id: id.into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None });
         }
         track.items.push(item);
         seq.tracks.push(Arc::new(track));

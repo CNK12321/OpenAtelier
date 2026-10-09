@@ -75,6 +75,14 @@ enum Shape {
     Info,
     Dropper,
     Fullscreen,
+    CloseGaps,
+    Distribute,
+    ToPlayhead,
+    Tune,
+    Transition,
+    Palette,
+    Lasso,
+    Equalizer,
 }
 
 macro_rules! icons {
@@ -133,6 +141,30 @@ icons! {
     INFO = "info", '\u{e88e}', Info;
     COLORIZE = "colorize", '\u{e3b8}', Dropper;
     FULLSCREEN = "fullscreen", '\u{e5d0}', Fullscreen;
+    CLOSE_GAPS = "align_justify_flex_start", '\u{f790}', CloseGaps;
+    SPACE_EVENLY = "align_justify_space_even", '\u{f78d}', Distribute;
+    TO_PLAYHEAD = "start", '\u{e089}', ToPlayhead;
+    TUNE = "tune", '\u{e429}', Tune;
+    TRANSITIONS = "transition_fade", '\u{f50c}', Transition;
+    PALETTE = "palette", '\u{e40a}', Palette;
+    MASKS = "lasso_select", '\u{eb03}', Lasso;
+    SOUND = "graphic_eq", '\u{e1b8}', Equalizer;
+    // The mask tools (the viewer's tool strip) and masks themselves. Their drawn shapes
+    // are rough stand-ins: the glyphs are in the built-in font.
+    TOOL_SELECT = "arrow_selector_tool", '\u{f82f}', Play;
+    TOOL_EDIT = "drag_pan", '\u{f71e}', Move;
+    TOOL_RECT = "rectangle", '\u{eb54}', Stop;
+    TOOL_ELLIPSE = "circle", '\u{ef4a}', Record;
+    TOOL_PEN = "ink_pen", '\u{e6d3}', Title;
+    TOOL_BRUSH = "brush", '\u{e3ae}', Dropper;
+    TOOL_ERASER = "ink_eraser", '\u{e6d0}', Delete;
+    TOOL_MAGIC = "auto_fix", '\u{e663}', Sparkle;
+    TOOL_FILL = "format_color_fill", '\u{e23a}', Dropper;
+    TOOL_ROTO = "frame_person", '\u{f8a6}', Lasso;
+    MASK = "vignette", '\u{e435}', HalfCircle;
+    VISIBLE = "visibility", '\u{e8f4}', Record;
+    HIDDEN = "visibility_off", '\u{e8f5}', Stop;
+    INVERT = "invert_colors", '\u{e891}', HalfCircle;
 }
 
 /// The subset font, built into the program: reading it from `assets/fonts` only worked
@@ -496,6 +528,59 @@ pub fn paint(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui:
             painter.line_segment([at(10.5, 7.5), at(16.5, 13.5)], egui::Stroke::new(2.4 * u, color));
             painter.line_segment([at(14.5, 9.5), at(6.0, 18.0)], egui::Stroke::new(2.6 * u, color));
             poly(&[(6.8, 18.8), (5.2, 17.2), (3.0, 21.0)]);
+        }
+        Shape::CloseGaps => {
+            // Two clips side by side, arrows pushing them together.
+            bar(4.0, 10.0, 11.5, 19.0);
+            bar(12.5, 10.0, 20.0, 19.0);
+            line((2.5, 5.5), (8.5, 5.5));
+            poly(&[(11.0, 5.5), (8.0, 3.0), (8.0, 8.0)]);
+            line((21.5, 5.5), (15.5, 5.5));
+            poly(&[(13.0, 5.5), (16.0, 3.0), (16.0, 8.0)]);
+        }
+        Shape::Distribute => {
+            // A clip held evenly between two edges.
+            line((4.0, 3.0), (4.0, 21.0));
+            line((20.0, 3.0), (20.0, 21.0));
+            bar(8.5, 7.0, 15.5, 17.0);
+        }
+        Shape::Tune => {
+            // Three sliders.
+            for (y, knob) in [(6.0, 15.0), (12.0, 8.0), (18.0, 13.0)] {
+                line((3.0, y), (21.0, y));
+                bar(knob - 1.5, y - 3.0, knob + 1.5, y + 3.0);
+            }
+        }
+        Shape::Transition => {
+            // A square fading into dots.
+            bar(3.0, 4.0, 11.0, 20.0);
+            for (x, y) in [(14.0, 6.0), (14.0, 12.0), (14.0, 18.0), (19.0, 9.0), (19.0, 15.0)] {
+                painter.circle_filled(at(x, y), 1.6 * u, color);
+            }
+        }
+        Shape::Palette => {
+            painter.circle_stroke(at(12.0, 12.0), 9.0 * u, round);
+            for (x, y) in [(8.0, 10.0), (12.0, 7.0), (16.0, 10.0)] {
+                painter.circle_filled(at(x, y), 1.6 * u, color);
+            }
+        }
+        Shape::Lasso => {
+            // A dashed loop with its tail.
+            let ring: Vec<egui::Pos2> = (0..=24).map(|i| i as f32 / 24.0 * std::f32::consts::TAU).map(|a| at(12.0 + 8.0 * a.cos(), 10.0 + 5.5 * a.sin())).collect();
+            painter.add(egui::Shape::dashed_line(&ring, round, 2.5 * u, 1.8 * u));
+            line((8.0, 15.0), (7.0, 21.0));
+        }
+        Shape::Equalizer => {
+            for (x, h) in [(5.0, 4.0), (9.0, 8.0), (13.0, 6.0), (17.0, 9.0), (21.0, 3.0)] {
+                line((x - 1.0, 12.0 - h), (x - 1.0, 12.0 + h));
+            }
+        }
+        Shape::ToPlayhead => {
+            // The playhead, and clips starting at it.
+            poly(&[(3.0, 3.0), (9.0, 3.0), (6.0, 7.0)]);
+            line((6.0, 5.0), (6.0, 21.0));
+            bar(9.0, 9.0, 14.5, 17.0);
+            bar(15.5, 9.0, 21.0, 17.0);
         }
     }
 }

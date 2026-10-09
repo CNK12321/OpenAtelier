@@ -43,6 +43,8 @@ pub enum Op {
     /// Mute/hide a whole track (disabled tracks don't render or play).
     SetTrackEnabled { seq: SeqId, track: TrackId, enabled: bool },
     SetTrackName { seq: SeqId, track: TrackId, name: String },
+    /// Makes a track a temp layer, or a temp layer a real track.
+    SetTrackTemp { seq: SeqId, track: TrackId, temp: bool },
     /// Enable or disable one clip.
     SetItemEnabled { seq: SeqId, item: ItemId, enabled: bool },
     /// The clip's outro plays its intro backwards (instead of its own outro effects).
@@ -237,6 +239,12 @@ impl Op {
                 let t = s.tracks.iter_mut().find(|t| t.id == track).ok_or(EditError::NotFound("track", track.0))?;
                 let old = std::mem::replace(&mut Arc::make_mut(t).name, name);
                 vec![Op::SetTrackName { seq, track, name: old }]
+            }
+            Op::SetTrackTemp { seq, track, temp } => {
+                let s = seq_mut(p, seq)?;
+                let t = s.tracks.iter_mut().find(|t| t.id == track).ok_or(EditError::NotFound("track", track.0))?;
+                let old = std::mem::replace(&mut Arc::make_mut(t).temp, temp);
+                vec![Op::SetTrackTemp { seq, track, temp: old }]
             }
             Op::SetItemEnabled { seq, item, enabled } => {
                 let it = item_mut(p, seq, item)?;

@@ -134,6 +134,28 @@ impl App {
         });
         ui.add_space(6.0);
         ui.checkbox(&mut s.save_as_you_go, tr("Save as you go")).on_hover_text(tr("Keeps the project file up to date while you edit. The crash-recovery autosave happens either way."));
+        // Where new projects go, a folder each.
+        ui.add_space(6.0);
+        ui.strong(tr("Projects folder"));
+        let dir = s.projects_dir.clone().unwrap_or_else(crate::projects::default_projects_dir);
+        ui.label(egui::RichText::new(dir.display().to_string()).small().monospace()).on_hover_text(tr("New projects are saved here, each in a folder of its own"));
+        ui.horizontal(|ui| {
+            if ui.button(tr("Change…")).clicked()
+                && let Some(picked) = rfd::FileDialog::new().set_directory(&dir).pick_folder()
+            {
+                s.projects_dir = Some(picked);
+            }
+            if s.projects_dir.is_some() && ui.button(tr("Use the default")).on_hover_text(crate::projects::default_projects_dir().display().to_string()).clicked() {
+                s.projects_dir = None;
+            }
+            if ui.button(tr("Show")).clicked() {
+                let _ = std::fs::create_dir_all(&dir);
+                #[cfg(windows)]
+                let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                #[cfg(not(windows))]
+                let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+            }
+        });
     }
 
     fn settings_interface(&mut self, ui: &mut egui::Ui) {
@@ -184,6 +206,7 @@ impl App {
         ui.checkbox(&mut s.compact_properties, tr("Compact properties panel"))
             .on_hover_text(tr("Tighter rows and smaller controls in the properties panel, so more fits without scrolling; section notes show on hover"));
         ui.checkbox(&mut s.show_performance, tr("Performance panel")).on_hover_text(tr("Frame times, GPU memory and renderer details under the inspector"));
+        ui.checkbox(&mut s.show_messages, tr("Messages panel")).on_hover_text(tr("What the app reported lately (warnings, finished jobs), under the properties"));
     }
 
     fn settings_performance(&mut self, ui: &mut egui::Ui) {

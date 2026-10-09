@@ -182,7 +182,7 @@ fn pattern_project(configure: impl FnOnce(&mut Item)) -> (Project, SeqId) {
 fn add_effect(clip: &mut Item, id: u64, type_id: &str, param: &str, value: ParamSource) {
     let mut params = ParamSet::default();
     params.set(param, value);
-    clip.effects.push(EffectInstance { id: EffectId(id), type_id: type_id.into(), type_version: 1, enabled: true, params, role: Default::default() });
+    clip.effects.push(EffectInstance { id: EffectId(id), type_id: type_id.into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None });
 }
 
 fn color_chain(clip: &mut Item) {
@@ -601,7 +601,8 @@ fn planned_crossfade_mixes_adjacent_clips() {
 
 /// A white solid clip with effects in each role, planned from the document: a fade in
 /// is half-way at 0.25 s, gone at 1 s; a zoom out has shrunk the layer to nothing by
-/// the clip's end; a passive fade does nothing.
+/// the clip's end; a passive fade does nothing. An effect with an off state (Invert) runs
+/// as an intro or an outro, easing between full and off.
 #[test]
 fn effect_roles_follow_their_windows() {
     let Some(ctx) = gpu() else { return };
@@ -646,6 +647,22 @@ fn effect_roles_follow_their_windows() {
 
     let p = project_with(vec![EffectInstance::new(EffectId(22), "oa.anim.fade")]);
     assert!(close(at(&p, 0.1, center), [1.0, 1.0, 1.0, 1.0], 0.001), "passive: fully visible");
+
+    // An effect with an off state as an intro: Invert, full as the clip arrives, easing
+    // to off (the clip as it is) by the intro's end.
+    let mut invert_in = EffectInstance::new(EffectId(23), "oa.color.invert");
+    invert_in.role = EffectRole::In { duration: secs(1.0) };
+    let p = project_with(vec![invert_in]);
+    let (start, mid, after) = (at(&p, 0.0, center), at(&p, 0.5, center), at(&p, 1.5, center));
+    assert!(start[0] < 0.01, "inverted as it arrives: {start:?}");
+    assert!(mid[0] > 0.05 && mid[0] < 0.95, "half-way: {mid:?}");
+    assert!(close(after, [1.0, 1.0, 1.0, 1.0], 0.001), "off once in: {after:?}");
+    // …and as an outro, the other way round.
+    let mut invert_out = EffectInstance::new(EffectId(24), "oa.color.invert");
+    invert_out.role = EffectRole::Out { duration: secs(1.0) };
+    let p = project_with(vec![invert_out]);
+    assert!(close(at(&p, 1.0, center), [1.0, 1.0, 1.0, 1.0], 0.001), "off as the outro starts");
+    assert!(at(&p, 1.99, center)[0] < 0.05, "inverted as it leaves");
 }
 
 /// A mask effect reads its matte from a second input: a 25%-gray matte leaves a quarter
@@ -749,6 +766,40 @@ fn every_offered_effect_changes_the_picture() {
     }
     eprintln!("checked: {checked:?}");
     assert!(checked.len() >= 12, "{checked:?}");
+}
+
+/// Every effect's off state really is off: set to it, the effect leaves the picture as
+/// it was — so as an intro or an outro it eases from (or to) the clip untouched.
+#[test]
+fn every_effect_at_its_off_state_does_nothing() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let mut render = |p: &Project, at: Time| {
+        let plan = plan_frame(p, SeqId(1), at, &PlanOptions { render_scale: 0.5, ..Default::default() }, &registry).unwrap();
+        let g = optimize(&plan.graph, OptLevel::Full, KeyContext::default());
+        let img = r.render(&g, &registry, &mut TestPatternSource::default()).unwrap();
+        read_linear(r.context(), &img).unwrap()
+    };
+    let at = Time::from_seconds(2);
+    let (base, _) = pattern_project(|_| {});
+    let reference = render(&base, at);
+    let mut checked = Vec::new();
+    for d in registry.offered(oa_graph::registry::EffectUsage::InOut).into_iter().filter(|d| !d.off.is_empty()) {
+        let (p, _) = pattern_project(|clip| {
+            let mut fx = EffectInstance::new(EffectId(90), &d.type_id);
+            for (id, v) in &d.off {
+                fx.params.set(id.as_str(), ParamSource::Static(v.clone()));
+            }
+            clip.effects.push(fx);
+        });
+        let out = render(&p, at);
+        let diff = out.iter().zip(&reference).map(|(a, b)| (a[0] - b[0]).abs() + (a[1] - b[1]).abs() + (a[2] - b[2]).abs()).sum::<f32>() / out.len() as f32;
+        assert!(diff < 2e-3, "{} at its off state still changes the picture (mean diff {diff})", d.name);
+        checked.push(d.name.clone());
+    }
+    eprintln!("checked: {checked:?}");
+    assert!(checked.len() >= 25, "{checked:?}");
 }
 
 /// A 640×360 canvas with one text clip (white "HELLO", 100 px) over black.
@@ -2285,4 +2336,94 @@ fn text_can_invert_what_is_behind_it() {
         assert!((0..3).all(|c| (first[c] - flipped[c]).abs() < 4e-3), "invert first at {i}: {first:?} != {flipped:?}");
         assert!((0..3).all(|c| (after[c] - original[c]).abs() < 4e-3), "invert after at {i}: {after:?} != {original:?}");
     }
+}
+
+/// Slice: a white frame cut down the middle (a vertical line) with the sides pushed
+/// apart — the gap shows the black under it, the sides stay white; Liquify flows the
+/// picture without tearing holes in it (edges clamped).
+#[test]
+fn slice_opens_a_gap_and_liquify_keeps_the_picture_whole() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let mut row = |configure: &dyn Fn(&mut Item)| {
+        let (p, _) = pattern_project(|clip| {
+            clip.kind = ItemKind::Solid;
+            clip.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color([1.0, 1.0, 1.0, 1.0])));
+            configure(clip);
+        });
+        let plan = plan_frame(&p, SeqId(1), Time::from_seconds(1), &PlanOptions::default(), &registry).unwrap();
+        let img = r.render(&plan.graph, &registry, &mut TestPatternSource::default()).unwrap();
+        let px = read_linear(r.context(), &img).unwrap();
+        let w = img.size[0] as usize;
+        let y = img.size[1] as usize / 2;
+        (0..w).map(|x| px[y * w + x]).collect::<Vec<[f32; 4]>>()
+    };
+    let sliced = row(&|clip| {
+        let mut fx = EffectInstance::new(EffectId(80), "oa.stylize.slice");
+        fx.params.set("angle", ParamSource::Static(Value::Float(90.0)));
+        fx.params.set("separation", ParamSource::Static(Value::Float(120.0)));
+        clip.effects.push(fx);
+    });
+    let w = sliced.len();
+    assert!(sliced[w / 2][0] < 0.02, "the gap: {:?}", sliced[w / 2]);
+    assert!(sliced[w / 4][0] > 0.98 && sliced[3 * w / 4][0] > 0.98, "the sides stay");
+    let gap = sliced.iter().filter(|p| p[0] < 0.5).count();
+    // 120 layer px on a 360-px-high canvas (the solid is the canvas: 1:1) — about 120.
+    assert!((100..=140).contains(&gap), "{gap} px apart");
+
+    // A picture of stripes: liquify moves them, and leaves nothing see-through.
+    let stripes = |clip: &mut Item| {
+        clip.kind = ItemKind::Media { media: MediaId(2) };
+        clip.params.0.remove(&oa_params::ParamId::new(schema::SOLID_COLOR));
+    };
+    let plain = row(&stripes);
+    let liquid = row(&|clip| {
+        stripes(clip);
+        clip.effects.push(EffectInstance::new(EffectId(81), "oa.warp.liquify"));
+    });
+    let moved = plain.iter().zip(&liquid).filter(|(a, b)| (a[0] - b[0]).abs() + (a[1] - b[1]).abs() > 0.05).count();
+    // (The pattern is flat bands: moving a pixel inside one changes nothing.)
+    assert!(moved > liquid.len() / 10, "it flows: {moved} of {} changed", liquid.len());
+    assert!(liquid.iter().all(|p| p[3] > 0.99), "no holes");
+}
+
+/// A glance at a picture on the GPU comes back small and in its colors: red on the
+/// left, blue on the right stays that way, read without blocking.
+#[test]
+fn a_glance_reads_a_picture_back_small() {
+    let Some(ctx) = gpu() else { return };
+    let (w, h) = (64u32, 32u32);
+    let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("glance-test"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let pixels: Vec<u8> = (0..w * h).flat_map(|i| if i % w < w / 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] }).collect();
+    ctx.queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        &pixels,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    let mut glance = oa_gpu::glance::Glance::new(&ctx);
+    glance.start(&ctx, &texture, 4);
+    let start = std::time::Instant::now();
+    let (bytes, size) = loop {
+        if let Some(got) = glance.poll(&ctx) {
+            break got;
+        }
+        assert!(glance.busy(), "the read failed");
+        assert!(start.elapsed().as_secs() < 10, "the read never came back");
+        std::thread::yield_now();
+    };
+    assert_eq!(size, [8, 4], "halved down to a short side of 4");
+    let px = |x: u32| &bytes[(x * 4) as usize..(x * 4 + 4) as usize];
+    assert!(px(0)[0] > 200 && px(0)[2] < 50, "left red: {:?}", px(0));
+    assert!(px(7)[2] > 200 && px(7)[0] < 50, "right blue: {:?}", px(7));
 }

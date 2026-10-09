@@ -57,6 +57,7 @@ is missing.
 | `preserves_opacity` | An opaque input stays opaque (lets the renderer skip what's hidden below). Default: true for `point`. |
 | `fusible` | May be run in one pass with its neighbors. Default: true for `point` and `uv_warp`. |
 | `category`, `description`, `preview` | The picker's group, a tooltip, and settings for its thumbnail (by parameter id) when its defaults show little. |
+| `off` | Its off state, by parameter id (`{"radius": 0}`): the values at which it does nothing. A passive effect with one is also offered as an intro and an outro (picture or sound), easing from full to off as the clip arrives and back as it leaves. |
 | `params` | Its settings — see [Parameters](#parameters). |
 | `shader` | `{"entry": "fn_name", "file": "x.wgsl"}` (or `"source": "…"` inline); `"passes": 2` runs it twice (`pass_index()` tells which). |
 | `bounds` | A [bounds script](#bounds): where it may draw, when that isn't just `expand`. |

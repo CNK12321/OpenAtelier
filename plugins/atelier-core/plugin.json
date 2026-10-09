@@ -7,7 +7,7 @@
   "api_version": 1,
   "effects": [
     {
-      "id": "oa.color.exposure", "name": "Exposure", "kind": "point", "category": "Color",
+      "id": "oa.color.exposure", "name": "Exposure", "off": {"stops": 0}, "kind": "point", "category": "Color",
       "preview": {"stops": 1.2},
       "params": [
         {"id": "stops", "type": "float", "default": 0, "min": -10, "max": 10}
@@ -15,7 +15,7 @@
       "shader": {"entry": "oa_color_exposure", "file": "color/exposure.wgsl"}
     },
     {
-      "id": "oa.color.saturation", "name": "Saturation", "kind": "point", "category": "Color",
+      "id": "oa.color.saturation", "name": "Saturation", "off": {"amount": 1}, "kind": "point", "category": "Color",
       "preview": {"amount": 2.2},
       "params": [
         {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 4}
@@ -139,7 +139,7 @@
       "shader": {"entry": "oa_color_hsl", "file": "color/hsl.wgsl"}
     },
     {
-      "id": "oa.color.posterize", "name": "Posterize", "kind": "point", "category": "Color", "space": "display",
+      "id": "oa.color.posterize", "name": "Posterize", "off": {"levels": 256}, "kind": "point", "category": "Color", "space": "display",
       "preview": {"levels": 4},
       "params": [
         {"id": "levels", "type": "float", "default": 8, "min": 2, "max": 256}
@@ -147,7 +147,7 @@
       "shader": {"entry": "oa_color_posterize", "file": "color/posterize.wgsl"}
     },
     {
-      "id": "oa.blur.gaussian", "name": "Blur", "kind": "spatial", "category": "Blur",
+      "id": "oa.blur.gaussian", "name": "Blur", "off": {"radius": 0}, "kind": "spatial", "category": "Blur",
       "preview": {"radius": 24},
       "params": [
         {"id": "radius", "type": "float", "default": 8, "min": 0, "max": 2000, "unit": "layer_pixels"},
@@ -156,7 +156,7 @@
       "shader": {"entry": "oa_blur_gaussian", "file": "blur/gaussian.wgsl", "passes": 2}
     },
     {
-      "id": "oa.blur.smear", "name": "Smear Blur", "kind": "spatial", "category": "Blur",
+      "id": "oa.blur.smear", "name": "Smear Blur", "off": {"length": 0}, "kind": "spatial", "category": "Blur",
       "params": [
         {"id": "length", "type": "float", "default": 40, "min": 0, "max": 2000, "unit": "layer_pixels"},
         {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
@@ -165,7 +165,7 @@
       "shader": {"entry": "oa_blur_smear", "file": "blur/smear.wgsl"}
     },
     {
-      "id": "oa.warp.wobble", "name": "Wobble", "kind": "uv_warp", "category": "Warp", "time_varying": true,
+      "id": "oa.warp.wobble", "name": "Wobble", "off": {"amount": 0}, "kind": "uv_warp", "category": "Warp", "time_varying": true,
       "params": [
         {"id": "amount", "type": "float", "default": 0.15, "min": 0, "max": 4},
         {"id": "speed", "type": "float", "default": 2, "min": 0, "max": 40},
@@ -174,7 +174,7 @@
       "shader": {"entry": "oa_warp_wobble", "file": "warp/wobble.wgsl"}
     },
     {
-      "id": "oa.stylize.pixelate", "name": "Pixelate", "kind": "spatial", "category": "Stylize",
+      "id": "oa.stylize.pixelate", "name": "Pixelate", "off": {"size": 1}, "kind": "spatial", "category": "Stylize",
       "params": [
         {"id": "size", "type": "float", "default": 16, "min": 1, "max": 512, "unit": "layer_pixels"},
         {"id": "blend", "type": "float", "default": 0, "min": 0, "max": 1}
@@ -182,7 +182,7 @@
       "shader": {"entry": "oa_stylize_pixelate", "file": "stylize/pixelate.wgsl"}
     },
     {
-      "id": "oa.stylize.scanlines", "name": "Scanlines", "kind": "point", "category": "Stylize", "time_varying": true, "preserves_opacity": false,
+      "id": "oa.stylize.scanlines", "name": "Scanlines", "off": {"amount": 0}, "kind": "point", "category": "Stylize", "time_varying": true, "preserves_opacity": false,
       "params": [
         {"id": "amount", "type": "float", "default": 0.35, "min": 0, "max": 2},
         {"id": "spacing", "type": "float", "default": 4, "min": 2, "max": 200, "unit": "layer_pixels"},
@@ -192,7 +192,7 @@
       "shader": {"entry": "oa_stylize_scanlines", "file": "stylize/scanlines.wgsl"}
     },
     {
-      "id": "oa.stylize.vignette", "name": "Vignette", "kind": "point", "category": "Stylize", "preserves_opacity": false,
+      "id": "oa.stylize.vignette", "name": "Vignette", "off": {"amount": 0}, "kind": "point", "category": "Stylize", "preserves_opacity": false,
       "params": [
         {"id": "amount", "type": "float", "default": 0.6, "min": 0, "max": 2},
         {"id": "size", "type": "float", "default": 0.75, "min": 0.05, "max": 2},
@@ -204,7 +204,7 @@
       "shader": {"entry": "oa_stylize_vignette", "file": "stylize/vignette.wgsl"}
     },
     {
-      "id": "oa.stylize.grain", "name": "Film Grain", "kind": "point", "category": "Stylize", "time_varying": true,
+      "id": "oa.stylize.grain", "name": "Film Grain", "off": {"amount": 0}, "kind": "point", "category": "Stylize", "time_varying": true,
       "params": [
         {"id": "amount", "type": "float", "default": 0.12, "min": 0, "max": 1.5},
         {"id": "size", "type": "float", "default": 2, "min": 1, "max": 64, "unit": "layer_pixels"},
@@ -223,7 +223,7 @@
       "shader": {"entry": "oa_stylize_halftone", "file": "stylize/halftone.wgsl"}
     },
     {
-      "id": "oa.stylize.sharpen", "name": "Sharpen", "kind": "spatial", "category": "Stylize",
+      "id": "oa.stylize.sharpen", "name": "Sharpen", "off": {"amount": 0}, "kind": "spatial", "category": "Stylize",
       "params": [
         {"id": "amount", "type": "float", "default": 0.6, "min": 0, "max": 5},
         {"id": "radius", "type": "float", "default": 1.5, "min": 0.5, "max": 32, "unit": "layer_pixels"}
@@ -231,7 +231,7 @@
       "shader": {"entry": "oa_stylize_sharpen", "file": "stylize/sharpen.wgsl"}
     },
     {
-      "id": "oa.stylize.edges", "name": "Edges", "kind": "spatial", "category": "Stylize",
+      "id": "oa.stylize.edges", "name": "Edges", "off": {"amount": 0, "blend": 0}, "kind": "spatial", "category": "Stylize",
       "params": [
         {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 8},
         {"id": "radius", "type": "float", "default": 1, "min": 0.5, "max": 16, "unit": "layer_pixels"},
@@ -241,7 +241,7 @@
       "shader": {"entry": "oa_stylize_edges", "file": "stylize/edges.wgsl"}
     },
     {
-      "id": "oa.warp.fisheye", "name": "Fisheye", "kind": "uv_warp", "category": "Warp",
+      "id": "oa.warp.fisheye", "name": "Fisheye", "off": {"amount": 0}, "kind": "uv_warp", "category": "Warp",
       "params": [
         {"id": "amount", "type": "float", "default": 0.6, "min": -3, "max": 3},
         {"id": "zoom", "type": "float", "default": 1, "min": 0.2, "max": 4},
@@ -250,7 +250,7 @@
       "shader": {"entry": "oa_warp_fisheye", "file": "warp/fisheye.wgsl"}
     },
     {
-      "id": "oa.warp.swirl", "name": "Swirl", "kind": "uv_warp", "category": "Warp",
+      "id": "oa.warp.swirl", "name": "Swirl", "off": {"angle": 0}, "kind": "uv_warp", "category": "Warp",
       "params": [
         {"id": "angle", "type": "float", "default": 90, "min": -1080, "max": 1080, "unit": "degrees"},
         {"id": "radius", "type": "float", "default": 0.8, "min": 0.05, "max": 3},
@@ -268,7 +268,7 @@
       "shader": {"entry": "oa_warp_mirror", "file": "warp/mirror.wgsl"}
     },
     {
-      "id": "oa.light.glow", "name": "Glow", "kind": "spatial", "category": "Light", "expand": "radius",
+      "id": "oa.light.glow", "name": "Glow", "off": {"strength": 0}, "kind": "spatial", "category": "Light", "expand": "radius",
       "second_input": "original",
       "pass_count": {"file": "light/glow.passes"},
       "pass_divisor": {"file": "light/glow.divisor"},
@@ -283,7 +283,7 @@
       "shader": {"entry": "oa_light_glow", "file": "light/glow.wgsl"}
     },
     {
-      "id": "oa.light.shadow", "name": "Drop Shadow", "kind": "spatial", "category": "Light",
+      "id": "oa.light.shadow", "name": "Drop Shadow", "off": {"opacity": 0}, "kind": "spatial", "category": "Light",
       "bounds": "let reach = (abs(distance) + abs(softness)) * raster_scale;\nleft = x0 - reach;\ntop = y0 - reach;\nright = x1 + reach;\nbottom = y1 + reach;",
       "params": [
         {"id": "color", "type": "color", "default": [0, 0, 0, 1]},
@@ -295,7 +295,7 @@
       "shader": {"entry": "oa_light_shadow", "file": "light/shadow.wgsl"}
     },
     {
-      "id": "oa.stylize.stroke", "name": "Stroke", "kind": "spatial", "category": "Stylize", "expand": "width",
+      "id": "oa.stylize.stroke", "name": "Stroke", "off": {"width": 0}, "kind": "spatial", "category": "Stylize", "expand": "width",
       "params": [
         {"id": "width", "type": "float", "default": 6, "min": 0, "max": 100, "unit": "layer_pixels"},
         {"id": "color", "type": "color", "default": [1, 1, 1, 1]}
@@ -303,7 +303,7 @@
       "shader": {"entry": "oa_stylize_stroke", "file": "stylize/stroke.wgsl"}
     },
     {
-      "id": "oa.stylize.glitch", "name": "Glitch", "kind": "spatial", "category": "Stylize", "time_varying": true,
+      "id": "oa.stylize.glitch", "name": "Glitch", "off": {"amount": 0, "split": 0}, "kind": "spatial", "category": "Stylize", "time_varying": true,
       "params": [
         {"id": "amount", "type": "float", "default": 0.5, "min": 0, "max": 1},
         {"id": "speed", "type": "float", "default": 8, "min": 0, "max": 30},
@@ -321,7 +321,7 @@
       "shader": {"entry": "oa_warp_kaleidoscope", "file": "warp/kaleidoscope.wgsl"}
     },
     {
-      "id": "oa.warp.ripple", "name": "Ripple", "kind": "uv_warp", "category": "Warp", "time_varying": true,
+      "id": "oa.warp.ripple", "name": "Ripple", "off": {"amplitude": 0}, "kind": "uv_warp", "category": "Warp", "time_varying": true,
       "params": [
         {"id": "amplitude", "type": "float", "default": 8, "min": 0, "max": 100, "unit": "layer_pixels"},
         {"id": "wavelength", "type": "float", "default": 60, "min": 4, "max": 1000, "unit": "layer_pixels"},
@@ -331,7 +331,7 @@
       "shader": {"entry": "oa_warp_ripple", "file": "warp/ripple.wgsl"}
     },
     {
-      "id": "oa.color.temperature", "name": "Temperature", "kind": "point", "category": "Color",
+      "id": "oa.color.temperature", "name": "Temperature", "off": {"temperature": 0, "tint": 0}, "kind": "point", "category": "Color",
       "preview": {"temperature": 0.7},
       "params": [
         {"id": "temperature", "type": "float", "default": 0, "min": -1, "max": 1},
@@ -359,7 +359,7 @@
       "shader": {"entry": "oa_warp_scroll", "file": "warp/scroll.wgsl"}
     },
     {
-      "id": "oa.blur.zoom", "name": "Zoom Blur", "kind": "spatial", "category": "Blur",
+      "id": "oa.blur.zoom", "name": "Zoom Blur", "off": {"zoom": 0, "spin": 0}, "kind": "spatial", "category": "Blur",
       "params": [
         {"id": "zoom", "type": "float", "default": 0.4, "min": -2, "max": 2},
         {"id": "spin", "type": "float", "default": 0, "min": -180, "max": 180, "unit": "degrees"},
@@ -368,7 +368,7 @@
       "shader": {"entry": "oa_blur_zoom", "file": "blur/zoom.wgsl"}
     },
     {
-      "id": "oa.color.chromatic", "name": "Chromatic Aberration", "kind": "spatial", "category": "Color",
+      "id": "oa.color.chromatic", "name": "Chromatic Aberration", "off": {"amount": 0}, "kind": "spatial", "category": "Color",
       "params": [
         {"id": "amount", "type": "float", "default": 3, "min": 0, "max": 200, "unit": "layer_pixels"},
         {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
@@ -377,7 +377,7 @@
       "shader": {"entry": "oa_color_chromatic", "file": "color/chromatic.wgsl"}
     },
     {
-      "id": "oa.color.hue", "name": "Hue Shift", "kind": "point", "category": "Color",
+      "id": "oa.color.hue", "name": "Hue Shift", "off": {"amount": 0}, "kind": "point", "category": "Color",
       "params": [
         {"id": "angle", "type": "float", "default": 30, "min": -360, "max": 360, "unit": "degrees"},
         {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
@@ -399,7 +399,7 @@
       "shader": {"entry": "oa_color_to", "file": "color/color-to.wgsl"}
     },
     {
-      "id": "oa.color.contrast", "name": "Contrast", "kind": "point", "category": "Color",
+      "id": "oa.color.contrast", "name": "Contrast", "off": {"contrast": 1, "brightness": 0}, "kind": "point", "category": "Color",
       "params": [
         {"id": "contrast", "type": "float", "default": 1.2, "min": 0, "max": 8},
         {"id": "brightness", "type": "float", "default": 0, "min": -2, "max": 2},
@@ -409,7 +409,7 @@
       "shader": {"entry": "oa_color_contrast", "file": "color/contrast.wgsl"}
     },
     {
-      "id": "oa.color.invert", "name": "Invert", "kind": "point", "category": "Color", "space": "display", "preserves_opacity": false,
+      "id": "oa.color.invert", "name": "Invert", "off": {"amount": 0}, "kind": "point", "category": "Color", "space": "display", "preserves_opacity": false,
       "description": "Flips the channels chosen: red, green and blue by default. Magenta, cyan and yellow flip the two channels each is made of (magenta: red and blue; cyan: green and blue; yellow: red and green); alpha flips transparency.",
       "params": [
         {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1},
@@ -418,7 +418,7 @@
       "shader": {"entry": "oa_color_invert", "file": "color/invert.wgsl"}
     },
     {
-      "id": "oa.color.duotone", "name": "Duotone", "kind": "point", "category": "Color", "space": "display",
+      "id": "oa.color.duotone", "name": "Duotone", "off": {"amount": 0}, "kind": "point", "category": "Color", "space": "display",
       "params": [
         {"id": "shadows", "type": "color", "default": [0.1, 0.1, 0.4, 1]},
         {"id": "highlights", "type": "color", "default": [1, 0.85, 0.4, 1]},
@@ -465,6 +465,46 @@
       "shader": {"entry": "oa_composite_blend", "file": "composite/blend.wgsl"}
     },
     {
+      "id": "oa.composite.duplicate", "name": "Duplicate", "kind": "point", "category": "Compositing", "preserves_opacity": true,
+      "description": "A second copy of the clip, drawn with it: in front or behind, moved, scaled, turned and faded on its own. Its effects: the clip's (inherit), only those listed above this one (copy previous), or none — plus any added to the duplicate alone.",
+      "params": [
+        {"id": "effects", "type": "enum", "options": ["inherit effects", "copy previous effects", "no effects"], "default": "inherit effects"},
+        {"id": "in_front", "type": "bool", "default": true},
+        {"id": "offset", "type": "vec2", "default": [0.05, 0.05], "unit": "canvas_fraction"},
+        {"id": "scale", "type": "float", "default": 1, "min": 0, "max": 10},
+        {"id": "rotation", "type": "float", "default": 0, "min": -360, "max": 360, "unit": "degrees"},
+        {"id": "opacity", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_composite_duplicate", "file": "composite/duplicate.wgsl"}
+    },
+    {
+      "id": "oa.stylize.slice", "name": "Slice", "off": {"separation": 0, "slide": 0}, "kind": "spatial", "category": "Stylize", "editor": "line", "preserves_opacity": false,
+      "description": "Cuts the picture along a line — drag its point in the viewer, turn it by its handle — and pushes the two sides apart (separation) or slides them along the cut.",
+      "bounds": "let reach = (abs(separation) + abs(slide)) * raster_scale;\nleft = x0 - reach;\ntop = y0 - reach;\nright = x1 + reach;\nbottom = y1 + reach;",
+      "preview": {"separation": 60, "angle": 30},
+      "params": [
+        {"id": "point", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"},
+        {"id": "angle", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "separation", "type": "float", "default": 40, "min": 0, "max": 4000, "unit": "layer_pixels"},
+        {"id": "slide", "type": "float", "default": 0, "min": -4000, "max": 4000, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_stylize_slice", "file": "stylize/slice.wgsl"}
+    },
+    {
+      "id": "oa.warp.liquify", "name": "Liquify", "off": {"amount": 0}, "kind": "uv_warp", "category": "Warp", "time_varying": true,
+      "description": "Melts the picture into swirling, marbled ribbons, like paint stirred in liquid. Amount is how far it flows; size how big the swirls are; detail how many smaller swirls ride on them; swirl how twisted they are; flow how fast they move.",
+      "params": [
+        {"id": "amount", "type": "float", "default": 280, "min": 0, "max": 3000, "unit": "layer_pixels"},
+        {"id": "size", "type": "float", "default": 800, "min": 10, "max": 5000, "unit": "layer_pixels"},
+        {"id": "detail", "type": "float", "default": 3, "min": 1, "max": 6},
+        {"id": "swirl", "type": "float", "default": 1.2, "min": 0, "max": 3},
+        {"id": "flow", "type": "float", "default": 0.15, "min": 0, "max": 4},
+        {"id": "seed", "type": "float", "default": 1, "min": 0, "max": 1000},
+        {"id": "edges", "type": "enum", "options": ["clamp", "transparent"], "static_only": true}
+      ],
+      "shader": {"entry": "oa_warp_liquify", "file": "warp/liquify.wgsl"}
+    },
+    {
       "id": "oa.stylize.shatter", "name": "Shatter", "kind": "spatial", "category": "Stylize", "expand": "travel_distance", "preserves_opacity": false,
       "description": "Breaks the picture into shards that fly out from the center point. Parts is how many; size how far from the center it breaks (1: all of it); travel distance how far they've flown — keyframe it from 0 to break it apart. Seed picks another way to break.",
       "preview": {"travel_distance": 120},
@@ -479,7 +519,7 @@
       "shader": {"entry": "oa_stylize_shatter", "file": "stylize/shatter.wgsl"}
     },
     {
-      "id": "oa.motion.shake", "name": "Camera Shake", "kind": "motion", "category": "Motion", "time_varying": true,
+      "id": "oa.motion.shake", "name": "Camera Shake", "off": {"intensity": 0, "rotation": 0}, "kind": "motion", "category": "Motion", "time_varying": true,
       "preview": {"intensity": 0.04, "rotation": 4},
       "params": [
         {"id": "intensity", "type": "float", "default": 0.012, "min": 0, "max": 0.5},
@@ -489,7 +529,7 @@
       "motion": {"file": "motion/shake.oamotion"}
     },
     {
-      "id": "oa.motion.wiggle", "name": "Wiggle", "kind": "motion", "category": "Motion", "time_varying": true,
+      "id": "oa.motion.wiggle", "name": "Wiggle", "off": {"amount": 0, "rotation": 0}, "kind": "motion", "category": "Motion", "time_varying": true,
       "preview": {"amount": 0.08, "rotation": 8},
       "params": [
         {"id": "amount", "type": "float", "default": 0.02, "min": 0, "max": 1},
@@ -618,7 +658,7 @@
       "shader": {"entry": "oa_text_background", "file": "text/background.wgsl"}
     },
     {
-      "id": "oa.color.tint", "name": "Tint", "kind": "point", "category": "Color",
+      "id": "oa.color.tint", "name": "Tint", "off": {"amount": 0}, "kind": "point", "category": "Color",
       "params": [
         {"id": "color", "type": "gradient", "default": {"angle":90.0,"stops":[{"pos":0.0,"color":[1.0,0.6,0.2,1.0]}]}},
         {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
@@ -626,7 +666,7 @@
       "shader": {"entry": "oa_color_tint", "file": "color/tint.wgsl"}
     },
     {
-      "id": "oa.light.shimmer", "name": "Shimmer", "kind": "point", "category": "Light", "time_varying": true,
+      "id": "oa.light.shimmer", "name": "Shimmer", "off": {"strength": 0}, "kind": "point", "category": "Light", "time_varying": true,
       "params": [
         {"id": "speed", "type": "float", "default": 0.6, "min": 0, "max": 4},
         {"id": "width", "type": "float", "default": 0.12, "min": 0.01, "max": 1},
@@ -738,7 +778,7 @@
       "shader": {"entry": "oa_transition_blur", "file": "transition/blur.wgsl"}
     },
     {
-      "id": "oa.audio.bass", "name": "Bass Boost", "kind": "sound", "category": "EQ & Tone",
+      "id": "oa.audio.bass", "name": "Bass Boost", "off": {"boost": 0}, "kind": "sound", "category": "EQ & Tone",
       "description": "Lifts the low end.",
       "params": [
         {"id": "boost", "type": "float", "default": 8, "min": 0, "max": 18, "unit": "decibels"},
@@ -747,7 +787,7 @@
       "shader": {"file": "sound/bass.oasound"}
     },
     {
-      "id": "oa.audio.pitch", "name": "Pitch Shift", "kind": "sound", "category": "Character",
+      "id": "oa.audio.pitch", "name": "Pitch Shift", "off": {"mix": 0}, "kind": "sound", "category": "Character",
       "description": "Higher or lower, same speed. Formant moves the voice's character (child to giant) on its own; \"keep voice\" holds it where it was while the pitch moves.",
       "params": [
         {"id": "semitones", "type": "float", "default": 5, "min": -12, "max": 12},
@@ -759,7 +799,7 @@
       "shader": {"file": "sound/pitch.oasound"}
     },
     {
-      "id": "oa.audio.echo", "name": "Echo", "kind": "sound", "category": "Space",
+      "id": "oa.audio.echo", "name": "Echo", "off": {"mix": 0}, "kind": "sound", "category": "Space",
       "description": "Repeats that fade away.",
       "params": [
         {"id": "delay", "type": "float", "default": 0.35, "min": 0.02, "max": 1.5, "unit": "seconds"},
@@ -770,7 +810,7 @@
       "shader": {"file": "sound/echo.oasound"}
     },
     {
-      "id": "oa.audio.reverb", "name": "Reverb", "kind": "sound", "category": "Space",
+      "id": "oa.audio.reverb", "name": "Reverb", "off": {"mix": 0}, "kind": "sound", "category": "Space",
       "description": "The sound of a room: pick a space, or set your own. It keeps ringing after the clip ends.",
       "params": [
         {"id": "space", "type": "enum", "options": ["custom", "small room", "studio", "hall", "cathedral", "plate", "cave"]},
@@ -848,7 +888,7 @@
       "shader": {"file": "sound/gate.oasound"}
     },
     {
-      "id": "oa.audio.crush", "name": "Bit Crush", "kind": "sound", "category": "Character",
+      "id": "oa.audio.crush", "name": "Bit Crush", "off": {"mix": 0}, "kind": "sound", "category": "Character",
       "description": "Coarse and grainy: fewer bits, a lower sample rate, like old hardware.",
       "params": [
         {"id": "bits", "type": "float", "default": 6, "min": 1, "max": 16},
@@ -858,7 +898,7 @@
       "shader": {"file": "sound/crush.oasound"}
     },
     {
-      "id": "oa.audio.denoise", "name": "Denoise", "kind": "sound", "category": "Cleanup",
+      "id": "oa.audio.denoise", "name": "Denoise", "off": {"reduction": 0}, "kind": "sound", "category": "Cleanup",
       "description": "Removes steady background noise (hiss, hum, fans).",
       "params": [
         {"id": "reduction", "type": "float", "default": 18, "min": 0, "max": 40, "unit": "decibels"},
@@ -873,7 +913,7 @@
       "shader": {"source": "out = in * pow(visibility, curve);"}
     },
     {
-      "id": "oa.audio.muffle", "name": "Muffle", "kind": "sound", "category": "EQ & Tone",
+      "id": "oa.audio.muffle", "name": "Muffle", "off": {"amount": 0}, "kind": "sound", "category": "EQ & Tone",
       "description": "Dull and far away, as if through a wall. As an intro it opens up; as an outro it closes in.",
       "params": [
         {"id": "cutoff", "type": "float", "default": 600, "min": 80, "max": 8000},
@@ -900,7 +940,7 @@
       "shader": {"file": "sound/tone.oasound"}
     },
     {
-      "id": "oa.audio.tremolo", "name": "Tremolo", "kind": "sound", "category": "Character",
+      "id": "oa.audio.tremolo", "name": "Tremolo", "off": {"depth": 0}, "kind": "sound", "category": "Character",
       "description": "The level swings up and down.",
       "params": [
         {"id": "speed", "type": "float", "default": 5, "min": 0.1, "max": 20},
@@ -909,7 +949,7 @@
       "shader": {"source": "let swing = 0.5 + 0.5 * sin(TAU * speed * time);\nout = in * (1 - depth * swing);"}
     },
     {
-      "id": "oa.audio.drive", "name": "Drive", "kind": "sound", "category": "Character",
+      "id": "oa.audio.drive", "name": "Drive", "off": {"mix": 0}, "kind": "sound", "category": "Character",
       "description": "Warm saturation, up to a fuzzy distortion.",
       "params": [
         {"id": "drive", "type": "float", "default": 12, "min": 0, "max": 36, "unit": "decibels"},
@@ -918,7 +958,7 @@
       "shader": {"source": "let d = db(drive);\nout = mix(in, tanh(in * d) / tanh(d), mix);"}
     },
     {
-      "id": "oa.audio.width", "name": "Stereo Width", "kind": "sound", "category": "Space", "meter": "correlation",
+      "id": "oa.audio.width", "name": "Stereo Width", "off": {"width": 1}, "kind": "sound", "category": "Space", "meter": "correlation",
       "description": "Narrower (0 is mono) or wider than it was recorded.",
       "params": [{"id": "width", "type": "float", "default": 1.5, "min": 0, "max": 3}],
       "shader": {"source": "let mid = (left + right) * 0.5;\nlet side = (left - right) * 0.5 * width;\nout = select(channels < 2, in, select(channel == 0, mid + side, mid - side));"}

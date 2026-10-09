@@ -69,7 +69,9 @@ impl Document {
     /// Like [`edit`](Self::edit), but merges into the previous undo step if it used the
     /// same `key` and hasn't been sealed with [`seal`](Self::seal).
     pub fn edit_coalesced(&mut self, label: &str, key: Option<&str>, ops: Vec<Op>) -> Result<(), EditError> {
-        let (project, mut undo) = run(&self.project, ops)?;
+        let (project, undo) = run(&self.project, ops)?;
+        // Temp layers emptied by a one-off edit go with it; a drag's wait for `seal`.
+        let (project, mut undo) = if key.is_none() { prune_temp(project, undo) } else { (project, undo) };
         self.project = project;
         self.revision += 1;
         self.redo.clear();
@@ -91,6 +93,13 @@ impl Document {
     pub fn seal(&mut self) {
         if let Some(top) = self.undo.last_mut() {
             top.coalesce = None;
+            // Temp layers the drag left empty go now, in the same undo step.
+            let (project, undo) = prune_temp(self.project.clone(), std::mem::take(&mut top.undo));
+            if !Arc::ptr_eq(&project, &self.project) {
+                self.project = project;
+                self.revision += 1;
+            }
+            top.undo = undo;
         }
     }
 
@@ -178,6 +187,29 @@ fn run(project: &Arc<Project>, ops: Vec<Op>) -> Result<(Arc<Project>, Vec<Op>), 
         }
     }
     Ok((Arc::new(next), undo))
+}
+
+/// Removes the temp layers that are empty in `project` (with `undo`, the edit that left
+/// them so): the removals join that edit, so undoing it brings them back.
+fn prune_temp(project: Arc<Project>, mut undo: Vec<Op>) -> (Arc<Project>, Vec<Op>) {
+    let empty: Vec<(crate::SeqId, crate::TrackId)> =
+        project.sequences.iter().flat_map(|(id, s)| s.tracks.iter().filter(|t| t.temp && t.items.is_empty()).map(|t| (*id, t.id))).collect();
+    if empty.is_empty() {
+        return (project, undo);
+    }
+    let mut next = (*project).clone();
+    let mut removed = Vec::new();
+    for (seq, track) in empty {
+        match (Op::RemoveTrack { seq, track }).apply(&mut next) {
+            Ok(mut inv) => {
+                inv.append(&mut removed);
+                removed = inv;
+            }
+            Err(_) => return (project, undo),
+        }
+    }
+    removed.append(&mut undo);
+    (Arc::new(next), removed)
 }
 
 /// Timing edits for the compound clips playing sequences whose length changed (`changed`:

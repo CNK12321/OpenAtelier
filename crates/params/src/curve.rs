@@ -145,6 +145,49 @@ impl Curve {
         }
     }
 
+    /// Keeps a clip-anchored curve's keys within `0..=length` of the clip's clock: keys
+    /// past either end (left there by a split or a trim) become one key on that end,
+    /// with the value the curve has there — so what's seen at the ends doesn't change,
+    /// and nothing out of sight pulls on the keys inside. Source-anchored curves are
+    /// left alone (their clock isn't the clip's).
+    pub fn confine(&mut self, length: Time) {
+        if self.anchor != KeyframeAnchor::ClipStart || self.keys.is_empty() {
+            return;
+        }
+        let (lo, hi) = (Time::ZERO, length.max(Time::ZERO));
+        let (at_lo, at_hi) = (self.eval_at(lo), self.eval_at(hi));
+        // The easing a stretch had carries on from the new key at its start.
+        let before = self.keys.iter().rev().find(|k| k.t < lo).map(|k| k.interp);
+        let after = self.keys.iter().find(|k| k.t > hi).is_some();
+        let last_inside = self.keys.iter().rev().find(|k| k.t <= hi).map(|k| k.interp);
+        if before.is_none() && !after {
+            return;
+        }
+        self.keys.retain(|k| k.t >= lo && k.t <= hi);
+        // An end key only where the stretch beyond moved the value inside the clip: one
+        // that would repeat its neighbor's value is what holding it gives anyway.
+        if self.keys.is_empty() {
+            // Every key was outside: the clip saw a constant, or a stretch of motion.
+            let interp = before.unwrap_or_else(crate::default_interp);
+            self.keys.push(Keyframe { t: lo, value: at_lo.clone(), interp });
+            if at_hi != at_lo {
+                self.keys.push(Keyframe { t: hi, value: at_hi, interp });
+            }
+            return;
+        }
+        if let Some(interp) = before
+            && self.keys[0].t > lo
+            && self.keys[0].value != at_lo
+        {
+            self.keys.insert(0, Keyframe { t: lo, value: at_lo, interp });
+        }
+        let last = self.keys.last().expect("not empty");
+        if after && last.t < hi && last.value != at_hi {
+            let interp = last_inside.or(before).unwrap_or_else(crate::default_interp);
+            self.keys.push(Keyframe { t: hi, value: at_hi, interp });
+        }
+    }
+
     /// See [`crate::ParamSource::shift_clip_clock`].
     pub fn shift_clip_clock(&mut self, delta: Time) {
         if self.anchor == KeyframeAnchor::ClipStart {
@@ -298,5 +341,50 @@ mod power_tests {
         assert!((e.ease(0.25) + e.ease(0.75) - 1.0).abs() < 1e-12, "mirror halves");
         assert!(e.ease(0.25) < 0.25, "slow start");
         assert!(Interp::Power { power: 2.0, ease: EaseDir::Out }.ease(0.5) > 0.5, "fast start");
+    }
+}
+
+#[cfg(test)]
+mod confine_tests {
+    use super::*;
+
+    fn secs(s: f64) -> Time {
+        Time::from_seconds_f64(s)
+    }
+
+    fn curve(keys: &[(f64, f64)]) -> Curve {
+        Curve::new(KeyframeAnchor::ClipStart, keys.iter().map(|(t, v)| Keyframe::linear(secs(*t), Value::Float(*v))).collect())
+    }
+
+    fn keys(c: &Curve) -> Vec<(f64, f64)> {
+        c.keys.iter().map(|k| (k.t.as_seconds_f64(), k.value.as_float().unwrap())).collect()
+    }
+
+    /// Keys a split left outside a clip 1 s long: the clip looks the same at its ends,
+    /// and nothing outside is left to pull on what's inside.
+    #[test]
+    fn keys_outside_the_clip_become_its_ends() {
+        // A constant held from a key past the end: one key.
+        let mut c = curve(&[(1.4, 0.5)]);
+        c.confine(secs(1.0));
+        assert_eq!(keys(&c), [(0.0, 0.5)]);
+        // Motion running past the end: a key there, with the value it had reached.
+        let mut c = curve(&[(0.0, 0.0), (2.0, 2.0)]);
+        c.confine(secs(1.0));
+        assert_eq!(keys(&c), [(0.0, 0.0), (1.0, 1.0)]);
+        // Motion from before the start: a key at the start; inside, unchanged.
+        let mut c = curve(&[(-1.0, 0.0), (0.5, 3.0)]);
+        let mid = c.eval_at(secs(0.25));
+        c.confine(secs(1.0));
+        assert_eq!(keys(&c), [(0.0, 2.0), (0.5, 3.0)]);
+        assert_eq!(c.eval_at(secs(0.25)), mid);
+        // Past the end but no change inside: nothing added.
+        let mut c = curve(&[(0.5, 1.0), (3.0, 1.0)]);
+        c.confine(secs(1.0));
+        assert_eq!(keys(&c), [(0.5, 1.0)]);
+        // Inside already: untouched.
+        let mut c = curve(&[(0.2, 1.0), (0.8, 2.0)]);
+        c.confine(secs(1.0));
+        assert_eq!(keys(&c), [(0.2, 1.0), (0.8, 2.0)]);
     }
 }

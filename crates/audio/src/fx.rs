@@ -47,6 +47,9 @@ pub struct FxInfo {
     pub shader: Arc<Program>,
     /// The live meter its card shows (`oa_graph::registry::METER_*`).
     pub meter: Option<String>,
+    /// Its off state (`EffectDescriptor::off`): as an intro or outro, it eases between
+    /// full and these values.
+    pub off: Vec<(oa_params::ParamId, oa_params::Value)>,
     tail: Option<Tail>,
 }
 
@@ -60,7 +63,7 @@ impl FxInfo {
     /// A sound effect written as a sound shader.
     pub fn shader(type_id: &str, name: &str, description: &str, params: Vec<ParamSchema>, usage: FxUsage, source: &str) -> Result<FxInfo, String> {
         let program = Program::compile(source, &params)?;
-        Ok(FxInfo { type_id: type_id.into(), name: name.into(), description: description.into(), params, usage, shader: Arc::new(program), meter: None, tail: None })
+        Ok(FxInfo { type_id: type_id.into(), name: name.into(), description: description.into(), params, usage, shader: Arc::new(program), meter: None, off: Vec::new(), tail: None })
     }
 
     /// A plugin's sound effect, as its manifest declares it.
@@ -88,6 +91,7 @@ impl FxInfo {
             usage,
             shader: Arc::new(program),
             meter: d.meter.clone(),
+            off: d.off.clone(),
             tail,
         })
     }
@@ -275,6 +279,31 @@ mod tests {
             let share = start.elapsed().as_secs_f32() / seconds;
             println!("{:<22} {:>6.2}% of real time", fx.type_id, share * 100.0);
         }
+    }
+
+    /// Every sound effect's off state really is off: set to it (as an intro or an outro
+    /// eases to), the sound comes out as it went in.
+    #[test]
+    fn every_sound_effect_at_its_off_state_does_nothing() {
+        let input: Vec<f32> = sine(220.0, 1.0, 0.3).into_iter().flat_map(|x| [x, x * 0.8]).collect();
+        let mut checked = Vec::new();
+        for fx in core_catalog().iter().filter(|f| !f.off.is_empty()) {
+            let mut v = ParamSet::default().eval(&fx.params, None, &EvalContext::at(Time::ZERO, Time::ZERO));
+            eased(&fx.off, &mut v, 0.0);
+            let mut p = processor(&fx.type_id, 2, RATE).unwrap();
+            let mut out = input.clone();
+            for block in out.chunks_mut(2 * 512) {
+                p.process(block, &v, &ClockSpan::default());
+            }
+            // The second half, once anything that ramps has settled — lined up with the
+            // input by the delay it reports (the mixer feeds that much ahead).
+            let (half, lag) = (input.len() / 2, p.latency() * 2);
+            let diff: Vec<f32> = out[half..].iter().zip(&input[half - lag..]).map(|(a, b)| a - b).collect();
+            let off_by = db(rms(&diff), rms(&input[half..]));
+            assert!(off_by < -40.0, "{} at its off state still changes the sound ({off_by:.1} dB)", fx.type_id);
+            checked.push(fx.type_id.clone());
+        }
+        assert!(checked.len() >= 8, "{checked:?}");
     }
 
     #[test]
@@ -486,5 +515,16 @@ mod tone_tests {
         assert!(rms(&y[24_000..28_800]) > 10.0 * rms(&y[20_000..24_000]), "starts again at 0.5 s");
         let y = tone(&[("gain", Value::Float(0.0)), ("follow", Value::Float(1.0))], &silence);
         assert!(rms(&y) < 1e-4, "follows the silence");
+    }
+}
+
+/// `values` `strength` of the way from `off` (0) to themselves (1): a sound effect with
+/// an off state running as an intro or an outro (as `EffectDescriptor::eased`).
+pub fn eased(off: &[(oa_params::ParamId, oa_params::Value)], values: &mut Evaluated, strength: f64) {
+    let k = strength.clamp(0.0, 1.0);
+    for (id, o) in off {
+        if let Some((_, v)) = values.0.iter_mut().find(|(p, _)| p == id) {
+            *v = o.interpolate(v, k);
+        }
     }
 }

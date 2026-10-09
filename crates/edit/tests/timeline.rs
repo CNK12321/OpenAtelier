@@ -153,6 +153,7 @@ fn split_changes_no_frame() {
             ps
         },
         role: Default::default(),
+        on_duplicate: None,
     };
     let set = |param: &str, target: ParamTarget, source: ParamSource| Op::SetParam {
         seq: SEQ,
@@ -424,12 +425,14 @@ fn paste_keeps_spacing_and_makes_room_on_a_new_track() {
     assert_eq!(ids.len(), 2);
     assert_eq!(item(&doc, ids[0].0).range.start, secs(10.0));
     assert_eq!(item(&doc, ids[1].0).range.start, secs(13.0), "spacing kept");
-    // At 1 s V1 is taken (and V2 is free).
+    // At 1 s V1 is taken and V2 is free: they go there, no new track.
+    let tracks = doc.project().sequence(SEQ).unwrap().tracks.len();
     let (ops, ids) = timeline::paste(doc.project(), SEQ, &copied, secs(1.0), &mut alloc).unwrap();
     apply(&mut doc, ops);
     let s = doc.project().sequence(SEQ).unwrap();
     let track_of = |id: ItemId| s.find_item(id).map(|(t, _)| s.tracks[t].id);
-    assert_ne!(track_of(ids[0]), Some(V1));
+    assert_eq!(track_of(ids[0]), Some(V2));
+    assert_eq!(s.tracks.len(), tracks);
     // Grouped copies stay grouped — in a new group.
     let mut grouped = copied.clone();
     for (_, it) in &mut grouped {
@@ -440,3 +443,106 @@ fn paste_keeps_spacing_and_makes_room_on_a_new_track() {
     let (a, b) = (item(&doc, ids[0].0).group, item(&doc, ids[1].0).group);
     assert!(a.is_some() && a == b && a != Some(7));
 }
+
+/// With no room anywhere, a paste makes a temp layer; it goes once emptied (in the same
+/// undo step), and stays when made a real track.
+#[test]
+fn a_paste_with_no_room_goes_on_a_temp_layer_that_clears_itself() {
+    // Both tracks busy for 10 s; the copy is 1 s long.
+    let mut doc = doc_with(&[(V1, 10, STILL, 0.0, 10.0, 0.0), (V2, 11, STILL, 0.0, 10.0, 0.0)]);
+    let mut clip = item(&doc, 10);
+    clip.range.duration = secs(1.0);
+    let copied = vec![(V1, clip)];
+    let mut next = 1000;
+    let mut alloc = || {
+        next += 1;
+        next
+    };
+    let (ops, ids) = timeline::paste(doc.project(), SEQ, &copied, secs(0.5), &mut alloc).unwrap();
+    apply(&mut doc, ops);
+    let temp = |doc: &Document| doc.project().sequence(SEQ).unwrap().tracks.iter().find(|t| t.temp).map(|t| t.id);
+    let layer = temp(&doc).expect("a temp layer");
+    // Another paste with no room elsewhere reuses it (it has room) — no second layer.
+    let tracks = doc.project().sequence(SEQ).unwrap().tracks.len();
+    let (ops, more) = timeline::paste(doc.project(), SEQ, &copied, secs(3.0), &mut alloc).unwrap();
+    apply(&mut doc, ops);
+    assert_eq!(doc.project().sequence(SEQ).unwrap().tracks.len(), tracks);
+    let s = doc.project().sequence(SEQ).unwrap();
+    assert_eq!(s.find_item(more[0]).map(|(t, _)| s.tracks[t].id), Some(layer));
+    apply(&mut doc, vec![Op::RemoveItem { seq: SEQ, item: more[0] }]);
+    // Emptied: it goes, and undo brings back both.
+    apply(&mut doc, vec![Op::RemoveItem { seq: SEQ, item: ids[0] }]);
+    assert_eq!(temp(&doc), None);
+    doc.undo().unwrap();
+    assert_eq!(temp(&doc), Some(layer));
+    assert!(doc.project().sequence(SEQ).unwrap().item(ids[0]).is_some());
+    // A drag that empties it leaves it until the drag ends.
+    doc.edit_coalesced("drag", Some("drag"), vec![Op::RemoveItem { seq: SEQ, item: ids[0] }]).unwrap();
+    assert_eq!(temp(&doc), Some(layer));
+    doc.seal();
+    assert_eq!(temp(&doc), None);
+    doc.undo().unwrap();
+    // Kept: a real track stays when emptied.
+    apply(&mut doc, vec![Op::SetTrackTemp { seq: SEQ, track: layer, temp: false }]);
+    apply(&mut doc, vec![Op::RemoveItem { seq: SEQ, item: ids[0] }]);
+    assert!(doc.project().sequence(SEQ).unwrap().track(layer).is_some());
+}
+
+/// A speed ramp keeps the clip playing the same part of its file: slowed, it gets longer
+/// (onto a temp layer when the next clip is in the way); sped up, shorter.
+#[test]
+fn speed_ramps_grow_and_shrink_the_clip() {
+    let mut doc = doc_with(&[(V1, 10, MEDIA, 0.0, 4.0, 0.0), (V1, 11, MEDIA, 6.0, 2.0, 0.0)]);
+    let mut next = 1000;
+    let mut alloc = || {
+        next += 1;
+        next
+    };
+    let ramp = |a: f64, b: f64| {
+        let key = |t: f64, v: f64| Keyframe { t: secs(t), value: Value::Float(v), interp: oa_params::Interp::Linear };
+        ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, vec![key(0.0, a), key(4.0, b)]))
+    };
+    let length = |doc: &Document| item(doc, 10).range.duration.as_seconds_f64();
+    // 1× → 2× over the first 4 s: 4 s of file take less than 4 s (t + t²/8 = 4: about 2.93 s).
+    let ops = timeline::set_speed_ramp(doc.project(), SEQ, ItemId(10), Some(ramp(1.0, 2.0)), &mut alloc).unwrap();
+    apply(&mut doc, ops);
+    assert!((length(&doc) - 2.93).abs() < 0.05, "shorter: {}", length(&doc));
+    assert!((timeline::source_span(&item(&doc, 10)) - 4.0).abs() < 0.05, "the same part of the file");
+    // 1× → 0.25×: longer than the 6 s before the next clip — up onto a temp layer.
+    let ops = timeline::set_speed_ramp(doc.project(), SEQ, ItemId(10), Some(ramp(1.0, 0.25)), &mut alloc).unwrap();
+    apply(&mut doc, ops);
+    let s = doc.project().sequence(SEQ).unwrap();
+    let (t, _) = s.find_item(ItemId(10)).unwrap();
+    assert!(length(&doc) > 6.0, "longer: {}", length(&doc));
+    assert!(s.tracks[t].id == V2 || s.tracks[t].temp, "moved up a track");
+}
+
+/// Opening time cuts what's under the point and pushes everything after it right;
+/// removing time cuts that stretch out of every track and pulls the rest left.
+#[test]
+fn time_opens_and_closes_across_every_track() {
+    let mut doc = doc_with(&[(V1, 10, MEDIA, 0.0, 4.0, 0.0), (V2, 11, MEDIA, 3.0, 2.0, 0.0)]);
+    let mut next = 1000;
+    let mut alloc = || {
+        next += 1;
+        next
+    };
+    let spans = |doc: &Document| {
+        let s = doc.project().sequence(SEQ).unwrap();
+        let mut v: Vec<(TrackId, f64, f64)> = s.tracks.iter().flat_map(|t| t.items.iter().map(move |i| (t.id, i.range.start.as_seconds_f64(), i.range.end().as_seconds_f64()))).collect();
+        v.sort_by(|a, b| (a.0 .0, a.1).partial_cmp(&(b.0 .0, b.1)).unwrap());
+        v
+    };
+    let ops = timeline::insert_time(doc.project(), SEQ, secs(2.0), secs(1.0), &mut alloc).unwrap();
+    apply(&mut doc, ops);
+    assert_eq!(spans(&doc), [(V1, 0.0, 2.0), (V1, 3.0, 5.0), (V2, 4.0, 6.0)]);
+    // Out again: back where they were (in pieces).
+    let ops = timeline::remove_time(doc.project(), SEQ, secs(2.0), secs(3.0), &mut alloc).unwrap();
+    apply(&mut doc, ops);
+    assert_eq!(spans(&doc), [(V1, 0.0, 2.0), (V1, 2.0, 4.0), (V2, 3.0, 5.0)]);
+    // Through the middle of both: 3.5–4.5 s goes.
+    let ops = timeline::remove_time(doc.project(), SEQ, secs(3.5), secs(4.5), &mut alloc).unwrap();
+    apply(&mut doc, ops);
+    assert_eq!(spans(&doc), [(V1, 0.0, 2.0), (V1, 2.0, 3.5), (V2, 3.0, 3.5), (V2, 3.5, 4.0)]);
+}
+

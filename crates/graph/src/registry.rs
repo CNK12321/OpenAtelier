@@ -21,6 +21,9 @@ pub const EDITOR_SURFACE: &str = "surface";
 /// The sound card draws the effect's response curve and drags its bands (params
 /// `low_freq`/`low_gain`, `p1_freq`/`p1_gain`/`p1_q` … `p3_*`, `high_freq`/`high_gain`).
 pub const EDITOR_EQUALIZER: &str = "equalizer";
+/// The viewer draws the effect's cut line through its point (a `vec2` param) at its
+/// `angle`, with a handle to turn it (Slice).
+pub const EDITOR_LINE: &str = "line";
 /// Edited in the Color tab (wheels, curves, the HSL mixer), not as a list of sliders.
 pub const EDITOR_COLOR: &str = "color";
 /// How far the effect is turning the sound down (what its shader writes to `reduction`).
@@ -192,6 +195,9 @@ pub struct EffectDescriptor {
     /// Settings its preview in the picker shows it with (a stronger look than its
     /// defaults, so the thumbnail says what it does).
     pub preview: Vec<(ParamId, Value)>,
+    /// Its off state: the values of these parameters at which it does nothing. With
+    /// one, a passive effect is also an intro and an outro ([`EffectDescriptor::eased`]).
+    pub off: Vec<(ParamId, Value)>,
     /// A host editor it uses, beyond the parameter list: [`EDITOR_SURFACE`],
     /// [`EDITOR_EQUALIZER`].
     pub editor: Option<String>,
@@ -271,6 +277,24 @@ pub fn packed_len(ty: oa_params::ParamType) -> usize {
 }
 
 impl EffectDescriptor {
+    /// Whether it can be an intro or an outro: one written as one, or an effect for the
+    /// whole clip that has an off state (it then eases between full and off).
+    pub fn in_out(&self) -> bool {
+        self.usage == EffectUsage::InOut || (self.usage == EffectUsage::Passive && !self.off.is_empty())
+    }
+
+    /// Its values `strength` of the way from its off state (0) to `values` (1) — what an
+    /// effect with an off state runs with as an intro or an outro. Values it has no off
+    /// state for stay as they are.
+    pub fn eased(&self, values: &mut oa_params::Evaluated, strength: f64) {
+        let k = strength.clamp(0.0, 1.0);
+        for (id, off) in &self.off {
+            if let Some((_, v)) = values.0.iter_mut().find(|(p, _)| p == id) {
+                *v = off.interpolate(v, k);
+            }
+        }
+    }
+
     /// An effect with its kind's usual settings and no shader yet.
     pub fn new(type_id: &str, name: &str, kind: EffectKind, params: Vec<ParamSchema>) -> Self {
         descriptor(type_id, name, kind, params)
@@ -367,6 +391,9 @@ pub const MOTION_BLUR: &str = "oa.motion.motion-blur";
 /// (or an effect container's result) over what's under it.
 /// (Also `oa_doc::schema::BLEND_EFFECT`, which old projects' blend property becomes.)
 pub const BLEND: &str = "oa.composite.blend";
+/// **Duplicate**: not a shader pass — the planner draws the clip a second time, with its
+/// own transform and effects (`oa_doc::schema::DUPLICATE_EFFECT`).
+pub const DUPLICATE: &str = "oa.composite.duplicate";
 /// **Drop Shadow**: the silhouette offset and softened behind the picture.
 pub const SHADOW: &str = "oa.light.shadow";
 /// **Depth**: the picture as a sheet with thickness, turned in 3D.
@@ -572,11 +599,13 @@ impl Registry {
     }
 
     /// Like [`Registry::offered`], including text-only (per-letter, per-pixel text)
-    /// effects when `text`. Text effects come first.
+    /// effects when `text`. Text effects come first. Asked for intros and outros, it
+    /// also offers the effects with an off state (see [`EffectDescriptor::in_out`]). Those
+    /// made for it come first.
     pub fn offered_for(&self, usage: EffectUsage, text: bool) -> Vec<&Arc<EffectDescriptor>> {
         let mut list: Vec<_> =
-            self.effects.values().filter(|d| d.usage == usage && d.renders() && !is_internal_effect(&d.type_id) && (text || !d.kind.text_only())).collect();
-        list.sort_by(|a, b| (!a.kind.text_only(), &a.name).cmp(&(!b.kind.text_only(), &b.name)));
+            self.effects.values().filter(|d| (d.usage == usage || (usage == EffectUsage::InOut && d.in_out())) && d.renders() && !is_internal_effect(&d.type_id) && (text || !d.kind.text_only())).collect();
+        list.sort_by(|a, b| (a.usage != usage, !a.kind.text_only(), &a.name).cmp(&(b.usage != usage, !b.kind.text_only(), &b.name)));
         list
     }
 }
@@ -594,6 +623,7 @@ pub(crate) fn descriptor(type_id: &str, name: &str, kind: EffectKind, params: Ve
         description: String::new(),
         category: None,
         preview: Vec::new(),
+        off: Vec::new(),
         editor: None,
         meter: None,
         latency: 0.0,
@@ -986,6 +1016,18 @@ pub(crate) fn host_effects() -> Vec<EffectDescriptor> {
 mod tests {
     use super::*;
     use oa_params::{EvalContext, ParamSet, ParamSource};
+
+    /// Intros and outros: the effects made for them first, then those offered because
+    /// they have an off state.
+    #[test]
+    fn intros_list_their_own_effects_first() {
+        let r = Registry::with_builtins();
+        let list = r.offered(EffectUsage::InOut);
+        let first_borrowed = list.iter().position(|d| d.usage != EffectUsage::InOut).expect("effects with an off state are offered");
+        assert!(first_borrowed > 0, "some made for it");
+        assert!(list[first_borrowed..].iter().all(|d| d.usage != EffectUsage::InOut), "none of its own after the borrowed ones");
+        assert!(list.iter().any(|d| d.type_id.as_ref() == "oa.blur.gaussian"), "Blur, which has an off state, is offered");
+    }
 
     /// A surface point pulled outside, or a sheet turned towards the camera, gets room
     /// to draw; at rest, both keep the layer's box.

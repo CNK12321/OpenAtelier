@@ -14,6 +14,7 @@
 //!   reported in [`RenderStats::unsupported`].
 
 mod context;
+pub mod glance;
 pub mod health;
 mod pipelines;
 mod pool;

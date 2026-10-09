@@ -4,6 +4,115 @@ Each release's section becomes its description on GitHub, and the app's update d
 lists its points. Name a section after the version as it's tagged (`0.1-beta.6`, the
 tag without its `v`) before tagging; until then it's **Unreleased**.
 
+## 0.1-beta.7 — Beta 7
+
+### New
+- **Duplicate** (Compositing): a second copy of the clip, drawn in front or behind,
+  moved, scaled, turned and faded on its own. Its effects: the clip's (**inherit
+  effects**), only those listed above the Duplicate (**copy previous effects**), or
+  **no effects** — plus effects added to the duplicate alone, with the button on its
+  card.
+- **Slice** (Stylize): cuts the picture along a line you drag and turn in the viewer
+  (Shift turns it in 15° steps), pushing the sides apart (separation) or sliding them
+  along the cut.
+- **Liquify** (Warp): melts the picture into swirling, marbled ribbons — amount, size,
+  detail, swirl, and flow to set them moving.
+- **New project** asks for a name, a format (with each shape drawn) and a frame rate,
+  and saves the project straight away in a folder of its own under Documents →
+  OpenAtelier Projects — no picking where it goes. Saving a project that was never
+  saved does the same; Save as… still puts it anywhere. Change the folder under
+  Settings → Editing.
+- **Opening a project** shows a loading screen over the workspace until it's ready.
+- **Temp layers:** a paste with no room on any track (or a clip whose new speed runs it
+  into the next one) goes onto a temp layer, outlined in gray dots. It goes away by
+  itself once it's empty; the + in its header keeps it as a real track.
+- **Arrange buttons:** with several clips picked on one track, buttons in the bar under
+  the timeline close the gaps between them, space them evenly, or move them to the
+  playhead.
+- **Open or close time:** Ctrl+drag on an empty stretch of a track. Right opens a gap
+  there on every track (cutting clips under that point), pushing everything after it
+  later; left takes the stretch dragged over out of every track and closes it up. Both
+  ends snap to clip edges and the playhead, and the playhead takes the color while you
+  drag.
+- **Every effect with an off state is also an intro and an outro:** Blur, Glow, Invert,
+  Pixelate, Glitch, Chromatic Aberration, Liquify, Shake and the rest (Echo, Reverb, Bass
+  and other sound effects too) can be picked in the Transitions tab's intros and outros
+  (or set to Intro/Outro on a sound effect's card). As an intro the effect starts at
+  full and eases to off as the clip arrives; as an outro it eases from off to full as
+  the clip leaves. Plugins mark an effect's off state with `off` in their manifest.
+- **Masks, clearer:** the mask tools stand down the left of the viewer while the Masks
+  tab is open — select, edit, rectangle, ellipse, pen, brush, eraser, magic select, fill
+  and rotoscope, as icons (picking one with no mask yet starts one). Each mask is a card
+  with a preview of what it covers, on/off and invert switches, and the one being drawn
+  lit. An effect's card has a mask button after its name: choose the mask it runs on
+  from their previews (or outside it); the same previews when choosing what properties
+  “on mask” use.
+- **Rotoscoping in the viewer:** a bar over the picture says what to click, counts the
+  points and holds the Rotoscope button (and the progress while SAM 2 works); the points
+  are clearer dots with + and −. Ctrl+Z takes points back one at a time (Ctrl+Shift+Z puts
+  them back), and they stay after a run — undo the result, adjust, and run again. Its
+  settings sit in a tidy grid in the Masks tab, which follows compact mode now too.
+- **Select all after / before the playhead**, in the timeline's right-click menus.
+- **Google Material icons** for the tools and buttons added lately (the arrange buttons,
+  Fullscreen, the mask tools), drawn from the built-in icon font.
+- **Click the empty space under the tracks** to let go of the selection, as on an empty
+  stretch of a track.
+- **Intro and outro pickers** list the effects made for intros and outros first, then
+  those that ease from their off state.
+- **Icons on the properties tabs**; when they don't fit in one row they stack, the open
+  tab's row nearest the page.
+- **With nothing selected**, the properties panel offers **Import Media**, **Add Title**
+  and **Edit Background**.
+- **The viewer's backdrop:** a faint grid of dots that moves with the picture as you
+  pan and zoom, and around the frame a soft glow and a thin edge, each side in the colors
+  near that edge of the picture as shown, slowly taking them in the longer it stays. The
+  viewer's toolbar floats over it with no band of its own, and the playback buttons
+  sit at the bottom of the viewer.
+
+### Changed
+- **The Messages panel** is hidden unless switched on (Settings → Interface).
+- **◀ key / key ▶** show only when the clip has keyframes.
+- **Speed ramps change the clip's length:** slowing down makes it longer and speeding
+  up shorter, so it plays the same part of its file; one that runs into the next clip
+  moves up a track. A plain speed change does the same instead of failing.
+- **Negative speeds play a clip backwards**, in place of the Reverse switch; the speed
+  presets are gone.
+
+### Fixed
+- **Pasting** puts clips on another track with room (the nearest, above first) when
+  their own track is taken, instead of always adding a new track.
+- **Changing a keyframed property adds a key** at the playhead from every control:
+  a title's text, bold, italic, alignment and font, text and picture inputs of effects
+  — these used to replace the keys with a single value.
+- **Keyframing position, scale and the rest of a transform** in a format with its own
+  values (a vertical version, say): the diamond keyframed the clip's main value while
+  edits went to that format's own, so changes made later didn't animate. Keys now go
+  where the edits go.
+- **The keyframe diamond** no longer throws a property's keys away when clicked where
+  there's no key: it adds one there. On a key it removes that key (the last one leaves
+  the value as it was); right-click → **Stop keyframing** removes them all.
+- **Keyframe diamonds on the timeline** and the properties panel's ◀ key / key ▶ show
+  the keys of the format on screen (a vertical version's own keys too), only those
+  inside the clip — key ▶ no longer jumps off the clip to a key a split left past its
+  end. The diamonds are bigger, outlined over pictures and waveforms.
+- **The media bin's search** is a proper search box (a magnifying glass, ✕ or Esc to
+  clear): every word typed has to be somewhere in a file's name or what it is
+  ("beach 4k", "wav"), and it searches the Assets tab too.
+- **Keyframes on split clips** stick: a split leaves each half's keys where the other
+  half carries on, out of sight past its ends, and those kept pulling new keys back
+  (a value set late in a clip drifted back by its end). Editing a keyframed property
+  now first turns keys outside the clip into keys at its ends — only where the motion
+  there changes what's seen.
+- **Titles bigger than the frame** (a wall of symbols, say) no longer stop an export with
+  "texture … exceeds GPU limits": a title is drawn only where it can be seen, plus room
+  for its shadow or blur, and one that can't be trimmed (under a scroll or a warp) is
+  drawn at a size the GPU can make and enlarged to its place.
+
+### Faster
+- **Frames that are only cut clips** render in far fewer steps: a clip that covers the
+  frame hides the blurred-content background under it (it's no longer made), and it's
+  copied once instead of once per layer of nesting — 2 GPU passes instead of 7.
+
 ## 0.1-beta.6 — Beta 6
 
 ### New

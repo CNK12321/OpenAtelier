@@ -83,6 +83,14 @@ const MAX_NESTING: usize = 32;
 /// The longest side a pixel-art layer is enlarged to before its effects run.
 const MAX_PIXEL_ART_SIDE: f64 = 4096.0;
 
+/// The longest side a title's layer is made at (its effects run at that size), and the
+/// longest it's drawn at, supersampled: past them it's made smaller and enlarged to its
+/// place — a title many times the canvas's size (a wall of symbols scrolling behind
+/// everything) would otherwise ask for textures no GPU makes. Most titles are also
+/// drawn only where they can be seen (`Planner::text_reach`).
+const MAX_TEXT_LAYER_SIDE: f64 = 4096.0;
+const MAX_TEXT_SIDE: f64 = 8192.0;
+
 pub fn plan_frame(
     project: &Project,
     seq: SeqId,
@@ -150,6 +158,18 @@ fn yuv_override(m: &oa_doc::MediaRef) -> [u8; 2] {
 
 /// "Highlight when spoken": `values` with each parameter that has a spoken value
 /// (`schema::spoken(id)` in `params`) replaced by it, or `None` when none has one.
+/// An effect's values at `ctx`, `visibility` being where its run is (see
+/// `oa_doc::EffectClock`). An effect for the whole clip that has an off state, placed as
+/// an intro or an outro, eases between full and off as the clip comes and goes: full as
+/// an intro starts and off by its end, the other way round over an outro.
+fn effect_values(d: &oa_graph::registry::EffectDescriptor, fx: &oa_doc::EffectInstance, ctx: &oa_params::EvalContext, visibility: f64) -> oa_params::Evaluated {
+    let mut values = fx.params.eval(&d.params, None, ctx);
+    if fx.role != oa_doc::EffectRole::Passive && d.usage == oa_graph::registry::EffectUsage::Passive {
+        d.eased(&mut values, 1.0 - visibility);
+    }
+    values
+}
+
 fn spoken(params: &oa_params::ParamSet, schema: &[oa_params::ParamSchema], values: &oa_params::Evaluated, ctx: &oa_params::EvalContext) -> Option<oa_params::Evaluated> {
     let mut out = values.clone();
     let mut any = false;
@@ -379,9 +399,9 @@ impl Planner<'_> {
     /// Intros, outros, motion and text effects stay with the clip.
     fn blend_split(&self, item: &Item) -> Option<(Item, Item)> {
         let passive = |e: &oa_doc::EffectInstance| e.role == oa_doc::EffectRole::Passive;
-        let at = item.effects.iter().rposition(|e| e.enabled && passive(e) && e.type_id == oa_graph::registry::BLEND)?;
+        let at = item.effects.iter().rposition(|e| e.enabled && e.on_duplicate.is_none() && passive(e) && e.type_id == oa_graph::registry::BLEND)?;
         let later = |i: usize, e: &oa_doc::EffectInstance| {
-            i > at
+            i > at && e.on_duplicate.is_none()
                 && passive(e)
                 && !self.registry.is_sound(&e.type_id)
                 && self.registry.effect(&e.type_id).is_some_and(|d| d.kind != oa_graph::EffectKind::Motion && !d.kind.text_only())
@@ -580,11 +600,11 @@ impl Planner<'_> {
     fn motion(&mut self, item: &Item, variant: &oa_doc::FormatVariant, ctx: &oa_params::EvalContext) -> Motion {
         let canvas = [variant.size.width as f64, variant.size.height as f64];
         let mut total = Motion::NONE;
-        for fx in item.active_effects().iter().filter(|e| e.enabled) {
+        for fx in item.active_effects().iter().filter(|e| e.enabled && e.on_duplicate.is_none()) {
             let Some(d) = self.registry.effect(&fx.type_id) else { continue };
             let Some(script) = d.motion.as_ref().filter(|_| d.kind == oa_graph::EffectKind::Motion) else { continue };
             let Some(clock) = fx.role.clock(ctx.clip_time, item.range.duration) else { continue };
-            let values = fx.params.eval(&d.params, None, ctx);
+            let values = effect_values(d, fx, ctx, clock.visibility);
             let input = MotionInput { visibility: clock.visibility, progress: clock.progress, seconds: clock.seconds, canvas, seed: fx.id.0, leaving: matches!(fx.role, oa_doc::EffectRole::Out { .. }) };
             total = total.then(script.eval(&values, &input));
         }
@@ -607,7 +627,7 @@ impl Planner<'_> {
         depth: usize,
         text: Option<(std::sync::Arc<oa_text::TextSpec>, f64)>,
     ) -> (NodeId, Rect) {
-        for fx in item.active_effects().iter().filter(|e| e.enabled) {
+        for fx in item.active_effects().iter().filter(|e| e.enabled && e.on_duplicate.is_none()) {
             // On a title, an effect can be bounded to some of its letters.
             let (before, before_bounds) = (node, bounds);
             if self.registry.is_sound(&fx.type_id) {
@@ -620,17 +640,18 @@ impl Planner<'_> {
             if d.kind == oa_graph::EffectKind::Motion || d.kind.text_only() {
                 continue; // folded into the layer's transform above / run in the text pass
             }
-            if fx.type_id == oa_graph::registry::MOTION_BLUR || fx.type_id == oa_graph::registry::BLEND {
-                continue; // the whole layer sampled across its shutter (`Planner::layer`) / how the compositor lays it down (`blend_of`)
+            if [oa_graph::registry::MOTION_BLUR, oa_graph::registry::BLEND, oa_graph::registry::DUPLICATE].contains(&fx.type_id.as_str()) {
+                continue; // the whole layer sampled across its shutter / drawn twice (`Planner::layer`), or how the compositor lays it down (`blend_of`)
             }
             // In/out effects only run inside their windows.
             let Some(clock) = fx.role.clock(ctx.clip_time, item.range.duration) else { continue };
+            let values = effect_values(&d, fx, ctx, clock.visibility);
             let clock = if fx.role == oa_doc::EffectRole::Passive && !d.time_varying {
                 oa_graph::registry::STILL_CLOCK
             } else {
                 [clock.visibility as f32, clock.progress as f32, clock.seconds as f32]
             };
-            let values = fx.params.eval(&d.params, None, ctx);
+
             // A media parameter's picture becomes the effect's second input, stretched
             // over the layer at the layer's raster size.
             // Or the picture as it came in (Glow lays it over its halo).
@@ -859,6 +880,39 @@ impl Planner<'_> {
     /// A text clip's glyphs at `raster` × canvas size, with its per-letter and per-pixel
     /// text effects. Returns the node and its bounds: the text box grown by the outline
     /// and by however far animated letters may travel.
+    /// How far past a title's visible part its effects reach (layer raster px, at
+    /// `raster`): what a title drawn only where it can be seen must keep around that.
+    /// `None` when one may read from anywhere in the layer — a warp (mirror, tile,
+    /// fisheye), a scroll, one with a second picture or other frames — so the title is
+    /// drawn whole.
+    fn text_reach(&self, item: &Item, ctx: &oa_params::EvalContext, raster: f64) -> Option<f64> {
+        let mut reach = 0.0;
+        for fx in item.active_effects().iter().filter(|e| e.enabled && e.on_duplicate.is_none() && !self.registry.is_sound(&e.type_id)) {
+            if fx.role.clock(ctx.clip_time, item.range.duration).is_none() {
+                continue;
+            }
+            let d = self.registry.effect(&fx.type_id)?;
+            if d.media_param().is_some() {
+                return None;
+            }
+            match &d.kind {
+                oa_graph::EffectKind::PointOp | oa_graph::EffectKind::Motion | oa_graph::EffectKind::Glyph { .. } | oa_graph::EffectKind::GlyphPixel | oa_graph::EffectKind::TextBox => {}
+                // A neighborhood effect that says how far it reaches (blur, shadow, glow) —
+                // not a warp or a sheet in depth, whose bounds say where they draw, not
+                // where they read from.
+                oa_graph::EffectKind::Spatial { expand } if !matches!(d.category.as_deref(), Some("Warp" | "Depth")) && (expand.is_some() || d.bounds.is_some()) => {
+                    let values = fx.params.eval(&d.params, None, ctx);
+                    let input = Rect::new(0.0, 0.0, 1e5, 1e5);
+                    let g = d.grown_bounds(&values, raster, input);
+                    reach += [input.x0 - g.x0, input.y0 - g.y0, g.x1 - input.x1, g.y1 - input.y1].into_iter().fold(0.0, f64::max);
+                }
+                _ => return None,
+            }
+        }
+        // Masks place pictures of their own over the layer.
+        item.masks.is_empty().then_some(reach)
+    }
+
     fn text(
         &mut self,
         item: &Item,
@@ -866,7 +920,8 @@ impl Planner<'_> {
         ctx: &oa_params::EvalContext,
         raster: f64,
         bounds: Rect,
-    ) -> (NodeId, Rect, std::sync::Arc<oa_text::TextSpec>) {
+        visible: Option<Rect>,
+    ) -> (NodeId, Rect, std::sync::Arc<oa_text::TextSpec>, f64) {
         let values = item.params.eval(schema::text(), variant.overrides.get(&item.id), ctx);
         let spec = scene::text_spec(&values);
         // "Highlight when spoken": the values the spoken word takes instead.
@@ -903,18 +958,19 @@ impl Planner<'_> {
         let mut reach_em = 0.3;
         let mut any_spoken = spoken_values.is_some();
         let mut chain = Vec::new();
-        for fx in item.active_effects().iter().filter(|e| e.enabled) {
+        for fx in item.active_effects().iter().filter(|e| e.enabled && e.on_duplicate.is_none()) {
             let Some(d) = self.registry.effect(&fx.type_id).cloned() else { continue };
             if !d.kind.text_only() {
                 continue;
             }
             let Some(clock) = fx.role.clock(ctx.clip_time, item.range.duration) else { continue };
+            let values = effect_values(&d, fx, ctx, clock.visibility);
             let clock = if fx.role == oa_doc::EffectRole::Passive && !d.time_varying {
                 oa_graph::registry::STILL_CLOCK
             } else {
                 [clock.visibility as f32, clock.progress as f32, clock.seconds as f32]
             };
-            let values = fx.params.eval(&d.params, None, ctx);
+
             let alt = spoken(&fx.params, &d.params, &values, ctx);
             for v in std::iter::once(&values).chain(alt.as_ref()) {
                 match &d.kind {
@@ -946,15 +1002,111 @@ impl Planner<'_> {
             -1.0
         };
         let margin = (outline + reach_em * spec.size) * raster + 2.0;
+        // Only what can be seen (and what effects after it reach for) is drawn.
+        let laid_out = bounds;
         let bounds = bounds.expand(margin);
+        let bounds = match visible {
+            Some(v) if v.intersect(&bounds).is_empty() => Rect::new(bounds.x0, bounds.y0, bounds.x0 + 1.0, bounds.y0 + 1.0),
+            Some(v) => v.intersect(&bounds),
+            None => bounds,
+        };
+        // Still too big to draw: drawn smaller (the caller enlarges it to its place).
+        let side = (bounds.x1 - bounds.x0).max(bounds.y1 - bounds.y0);
+        if side > MAX_TEXT_SIDE {
+            let f = MAX_TEXT_SIDE / side * 0.98;
+            let s = Affine2::scale(f, f);
+            return self.text(item, variant, ctx, raster * f, s.map_rect(laid_out), visible.map(|v| s.map_rect(v)));
+        }
         let spec = std::sync::Arc::new(spec);
         let op = NodeOp::Text { spec: spec.clone(), scale: raster, style, spoken_style, spoken_word, chain };
-        (self.b.add(op, vec![], bounds, false), bounds, spec)
+        (self.b.add(op, vec![], bounds, false), bounds, spec, raster)
     }
 
-    /// A clip's layer on the canvas at `t` — with Motion Blur on it, built at moments
-    /// across its shutter and averaged (see [`Planner::motion_blurred`]).
+    /// A clip's layer on the canvas at `t` — and, with Duplicate effects on it, its copies
+    /// behind or in front of it ([`Planner::duplicate`]), all in one layer.
     fn layer(&mut self, item: &Item, variant: &oa_doc::FormatVariant, t: Time, out_scale: f64, depth: usize) -> Option<(NodeId, LayerInfo)> {
+        let duplicates: Vec<oa_doc::EffectInstance> = item
+            .effects
+            .iter()
+            .filter(|e| e.enabled && e.on_duplicate.is_none() && e.role == oa_doc::EffectRole::Passive && e.type_id == oa_graph::registry::DUPLICATE)
+            .cloned()
+            .collect();
+        if duplicates.is_empty() {
+            return self.layer_once(item, variant, t, out_scale, depth);
+        }
+        let ctx = item.eval_context(t);
+        let (mut behind, mut front) = (Vec::new(), Vec::new());
+        for fx in &duplicates {
+            let Some((copy, in_front)) = self.duplicate(item, fx, variant, &ctx) else { continue };
+            if let Some(l) = self.layer_once(&copy, variant, t, out_scale, depth) {
+                if in_front { front.push(l) } else { behind.push(l) }
+            }
+        }
+        let main = self.layer_once(item, variant, t, out_scale, depth);
+        let blend = main.map_or(BlendMode::Normal, |m| m.1.blend);
+        let all: Vec<(NodeId, LayerInfo)> = behind.into_iter().chain(main).chain(front).collect();
+        if all.len() <= 1 {
+            return all.into_iter().next();
+        }
+        // On one canvas, each as it would be drawn; the clip's blend mode for the lot.
+        let size = [((variant.size.width as f64 * out_scale).round() as u32).max(1), ((variant.size.height as f64 * out_scale).round() as u32).max(1)];
+        let canvas = Rect::from_size(size[0] as f64, size[1] as f64);
+        let (inputs, layers): (Vec<NodeId>, Vec<LayerInfo>) = all.into_iter().map(|(n, l)| (n, LayerInfo { blend: BlendMode::Normal, ..l })).unzip();
+        let node = self.b.add(NodeOp::Composite { size, background: [0.0; 4], layers }, inputs, canvas, false);
+        Some((node, LayerInfo { opacity: 1.0, blend, pixelated: false }))
+    }
+
+    /// The copy Duplicate `fx` makes of `item` at `ctx`, and whether it goes in front: the
+    /// clip with the effects its "effects" setting gives it (all the clip's, those above
+    /// the Duplicate, or none), then the Duplicate's own; and the clip's values at this
+    /// instant (the format's own ones included) moved, scaled, turned and faded by the
+    /// Duplicate's.
+    fn duplicate(&self, item: &Item, fx: &oa_doc::EffectInstance, variant: &oa_doc::FormatVariant, ctx: &oa_params::EvalContext) -> Option<(Item, bool)> {
+        let d = self.registry.effect(oa_graph::registry::DUPLICATE)?;
+        let v = fx.params.eval(&d.params, None, ctx);
+        let mode = v.get("effects").and_then(Value::as_enum).unwrap_or(schema::DUPLICATE_INHERIT).to_string();
+        let in_front = !matches!(v.get("in_front"), Some(Value::Bool(false)));
+        let at = item.effects.iter().position(|e| e.id == fx.id)?;
+        let mut copy = item.clone();
+        // Its own id, so the format's overrides (folded in below) aren't applied twice.
+        copy.id = oa_doc::ItemId(fx.id.0 | 1 << 62);
+        let inherited = item.effects.iter().enumerate().filter(|(i, e)| {
+            e.on_duplicate.is_none()
+                && e.type_id != oa_graph::registry::DUPLICATE
+                && match mode.as_str() {
+                    schema::DUPLICATE_INHERIT => true,
+                    schema::DUPLICATE_PREVIOUS => *i < at,
+                    _ => false,
+                }
+        });
+        let own = item.effects.iter().filter(|e| e.on_duplicate == Some(fx.id)).map(|e| oa_doc::EffectInstance { on_duplicate: None, ..e.clone() });
+        copy.effects = inherited.map(|(_, e)| e.clone()).chain(own).collect();
+        // The clip's values now, as this format shows them, then the duplicate's on top.
+        let overrides = variant.overrides.get(&item.id);
+        let mut vis = item.params.eval(schema::visual(), overrides, ctx);
+        if item.kind == ItemKind::Text {
+            vis.0.extend(item.params.eval(schema::text(), overrides, ctx).0);
+        }
+        let offset = v.vec2("offset");
+        let pos = vis.vec2(schema::POSITION);
+        let scale = vis.vec2(schema::SCALE);
+        let k = v.float("scale").max(0.0);
+        for (id, value) in vis.0 {
+            let value = match id.as_str() {
+                schema::POSITION => Value::Vec2([pos[0] + offset[0], pos[1] + offset[1]]),
+                schema::SCALE => Value::Vec2([scale[0] * k, scale[1] * k]),
+                schema::ROTATION => Value::Float(value.as_float().unwrap_or(0.0) + v.float("rotation")),
+                schema::OPACITY => Value::Float(value.as_float().unwrap_or(1.0) * v.float("opacity").clamp(0.0, 1.0)),
+                _ => value,
+            };
+            copy.params.set(id.as_str(), oa_params::ParamSource::Static(value));
+        }
+        Some((copy, in_front))
+    }
+
+    /// One drawing of a clip's layer — with Motion Blur on it, built at moments across
+    /// its shutter and averaged (see [`Planner::motion_blurred`]).
+    fn layer_once(&mut self, item: &Item, variant: &oa_doc::FormatVariant, t: Time, out_scale: f64, depth: usize) -> Option<(NodeId, LayerInfo)> {
         match self.motion_blur(item, t) {
             Some((samples, shutter)) => self.motion_blurred(item, variant, t, out_scale, depth, samples, shutter),
             None => self.layer_at(item, variant, t, out_scale, depth),
@@ -964,7 +1116,7 @@ impl Planner<'_> {
     /// Motion Blur's settings on `item` at `t`, if it has it on: (samples, shutter as a
     /// share of a frame).
     fn motion_blur(&self, item: &Item, t: Time) -> Option<(usize, f64)> {
-        let fx = item.effects.iter().find(|e| e.enabled && e.type_id == oa_graph::registry::MOTION_BLUR)?;
+        let fx = item.effects.iter().find(|e| e.enabled && e.on_duplicate.is_none() && e.type_id == oa_graph::registry::MOTION_BLUR)?;
         let d = self.registry.effect(&fx.type_id)?;
         let ctx = item.eval_context(t);
         let values = fx.params.eval(&d.params, None, &ctx);
@@ -1086,6 +1238,8 @@ impl Planner<'_> {
             let want = (shown_scale * 4.0).round().max(4.0) / 4.0;
             let room = (MAX_PIXEL_ART_SIDE / native[0].max(native[1]).max(1.0)).max(1.0);
             want.min(room)
+        } else if item.kind == ItemKind::Text {
+            quantize_scale(shown_scale, max_raster).min(MAX_TEXT_LAYER_SIDE / native[0].max(native[1]).max(1.0))
         } else {
             quantize_scale(shown_scale, max_raster)
         };
@@ -1135,12 +1289,24 @@ impl Planner<'_> {
             ItemKind::Nested { sequence } => self.sequence(*sequence, None, ctx.source_time, raster, depth + 1),
             ItemKind::Text => {
                 // Anti-aliased: drawn k× larger, then shrunk back to the layer's raster —
-                // its own pass, before the crop and the clip's effects.
+                // its own pass, before the crop and the clip's effects. Too big to draw
+                // (`MAX_TEXT_SIDE`), it's drawn smaller and enlarged instead.
                 let k = self.opts.text_supersample.clamp(1, 4) as f64;
                 let up = Affine2::scale(k, k);
-                let (mut node, mut grown, spec) = self.text(item, variant, &ctx, raster * k, up.map_rect(bounds));
-                if k > 1.0 {
-                    let down = Affine2::scale(1.0 / k, 1.0 / k);
+                // Drawn only where it can be seen, when what its effects reach is known.
+                let visible = self.text_reach(item, &ctx, raster).and_then(|reach| {
+                    let to_canvas = Affine2::scale(1.0 / raster, 1.0 / raster).then(&full);
+                    let size = [(variant.size.width as f64 * out_scale).max(1.0), (variant.size.height as f64 * out_scale).max(1.0)];
+                    let canvas = Rect::from_size(size[0], size[1]);
+                    let mut seen = to_canvas.invert()?.map_rect(canvas);
+                    if let Some(m) = full_in {
+                        seen = seen.union(&Affine2::scale(1.0 / raster, 1.0 / raster).then(&m).invert()?.map_rect(canvas));
+                    }
+                    Some(up.map_rect(seen.expand(reach + 2.0)))
+                });
+                let (mut node, mut grown, spec, drawn) = self.text(item, variant, &ctx, raster * k, up.map_rect(bounds), visible);
+                if drawn != raster {
+                    let down = Affine2::scale(raster / drawn, raster / drawn);
                     grown = down.map_rect(grown);
                     node = self.b.add(NodeOp::Transform { matrix: down }, vec![node], grown, false);
                 }

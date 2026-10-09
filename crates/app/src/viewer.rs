@@ -94,6 +94,101 @@ pub struct Follower {
     pub rotation: f64,
 }
 
+/// Space kept between the fitted picture and the bars above and below it (px).
+const FIT_MARGIN: f32 = 10.0;
+
+/// Dots spaced this far apart (screen px) behind the canvas.
+const DOT_GAP: f32 = 18.0;
+
+/// Behind the canvas: a faint grid of dots that moves with it (panning and zooming show
+/// where you are), and around it a soft glow in the colors along the picture's edges
+/// (`edges`: top, right, bottom, left; until a frame's been read, one color all round).
+fn backdrop(painter: &egui::Painter, area: egui::Rect, canvas: egui::Rect, visuals: &egui::Visuals, edges: [egui::Color32; 4]) {
+    let dot = if visuals.dark_mode { egui::Color32::from_white_alpha(16) } else { egui::Color32::from_black_alpha(22) };
+    // Anchored to the canvas corner, so the dots travel with it.
+    let first = |lo: f32, anchor: f32| anchor - ((anchor - lo) / DOT_GAP).floor() * DOT_GAP;
+    let (x0, y0) = (first(area.left(), canvas.left()), first(area.top(), canvas.top()));
+    let mut mesh = egui::Mesh::default();
+    let mut y = y0;
+    while y <= area.bottom() {
+        let mut x = x0;
+        while x <= area.right() {
+            let p = egui::pos2(x, y);
+            // Under the picture they'd only be covered.
+            if !canvas.contains(p) {
+                mesh.add_colored_rect(egui::Rect::from_center_size(p, egui::vec2(1.6, 1.6)), dot);
+            }
+            x += DOT_GAP;
+        }
+        y += DOT_GAP;
+    }
+    painter.add(mesh);
+    // The glow: a band out from each side, its edge's color fading to nothing, mitred at
+    // the corners so neighboring sides meet.
+    const REACH: f32 = 46.0;
+    let mut glow = egui::Mesh::default();
+    let (c, r) = (canvas, REACH);
+    let sides = [
+        ([c.left_top(), c.right_top()], [c.left_top() + egui::vec2(-r, -r), c.right_top() + egui::vec2(r, -r)]),
+        ([c.right_top(), c.right_bottom()], [c.right_top() + egui::vec2(r, -r), c.right_bottom() + egui::vec2(r, r)]),
+        ([c.right_bottom(), c.left_bottom()], [c.right_bottom() + egui::vec2(r, r), c.left_bottom() + egui::vec2(-r, r)]),
+        ([c.left_bottom(), c.left_top()], [c.left_bottom() + egui::vec2(-r, r), c.left_top() + egui::vec2(-r, -r)]),
+    ];
+    for ((inner, outer), color) in sides.into_iter().zip(edges) {
+        // Fades out in steps (a straight fade reads as a hard band).
+        let steps = 6;
+        let at = |k: f32, i: usize| inner[i] + (outer[i] - inner[i]) * k;
+        for s in 0..steps {
+            let (k0, k1) = (s as f32 / steps as f32, (s + 1) as f32 / steps as f32);
+            let fade = |k: f32| glow_color(color).gamma_multiply((1.0 - k).powf(2.2) * 0.2);
+            let base = glow.vertices.len() as u32;
+            for (p, col) in [(at(k0, 0), fade(k0)), (at(k0, 1), fade(k0)), (at(k1, 1), fade(k1)), (at(k1, 0), fade(k1))] {
+                glow.vertices.push(egui::epaint::Vertex { pos: p, uv: egui::epaint::WHITE_UV, color: col });
+            }
+            glow.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+    painter.add(glow);
+}
+
+/// The panel border's color, brighter and more saturated: the glow's color until the
+/// picture's own are known.
+fn frame_color(visuals: &egui::Visuals) -> egui::Color32 {
+    let mut hsva = egui::ecolor::Hsva::from(visuals.widgets.noninteractive.bg_stroke.color);
+    // A gray border has no hue of its own: borrow the accent's.
+    if hsva.s < 0.15 {
+        hsva.h = egui::ecolor::Hsva::from(crate::style::ACCENT).h;
+    }
+    hsva.s = (hsva.s + 0.45).min(0.85);
+    hsva.v = (hsva.v * 1.8).clamp(0.6, 1.0);
+    hsva.a = 1.0;
+    hsva.into()
+}
+
+/// An edge's color as it glows: a touch less saturated, and never so dark it vanishes.
+fn glow_color(edge: egui::Color32) -> egui::Color32 {
+    let mut hsva = egui::ecolor::Hsva::from(edge);
+    hsva.s *= 0.85;
+    hsva.v = hsva.v.max(0.25);
+    hsva.a = 1.0;
+    hsva.into()
+}
+
+/// A 1 px line round the canvas, each side a lighter, muted take on the color along
+/// that edge.
+fn frame_outline(painter: &egui::Painter, canvas: egui::Rect, edges: [egui::Color32; 4]) {
+    let c = canvas.expand(0.5);
+    let corners = [c.left_top(), c.right_top(), c.right_bottom(), c.left_bottom()];
+    for (i, edge) in edges.into_iter().enumerate() {
+        let mut hsva = egui::ecolor::Hsva::from(edge);
+        hsva.s *= 0.55;
+        hsva.v = (hsva.v * 1.25 + 0.15).min(1.0);
+        hsva.a = 1.0;
+        let color: egui::Color32 = hsva.into();
+        painter.line_segment([corners[i], corners[(i + 1) % 4]], egui::Stroke::new(1.0, color.gamma_multiply(0.7)));
+    }
+}
+
 fn cursor_for(handle: Handle, rotation: f64) -> egui::CursorIcon {
     match handle {
         Handle::Body => egui::CursorIcon::Move,
@@ -208,12 +303,41 @@ impl App {
                 }
             }
         }
-        // A thin frame so the canvas edge reads when zoomed out over the dark panel.
-        painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)), egui::StrokeKind::Outside);
+    }
+
+    /// Under the picture: playback, in the middle.
+    fn playback_bar(&mut self, ui: &mut egui::Ui, bar: egui::Rect) {
+        use crate::icons;
+        let gap = ui.spacing().item_spacing.x;
+        let transport = egui::Rect::from_center_size(bar.center(), egui::vec2(5.0 * crate::style::ICON + 4.0 * gap, crate::style::ICON + 4.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(transport).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            if icons::button(ui, icons::SKIP_START, tr("Go to the start"), "Home", true).clicked() {
+                self.set_playhead(oa_time::Time::ZERO);
+            }
+            if icons::button(ui, icons::STEP_BACK, tr("Back a frame"), "←", true).clicked() {
+                self.step(-1);
+            }
+            let (glyph, tip) = if self.playing { (icons::PAUSE, "Pause") } else { (icons::PLAY, "Play") };
+            if icons::button(ui, glyph, tip, "Space", true).clicked() {
+                let playing = !self.playing;
+                self.set_playing(playing);
+            }
+            if icons::button(ui, icons::STEP_ON, tr("On a frame"), "→", true).clicked() {
+                self.step(1);
+            }
+            if icons::button(ui, icons::SKIP_END, tr("Go to the end"), "End", true).clicked() {
+                let end = self.editor.duration();
+                self.set_playhead(end);
+            }
+        });
     }
 
     /// Draws the preview into the available space and handles pointer interaction.
     pub(crate) fn viewer(&mut self, ui: &mut egui::Ui) {
+        if self.opening.is_some() {
+            self.loading_overlay(ui);
+            return;
+        }
         let Some(preview_id) = self.preview.as_ref().map(|p| p.id) else {
             ui.centered_and_justified(|ui| {
                 ui.label(tr("Import media (or drop files here) to start."));
@@ -222,9 +346,15 @@ impl App {
         };
         let canvas = self.editor.sequence().variants[self.variant.min(self.editor.sequence().variants.len() - 1)].size;
         let canvas = [canvas.width as f64, canvas.height as f64];
-        self.viewer_toolbar(ui, canvas);
-        let available = ui.available_rect_before_wrap();
-        let fit = (available.width() / canvas[0] as f32).min(available.height() / canvas[1] as f32);
+        // The toolbar along the top and playback along the bottom float over the
+        // viewer's backdrop (no bands of their own); the picture fits between them.
+        let whole = ui.available_rect_before_wrap();
+        let top_bar = egui::Rect::from_min_size(whole.min, egui::vec2(whole.width(), ui.spacing().interact_size.y + 6.0));
+        let bottom_bar = egui::Rect::from_min_max(egui::pos2(whole.left(), whole.bottom() - crate::style::ICON - 12.0), whole.max);
+        let available = egui::Rect::from_min_max(egui::pos2(whole.left(), top_bar.bottom()), egui::pos2(whole.right(), bottom_bar.top()));
+        // Fitted with a margin, so the frame's outline and glow show all round.
+        let room = available.shrink(FIT_MARGIN);
+        let fit = (room.width() / canvas[0] as f32).min(room.height() / canvas[1] as f32).max(0.01);
         let response = ui.allocate_rect(available, egui::Sense::click_and_drag());
 
         // Zoom (Ctrl+wheel, around the pointer) and pan (middle drag, or the wheel when
@@ -251,6 +381,10 @@ impl App {
         let pan = if view.zoom.is_some() { view.pan } else { egui::Vec2::ZERO };
         let size = egui::vec2(canvas[0] as f32 * scale, canvas[1] as f32 * scale);
         let rect = egui::Rect::from_center_size(available.center() + pan, size);
+        let edges = self.ambient_colors().unwrap_or([frame_color(ui.visuals()); 4]);
+        backdrop(&ui.painter_at(whole), whole, rect, ui.visuals(), edges);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(top_bar.shrink2(egui::vec2(2.0, 3.0))), |ui| self.viewer_toolbar(ui, canvas));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bottom_bar), |ui| self.playback_bar(ui, bottom_bar));
         let clip = ui.painter_at(available);
         // Inside a compound clip the picture is see-through where it has nothing: a
         // checkerboard shows where. One made of sound alone has no picture at all: it
@@ -266,6 +400,7 @@ impl App {
         if !sound_only {
             clip.image(preview_id, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         }
+        frame_outline(&clip, rect, edges);
         self.draw_guides(&clip, rect);
 
         self.display_scale = rect.width() / canvas[0] as f32 * ui.ctx().pixels_per_point();
@@ -310,7 +445,11 @@ impl App {
         }
         // The Masks tab shows the mask being drawn; with a drawing tool, it takes the
         // pointer over.
-        if self.mask_viewer(ui, &response, rect, zoom, available) {
+        let masking = self.mask_viewer(ui, &response, rect, zoom, available);
+        // Its tools, down the left of the viewer (over the mask, taking clicks first).
+        self.mask_tool_strip(ui, available);
+        self.roto_banner(ui, available);
+        if masking {
             self.viewer_canvas = Some((available, rect));
             return;
         }
@@ -362,7 +501,11 @@ impl App {
                 _ if hovered_effect_point.is_some() => {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                     if let Some(e) = hovered_effect_point.and_then(|i| effect_points.get(i)) {
-                        response.clone().on_hover_text(trf("{0}: {1} (drag it; right-click its values in the inspector to track it)", &[("0", &(e.name).to_string()), ("1", &(e.param.replace('_', " ")).to_string())]));
+                        if e.turn {
+                            response.clone().on_hover_text(trf("{0}: drag to turn the cut (Shift: 15° steps)", &[("0", &e.name)]));
+                        } else {
+                            response.clone().on_hover_text(trf("{0}: {1} (drag it; right-click its values in the inspector to track it)", &[("0", &(e.name).to_string()), ("1", &(e.param.replace('_', " ")).to_string())]));
+                        }
                     }
                 }
                 _ if hovered_point.is_some() => ui.ctx().set_cursor_icon(egui::CursorIcon::Grab),
@@ -621,7 +764,8 @@ impl App {
             && response.dragged_by(egui::PointerButton::Primary)
             && drag.item == p.item
         {
-            self.drag_point(&drag, p, to_canvas(pos));
+            let shift = ui.input(|i| i.modifiers.shift);
+            self.drag_point(&drag, p, to_canvas(pos), shift);
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
         if !ui.input(|i| i.pointer.primary_down()) && self.surface_drag.take().is_some() {
@@ -764,7 +908,7 @@ impl App {
     fn canvas_text_editor(&mut self, ui: &mut egui::Ui, p: &scene::Placement, to_screen: &dyn Fn([f64; 2]) -> egui::Pos2) {
         use crate::text_edit;
         use oa_doc::{schema, ParamTarget};
-        use oa_params::{ParamSource, Value};
+        use oa_params::Value;
         let Some(item) = self.canvas_text.as_ref().map(|c| c.item) else { return };
         // Another text field took the keyboard (the inspector's, say): done here.
         if ui.ctx().text_edit_focused() {
@@ -809,7 +953,7 @@ impl App {
             }
         }
         if changed {
-            self.editor.set_param(item, ParamTarget::Item, schema::TEXT_CONTENT, ParamSource::Static(Value::Text(text.clone())), "canvas-text");
+            self.editor.set_value_at(item, ParamTarget::Item, schema::TEXT_CONTENT, Value::Text(text.clone()), self.playhead, "canvas-text");
         }
 
         // The title's box, marked as being edited; the selection and the cursor over the

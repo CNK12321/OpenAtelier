@@ -212,11 +212,15 @@ pub struct Track {
     /// a video one, the sound mixed below it for an audio one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub effects: bool,
+    /// A **temp layer**: made for clips that had nowhere else to go (a paste with no room).
+    /// It goes away by itself once it's empty, unless it's kept (made a real track).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub temp: bool,
 }
 
 impl Track {
     pub fn new(id: TrackId, name: &str, kind: TrackKind) -> Self {
-        Track { id, name: name.into(), kind, enabled: true, items: Vec::new(), effects: false }
+        Track { id, name: name.into(), kind, enabled: true, items: Vec::new(), effects: false, temp: false }
     }
     /// An effect track of `kind`: its containers' effects run over everything below it.
     pub fn effects(id: TrackId, name: &str, kind: TrackKind) -> Self {
@@ -413,6 +417,20 @@ pub struct Item {
 }
 
 impl Item {
+    /// Gives every effect a fresh id (the clip is being copied), keeping each
+    /// Duplicate's own effects tied to it.
+    pub fn renumber_effects(&mut self, alloc: &mut dyn FnMut() -> u64) {
+        let mut renamed = BTreeMap::new();
+        for fx in &mut self.effects {
+            let new = EffectId(alloc());
+            renamed.insert(fx.id, new);
+            fx.id = new;
+        }
+        for fx in &mut self.effects {
+            fx.on_duplicate = fx.on_duplicate.and_then(|d| renamed.get(&d).copied());
+        }
+    }
+
     pub fn new(id: ItemId, name: &str, kind: ItemKind, range: TimeRange) -> Self {
         Item {
             id,
@@ -650,6 +668,10 @@ pub struct EffectInstance {
     pub params: ParamSet,
     #[serde(default, skip_serializing_if = "is_passive")]
     pub role: EffectRole,
+    /// An effect on a Duplicate's copy only ([`crate::schema::DUPLICATE_EFFECT`]): the
+    /// Duplicate it belongs to. It's listed under that Duplicate, not run on the clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_duplicate: Option<EffectId>,
 }
 
 fn is_passive(r: &EffectRole) -> bool {
@@ -658,7 +680,7 @@ fn is_passive(r: &EffectRole) -> bool {
 
 impl EffectInstance {
     pub fn new(id: EffectId, type_id: &str) -> Self {
-        EffectInstance { id, type_id: type_id.into(), type_version: 1, enabled: true, params: ParamSet::default(), role: EffectRole::Passive }
+        EffectInstance { id, type_id: type_id.into(), type_version: 1, enabled: true, params: ParamSet::default(), role: EffectRole::Passive, on_duplicate: None }
     }
 }
 

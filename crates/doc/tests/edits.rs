@@ -226,6 +226,7 @@ fn project_file_round_trips() {
         enabled: true,
         params: Default::default(),
         role: Default::default(),
+        on_duplicate: None,
     });
     item.params.set("future.param", ParamSource::Static(Value::Text("kept".into())));
     insert(&mut doc, item).unwrap();
@@ -396,4 +397,17 @@ fn point_tracks_are_undoable_and_saved() {
     assert_eq!(doc.project().tracks[&50].points.len(), 1);
     doc.undo().unwrap();
     assert!(doc.project().tracks.is_empty());
+}
+
+/// A temp layer stays one through saving and loading (with a clip on it); ordinary
+/// tracks don't write the flag at all.
+#[test]
+fn temp_layers_survive_saving() {
+    let mut doc = base();
+    assert!(!ProjectFile::to_json(doc.project()).unwrap().contains("\"temp\""), "nothing written for an ordinary track");
+    let layer = TrackId(50);
+    let track = Track { temp: true, ..Track::new(layer, "V2", TrackKind::Video) };
+    doc.edit("paste", vec![Op::InsertTrack { seq: SEQ, index: 1, track: Arc::new(track) }, Op::InsertItem { seq: SEQ, track: layer, item: clip(51, 0, 2) }]).unwrap();
+    let back = ProjectFile::from_json(&ProjectFile::to_json(doc.project()).unwrap()).unwrap();
+    assert!(back.sequence(SEQ).unwrap().track(layer).is_some_and(|t| t.temp));
 }

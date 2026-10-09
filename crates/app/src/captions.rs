@@ -1667,9 +1667,8 @@ impl App {
             item.name = "Caption".into();
             item.range = TimeRange::new(start, end - start);
             item.time_map = oa_doc::TimeMap::default();
-            for fx in &mut item.effects {
-                fx.id = EffectId(self.editor.doc.alloc_id());
-            }
+            let doc = &mut self.editor.doc;
+            item.renumber_effects(&mut || doc.alloc_id());
             item.params.set(schema::TEXT_CONTENT, ParamSource::Static(Value::Text(cap.text.clone())));
             if let Some(color) = color {
                 item.params.set(schema::TEXT_COLOR, ParamSource::Static(Value::Gradient(Gradient::solid(*color))));

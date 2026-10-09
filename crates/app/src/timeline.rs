@@ -101,6 +101,10 @@ pub enum TimelineDrag {
     Track { track: TrackId },
     /// The clip's keyframe line: one key, or the whole line (`key: None`).
     Band { item: ItemId, band: crate::band::Band, key: Option<usize>, grab_y: f32, original: oa_params::ParamSource, rect: egui::Rect },
+    /// Ctrl+drag on an empty stretch: time opens at `at` on every track (dragged right,
+    /// to `to`) or the stretch from `to` back to `at` is taken out (dragged left). Both
+    /// ends snap.
+    Space { at: Time, to: Time },
 }
 
 /// A clip as drawn: where it is and what it is.
@@ -190,6 +194,7 @@ impl App {
 
     pub(crate) fn timeline(&mut self, ui: &mut egui::Ui) {
         // Video tracks top-down (V2 above V1), then audio.
+        let variant = self.variant_id();
         let seq = self.editor.sequence();
         let mut rows: Vec<(TrackId, TrackKind, String, bool)> = seq
             .tracks
@@ -205,6 +210,8 @@ impl App {
         let row_height = self.timeline_view.track_height();
         // Effect tracks are half height: they hold effects, not pictures to look at.
         let fx_rows: Vec<bool> = rows.iter().map(|r| seq.track(r.0).is_some_and(|t| t.effects)).collect();
+        // Temp layers (a paste that found no room): outlined, with a + that keeps them.
+        let temp_rows: Vec<bool> = rows.iter().map(|r| seq.track(r.0).is_some_and(|t| t.temp)).collect();
         let row_h = |r: usize| if fx_rows.get(r).copied().unwrap_or(false) { (row_height * 0.5).max(18.0) } else { row_height };
         let tops: Vec<f32> = std::iter::once(0.0).chain((0..rows.len()).scan(0.0, |y, r| {
             *y += row_h(r);
@@ -351,13 +358,10 @@ impl App {
                 }
                 let x1 = x_of(item.range.end()).max(x0 + 2.0);
                 let rect = egui::Rect::from_min_max(egui::pos2(x0, row_top(r) + 2.0), egui::pos2(x1, row_top(r) + row_h(r) - 2.0));
-                let mut keys: Vec<f32> = item
-                    .params
-                    .0
-                    .values()
-                    .chain(item.effects.iter().flat_map(|e| e.params.0.values()))
-                    .filter_map(|s| s.curve().filter(|c| c.anchor == oa_params::KeyframeAnchor::ClipStart))
-                    .flat_map(|c| c.keys.iter().map(|k| x_of(item.range.start + k.t)))
+                // Its keyframes as the format on screen shows them, inside the clip.
+                let mut keys: Vec<f32> = crate::editor::Editor::clip_key_times(seq, item, variant)
+                    .into_iter()
+                    .map(&x_of)
                     // In the clip, and on screen (a tracked clip can carry thousands).
                     .filter(|x| *x >= x0.max(lane.left() - 8.0) && *x <= x1.min(lane.right() + 8.0))
                     .collect();
@@ -441,8 +445,13 @@ impl App {
             egui::Rect::from_center_size(egui::pos2(full.left() + HEADER_WIDTH - 12.0, row_top(r) + row_h(r) / 2.0), egui::vec2(12.0, 12.0))
         };
 
+        // A temp layer's + (keep it as a real track), where the on/off toggle would be
+        // (a temp layer has none).
+        let keep_rect = toggle_rect;
+        let keep_at = |p: egui::Pos2| (0..rows.len()).find(|&r| temp_rows[r] && keep_rect(r).expand(3.0).contains(p));
+
         let header_at = |p: egui::Pos2| {
-            (p.x < lane.left() && p.y >= full.top() + RULER_HEIGHT).then(|| row_at(p.y)).flatten().filter(|r| !toggle_rect(*r).expand(3.0).contains(p))
+            (p.x < lane.left() && p.y >= full.top() + RULER_HEIGHT).then(|| row_at(p.y)).flatten().filter(|r| !toggle_rect(*r).expand(3.0).contains(p) && keep_at(p).is_none())
         };
 
         // Hover cursor.
@@ -517,6 +526,16 @@ impl App {
                             TimelineDrag::Move { anchor: b.id, grab: time_at(origin.x) - start }
                         }
                     },
+                    // Ctrl+drag on empty space: open or close time.
+                    None if origin.x >= lane.left() && row_at(origin.y).is_some() && mods.command => {
+                        let s = self.editor.sequence();
+                        let t = time_at(origin.x);
+                        let at = match Snapper::new(s, None, &[self.playhead]).snap(t, px_to_time(SNAP_PX)).filter(|_| self.settings.snapping) {
+                            Some(point) => point,
+                            None => cmd::snap_to_frame(s, t),
+                        };
+                        TimelineDrag::Space { at, to: at }
+                    }
                     None if origin.x >= lane.left() => {
                         TimelineDrag::Marquee { from: origin, base: if adding { self.selected.clone() } else { Default::default() } }
                     }
@@ -543,6 +562,22 @@ impl App {
                 Some(TimelineDrag::Scrub) | None => {
                     // Past the lane's edge, the playhead rides the edge as the view scrolls.
                     self.set_playhead(cmd::snap_to_frame(s, time_at(pos.x.clamp(lane.left(), lane.right()))));
+                    Ok(())
+                }
+                // Painted below; applied on release.
+                Some(TimelineDrag::Space { at, .. }) => {
+                    // The far end snaps to clip edges and the playhead (Shift: free).
+                    let at = *at;
+                    let t = time_at(pos.x.max(lane.left()));
+                    let to = match Snapper::new(s, None, &[playhead]).snap(t, tolerance).filter(|_| snapping) {
+                        Some(point) => {
+                            snapped_at = Some(point);
+                            point
+                        }
+                        None => cmd::snap_to_frame(s, t),
+                    };
+                    self.timeline_drag = Some(TimelineDrag::Space { at, to });
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
                     Ok(())
                 }
                 // Painted below; applied on release.
@@ -643,6 +678,12 @@ impl App {
                 && let Some(to) = track_drop_row(&rows, track, pos.y, &row_at, full.top() + RULER_HEIGHT) {
                     self.reorder_track(&rows, track, to);
                 }
+        // Time opened or closed: on release, one edit.
+        if response.drag_stopped()
+            && let Some(TimelineDrag::Space { at, to }) = self.timeline_drag
+        {
+            self.open_or_close_time(at, to);
+        }
         if response.drag_stopped() {
             self.timeline_drag = None;
             self.editor.doc.seal();
@@ -652,8 +693,14 @@ impl App {
             .clicked()
             .then(|| response.interact_pointer_pos())
             .flatten()
-            .and_then(|pos| (0..rows.len()).find(|&r| toggle_rect(r).expand(3.0).contains(pos)));
-        if let Some(r) = toggled {
+            .and_then(|pos| (0..rows.len()).find(|&r| !temp_rows[r] && toggle_rect(r).expand(3.0).contains(pos)));
+        let kept = response.clicked().then(|| response.interact_pointer_pos()).flatten().and_then(keep_at);
+        if let Some(r) = kept {
+            let op = oa_doc::Op::SetTrackTemp { seq: self.editor.seq, track: rows[r].0, temp: false };
+            if let Err(e) = self.editor.apply(tr("Keep layer"), vec![op]) {
+                self.error = Some(e.to_string());
+            }
+        } else if let Some(r) = toggled {
             let (track, enabled) = (rows[r].0, rows[r].3);
             let op = oa_doc::Op::SetTrackEnabled { seq: self.editor.seq, track, enabled: !enabled };
             if let Err(e) = self.editor.apply(if enabled { tr("Turn track off") } else { tr("Turn track on") }, vec![op]) {
@@ -788,6 +835,24 @@ impl App {
                     egui::Color32::from_black_alpha(90),
                 );
             }
+            if temp_rows[r] {
+                // Lighter, with a dotted gray outline all round; a + in the header keeps it.
+                let row = egui::Rect::from_min_max(egui::pos2(full.left(), top), egui::pos2(full.right(), top + row_h(r))).shrink(1.0);
+                painter.rect_filled(row, 0.0, egui::Color32::from_white_alpha(10));
+                let outline = [row.left_top(), row.right_top(), row.right_bottom(), row.left_bottom(), row.left_top()];
+                painter.add(egui::Shape::dashed_line(&outline, egui::Stroke::new(1.0, egui::Color32::from_gray(88)), 3.0, 3.0));
+                let k = keep_rect(r);
+                let hot = response.hover_pos().is_some_and(|p| k.expand(3.0).contains(p));
+                painter.rect(k, 3.0, if hot { crate::style::ACCENT } else { egui::Color32::from_gray(60) }, egui::Stroke::new(1.0, egui::Color32::from_gray(130)), egui::StrokeKind::Inside);
+                let c = k.center();
+                let plus = egui::Stroke::new(1.5, egui::Color32::WHITE);
+                painter.line_segment([c - egui::vec2(3.5, 0.0), c + egui::vec2(3.5, 0.0)], plus);
+                painter.line_segment([c - egui::vec2(0.0, 3.5), c + egui::vec2(0.0, 3.5)], plus);
+                if hot {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                continue;
+            }
             let t = toggle_rect(r);
             let on = if *kind == TrackKind::Video { egui::Color32::from_rgb(140, 170, 220) } else { egui::Color32::from_rgb(140, 200, 160) };
             if *enabled {
@@ -914,13 +979,15 @@ impl App {
                     }
                 }
             }
+            // Its keyframes: gold diamonds along the bottom, outlined so they show over the
+            // pictures and the waveform.
             for x in &b.keys {
-                let c = egui::pos2(*x, b.rect.bottom() - 5.0);
-                let d = 3.0;
+                let c = egui::pos2(*x, b.rect.bottom() - 6.0);
+                let d = 4.0;
                 clip_painter.add(egui::Shape::convex_polygon(
                     vec![c + egui::vec2(0.0, -d), c + egui::vec2(d, 0.0), c + egui::vec2(0.0, d), c + egui::vec2(-d, 0.0)],
                     crate::style::GOLD,
-                    egui::Stroke::NONE,
+                    egui::Stroke::new(1.0, egui::Color32::from_black_alpha(200)),
                 ));
             }
         }
@@ -944,6 +1011,28 @@ impl App {
             // A diagonal from the outgoing to the incoming side, like a dissolve curve.
             clip_painter.line_segment([rect.left_bottom(), rect.right_top()], egui::Stroke::new(1.0, egui::Color32::from_white_alpha(200)));
         }
+        // Time being opened (right of the press: a gap, striped) or closed (left: what
+        // goes, in red).
+        if let Some(TimelineDrag::Space { at, to }) = self.timeline_drag {
+            let (x0, x1) = (x_of(at), x_of(to));
+            let body = egui::Rect::from_min_max(egui::pos2(x0.min(x1), full.top() + RULER_HEIGHT), egui::pos2(x0.max(x1), full.bottom()));
+            let color = if x1 >= x0 { crate::style::ACCENT } else { crate::style::ERROR };
+            clip_painter.rect_filled(body, 0.0, color.gamma_multiply(0.18));
+            if x1 >= x0 {
+                let mut x = body.left() - body.height();
+                while x < body.right() {
+                    let a = egui::pos2(x, body.bottom());
+                    clip_painter.with_clip_rect(body).line_segment([a, a + egui::vec2(body.height(), -body.height())], egui::Stroke::new(1.0, color.gamma_multiply(0.35)));
+                    x += 8.0;
+                }
+            }
+            for x in [x0, x1] {
+                clip_painter.line_segment([egui::pos2(x, body.top()), egui::pos2(x, body.bottom())], egui::Stroke::new(1.5, color));
+            }
+            let secs = (to.as_seconds_f64() - at.as_seconds_f64()).abs();
+            let label = if x1 >= x0 { trf("+{0}s", &[("0", &format!("{secs:.2}"))]) } else { trf("−{0}s", &[("0", &format!("{secs:.2}"))]) };
+            clip_painter.text(egui::pos2(x1 + 4.0, body.top() + 2.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(11.0), color);
+        }
         if let Some(area) = marquee {
             clip_painter.rect_filled(area, 0.0, egui::Color32::from_rgba_unmultiplied(120, 170, 255, 30));
             clip_painter.rect_stroke(area, 0.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 170, 255)), egui::StrokeKind::Inside);
@@ -955,11 +1044,17 @@ impl App {
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 80, 200)),
             );
         }
+        // The playhead: gold, or while time is being opened or closed, that color.
+        let head = match self.timeline_drag {
+            Some(TimelineDrag::Space { at, to }) if to < at => crate::style::ERROR,
+            Some(TimelineDrag::Space { .. }) => crate::style::ACCENT,
+            _ => crate::style::GOLD,
+        };
         let x = x_of(self.playhead);
-        clip_painter.line_segment([egui::pos2(x, full.top()), egui::pos2(x, full.bottom())], egui::Stroke::new(1.5, crate::style::GOLD));
+        clip_painter.line_segment([egui::pos2(x, full.top()), egui::pos2(x, full.bottom())], egui::Stroke::new(1.5, head));
         clip_painter.add(egui::Shape::convex_polygon(
             vec![egui::pos2(x - 5.0, full.top()), egui::pos2(x + 5.0, full.top()), egui::pos2(x, full.top() + 7.0)],
-            crate::style::GOLD,
+            head,
             egui::Stroke::NONE,
         ));
 
@@ -1166,6 +1261,14 @@ impl App {
         }
         if item(ui, "Duplicate", "Ctrl+D", has) {
             self.duplicate_selection();
+            ui.close();
+        }
+        if item(ui, tr("Select all after playhead"), "", true) {
+            self.select_around_playhead(true);
+            ui.close();
+        }
+        if item(ui, tr("Select all before playhead"), "", true) {
+            self.select_around_playhead(false);
             ui.close();
         }
         ui.separator();
@@ -1408,6 +1511,14 @@ impl App {
         }
         if item(ui, "Select all", "Ctrl+A", true) {
             self.select_all();
+            ui.close();
+        }
+        if item(ui, tr("Select all after playhead"), "", true) {
+            self.select_around_playhead(true);
+            ui.close();
+        }
+        if item(ui, tr("Select all before playhead"), "", true) {
+            self.select_around_playhead(false);
             ui.close();
         }
     }

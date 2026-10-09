@@ -8,6 +8,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ambient;
 mod assets;
 mod audition;
 mod autosave;
@@ -52,6 +53,7 @@ mod menu;
 mod notify;
 mod plugins;
 mod prefs;
+mod projects;
 mod picker;
 mod plan_ahead;
 mod plugin_previews;
@@ -559,6 +561,13 @@ struct App {
     opening: Option<(PathBuf, std::sync::mpsc::Receiver<Opened>)>,
     /// A save-as-you-go running on its own thread: the file, the snapshot being written.
     saving: Option<BackgroundSave>,
+    /// The New project window, while it's open.
+    new_project_form: Option<projects::NewProjectForm>,
+    /// The properties panel shows the background's settings (nothing selected, after
+    /// Edit background).
+    editing_background: bool,
+    /// The viewer glow's colors, read from the picture.
+    ambient: ambient::Ambient,
 }
 
 impl App {
@@ -724,6 +733,9 @@ impl App {
             imports: Default::default(),
             opening: None,
             saving: None,
+            new_project_form: None,
+            editing_background: false,
+            ambient: Default::default(),
         }
     }
 
@@ -817,6 +829,7 @@ impl App {
         self.track_editor = None;
         self.captions = None;
         self.captions_added = None;
+        self.editing_background = false;
         self.follower = None;
         self.follower_key = (0, 0);
         self.follower_complete = false;
@@ -1316,7 +1329,7 @@ impl App {
                     ui.separator();
                     egui::CollapsingHeader::new("Performance").default_open(false).show(ui, |ui| self.stats_panel(ui));
                 }
-                if !self.messages.is_empty() {
+                if self.settings.show_messages && !self.messages.is_empty() {
                     egui::CollapsingHeader::new("Messages").default_open(true).show(ui, |ui| {
                         for m in self.messages.iter().rev().take(8) {
                             ui.label(egui::RichText::new(m).small().weak());
@@ -1447,11 +1460,23 @@ impl App {
     pub(crate) fn save(&mut self, save_as: bool) {
         // Never two writers on one file: let a background save finish first.
         self.finish_background_save();
+        // Never saved: it gets a folder of its own in the projects folder, named after it
+        // (Save as… still puts it anywhere).
+        let name = self.editor.doc.project().name.clone();
+        let name = if name.is_empty() || name == "Untitled" { projects::UNTITLED.to_string() } else { name };
         let path = match (&self.editor.path, save_as) {
             (Some(path), false) => Some(path.clone()),
+            (None, false) => match projects::fresh_project_file(&self.projects_dir(), &name) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    self.report_error(trf("couldn't make the project's folder: {e}", &[("e", &e.to_string())]));
+                    return;
+                }
+            },
             _ => rfd::FileDialog::new()
                 .add_filter(tr("OpenAtelier project"), &["json"])
-                .set_file_name("project.oaproj.json")
+                .set_directory(self.projects_dir())
+                .set_file_name(format!("{}.oaproj.json", projects::folder_name(&name)))
                 .save_file(),
         };
         let Some(path) = path else { return };
@@ -1912,6 +1937,7 @@ impl App {
                 None => render_state.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear),
             };
             self.preview = Some(Preview { _texture: texture, id, size: done.size });
+            self.ambient.fresh = true;
             if done.settled {
                 self.seek_settling = false;
             }
@@ -2249,6 +2275,10 @@ impl App {
     }
 
     pub(crate) fn undo(&mut self) {
+        // Rotoscope points placed since the last edit go first, one at a time.
+        if self.undo_roto_click() {
+            return;
+        }
         let captions = self.editor.doc.undo_label() == Some(captions::ADD_CAPTIONS);
         match self.editor.doc.undo() {
             Err(oa_doc::EditError::LastSequence) => self.notify(tr("Nothing more to undo.")),
@@ -2259,6 +2289,9 @@ impl App {
     }
 
     pub(crate) fn redo(&mut self) {
+        if self.redo_roto_click() {
+            return;
+        }
         let captions = self.editor.doc.redo_label() == Some(captions::ADD_CAPTIONS);
         match self.editor.doc.redo() {
             Err(e) => self.error = Some(e.to_string()),
@@ -2460,6 +2493,7 @@ impl App {
         self.font_samples.frame_start();
         self.poll_imports();
         self.poll_eyedropper();
+        self.ambient_tick(ctx);
         if !self.imports.is_empty() || self.opening.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -2475,6 +2509,7 @@ impl App {
         }
         self.poll_updates(ctx);
         self.settings_window(ctx);
+        self.new_project_window(ctx);
         self.script_consent_window(ctx);
         if self.screen == home::Screen::Home {
             self.update_banner(root);
@@ -2549,13 +2584,13 @@ impl App {
             ui.add_space(style::GAP_S);
             // The tracks are as tall as the settings say.
             self.timeline_view.row_height = self.settings.track_height.min(timeline::ROW_HEIGHTS.len() - 1);
-            // Where we are on the left, playback in the middle, what the selection can do
-            // and the playback volume on the right.
+            // Where we are on the left; what the selection can do and the playback volume
+            // on the right (playback itself is under the viewer).
             let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), style::ICON + 4.0), egui::Sense::hover());
             let gap = ui.spacing().item_spacing.x;
-            let transport = egui::Rect::from_center_size(row.center(), egui::vec2(5.0 * style::ICON + 4.0 * gap, row.height()));
-            let left = egui::Rect::from_min_max(row.min + egui::vec2(style::GAP_S, 0.0), egui::pos2(transport.left() - style::GAP_L, row.bottom()));
-            let right = egui::Rect::from_min_max(egui::pos2(transport.right() + style::GAP_L, row.top()), row.max - egui::vec2(style::GAP_S, 0.0));
+            let split = row.left() + (row.width() * 0.3).clamp(160.0, 260.0);
+            let left = egui::Rect::from_min_max(row.min + egui::vec2(style::GAP_S, 0.0), egui::pos2(split, row.bottom()));
+            let right = egui::Rect::from_min_max(egui::pos2(split + gap, row.top()), row.max - egui::vec2(style::GAP_S, 0.0));
             ui.scope_builder(egui::UiBuilder::new().max_rect(left).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
                 ui.set_clip_rect(left.intersect(ui.clip_rect()));
                 ui.label(
@@ -2563,26 +2598,6 @@ impl App {
                         .size(style::TEXT_L),
                 );
                 ui.label(egui::RichText::new(trf("frame {0}", &[("0", &(rate.frame_at(self.playhead)).to_string())])).small().weak());
-            });
-            ui.scope_builder(egui::UiBuilder::new().max_rect(transport).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
-                if icons::button(ui, icons::SKIP_START, tr("Go to the start"), "Home", true).clicked() {
-                    self.set_playhead(Time::ZERO);
-                }
-                if icons::button(ui, icons::STEP_BACK, tr("Back a frame"), "←", true).clicked() {
-                    self.step(-1);
-                }
-                let (glyph, tip) = if self.playing { (icons::PAUSE, "Pause") } else { (icons::PLAY, "Play") };
-                if icons::button(ui, glyph, tip, "Space", true).clicked() {
-                    let playing = !self.playing;
-                    self.set_playing(playing);
-                }
-                if icons::button(ui, icons::STEP_ON, tr("On a frame"), "→", true).clicked() {
-                    self.step(1);
-                }
-                if icons::button(ui, icons::SKIP_END, tr("Go to the end"), "End", true).clicked() {
-                    let end = self.editor.duration();
-                    self.set_playhead(end);
-                }
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(right).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
                 ui.set_clip_rect(right.intersect(ui.clip_rect()));
@@ -2624,6 +2639,14 @@ impl App {
                 egui::ScrollArea::vertical().max_height(tracks.height()).min_scrolled_height(0.0).auto_shrink([false, false]).show(ui, |ui| {
                     self.timeline(ui);
                     ui.add_space(4.0);
+                    // The empty space under the tracks: a click there lets go of the
+                    // selection, as one on an empty stretch of a track does.
+                    let rest = (tracks.bottom() - ui.min_rect().bottom()).max(0.0);
+                    if rest > 0.0 && ui.allocate_response(egui::vec2(ui.available_width(), rest), egui::Sense::click()).clicked() {
+                        self.selection = None;
+                        self.selected.clear();
+                        self.selected_tracks.clear();
+                    }
                 });
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
@@ -2646,6 +2669,12 @@ impl App {
                     && icons::button(ui, icons::CAPTIONS, tr("Captions: turn the speech on the timeline into captions"), "", true).clicked()
                 {
                     self.open_captions();
+                }
+                // Several clips picked on one track: ways to arrange them.
+                if self.arrangeable() {
+                    ui.separator();
+                    self.arrange_buttons(ui);
+                    ui.separator();
                 }
                 ui.label(egui::RichText::new(tr("Wheel scrolls through time · Shift+wheel up and down · Ctrl+wheel zooms")).small().weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

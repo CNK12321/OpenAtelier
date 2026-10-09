@@ -92,7 +92,7 @@ Ready-to-run builds are on the [Releases page](https://github.com/CNK12321/OpenA
   Install `ffmpeg` from your package manager too (the app tells you if it can't find it).
 
 The app checks the releases at start (and every few hours while open). When there's a
-newer one it says so ("Beta 6 is available!") with what's new, and offers **Restart and
+newer one it says so ("Beta 7 is available!") with what's new, and offers **Restart and
 Update Now** or **Later**. Updating downloads the package, checks it against the
 release's `SHA256SUMS.txt`, installs it and restarts (installed from the `.deb`, it
 installs the new `.deb` through apt, and your system asks for your password). Settings → Updates picks the channel (Stable, or Beta
@@ -100,17 +100,17 @@ for pre-releases too), turns the check off, or checks now.
 
 ### Making a release
 
-The version lives in the workspace `Cargo.toml` (`0.1.0-beta.6`). Rename `CHANGELOG.md`'s
+The version lives in the workspace `Cargo.toml` (`0.1.0-beta.7`). Rename `CHANGELOG.md`'s
 **Unreleased** section to the version first: it becomes the release's description and the
 list in the app's update dialog. Its tag leaves a patch
-of 0 off (`v0.1-beta.6`; the full form works too), and tagging publishes the release:
+of 0 off (`v0.1-beta.7`; the full form works too), and tagging publishes the release:
 
 ```bash
-git tag v0.1-beta.6
+git tag v0.1-beta.7
 ```
 
 ```bash
-git push origin v0.1-beta.6
+git push origin v0.1-beta.7
 ```
 
 `.github/workflows/release.yml` builds Windows and Linux packages, writes the checksums

@@ -72,6 +72,9 @@ pub struct Settings {
     pub default_curve: DefaultCurve,
     /// The Performance panel under the inspector.
     pub show_performance: bool,
+    /// The Messages list under the properties (what the app reported lately).
+    #[serde(default)]
+    pub show_messages: bool,
     /// A denser properties panel: tighter rows, smaller controls, section notes hidden
     /// (shown on hover instead).
     #[serde(default)]
@@ -131,6 +134,12 @@ pub struct Settings {
     /// How soft a rotoscoped edge is made (the matte's feather), in clip px.
     #[serde(default = "two")]
     pub roto_softness_px: f64,
+    /// Where new projects are saved, a folder each (`None`: Documents/OpenAtelier
+    /// Projects).
+    #[serde(default)]
+    pub projects_dir: Option<PathBuf>,
+    /// The New project window's last choices.
+    pub new_project: NewProjectPrefs,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -279,6 +288,22 @@ impl DefaultCurve {
     }
 }
 
+/// What the New project window remembers: the format and frame rate last picked.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NewProjectPrefs {
+    /// An `AspectPreset` id.
+    pub layout: String,
+    /// Frames per second as a fraction (30000/1001 for 29.97).
+    pub fps: [u32; 2],
+}
+
+impl Default for NewProjectPrefs {
+    fn default() -> Self {
+        NewProjectPrefs { layout: "landscape-16x9".into(), fps: [30, 1] }
+    }
+}
+
 /// What the Export window remembers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -343,6 +368,7 @@ impl Default for Settings {
             advanced_transform: false,
             default_curve: DefaultCurve::default(),
             show_performance: false,
+            show_messages: false,
             compact_properties: false,
             ui_scale: 1.0,
             still_seconds: 5.0,
@@ -363,6 +389,8 @@ impl Default for Settings {
             captions: CaptionPrefs::default(),
             sam_model: small(),
             roto_softness_px: 2.0,
+            projects_dir: None,
+            new_project: NewProjectPrefs::default(),
             path: None,
         }
     }

@@ -74,10 +74,10 @@ impl App {
         vec![
             // ---- project ----
             cmd("project.new", tr("New project"), Group::Project, "", Some(icons::ADD), true, false, |a| {
-                a.new_project();
+                a.ask_new_project();
             }),
             cmd("project.open", tr("Open project…"), Group::Project, "", Some(icons::FOLDER_OPEN), true, false, |a| {
-                if let Some(path) = rfd::FileDialog::new().add_filter(tr("OpenAtelier project"), &["json"]).pick_file() {
+                if let Some(path) = rfd::FileDialog::new().add_filter(tr("OpenAtelier project"), &["json"]).set_directory(a.projects_dir()).pick_file() {
                     a.open_project(&path);
                 }
             }),

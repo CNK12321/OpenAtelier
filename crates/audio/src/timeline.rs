@@ -333,7 +333,12 @@ impl Chain {
                 oa_doc::EffectRole::In { .. } => oa_doc::EffectClock { visibility: 1.0, progress: 1.0, ..start },
                 _ => start,
             });
-            let values = e.params.eval(&info.params, None, &owner.context);
+            let mut values = e.params.eval(&info.params, None, &owner.context);
+            // An effect for the whole clip with an off state, as an intro or an outro:
+            // eased between full and off as the clip comes and goes.
+            if e.role != oa_doc::EffectRole::Passive && info.usage == fx::FxUsage::Passive {
+                fx::eased(&info.off, &mut values, 1.0 - start.visibility);
+            }
             before.clear();
             before.extend_from_slice(buf);
             p.process(buf, &values, &fx::ClockSpan { start, end: stop });

@@ -26,6 +26,15 @@ pub const BLEND: &str = "transform.blend";
 /// intro fade fades the effect in). Same id as `oa_graph::registry::BLEND`.
 pub const BLEND_EFFECT: &str = "oa.composite.blend";
 pub const BLEND_MODE: &str = "mode";
+/// The Duplicate effect: the clip drawn a second time, with its own transform (`offset`,
+/// a canvas fraction; `scale`; `rotation`; `opacity`) in front of it or behind
+/// (`in_front`). Its picture runs the clip's effects ([`DUPLICATE_INHERIT`]), only those
+/// listed above the Duplicate ([`DUPLICATE_PREVIOUS`]) or none — and then its own, the
+/// effects whose `on_duplicate` is this one. Same id as `oa_graph::registry::DUPLICATE`.
+pub const DUPLICATE_EFFECT: &str = "oa.composite.duplicate";
+pub const DUPLICATE_INHERIT: &str = "inherit effects";
+pub const DUPLICATE_PREVIOUS: &str = "copy previous effects";
+
 /// The modes the compositor draws directly (`oa_graph::BlendMode`).
 pub const BLEND_MODES: [&str; 6] = ["normal", "add", "multiply", "screen", "darken", "lighten"];
 /// The modes that read the picture under the layer: it's flattened first, then mixed
@@ -47,7 +56,7 @@ pub fn blend_index(mode: &str) -> usize {
 /// The blend mode the item's Blend effect sets at `ctx` (the last one on, if several);
 /// `normal` without one.
 pub fn blend_mode(item: &crate::Item, ctx: &oa_params::EvalContext) -> String {
-    let Some(fx) = item.effects.iter().rev().find(|e| e.enabled && e.type_id == BLEND_EFFECT) else { return "normal".into() };
+    let Some(fx) = item.effects.iter().rev().find(|e| e.enabled && e.on_duplicate.is_none() && e.type_id == BLEND_EFFECT) else { return "normal".into() };
     // Unset: the effect's default.
     fx.params.get(BLEND_MODE).and_then(|s| s.eval(ctx).as_enum().map(str::to_string)).unwrap_or_else(|| "add".into())
 }

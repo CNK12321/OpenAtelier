@@ -146,6 +146,7 @@ fn demo(args: &[String]) -> Res {
         enabled: true,
         params: Default::default(),
         role: Default::default(),
+        on_duplicate: None,
     });
     item.effects.push(EffectInstance {
         id: EffectId(doc.alloc_id()),
@@ -154,6 +155,7 @@ fn demo(args: &[String]) -> Res {
         enabled: true,
         params: Default::default(),
         role: Default::default(),
+        on_duplicate: None,
     });
     // Blur intensity is keyframed: sharp at 0s, soft by 6s.
     let mut blur = oa_params::ParamSet::default();
@@ -171,6 +173,7 @@ fn demo(args: &[String]) -> Res {
         enabled: true,
         params: blur,
         role: Default::default(),
+        on_duplicate: None,
     });
     let mut card = Item::new(title, "Color card", ItemKind::Solid, TimeRange::new(secs(2), secs(3)));
     card.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color([0.9, 0.3, 0.1, 1.0])));

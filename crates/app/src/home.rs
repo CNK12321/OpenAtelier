@@ -148,11 +148,10 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             if tile(ui, crate::icons::ADD, t("home.new_project"), t("home.new_project_hint"), true, tile_w).clicked() {
-                self.new_project();
-                self.screen = Screen::Editor;
+                self.ask_new_project();
             }
             if tile(ui, crate::icons::FOLDER_OPEN, t("home.open"), t("home.open_hint"), false, tile_w).clicked()
-                && let Some(path) = rfd::FileDialog::new().add_filter(tr("OpenAtelier project"), &["json"]).pick_file()
+                && let Some(path) = rfd::FileDialog::new().add_filter(tr("OpenAtelier project"), &["json"]).set_directory(self.projects_dir()).pick_file()
             {
                 self.open_project(&path);
                 self.screen = Screen::Editor;

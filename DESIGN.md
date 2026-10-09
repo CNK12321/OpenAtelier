@@ -68,8 +68,9 @@ Dependency rule: `oa-graph` never depends on `oa-doc`. `oa-plan` is the only bri
   first frame select frame 0. Derived times (speed maps) round toward −∞
   (`Time::from_rational_floor`). Nothing else may round time to frames.
 * Clip time map: `source = source_in + floor(local × speed)`; speed is a `Rational`
-  (0 = freeze, negative = reverse). Speed *curves* ⏳ will integrate to source time and
-  then pass through the same floor rule.
+  (0 = freeze, negative = reverse). Speed *ramps* (keyframed `time.speed`) integrate to
+  source time (`Item::source_time_at`); changing one keeps the clip playing the same part
+  of its file, so its length follows (`oa_edit::timeline::set_speed_ramp`).
 
 ## 2. Document ✅
 
@@ -326,7 +327,8 @@ Descriptor fields: kind (`PointOp`, `UvWarp`, `Spatial{expand}`, `Transition`,
 plugin can declare them yet), **`Statefulness`** (`Pure` | `Stateful{preroll}`),
 **`WorkingSpace`** (`Linear` | `Display`), `fusible`, `preserves_opacity`, param
 schemas, and what the manifest adds: `category`, `description`, `preview` (thumbnail
-settings), `editor` (`surface`, `equalizer`: host editors a plugin opts into by naming
+settings), `off` (the values at which it does nothing: a passive effect with an off state
+is also an intro/outro, eased between full and off), `editor` (`surface`, `equalizer`: host editors a plugin opts into by naming
 its parameters as they expect), `second_input` (`media` | `original`), and scripts —
 `motion`, `bounds`, `pass_count`/`pass_divisor`, and for sound `tail`, `latency`, `meter`.
 
@@ -661,7 +663,7 @@ Memory & robustness ✅ / ⏳ (`health.rs`):
   longer side if that's more (at most 8192): that's its "native" size, sharp when scaled
   up. Transparency kept; bin cards and filmstrips draw it at their own size.
 * **Reverse playback** (2026-09-27): a clip's speed can be negative (Properties →
-  Speed → Reverse, `oa_edit::timeline::reversed`: the same part of the file, last frame
+  Speed: a negative speed, `oa_edit::timeline::reversed`: the same part of the file, last frame
   first). Decoding backwards frame by frame would be a seek and a GOP of decoding per
   frame; instead a decoder asked for a frame a step behind its last decodes the
   stretch (up to `REVERSE_CHUNK` = 12 frames, not past its keyframe) forward once and

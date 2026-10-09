@@ -233,6 +233,8 @@ impl App {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             }
             let (pressed, alt) = ui.input(|i| (i.pointer.primary_pressed(), i.modifiers.alt));
+            // Only on the picture itself, not on what floats over it (the tool strip).
+            let pressed = pressed && response.hovered();
             if pressed
                 && let Some(o) = ui.input(|i| i.pointer.press_origin()).filter(|o| response.rect.contains(*o))
                 && let Some(f) = p.to_layer_fraction(to_canvas(o)).filter(|f| (0.0..=1.0).contains(&f[0]) && (0.0..=1.0).contains(&f[1]))
@@ -245,6 +247,9 @@ impl App {
 
         let point = |q: egui::Pos2| drawing_point(&p, &values, m.frame, to_canvas(q));
         let (pressed, down, latest, origin, alt) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.latest_pos(), i.pointer.press_origin(), i.modifiers.alt));
+        // A press on what floats over the picture (the tool strip, the toolbars) isn't a
+        // stroke.
+        let pressed = pressed && response.hovered();
         let erase = self.masks.erase ^ alt;
         let near = self.half_frame();
         // The brush's size on screen.

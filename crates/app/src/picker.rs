@@ -23,6 +23,9 @@ struct Entry {
     name: String,
     category: String,
     used: bool,
+    /// Made for what's being added (an intro/outro proper), not an effect offered for
+    /// it because it has an off state: these come first.
+    own: bool,
 }
 
 impl App {
@@ -54,10 +57,10 @@ impl App {
             .registry
             .offered_for(usage, is_text)
             .iter()
-            .map(|d| (d.type_id.to_string(), d.name.clone()))
+            .map(|d| (d.type_id.to_string(), d.name.clone(), d.usage == usage))
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|(type_id, name)| Entry { category: self.effect_category(&type_id), used: used(&type_id), name, type_id })
+            .map(|(type_id, name, own)| Entry { category: self.effect_category(&type_id), used: used(&type_id), name, type_id, own })
             .collect();
 
         // Search text and the chosen category live in egui's memory, so each menu keeps
@@ -66,9 +69,12 @@ impl App {
         let (mut search, mut category): (String, String) = ui.data(|d| d.get_temp(id)).unwrap_or_default();
         let before = (search.clone(), category.clone());
 
-        let mut categories: Vec<String> = entries.iter().map(|e| e.category.clone()).collect();
+        // Categories with effects made for this first (an intro picker's Animation and
+        // Text before the effects that ease to off), each lot in alphabetical order.
+        let mut categories: Vec<(bool, String)> = entries.iter().map(|e| (!entries.iter().any(|o| o.own && o.category == e.category), e.category.clone())).collect();
         categories.sort();
         categories.dedup();
+        let categories: Vec<String> = categories.into_iter().map(|(_, c)| c).collect();
 
         // The menu is as wide as three preview cells; everything inside fills it.
         let width = CELL * COLUMNS as f32 + crate::style::GAP * (COLUMNS as f32 + 1.0);

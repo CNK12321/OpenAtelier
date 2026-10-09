@@ -61,16 +61,24 @@ fn variant(project: &mut Project, preset: &str, short_edge: u32) -> FormatVarian
 impl Editor {
     /// An empty project: one sequence, a video and an audio track, three format variants.
     pub fn new() -> Self {
+        Self::with_setup("Untitled", "landscape-16x9", FrameRate::FPS_30)
+    }
+
+    /// An empty project as the New project window sets it up: its name, the format it
+    /// opens in (`layout`, an `AspectPreset` id: first in the list, so it's the one
+    /// shown) and its frame rate. Landscape, vertical and square are there too.
+    pub fn with_setup(name: &str, layout: &str, rate: FrameRate) -> Self {
         // Built directly, not as an edit: the empty project is where undo stops. (As an
         // edit, undoing past the first change took the whole timeline away.)
-        let mut project = Project::new("Untitled");
+        let mut project = Project::new(name);
         let (seq, video_track, audio_track) = (SeqId(project.alloc_id()), TrackId(project.alloc_id()), TrackId(project.alloc_id()));
-        let wide = variant(&mut project, "landscape-16x9", 1080);
-        let tall = variant(&mut project, "vertical-9x16", 1080);
-        let square = variant(&mut project, "square-1x1", 1080);
-        let mut sequence = Sequence::new(seq, "Main", FrameRate::FPS_30, wide);
-        sequence.variants.push(tall);
-        sequence.variants.push(square);
+        let layout = AspectPreset::by_id(layout).map_or("landscape-16x9", |p| p.id);
+        let first = variant(&mut project, layout, 1080);
+        let mut sequence = Sequence::new(seq, "Main", rate, first);
+        for other in ["landscape-16x9", "vertical-9x16", "square-1x1"].into_iter().filter(|p| *p != layout) {
+            let v = variant(&mut project, other, 1080);
+            sequence.variants.push(v);
+        }
         sequence.tracks.push(Arc::new(Track::new(video_track, "V1", TrackKind::Video)));
         sequence.tracks.push(Arc::new(Track::new(audio_track, "A1", TrackKind::Audio)));
         project.sequences.insert(seq, Arc::new(sequence));
@@ -478,10 +486,32 @@ impl Editor {
         Ok(backs)
     }
 
+    /// Where a clip's keyframes are on the timeline as format `variant` shows it: its
+    /// own values (a value the format overrides counting from the override instead),
+    /// its effects' and its transitions'. Only the ones inside the clip — a split leaves
+    /// keys past each half's ends, where nothing can be seen of them.
+    pub fn clip_key_times(seq: &oa_doc::Sequence, it: &Item, variant: oa_doc::VariantId) -> Vec<Time> {
+        let overrides = seq.variant(variant).and_then(|v| v.overrides.get(&it.id));
+        let own = it.params.0.iter().filter(|(id, _)| overrides.is_none_or(|o| o.get(id.as_str()).is_none())).map(|(_, s)| s);
+        let mut keys: Vec<Time> = own
+            .chain(overrides.into_iter().flat_map(|o| o.0.values()))
+            .chain(it.effects.iter().flat_map(|e| e.params.0.values()))
+            .chain([oa_doc::ClipEnd::Head, oa_doc::ClipEnd::Tail].into_iter().filter_map(|end| it.transition(end)).flat_map(|t| t.params.0.values()))
+            .filter_map(|s| s.curve().filter(|c| c.anchor == KeyframeAnchor::ClipStart))
+            .flat_map(|c| c.keys.iter().map(|k| k.t))
+            .filter(|t| *t >= Time::ZERO && *t <= it.range.duration)
+            .map(|t| it.range.start + t)
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     /// Where a clip or effect parameter's keyframes are, in clip-local seconds.
     pub fn keyframe_times(&self, item: ItemId, target: &ParamTarget, param: &str) -> Vec<Time> {
         let Some(it) = self.item(item) else { return Vec::new() };
-        let Some(curve) = Self::param_set(it, target).and_then(|set| set.get(param)).and_then(|s| s.curve()) else { return Vec::new() };
+        let Some(source) = self.source_of(it, target, param) else { return Vec::new() };
+        let Some(curve) = source.curve() else { return Vec::new() };
         let offset = match curve.anchor {
             KeyframeAnchor::ClipStart => Time::ZERO,
             // Source-anchored keys: convert to clip time (speed 1 assumed for display).
@@ -490,8 +520,52 @@ impl Editor {
         curve.keys.iter().map(|k| k.t + offset).collect()
     }
 
-    /// Turns keyframing of a clip parameter on (the current value becomes a key at `t`)
-    /// or off (the value at `t` becomes the static value).
+    /// Edits of a clip's speed (its ramp) keep the clip playing the same part of its
+    /// file: it grows as it slows and shrinks as it speeds up, moving up a track (onto a
+    /// temp layer if need be) when it runs into the next clip. Other ops pass through.
+    fn with_speed_lengths(&mut self, ops: Vec<Op>) -> Vec<Op> {
+        if !ops.iter().any(|op| matches!(op, Op::SetParam { target: ParamTarget::Item, param, .. } if param.as_str() == oa_doc::schema::SPEED)) {
+            return ops;
+        }
+        let project = self.doc.snapshot();
+        let mut out = Vec::new();
+        for op in ops {
+            match op {
+                Op::SetParam { seq, item, target: ParamTarget::Item, param, source } if param.as_str() == oa_doc::schema::SPEED => {
+                    let doc = &mut self.doc;
+                    match oa_edit::timeline::set_speed_ramp(&project, seq, item, source.clone(), &mut || doc.alloc_id()) {
+                        Ok(more) => out.extend(more),
+                        Err(_) => out.push(Op::SetParam { seq, item, target: ParamTarget::Item, param, source }),
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// Every key of `param` goes; the value at `t` stays (procedural motion too).
+    pub fn stop_keyframing(&mut self, item: ItemId, target: ParamTarget, param: &str, t: Time) -> Result<(), EditError> {
+        let mut ops = Vec::new();
+        for (item, target) in self.fan_out(item, &target, param) {
+            let Some(it) = self.item(item) else { continue };
+            let Some(src) = self.source_of(it, &target, param).filter(|s| s.curve().is_some()) else { continue };
+            let value = base_value(&src, &it.eval_context(t));
+            let source = match src {
+                ParamSource::Modulated { modulator, .. } => ParamSource::Modulated { base: Box::new(ParamSource::Static(value)), modulator },
+                _ => ParamSource::Static(value),
+            };
+            ops.push(Op::SetParam { seq: self.seq, item, target, param: ParamId::new(param), source: Some(source) });
+        }
+        let ops = self.with_speed_lengths(ops);
+        self.doc.edit("Stop keyframing", ops)
+    }
+
+    /// The keyframe diamond at `t`: not keyframed yet, keyframing starts (the value
+    /// there becomes the first key); keyframed with no key there, the value there
+    /// becomes a key; on a key, that key goes — and with the last one, keyframing stops
+    /// (the value there stays). `target` may be a format's override: it starts from the
+    /// clip's own value, as an edit there does.
     pub fn toggle_keyframing(
         &mut self,
         item: ItemId,
@@ -501,44 +575,85 @@ impl Editor {
         anchor: KeyframeAnchor,
         t: Time,
     ) -> Result<(), EditError> {
+        #[derive(PartialEq)]
+        enum Diamond {
+            Start,
+            AddKey,
+            RemoveKey,
+        }
         let it = self.item(item).ok_or(EditError::NotFound("item", item.0))?;
-        // Every linked clip goes the way the clicked one does: all on, or all off.
-        let turning_off = Self::param_set(it, &target).and_then(|set| set.get(param)).is_some_and(|s| s.curve().is_some());
+        // Every linked clip goes the way the clicked one does.
+        let ctx = it.eval_context(t);
+        let action = match self.source_of(it, &target, param).as_ref().and_then(|s| s.curve()) {
+            None => Diamond::Start,
+            Some(c) if c.keys.iter().any(|k| k.t == c.clock(&ctx)) => Diamond::RemoveKey,
+            Some(_) => Diamond::AddKey,
+        };
         let mut ops = Vec::new();
         for (item, target) in self.fan_out(item, &target, param) {
             let Some(it) = self.item(item) else { continue };
             let ctx = it.eval_context(t);
-            let current = Self::param_set(it, &target).and_then(|set| set.get(param)).cloned();
-            let source = match current {
-                Some(src) if turning_off => {
+            let current = self.source_of(it, &target, param);
+            let source = match (&action, current) {
+                (Diamond::Start, Some(src)) if src.curve().is_some() => continue,
+                (Diamond::Start, Some(src)) => src.keyframed(&ctx, anchor),
+                (Diamond::Start, None) => ParamSource::Static(default.clone()).keyframed(&ctx, anchor),
+                (Diamond::AddKey, Some(mut src)) if src.curve().is_some() => {
+                    src.confine(it.range.duration);
                     let value = src.eval(&ctx);
-                    match src {
-                        // Keep procedural motion; only the keys go.
-                        ParamSource::Modulated { modulator, .. } => {
-                            ParamSource::Modulated { base: Box::new(ParamSource::Static(value)), modulator }
+                    src.set_at(&ctx, value);
+                    src
+                }
+                (Diamond::RemoveKey, Some(mut src)) if src.curve().is_some() => {
+                    src.confine(it.range.duration);
+                    let value = base_value(&src, &ctx);
+                    let curve = src.curve_mut().expect("checked");
+                    let at = curve.clock(&ctx);
+                    curve.remove_key(at);
+                    if curve.keys.is_empty() {
+                        match src {
+                            // Keep procedural motion; only the keys go.
+                            ParamSource::Modulated { modulator, .. } => ParamSource::Modulated { base: Box::new(ParamSource::Static(value)), modulator },
+                            _ => ParamSource::Static(value),
                         }
-                        _ => ParamSource::Static(value),
+                    } else {
+                        src
                     }
                 }
-                None if turning_off => continue,
-                Some(src) if src.curve().is_some() => continue,
-                Some(src) => src.keyframed(&ctx, anchor),
-                None => ParamSource::Static(default.clone()).keyframed(&ctx, anchor),
+                _ => continue,
             };
             ops.push(Op::SetParam { seq: self.seq, item, target, param: ParamId::new(param), source: Some(source) });
         }
-        self.doc.edit("Keyframing", ops)
+        let label = match action {
+            Diamond::Start => "Keyframing",
+            Diamond::AddKey => "Add keyframe",
+            Diamond::RemoveKey => "Remove keyframe",
+        };
+        let ops = self.with_speed_lengths(ops);
+        self.doc.edit(label, ops)
     }
 
     /// Value of a clip or effect parameter at `t`.
     pub fn param_value(&self, item: ItemId, target: &ParamTarget, param: &str, t: Time) -> Option<Value> {
         let it = self.item(item)?;
-        Some(Self::param_set(it, target)?.get(param)?.eval(&it.eval_context(t)))
+        Some(self.source_of(it, target, param)?.eval(&it.eval_context(t)))
     }
 
     /// How a parameter is stored (static, keyframed…), if it has been set.
     pub fn param_source(&self, item: ItemId, target: &ParamTarget, param: &str) -> Option<ParamSource> {
-        Self::param_set(self.item(item)?, target)?.get(param).cloned()
+        self.source_of(self.item(item)?, target, param)
+    }
+
+    /// Where `param` of `it` at `target` comes from — a format's override included: the
+    /// override, or (none yet) the clip's own value it would start from.
+    fn source_of(&self, it: &Item, target: &ParamTarget, param: &str) -> Option<ParamSource> {
+        match target {
+            ParamTarget::VariantOverride(v) => {
+                let own = self.sequence().variant(*v).and_then(|v| v.overrides.get(&it.id)).and_then(|o| o.get(param)).cloned();
+                own.or_else(|| it.params.get(param).cloned())
+            }
+            _ => Self::param_set(it, target)?.get(param).cloned(),
+        }
     }
 
     fn param_set<'a>(it: &'a Item, target: &ParamTarget) -> Option<&'a oa_params::ParamSet> {
@@ -710,6 +825,7 @@ impl Editor {
             .into_iter()
             .map(|(item, target)| Op::SetParam { seq: self.seq, item, target, param: ParamId::new(param), source: Some(source.clone()) })
             .collect();
+        let ops = self.with_speed_lengths(ops);
         if let Err(e) = self.doc.edit_coalesced(drag_key, Some(drag_key), ops) {
             eprintln!("edit failed: {e}");
         }
@@ -723,9 +839,11 @@ impl Editor {
         for (item, target) in self.fan_out(item, &target, param) {
             let Some(it) = self.item(item) else { continue };
             let ctx = it.eval_context(t);
-            let source = match Self::param_set(it, &target).and_then(|set| set.get(param)) {
+            let source = match self.source_of(it, &target, param) {
                 Some(existing) => {
-                    let mut src = existing.clone();
+                    let mut src = existing;
+                    // Keys left outside the clip (by a split) don't pull on this one.
+                    src.confine(it.range.duration);
                     src.set_at(&ctx, value.clone());
                     src
                 }
@@ -733,6 +851,7 @@ impl Editor {
             };
             ops.push(Op::SetParam { seq: self.seq, item, target, param: ParamId::new(param), source: Some(source) });
         }
+        let ops = self.with_speed_lengths(ops);
         if let Err(e) = self.doc.edit_coalesced(drag_key, Some(drag_key), ops) {
             eprintln!("edit failed: {e}");
         }
@@ -896,6 +1015,15 @@ fn missing_item(media: &MediaRef) -> PoolItem {
     }
 }
 
+/// What `src` is at `ctx` under any procedural motion on top (a wave, the sound): the
+/// value its keys give.
+fn base_value(src: &ParamSource, ctx: &oa_params::EvalContext) -> Value {
+    match src {
+        ParamSource::Modulated { base, .. } => base_value(base, ctx),
+        other => other.eval(ctx),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,6 +1058,115 @@ mod tests {
     /// new value; switching keyframing on turns it on for all of them.
     /// The clip index follows every change: clips added, moved along their track by an
     /// edit before them, removed, and brought back by undo.
+    /// The keyframe diamond: grey starts keyframing; gold without a key here adds one
+    /// (it used to throw the keys away); on a key, that key goes, and with the last
+    /// one the value stays. Later changes key the value — in a format's own override
+    /// too, where the keys start from the clip's value.
+    #[test]
+    fn changing_a_keyframed_toggle_or_text_adds_a_key() {
+        let mut e = Editor::new();
+        let clip = e.add_text(Time::ZERO, "A", Time::from_seconds(10)).unwrap();
+        let (t1, t2) = (Time::from_seconds(1), Time::from_seconds(5));
+        for (p, was, now) in [(schema::TEXT_BOLD, Value::Bool(false), Value::Bool(true)), (schema::TEXT_CONTENT, Value::Text("A".into()), Value::Text("B".into()))] {
+            e.toggle_keyframing(clip, ParamTarget::Item, p, was.clone(), KeyframeAnchor::ClipStart, t1).unwrap();
+            e.set_value_at(clip, ParamTarget::Item, p, now.clone(), t2, p);
+            assert_eq!(e.keyframe_times(clip, &ParamTarget::Item, p).len(), 2, "{p}: a key where it changed");
+            assert_eq!(e.param_value(clip, &ParamTarget::Item, p, t1), Some(was), "{p}: the first key kept");
+            assert_eq!(e.param_value(clip, &ParamTarget::Item, p, t2), Some(now));
+        }
+    }
+
+    #[test]
+    fn a_new_project_opens_in_the_format_and_rate_picked() {
+        let e = Editor::with_setup("Trip", "portrait-4x5", FrameRate::FPS_24);
+        let s = e.sequence();
+        assert_eq!(e.doc.project().name, "Trip");
+        assert_eq!(s.rate, FrameRate::FPS_24);
+        assert_eq!((s.variants[0].size.width, s.variants[0].size.height), (1080, 1350));
+        assert_eq!(s.variants.len(), 4, "landscape, vertical and square are there too");
+        let vertical = Editor::with_setup("V", "vertical-9x16", FrameRate::FPS_30);
+        let names: Vec<&str> = vertical.sequence().variants.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["Vertical 9:16", "Landscape 16:9", "Square 1:1"]);
+    }
+
+    #[test]
+    fn the_keyframe_diamond_adds_and_removes_keys() {
+        let mut e = Editor::new();
+        let clip = e.add_text(Time::ZERO, "A", Time::from_seconds(10)).unwrap();
+        let p = schema::POSITION;
+        let (t1, t2, t3) = (Time::from_seconds(1), Time::from_seconds(4), Time::from_seconds(7));
+        let at = |e: &Editor, t: Time| e.param_value(clip, &ParamTarget::Item, p, t).and_then(|v| v.as_vec2()).unwrap()[0];
+        let keys = |e: &Editor, target: &ParamTarget| e.keyframe_times(clip, target, p).len();
+        e.toggle_keyframing(clip, ParamTarget::Item, p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, t1).unwrap();
+        assert_eq!(keys(&e, &ParamTarget::Item), 1);
+        // Changed later: a second key, and the value moves between them.
+        e.set_value_at(clip, ParamTarget::Item, p, Value::Vec2([0.4, 0.0]), t2, "x");
+        assert_eq!(keys(&e, &ParamTarget::Item), 2);
+        assert!((at(&e, t2) - 0.4).abs() < 1e-9 && at(&e, t1).abs() < 1e-9);
+        // The diamond where there's no key: a key with the value there.
+        let before = at(&e, t3);
+        e.toggle_keyframing(clip, ParamTarget::Item, p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, t3).unwrap();
+        assert_eq!(keys(&e, &ParamTarget::Item), 3);
+        assert!((at(&e, t3) - before).abs() < 1e-9);
+        // On a key: that one goes; the last one leaves the value it had.
+        for t in [t3, t1] {
+            e.toggle_keyframing(clip, ParamTarget::Item, p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, t).unwrap();
+        }
+        assert_eq!(keys(&e, &ParamTarget::Item), 1);
+        e.toggle_keyframing(clip, ParamTarget::Item, p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, t2).unwrap();
+        assert_eq!(keys(&e, &ParamTarget::Item), 0);
+        assert!((at(&e, t1) - 0.4).abs() < 1e-9, "still where it was");
+
+        // A second format, edited on its own: its keys live in its override, starting
+        // from the clip's value, and edits there animate.
+        e.add_variant("vertical-9x16").unwrap();
+        let v = e.sequence().variants[1].id;
+        let here = ParamTarget::VariantOverride(v);
+        e.toggle_keyframing(clip, here.clone(), p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, t1).unwrap();
+        assert_eq!(keys(&e, &here), 1);
+        assert_eq!(keys(&e, &ParamTarget::Item), 0, "the clip's own value is untouched");
+        e.set_value_at(clip, here.clone(), p, Value::Vec2([-0.2, 0.0]), t2, "y");
+        let o = |t: Time| e.param_value(clip, &here, p, t);
+        assert_eq!(keys(&e, &here), 2);
+        assert!(o(t1).is_some_and(|v| (v.as_vec2().unwrap()[0] - 0.4).abs() < 1e-9), "{:?}", o(t1));
+        assert!(o(t2).is_some_and(|v| (v.as_vec2().unwrap()[0] + 0.2).abs() < 1e-9), "{:?}", o(t2));
+    }
+
+    /// A clip split off a keyframed one has a key past its end (where the other half
+    /// carries on). Keying it inside and changing the value later holds that value: the
+    /// key out of sight no longer pulls it back.
+    #[test]
+    fn keys_left_past_a_split_dont_pull_on_new_ones() {
+        let mut e = Editor::new();
+        let clip = e.add_text(Time::ZERO, "A", Time::from_seconds(2)).unwrap();
+        let p = schema::POSITION;
+        let outside = ParamSource::Animated(oa_params::Curve::new(KeyframeAnchor::ClipStart, vec![oa_params::Keyframe::linear(Time::from_seconds(3), Value::Vec2([0.0; 2]))]));
+        e.doc.edit("keys", vec![Op::SetParam { seq: e.seq, item: clip, target: ParamTarget::Item, param: ParamId::new(p), source: Some(outside) }]).unwrap();
+        let s = |x: f64| Time::from_seconds_f64(x);
+        e.toggle_keyframing(clip, ParamTarget::Item, p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, s(0.2)).unwrap();
+        e.set_value_at(clip, ParamTarget::Item, p, Value::Vec2([0.5, 0.0]), s(1.0), "x");
+        let x = |t: f64| e.param_value(clip, &ParamTarget::Item, p, s(t)).and_then(|v| v.as_vec2()).unwrap()[0];
+        assert!((x(1.0) - 0.5).abs() < 1e-9 && (x(1.8) - 0.5).abs() < 1e-9, "held: {} {}", x(1.0), x(1.8));
+    }
+
+    /// The keys a clip shows (on the timeline, and for ◀ key / key ▶): those of the
+    /// format on screen — its own value where it has one — and only inside the clip.
+    #[test]
+    fn clips_show_the_keys_of_the_format_on_screen() {
+        let mut e = Editor::new();
+        let clip = e.add_text(Time::from_seconds(10), "A", Time::from_seconds(2)).unwrap();
+        let curve = |ts: &[i64]| ParamSource::Animated(oa_params::Curve::new(KeyframeAnchor::ClipStart, ts.iter().map(|t| oa_params::Keyframe::linear(Time::from_seconds(*t), Value::Vec2([0.0; 2]))).collect()));
+        e.add_variant("vertical-9x16").unwrap();
+        let (wide, tall) = (e.sequence().variants[0].id, e.sequence().variants[1].id);
+        let set = |target: ParamTarget, ts: &[i64]| Op::SetParam { seq: e.seq, item: clip, target, param: ParamId::new(schema::POSITION), source: Some(curve(ts)) };
+        let ops = vec![set(ParamTarget::Item, &[-1, 1, 5]), set(ParamTarget::VariantOverride(tall), &[0, 2])];
+        e.doc.edit("keys", ops).unwrap();
+        let it = e.item(clip).unwrap().clone();
+        let secs = |v: Vec<Time>| v.into_iter().map(|t| t.as_seconds_f64()).collect::<Vec<_>>();
+        assert_eq!(secs(Editor::clip_key_times(e.sequence(), &it, wide)), [11.0], "the one key inside the clip");
+        assert_eq!(secs(Editor::clip_key_times(e.sequence(), &it, tall)), [10.0, 12.0], "the format's own keys");
+    }
+
     #[test]
     fn the_clip_index_is_never_stale() {
         let mut e = Editor::new();

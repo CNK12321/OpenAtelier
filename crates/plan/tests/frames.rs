@@ -151,7 +151,7 @@ fn layer_pixel_params_and_bounds_follow_raster_scale() {
     let p = project(|clip| {
         let mut params = oa_params::ParamSet::default();
         params.set("radius", ParamSource::Static(Value::Float(20.0)));
-        clip.effects.push(EffectInstance { id: EffectId(9), type_id: "oa.blur.gaussian".into(), type_version: 1, enabled: true, params, role: Default::default() });
+        clip.effects.push(EffectInstance { id: EffectId(9), type_id: "oa.blur.gaussian".into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None });
     });
     let full = plan(&p, secs(1), PlanOptions::default());
     let blur = |g: &oa_graph::Graph| match &find(g, |op| matches!(op, NodeOp::Effect { .. }))[0].op {
@@ -179,7 +179,7 @@ fn effect_params_are_keyframed_and_modulated_per_frame() {
                 vec![Keyframe::linear(secs(0), Value::Float(0.0)), Keyframe::linear(secs(4), Value::Float(40.0))],
             )),
         );
-        clip.effects.push(EffectInstance { id: EffectId(9), type_id: "oa.blur.gaussian".into(), type_version: 1, enabled: true, params, role: Default::default() });
+        clip.effects.push(EffectInstance { id: EffectId(9), type_id: "oa.blur.gaussian".into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None });
         // ...while the layer shakes.
         clip.params.set(schema::POSITION, ParamSource::Static(Value::Vec2([0.0, 0.0])).wiggle(0.01, 10.0, 1));
     });
@@ -281,7 +281,7 @@ fn with_stateful_effect() -> Registry {
 fn missing_and_stateful_effects() {
     let p = project(|clip| {
         for (i, id) in ["com.someone.missing", "test.trail"].iter().enumerate() {
-            clip.effects.push(EffectInstance { id: EffectId(30 + i as u64), type_id: (*id).into(), type_version: 1, enabled: true, params: Default::default(), role: Default::default() });
+            clip.effects.push(EffectInstance { id: EffectId(30 + i as u64), type_id: (*id).into(), type_version: 1, enabled: true, params: Default::default(), role: Default::default(), on_duplicate: None });
         }
     });
     let plan = plan_frame(&p, SEQ, secs(3), &PlanOptions::default(), &with_stateful_effect()).unwrap();
@@ -958,4 +958,55 @@ fn effects_after_a_blend_run_on_what_it_made() {
     };
     assert!(!blur_after_blend(vec![blur(), blend()]), "blurred first, then laid down by the compositor");
     assert!(blur_after_blend(vec![blend(), blur()]), "blended first, then blurred");
+}
+
+/// A title far bigger than the frame: drawn only where it can be seen (with room for its
+/// shadow) — or, with an effect that may read from anywhere in it (a scroll), whole but
+/// never larger than a GPU can make.
+#[test]
+fn huge_titles_are_drawn_only_where_they_show() {
+    let text_node = |effect: Option<&str>| {
+        let p = project(|clip| {
+            clip.kind = ItemKind::Text;
+            let line = "WIDE TEXT ".repeat(40);
+            clip.params.set(schema::TEXT_CONTENT, ParamSource::Static(Value::Text(vec![line; 30].join("\n"))));
+            clip.params.set(schema::TEXT_SIZE, ParamSource::Static(Value::Float(200.0)));
+            if let Some(id) = effect {
+                clip.effects.push(EffectInstance::new(EffectId(9), id));
+            }
+        });
+        let g = plan(&p, secs(1), PlanOptions { text_supersample: 2, ..Default::default() }).graph;
+        let b = find(&g, |op| matches!(op, NodeOp::Text { .. }))[0].bounds;
+        [b.x1 - b.x0, b.y1 - b.y0]
+    };
+    // The 1920×1080 frame, drawn twice as large, plus the shadow's reach and a margin.
+    let trimmed = text_node(Some(oa_graph::registry::SHADOW));
+    assert!(trimmed[0] < 2.0 * 1920.0 + 400.0 && trimmed[1] < 2.0 * 1080.0 + 400.0, "{trimmed:?}");
+    let whole = text_node(Some("oa.warp.scroll"));
+    assert!(whole[0] > trimmed[0] && whole[0].max(whole[1]) <= 8192.0, "{whole:?}");
+}
+
+/// A Duplicate draws the clip again: with the clip's effects (inherit), only those above
+/// it (copy previous) or none — then its own, which never run on the clip itself.
+#[test]
+fn duplicates_take_the_effects_they_are_given() {
+    let count = |mode: &str| {
+        let p = project(|clip| {
+            clip.effects.push(EffectInstance::new(EffectId(20), "oa.color.tint"));
+            let mut dup = EffectInstance::new(EffectId(21), oa_graph::registry::DUPLICATE);
+            dup.params.set("effects", ParamSource::Static(Value::Enum(mode.into())));
+            clip.effects.push(dup);
+            clip.effects.push(EffectInstance::new(EffectId(22), "oa.color.invert"));
+            let mut own = EffectInstance::new(EffectId(23), "oa.blur.gaussian");
+            own.on_duplicate = Some(EffectId(21));
+            clip.effects.push(own);
+        });
+        let g = plan(&p, secs(1), PlanOptions::default()).graph;
+        let n = |id: &str| find(&g, |op| matches!(op, NodeOp::Effect { type_id, .. } if type_id.as_ref() == id)).len();
+        (n("oa.color.tint"), n("oa.color.invert"), n("oa.blur.gaussian"))
+    };
+    // (tint above it, invert below it, blur on the duplicate alone)
+    assert_eq!(count(schema::DUPLICATE_INHERIT), (2, 2, 1));
+    assert_eq!(count(schema::DUPLICATE_PREVIOUS), (2, 1, 1));
+    assert_eq!(count("no effects"), (1, 1, 1));
 }

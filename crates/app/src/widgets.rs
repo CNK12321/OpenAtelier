@@ -91,60 +91,106 @@ pub fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// A row of folder tabs over a baseline: the open tab is raised (rounded top, an accent
-/// strip, joined to the page below with no line under it); the others sit flat and
-/// dimmer. Returns true when the open tab changed.
-pub fn tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T, &str)]) -> bool {
+/// Tabs laid out in rows of at most `full` px (`widths`: each tab's narrowest, `gap`
+/// between them), in order; the row holding `current` goes last, next to the page, as
+/// stacked folder tabs do.
+pub fn stack_rows(widths: &[f32], full: f32, gap: f32, current: usize) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut used = 0.0;
+    for (i, w) in widths.iter().enumerate() {
+        match rows.last_mut() {
+            Some(row) if used + gap + w <= full => {
+                row.push(i);
+                used += gap + w;
+            }
+            _ => {
+                rows.push(vec![i]);
+                used = *w;
+            }
+        }
+    }
+    if let Some(at) = rows.iter().position(|r| r.contains(&current)) {
+        let open = rows.remove(at);
+        rows.push(open);
+    }
+    rows
+}
+
+/// Folder tabs over a baseline: the open tab is raised (rounded top, an accent strip,
+/// joined to the page below with no line under it); the others sit flat and dimmer.
+/// Each has an icon before its title. Too many for one row, they stack in rows, the
+/// open tab's row nearest the page. Returns true when the open tab changed.
+pub fn tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T, &str, crate::icons::Icon)]) -> bool {
     let font = egui::FontId::proportional(crate::style::TEXT);
     // Shorter when the controls are (the compact properties panel).
     let height = if ui.spacing().interact_size.y < 18.0 { 22.0 } else { 28.0 };
     let full = ui.available_width();
-    let (bar, _) = ui.allocate_exact_size(egui::vec2(full, height), egui::Sense::hover());
-    let painter = ui.painter_at(bar.expand(1.0));
     let visuals = ui.visuals().clone();
-    let galleys: Vec<_> = tabs.iter().map(|(_, title)| ui.painter().layout_no_wrap(title.to_string(), font.clone(), egui::Color32::PLACEHOLDER)).collect();
-    // Padding shrinks so the tabs fit a narrow panel.
-    let text: f32 = galleys.iter().map(|g| g.size().x).sum();
-    let pad = ((full - text - 2.0 * tabs.len() as f32) / tabs.len().max(1) as f32).clamp(8.0, 26.0);
+    let icon = 15.0;
+    const MIN_PAD: f32 = 12.0;
+    const GAP: f32 = 2.0;
+    let galleys: Vec<_> = tabs.iter().map(|(_, title, _)| ui.painter().layout_no_wrap(title.to_string(), font.clone(), egui::Color32::PLACEHOLDER)).collect();
+    let label_w: Vec<f32> = galleys.iter().map(|g| g.size().x + icon + 4.0).collect();
+    let open = tabs.iter().position(|(t, ..)| *t == *current).unwrap_or(0);
+    let rows = stack_rows(&label_w.iter().map(|w| w + MIN_PAD).collect::<Vec<_>>(), full, GAP, open);
+    let (area, _) = ui.allocate_exact_size(egui::vec2(full, height * rows.len().max(1) as f32), egui::Sense::hover());
+    let painter = ui.painter_at(area.expand(1.0));
     let stroke = egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color);
-    let base = bar.bottom() - 0.5;
     let mut changed = false;
     let mut gap = None;
-    let mut x = bar.left();
-    for (i, ((tab, _), galley)) in tabs.iter().zip(galleys).enumerate() {
-        let w = galley.size().x + pad;
-        let rect = egui::Rect::from_min_max(egui::pos2(x, bar.top() + 3.0), egui::pos2(x + w, base));
-        let r = ui.interact(rect, ui.id().with(("tab", i)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-        let on = *current == *tab;
-        if r.clicked() && !on {
-            *current = *tab;
-            changed = true;
-        }
-        let top = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
-        let color = if on {
-            painter.rect_filled(rect, top, visuals.faint_bg_color.lerp_to_gamma(visuals.widgets.inactive.bg_fill, 0.5));
-            painter.add(egui::Shape::line(vec![rect.left_bottom(), rect.left_top() + egui::vec2(0.0, 6.0), rect.left_top() + egui::vec2(6.0, 0.0), rect.right_top() - egui::vec2(6.0, 0.0), rect.right_top() + egui::vec2(0.0, 6.0), rect.right_bottom()], stroke));
-            painter.rect_filled(egui::Rect::from_min_max(rect.left_top() + egui::vec2(5.0, 0.0), egui::pos2(rect.right() - 5.0, rect.top() + 2.0)), 1.0, crate::style::ACCENT);
-            gap = Some((rect.left(), rect.right()));
-            visuals.strong_text_color()
-        } else {
-            if r.hovered() {
-                painter.rect_filled(rect.shrink2(egui::vec2(1.0, 0.0)), top, visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.5));
+    let last = rows.len().saturating_sub(1);
+    for (row_i, row) in rows.iter().enumerate() {
+        let top_y = area.top() + row_i as f32 * height;
+        let base = top_y + height - 0.5;
+        // The row's spare width shared out as padding.
+        let text: f32 = row.iter().map(|i| label_w[*i]).sum();
+        let pad = ((full - text - GAP * row.len() as f32) / row.len().max(1) as f32).clamp(MIN_PAD, 26.0);
+        let mut x = area.left();
+        for &i in row {
+            let (tab, _, glyph) = &tabs[i];
+            let galley = galleys[i].clone();
+            let w = label_w[i] + pad;
+            let rect = egui::Rect::from_min_max(egui::pos2(x, top_y + 3.0), egui::pos2(x + w, base));
+            let r = ui.interact(rect, ui.id().with(("tab", i)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let on = *current == *tab;
+            if r.clicked() && !on {
+                *current = *tab;
+                changed = true;
             }
-            if r.hovered() { visuals.text_color() } else { visuals.weak_text_color() }
-        };
-        let at = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0 + 1.0);
-        painter.galley(at, galley, color);
-        x += w + 2.0;
+            let corners = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+            let color = if on {
+                painter.rect_filled(rect, corners, visuals.faint_bg_color.lerp_to_gamma(visuals.widgets.inactive.bg_fill, 0.5));
+                painter.add(egui::Shape::line(vec![rect.left_bottom(), rect.left_top() + egui::vec2(0.0, 6.0), rect.left_top() + egui::vec2(6.0, 0.0), rect.right_top() - egui::vec2(6.0, 0.0), rect.right_top() + egui::vec2(0.0, 6.0), rect.right_bottom()], stroke));
+                painter.rect_filled(egui::Rect::from_min_max(rect.left_top() + egui::vec2(5.0, 0.0), egui::pos2(rect.right() - 5.0, rect.top() + 2.0)), 1.0, crate::style::ACCENT);
+                gap = Some((rect.left(), rect.right()));
+                visuals.strong_text_color()
+            } else {
+                if r.hovered() {
+                    painter.rect_filled(rect.shrink2(egui::vec2(1.0, 0.0)), corners, visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.5));
+                }
+                if r.hovered() { visuals.text_color() } else { visuals.weak_text_color() }
+            };
+            // The icon, then the title, centered together.
+            let left = rect.center().x - label_w[i] / 2.0;
+            let cy = rect.center().y + 1.0;
+            crate::icons::paint(&painter, egui::Rect::from_min_size(egui::pos2(left, cy - icon / 2.0), egui::vec2(icon, icon)), *glyph, if on { crate::style::ACCENT } else { color });
+            painter.galley(egui::pos2(left + icon + 4.0, cy - galley.size().y / 2.0), galley, color);
+            x += w + GAP;
+        }
+        // Between stacked rows, a faint line; under the last, the baseline, open under the
+        // raised tab.
+        if row_i < last {
+            painter.line_segment([egui::pos2(area.left(), base), egui::pos2(area.right(), base)], egui::Stroke::new(1.0, stroke.color.gamma_multiply(0.5)));
+        }
     }
-    // The baseline, open under the raised tab.
+    let base = area.bottom() - 0.5;
     match gap {
         Some((l, r)) => {
-            painter.line_segment([egui::pos2(bar.left(), base), egui::pos2(l, base)], stroke);
-            painter.line_segment([egui::pos2(r, base), egui::pos2(bar.right(), base)], stroke);
+            painter.line_segment([egui::pos2(area.left(), base), egui::pos2(l, base)], stroke);
+            painter.line_segment([egui::pos2(r, base), egui::pos2(area.right(), base)], stroke);
         }
         None => {
-            painter.line_segment([egui::pos2(bar.left(), base), egui::pos2(bar.right(), base)], stroke);
+            painter.line_segment([egui::pos2(area.left(), base), egui::pos2(area.right(), base)], stroke);
         }
     }
     changed
@@ -210,6 +256,48 @@ pub fn side_tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: 
         }
     }
     changed
+}
+
+/// A search box `width` wide: a magnifying glass, the text, and a ✕ that clears it
+/// (Esc clears it too). Returns true when the text changed.
+pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) -> bool {
+    let height = 26.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width.max(80.0), height), egui::Sense::hover());
+    let id = ui.id().with(("search-field", hint));
+    let focused = ui.memory(|m| m.has_focus(id));
+    let visuals = ui.visuals().clone();
+    let stroke = if focused { egui::Stroke::new(1.5, crate::style::ACCENT) } else { egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color) };
+    ui.painter().rect(rect, height / 2.0, visuals.extreme_bg_color, stroke, egui::StrokeKind::Inside);
+    // The glass.
+    let c = egui::pos2(rect.left() + 14.0, rect.center().y - 1.0);
+    let weak = visuals.weak_text_color();
+    ui.painter().circle_stroke(c, 4.5, egui::Stroke::new(1.5, weak));
+    ui.painter().line_segment([c + egui::vec2(3.2, 3.2), c + egui::vec2(7.0, 7.0)], egui::Stroke::new(1.8, weak));
+    let clear = !text.is_empty();
+    let field = egui::Rect::from_min_max(egui::pos2(rect.left() + 26.0, rect.top()), egui::pos2(rect.right() - if clear { 26.0 } else { 10.0 }, rect.bottom()));
+    let before = text.clone();
+    let r = ui.put(
+        field,
+        egui::TextEdit::singleline(text).id(id).frame(egui::Frame::NONE).hint_text(hint).vertical_align(egui::Align::Center).desired_width(field.width()),
+    );
+    if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        text.clear();
+    }
+    if clear {
+        let x = egui::Rect::from_center_size(egui::pos2(rect.right() - 14.0, rect.center().y), egui::vec2(18.0, 18.0));
+        let b = ui.interact(x, id.with("clear"), egui::Sense::click()).on_hover_text(crate::i18n::tr("Clear"));
+        if b.hovered() {
+            ui.painter().circle_filled(x.center(), 9.0, visuals.widgets.hovered.weak_bg_fill);
+        }
+        let s = 3.5;
+        let color = if b.hovered() { visuals.strong_text_color() } else { weak };
+        ui.painter().line_segment([x.center() + egui::vec2(-s, -s), x.center() + egui::vec2(s, s)], egui::Stroke::new(1.5, color));
+        ui.painter().line_segment([x.center() + egui::vec2(-s, s), x.center() + egui::vec2(s, -s)], egui::Stroke::new(1.5, color));
+        if b.clicked() {
+            text.clear();
+        }
+    }
+    *text != before
 }
 
 /// A compact button for toolbars: its text in a small rounded box, lit with the accent
@@ -545,4 +633,48 @@ pub fn gradient(ui: &mut egui::Ui, id: egui::Id, g: &mut Gradient) -> (bool, boo
     });
     ui.data_mut(|d| d.insert_temp(id, state));
     (changed, finished)
+}
+
+/// A full-width button card: an icon in a round spot, what it does, and a line more
+/// about it (the empty properties panel's choices).
+pub fn action_card(ui: &mut egui::Ui, icon: crate::icons::Icon, title: &str, about: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let v = ui.visuals();
+        let hovered = response.hovered();
+        let edge = if hovered { crate::style::ACCENT } else { v.widgets.noninteractive.bg_stroke.color };
+        let fill = if hovered { v.widgets.hovered.weak_bg_fill } else { v.faint_bg_color };
+        let painter = ui.painter();
+        painter.rect(rect, 8.0, fill, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+        let spot = egui::pos2(rect.left() + 26.0, rect.center().y);
+        painter.circle_filled(spot, 16.0, crate::style::ACCENT.gamma_multiply(0.16));
+        crate::icons::paint(painter, egui::Rect::from_center_size(spot, egui::vec2(20.0, 20.0)), icon, crate::style::ACCENT);
+        let x = spot.x + 26.0;
+        let wrap = (rect.right() - x - 8.0).max(10.0);
+        let mut title_job = egui::text::LayoutJob::simple_singleline(title.to_string(), egui::FontId::proportional(crate::style::TEXT_L), v.text_color());
+        title_job.wrap = egui::text::TextWrapping::truncate_at_width(wrap);
+        let title = painter.layout_job(title_job);
+        let mut about_job = egui::text::LayoutJob::simple_singleline(about.to_string(), egui::FontId::proportional(crate::style::TEXT_S), v.weak_text_color());
+        about_job.wrap = egui::text::TextWrapping::truncate_at_width(wrap);
+        let about = painter.layout_job(about_job);
+        let top = rect.center().y - (title.size().y + 2.0 + about.size().y) / 2.0;
+        let title_h = title.size().y;
+        painter.galley(egui::pos2(x, top), title, v.text_color());
+        painter.galley(egui::pos2(x, top + title_h + 2.0), about, v.weak_text_color());
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tabs_tests {
+    use super::stack_rows;
+
+    #[test]
+    fn tabs_that_dont_fit_stack_with_the_open_row_last() {
+        // Five 100 px tabs, 250 px wide: two to a row.
+        let w = [100.0; 5];
+        assert_eq!(stack_rows(&w, 250.0, 2.0, 0), [vec![2, 3], vec![4], vec![0, 1]]);
+        assert_eq!(stack_rows(&w, 250.0, 2.0, 4), [vec![0, 1], vec![2, 3], vec![4]]);
+        assert_eq!(stack_rows(&w, 600.0, 2.0, 3), [vec![0, 1, 2, 3, 4]], "room for all: one row");
+    }
 }

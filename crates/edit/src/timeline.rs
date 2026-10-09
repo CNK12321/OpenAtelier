@@ -178,8 +178,8 @@ pub fn split(p: &Project, seq: SeqId, item: ItemId, at: Time, alloc: &mut dyn Fn
     for m in &mut back.masks {
         m.shift_clip_clock(delta);
     }
+    back.renumber_effects(alloc);
     for fx in &mut back.effects {
-        fx.id = oa_doc::EffectId(alloc());
         for src in fx.params.0.values_mut() {
             src.shift_clip_clock(delta);
         }
@@ -461,8 +461,10 @@ pub fn arrange(p: &Project, seq: SeqId, items: &[ItemId], how: Arrange) -> R<Vec
 
 /// Pastes copies of `clips` (each with the track it came from) so the earliest starts at
 /// `at`, keeping their spacing. Each goes back on its own track when there's room there,
-/// otherwise on a new track of its kind added on top. Copies get fresh ids (clips,
-/// effects, groups — pasted clips that were grouped are grouped again, separately).
+/// otherwise on the nearest track of its kind with room (above first), otherwise on a
+/// temp layer of its kind added on top (it goes away once emptied, unless it's kept).
+/// Copies get fresh ids (clips, effects, groups — pasted clips that were grouped are
+/// grouped again, separately).
 /// Returns the ops and the new clips' ids.
 pub fn paste(p: &Project, seq: SeqId, clips: &[(TrackId, Item)], at: Time, alloc: &mut dyn FnMut() -> u64) -> R<(Vec<Op>, Vec<ItemId>)> {
     let s = sequence(p, seq)?;
@@ -482,8 +484,16 @@ pub fn paste(p: &Project, seq: SeqId, clips: &[(TrackId, Item)], at: Time, alloc
         let kind = s.track(*from).map_or(oa_doc::TrackKind::Video, |t| t.kind);
         // An effect container goes back on an effect track, anything else on an ordinary one.
         let effects = matches!(item.kind, oa_doc::ItemKind::Adjustment);
-        let own = s.track(*from).filter(|t| t.effects == effects && fits(Some(t), placed.get(&t.id).map_or(&[], |v| v), range)).map(|t| t.id);
+        let room = |t: &Track| t.kind == kind && t.effects == effects && fits(Some(t), placed.get(&t.id).map_or(&[], |v| v), range);
+        let origin = s.tracks.iter().position(|t| t.id == *from);
+        let own = s.track(*from).filter(|t| room(t)).map(|t| t.id);
+        // The nearest other track with room; at the same distance, the one above.
+        let near = || {
+            let o = origin? as i64;
+            s.tracks.iter().enumerate().filter(|(_, t)| room(t)).min_by_key(|(i, _)| ((*i as i64 - o).abs(), *i as i64 <= o)).map(|(_, t)| t.id)
+        };
         let track = own
+            .or_else(near)
             .or_else(|| new_tracks.iter().filter(|(_, k, e)| *k == kind && *e == effects).map(|(id, _, _)| *id).find(|id| fits(None, placed.get(id).map_or(&[], |v| v), range)))
             .unwrap_or_else(|| {
                 let id = TrackId(alloc());
@@ -495,6 +505,7 @@ pub fn paste(p: &Project, seq: SeqId, clips: &[(TrackId, Item)], at: Time, alloc
                     oa_doc::TrackKind::Audio => s.tracks.len() + new_tracks.len(),
                 };
                 let track = if effects { Track::effects(id, &name, kind) } else { Track::new(id, &name, kind) };
+                let track = Track { temp: true, ..track };
                 ops.push(Op::InsertTrack { seq, index, track: std::sync::Arc::new(track) });
                 new_tracks.push((id, kind, effects));
                 id
@@ -503,9 +514,7 @@ pub fn paste(p: &Project, seq: SeqId, clips: &[(TrackId, Item)], at: Time, alloc
         let mut copy = item.clone();
         copy.id = ItemId(alloc());
         copy.range = range;
-        for fx in &mut copy.effects {
-            fx.id = oa_doc::EffectId(alloc());
-        }
+        copy.renumber_effects(alloc);
         copy.group = item.group.map(|g| *groups.entry(g).or_insert_with(&mut *alloc));
         ids.push(copy.id);
         ops.push(Op::InsertItem { seq, track, item: copy });
@@ -563,4 +572,166 @@ impl Snapper {
             None => (start, None),
         }
     }
+}
+
+/// How many seconds of its file `it` plays over its length: its speed added up.
+pub fn source_span(it: &Item) -> f64 {
+    let d = it.range.duration.as_seconds_f64();
+    match it.speed_ramp() {
+        Some(ramp) => oa_doc::ramp_integral(ramp, d).abs(),
+        None => d * (it.time_map.speed.num() as f64 / it.time_map.speed.den().max(1) as f64).abs(),
+    }
+}
+
+/// How long a clip takes to play `span` seconds of its file at `speed` — a ramp (keys on
+/// the clip's clock: it plays until its speed, added up, reaches `span`) or `steady`.
+pub fn length_for(span: f64, ramp: Option<&oa_params::ParamSource>, steady: f64) -> f64 {
+    match ramp {
+        None => span / steady.abs().max(oa_doc::schema::MIN_SPEED),
+        Some(ramp) => {
+            // The speed is never below the minimum, so the length is at most this; the
+            // ramp only ever adds up, so halving finds it.
+            let (mut lo, mut hi) = (0.0, span / oa_doc::schema::MIN_SPEED);
+            for _ in 0..60 {
+                let mid = (lo + hi) / 2.0;
+                if oa_doc::ramp_integral(ramp, mid) < span { lo = mid } else { hi = mid }
+            }
+            hi
+        }
+    }
+}
+
+/// Sets a clip's speed (`ramp`: its keyframed speed, or `None` for none) so it plays the
+/// same part of its file as before — getting longer as it slows, shorter as it speeds up.
+/// A clip that no longer fits before the next one moves up: onto the track above if it
+/// has room there, otherwise onto a temp layer made just above its track. Frozen clips
+/// (0×) keep their length.
+pub fn set_speed_ramp(p: &Project, seq: SeqId, item: ItemId, ramp: Option<oa_params::ParamSource>, alloc: &mut dyn FnMut() -> u64) -> R<Vec<Op>> {
+    let (s, _, it) = locate(p, seq, item)?;
+    let ti = s.find_item(item).map_or(0, |(t, _)| t);
+    let param = oa_params::ParamId::new(oa_doc::schema::SPEED);
+    let set = Op::SetParam { seq, item, target: ParamTarget::Item, param: param.clone(), source: ramp.clone() };
+    let steady = it.time_map.speed.num() as f64 / it.time_map.speed.den().max(1) as f64;
+    if steady == 0.0 {
+        return Ok(vec![set]);
+    }
+    let span = source_span(it);
+    let mut after = it.clone();
+    match &ramp {
+        Some(r) => {
+            after.params.set(oa_doc::schema::SPEED, r.clone());
+        }
+        None => {
+            after.params.remove(oa_doc::schema::SPEED);
+        }
+    }
+    let seconds = length_for(span, after.speed_ramp(), steady);
+    // On a frame, at least one long.
+    let frame = s.rate.frame_start(1);
+    let end = s.rate.frame_start(s.rate.frame_at(it.range.start + Time::from_seconds_f64(seconds) + Time(frame.0 / 2)));
+    let range = TimeRange::new(it.range.start, (end - it.range.start).max(frame));
+    if range == it.range {
+        return Ok(vec![set]);
+    }
+    after.range = range;
+    let track = &s.tracks[ti];
+    if !track.items.iter().any(|i| i.id != item && i.range.overlaps(range)) {
+        return Ok(vec![set, Op::SetItemTiming { seq, item, range, time_map: it.time_map }]);
+    }
+    move_up(p, seq, after, alloc)
+}
+
+/// Puts `after` (a clip of the timeline, changed: longer, say) back in place of the
+/// clip it was if it still fits there; otherwise up a track — onto the one above if it
+/// has room, or a temp layer made just above.
+pub fn retimed_in_place(p: &Project, seq: SeqId, after: Item, alloc: &mut dyn FnMut() -> u64) -> R<Vec<Op>> {
+    let (_, track, _) = locate(p, seq, after.id)?;
+    if !track.items.iter().any(|i| i.id != after.id && i.range.overlaps(after.range)) {
+        return Ok(vec![Op::SetItemTiming { seq, item: after.id, range: after.range, time_map: after.time_map }]);
+    }
+    move_up(p, seq, after, alloc)
+}
+
+/// `after` taken off its track and put up one (see [`retimed_in_place`]).
+fn move_up(p: &Project, seq: SeqId, after: Item, alloc: &mut dyn FnMut() -> u64) -> R<Vec<Op>> {
+    let (s, _, _) = locate(p, seq, after.id)?;
+    let ti = s.find_item(after.id).map_or(0, |(t, _)| t);
+    let (item, range) = (after.id, after.range);
+    let track = &s.tracks[ti];
+    let fits = |t: &Track| !t.items.iter().any(|i| i.id != item && i.range.overlaps(range));
+    // Up a track: for pictures the next one in the list, for sound the one before.
+    let above = match track.kind {
+        oa_doc::TrackKind::Video => ti + 1,
+        oa_doc::TrackKind::Audio => ti.wrapping_sub(1),
+    };
+    let mut ops = vec![Op::RemoveItem { seq, item }];
+    let to = match s.tracks.get(above).filter(|t| t.kind == track.kind && t.effects == track.effects && fits(t)) {
+        Some(t) => t.id,
+        None => {
+            let id = TrackId(alloc());
+            let letter = if track.kind == oa_doc::TrackKind::Video { "V" } else { "A" };
+            let count = s.tracks.iter().filter(|t| t.kind == track.kind && t.effects == track.effects).count();
+            let layer = Track { temp: true, ..Track::new(id, &format!("{letter}{}", count + 1), track.kind) };
+            let index = if track.kind == oa_doc::TrackKind::Video { ti + 1 } else { ti };
+            ops.push(Op::InsertTrack { seq, index, track: std::sync::Arc::new(layer) });
+            id
+        }
+    };
+    ops.push(Op::InsertItem { seq, track: to, item: after });
+    Ok(ops)
+}
+
+/// Applies `ops` to a copy of `p`, to plan edits that build on them.
+fn after_ops(p: &Project, ops: &[Op]) -> R<Project> {
+    let mut next = p.clone();
+    for op in ops {
+        op.clone().apply(&mut next)?;
+    }
+    Ok(next)
+}
+
+/// Opens `amount` of empty time at `at` on every track: clips under `at` are cut there,
+/// and everything from `at` on moves right.
+pub fn insert_time(p: &Project, seq: SeqId, at: Time, amount: Time, alloc: &mut dyn FnMut() -> u64) -> R<Vec<Op>> {
+    if amount <= Time::ZERO {
+        return Ok(Vec::new());
+    }
+    let mut ops = split_all(p, seq, at, &[], alloc)?;
+    let cut = after_ops(p, &ops)?;
+    let s = sequence(&cut, seq)?;
+    for track in &s.tracks {
+        // Right to left, so each lands where nothing is yet.
+        for it in track.items.iter().rev().filter(|i| i.range.start >= at) {
+            ops.push(Op::SetItemTiming { seq, item: it.id, range: TimeRange::new(it.range.start + amount, it.range.duration), time_map: it.time_map });
+        }
+    }
+    Ok(ops)
+}
+
+/// Takes the time from `from` to `to` out of every track: what's in it is cut out and
+/// everything after moves left to close it up.
+pub fn remove_time(p: &Project, seq: SeqId, from: Time, to: Time, alloc: &mut dyn FnMut() -> u64) -> R<Vec<Op>> {
+    let from = from.max(Time::ZERO);
+    if to <= from {
+        return Ok(Vec::new());
+    }
+    let mut ops = split_all(p, seq, from, &[], alloc)?;
+    let cut = after_ops(p, &ops)?;
+    ops.extend(split_all(&cut, seq, to, &[], alloc)?);
+    let cut = after_ops(p, &ops)?;
+    let s = sequence(&cut, seq)?;
+    let span = to - from;
+    let frame = min_duration(s);
+    for track in &s.tracks {
+        for it in &track.items {
+            if it.range.start >= from && it.range.end() <= to + frame {
+                ops.push(Op::RemoveItem { seq, item: it.id });
+            }
+        }
+        // Left to right, into the space just emptied.
+        for it in track.items.iter().filter(|i| i.range.start >= to && i.range.end() > to + frame) {
+            ops.push(Op::SetItemTiming { seq, item: it.id, range: TimeRange::new(it.range.start - span, it.range.duration), time_map: it.time_map });
+        }
+    }
+    Ok(ops)
 }

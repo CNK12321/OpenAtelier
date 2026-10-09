@@ -25,7 +25,7 @@ use oa_params::{KeyframeAnchor, ParamSource, Value};
 use oa_time::Time;
 
 /// Whether the properties panel is drawn compact this frame (Settings → Interface).
-fn compact(ui: &egui::Ui) -> bool {
+pub(crate) fn compact(ui: &egui::Ui) -> bool {
     ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new(COMPACT)).unwrap_or(false))
 }
 
@@ -173,12 +173,46 @@ impl Tab {
             Tab::Sound => tr("Sound"),
         }
     }
+
+    fn icon(self) -> crate::icons::Icon {
+        use crate::icons;
+        match self {
+            Tab::Properties => icons::TUNE,
+            Tab::Transitions => icons::TRANSITIONS,
+            Tab::Effects => icons::EFFECTS,
+            Tab::Color => icons::PALETTE,
+            Tab::Masks => icons::MASKS,
+            Tab::Sound => icons::SOUND,
+        }
+    }
 }
 
 impl App {
     pub(crate) fn inspector(&mut self, ui: &mut egui::Ui) {
         let Some(item) = self.selection.filter(|i| self.editor.item(*i).is_some()) else {
-            ui.label(egui::RichText::new(tr("Select a clip — in the viewer or on the timeline.")).weak());
+            // Nothing picked: three ways to start; Edit background opens its settings.
+            if !self.editing_background {
+                ui.add_space(crate::style::GAP_S);
+                if crate::widgets::action_card(ui, crate::icons::IMPORT, tr("Import Media"), tr("Videos, pictures and sound from your computer")).clicked()
+                    && let Some(files) = rfd::FileDialog::new().add_filter(tr("Media"), crate::MEDIA_EXTENSIONS).pick_files()
+                {
+                    self.open_paths(&files);
+                }
+                ui.add_space(crate::style::GAP_S);
+                if crate::widgets::action_card(ui, crate::icons::TITLE, tr("Add Title"), tr("Text at the playhead, on the timeline")).clicked() {
+                    self.add_text();
+                }
+                ui.add_space(crate::style::GAP_S);
+                if crate::widgets::action_card(ui, crate::icons::PALETTE, tr("Edit Background"), tr("What shows behind the clips, and its effects")).clicked() {
+                    self.editing_background = true;
+                }
+                ui.add_space(crate::style::GAP);
+                ui.label(egui::RichText::new(tr("Or select a clip — in the viewer or on the timeline.")).small().weak());
+                return;
+            }
+            if crate::icons::flat_button(ui, crate::icons::STEP_BACK, tr("Back")).clicked() {
+                self.editing_background = false;
+            }
             section(ui, tr("Background"), tr("What shows behind the clips, in every format."));
             self.background_section(ui);
             section(ui, tr("Background effects"), tr("Run on the background only, under the clips — keyframable like a clip's."));
@@ -189,6 +223,8 @@ impl App {
             }
             return;
         };
+        // A clip picked: let go of the background, so nothing picked starts over.
+        self.editing_background = false;
         let it = self.editor.item(item).expect("checked").clone();
         let t = self.playhead;
         let inside = it.range.contains(t);
@@ -213,28 +249,22 @@ impl App {
             return;
         }
 
-        // Keyframe navigation over every animated property of the clip.
-        let mut keys: Vec<Time> = it
-            .params
-            .0
-            .values()
-            .chain(it.effects.iter().flat_map(|e| e.params.0.values()))
-            .filter_map(|s| s.curve().filter(|c| c.anchor == KeyframeAnchor::ClipStart))
-            .flat_map(|c| c.keys.iter().map(|k| it.range.start + k.t))
-            .collect();
-        keys.sort();
-        keys.dedup();
-        ui.horizontal(|ui| {
-            let prev = keys.iter().rev().find(|k| **k < self.playhead).copied();
-            let next = keys.iter().find(|k| **k > self.playhead).copied();
-            if ui.add_enabled(prev.is_some(), egui::Button::new(tr("◀ key"))).clicked() {
-                self.set_playhead(prev.expect("enabled"));
-            }
-            if ui.add_enabled(next.is_some(), egui::Button::new(tr("key ▶"))).clicked() {
-                self.set_playhead(next.expect("enabled"));
-            }
-            ui.label(egui::RichText::new(trf("{0} keyframes", &[("0", &(keys.len()).to_string())])).weak());
-        });
+        // Keyframe navigation over every animated property of the clip, as this format
+        // shows it (keys a split left outside the clip don't count) — only when it has any.
+        let keys = crate::editor::Editor::clip_key_times(self.editor.sequence(), &it, self.variant_id());
+        if !keys.is_empty() {
+            ui.horizontal(|ui| {
+                let prev = keys.iter().rev().find(|k| **k < self.playhead).copied();
+                let next = keys.iter().find(|k| **k > self.playhead).copied();
+                if ui.add_enabled(prev.is_some(), egui::Button::new(tr("◀ key"))).clicked() {
+                    self.set_playhead(prev.expect("enabled"));
+                }
+                if ui.add_enabled(next.is_some(), egui::Button::new(tr("key ▶"))).clicked() {
+                    self.set_playhead(next.expect("enabled"));
+                }
+                ui.label(egui::RichText::new(trf("{0} keyframes", &[("0", &(keys.len()).to_string())])).weak());
+            });
+        }
 
         let visual = !matches!(it.kind, ItemKind::Media { .. }) || self.is_visual(item);
         let audible = self.is_audible(item);
@@ -254,7 +284,7 @@ impl App {
             self.inspector_tab = Tab::Properties;
         }
         ui.add_space(crate::style::GAP_S);
-        let titled: Vec<(Tab, &str)> = tabs.iter().map(|t| (*t, t.title())).collect();
+        let titled: Vec<(Tab, &str, crate::icons::Icon)> = tabs.iter().map(|t| (*t, t.title(), t.icon())).collect();
         crate::widgets::tabs(ui, &mut self.inspector_tab, &titled);
         ui.add_space(crate::style::GAP);
 
@@ -340,7 +370,7 @@ impl App {
                         self.seal_on_release(&a);
                         self.seal_on_release(&b);
                         for r in [&a, &b] {
-                            self.property_menu(r, item, &ParamTarget::Item, schema::POSITION, &Value::Vec2([0.0, 0.0]), None, t);
+                            self.property_menu(r, item, &self.transform_target(item, schema::POSITION), schema::POSITION, &Value::Vec2([0.0, 0.0]), None, t);
                         }
                     });
                     ui.end_row();
@@ -370,7 +400,7 @@ impl App {
                         for r in &responses {
                             self.seal_on_release(r);
                             crate::widgets::context_menu(r, |ui| {
-                                self.property_menu_items(ui, item, &ParamTarget::Item, schema::SCALE, &Value::Vec2([1.0, 1.0]), None, t);
+                                self.property_menu_items(ui, item, &self.transform_target(item, schema::SCALE), schema::SCALE, &Value::Vec2([1.0, 1.0]), None, t);
                                 ui.separator();
                                 if !advanced && ui.button(tr("Advanced: separate X and Y")).clicked() {
                                     advanced = true;
@@ -420,7 +450,7 @@ impl App {
                             p if p == schema::ROTATION => Some((-180.0, 180.0)),
                             _ => Some((-0.9, 2.0)),
                         };
-                        self.property_menu(&r, item, &ParamTarget::Item, param, &Value::Float(default), band, t);
+                        self.property_menu(&r, item, &self.transform_target(item, param), param, &Value::Float(default), band, t);
                         ui.end_row();
                         self.on_mask_row(ui, item, param, t);
                     }
@@ -514,7 +544,7 @@ impl App {
             }
         }
         if r.changed() {
-            self.editor.set_param(item, target.clone(), schema::TEXT_CONTENT, ParamSource::Static(Value::Text(content)), "text-content");
+            self.editor.set_value_at(item, target.clone(), schema::TEXT_CONTENT, Value::Text(content), t, "text-content");
         }
         self.seal_on_release(&r);
 
@@ -530,20 +560,20 @@ impl App {
                 let on = matches!(value(self, param), Some(Value::Bool(true)));
                 let text = if param == schema::TEXT_BOLD { egui::RichText::new(tr(label)).strong() } else { egui::RichText::new(tr(label)).italics() };
                 if ui.selectable_label(on, text).on_hover_text(tr(tip)).clicked() {
-                    self.editor.set_param(item, target.clone(), param, ParamSource::Static(Value::Bool(!on)), param);
+                    self.editor.set_value_at(item, target.clone(), param, Value::Bool(!on), t, param);
                     self.editor.doc.seal();
                 }
             }
             let align = value(self, schema::TEXT_ALIGN).and_then(|v| v.as_enum().map(str::to_string)).unwrap_or_else(|| "center".into());
             for (option, label) in [("left", "Left"), ("center", "Center"), ("right", "Right")] {
                 if ui.selectable_label(align == option, tr(label)).clicked() && align != option {
-                    self.editor.set_param(item, target.clone(), schema::TEXT_ALIGN, ParamSource::Static(Value::Enum(option.into())), "text-align");
+                    self.editor.set_value_at(item, target.clone(), schema::TEXT_ALIGN, Value::Enum(option.into()), t, "text-align");
                     self.editor.doc.seal();
                 }
             }
         });
         if chosen != family {
-            self.editor.set_param(item, target.clone(), schema::TEXT_FONT, ParamSource::Static(Value::Text(chosen)), "text-font");
+            self.editor.set_value_at(item, target.clone(), schema::TEXT_FONT, Value::Text(chosen), t, "text-font");
             self.editor.doc.seal();
         }
         for id in [
@@ -741,7 +771,7 @@ impl App {
                     ui.add_space(24.0);
                     let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(160.0));
                     if r.changed() {
-                        self.editor.set_param(item, target.clone(), id, ParamSource::Static(Value::Text(text)), id);
+                        self.editor.set_value_at(item, target.clone(), id, Value::Text(text), t, id);
                     }
                     self.seal_on_release(&r);
                     ui.label(&label);
@@ -760,7 +790,7 @@ impl App {
                     ui.label(&label);
                 });
                 if chosen != was {
-                    self.editor.set_param(item, target.clone(), id, ParamSource::Static(Value::Media(chosen)), id);
+                    self.editor.set_value_at(item, target.clone(), id, Value::Media(chosen), t, id);
                     self.editor.doc.seal();
                 }
             }
@@ -928,6 +958,10 @@ impl App {
         let registry = &self.registry;
         let in_list = |e: &oa_doc::EffectInstance| {
             let heard = registry.is_sound(&e.type_id);
+            // A Duplicate's own effects are listed under it.
+            if e.on_duplicate.is_some() {
+                return false;
+            }
             match list {
                 List::Effects => e.role == EffectRole::Passive && !heard,
                 List::Sound => heard,
@@ -1026,6 +1060,8 @@ impl App {
                         let more = if is_text && self.can_bound(item, &fx.type_id) { ", or to bound it to some of the letters" } else { "" };
                         let r = r.on_hover_text(trf("{tip}Right-click to copy or paste{more}", &[("tip", &tip.to_string()), ("more", more)]));
                         crate::widgets::context_menu(&r, |ui| self.effect_menu(ui, item, fx));
+                        // Which mask it runs on (with previews), when it can be masked.
+                        self.effect_mask_button(ui, item, fx);
                         if in_out {
                             // How long it plays, over the clip's start or end.
                             let mut seconds = match fx.role {
@@ -1045,7 +1081,10 @@ impl App {
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button(tr("✕")).on_hover_text(tr("Remove this effect")).clicked() {
-                                ops = Some(("Remove effect", vec![Op::RemoveEffect { seq, item, effect: fx.id }]));
+                                // A Duplicate takes its own effects with it.
+                                let own = self.editor.item(item).map(|it| it.effects.iter().filter(|e| e.on_duplicate == Some(fx.id)).map(|e| e.id).collect::<Vec<_>>()).unwrap_or_default();
+                                let removed = std::iter::once(fx.id).chain(own).map(|effect| Op::RemoveEffect { seq, item, effect }).collect();
+                                ops = Some(("Remove effect", removed));
                             }
                             if !fits.is_empty() {
                                 let n = fits.len();
@@ -1130,6 +1169,9 @@ impl App {
                             }
                             if is_text && self.can_bound(item, &fx.type_id) {
                                 self.bounds_settings(ui, item, fx, t);
+                            }
+                            if fx.type_id == oa_graph::registry::DUPLICATE {
+                                self.duplicate_effects(ui, item, fx, t);
                             }
                         }
                         None => {
@@ -1380,21 +1422,21 @@ impl App {
 
 
     /// Playback speed: the clip plays the same part of its file faster or slower, so its
-    /// length on the timeline changes. Pitch is kept unless "keep pitch" is off.
+    /// length on the timeline changes. Negative plays it backwards. Pitch is kept unless
+    /// "keep pitch" is off.
     fn speed_row(&mut self, ui: &mut egui::Ui, item: ItemId) {
         let Some(it) = self.editor.item(item) else { return };
         let signed = it.time_map.speed.num() as f64 / it.time_map.speed.den() as f64;
-        // Shown as a size; which way it plays is the Reverse switch.
         let (old, reversed) = (signed.abs(), signed < 0.0);
+        let sign = if reversed { -1.0 } else { 1.0 };
         let keep = !matches!(it.params.get(schema::AUDIO_KEEP_PITCH).map(|s| s.eval(&it.eval_context(it.range.start))), Some(Value::Bool(false)));
-        let mut speed = old;
-        let mut reverse = reversed;
+        let mut speed = signed;
         // Keyframed (a speed ramp): the speed at the playhead, set there as a key; the
-        // clip keeps its length and plays more or less of its file.
+        // clip grows or shrinks to play the same part of its file.
         let t = self.playhead;
         let ramped = it.speed_ramp().is_some() && signed != 0.0;
         let at_playhead = it.speed_at((t - it.range.start).clamp(Time::ZERO, it.range.duration)).abs();
-        let mut ramp_value = at_playhead;
+        let mut ramp_value = at_playhead * sign;
         ui.horizontal(|ui| {
             ui.add_space(4.0);
             if signed != 0.0 {
@@ -1402,31 +1444,20 @@ impl App {
             } else {
                 ui.add_space(20.0);
             }
-            ui.add_enabled(signed != 0.0, egui::Checkbox::new(&mut reverse, tr("Reverse")))
-                .on_hover_text(tr("Plays the same part of the file backwards, last frame first — the sound too."));
+            let range = -schema::MAX_SPEED..=schema::MAX_SPEED;
             let r = if ramped {
-                ui.add(egui::DragValue::new(&mut ramp_value).speed(0.01).range(schema::MIN_SPEED..=schema::MAX_SPEED).max_decimals(3).suffix("×"))
-                    .on_hover_text(tr("The speed here (a key at the playhead). Keyframed, the speed ramps between its keys: the clip keeps its length and plays faster or slower through its file (0.01× to 100×)."))
+                ui.add(egui::DragValue::new(&mut ramp_value).speed(0.01).range(range).max_decimals(3).suffix("×"))
+                    .on_hover_text(tr("The speed here (a key at the playhead). Keyframed, the speed ramps between its keys and the clip grows or shrinks to play the same part of its file (0.01× to 100×; negative plays it backwards)."))
             } else {
-                ui.add(egui::DragValue::new(&mut speed).speed(0.01).range(0.0..=schema::MAX_SPEED).max_decimals(3).suffix("×")).on_hover_text(tr(
-                    tr("Playback speed, picture and sound together (0.01× to 100×). The clip gets shorter or longer on the timeline. 0× holds its first frame as a still, silent, at the length it has. The diamond keyframes it: a speed ramp."),
+                ui.add(egui::DragValue::new(&mut speed).speed(0.01).range(range).max_decimals(3).suffix("×")).on_hover_text(tr(
+                    "Playback speed, picture and sound together (0.01× to 100×; negative plays it backwards). The clip gets shorter or longer on the timeline. 0× holds its first frame as a still, silent, at the length it has. The diamond keyframes it: a speed ramp.",
                 ))
             };
             ui.label(tr("speed"));
             // Between 0× and 0.01× there's nothing useful (a clip thousands of times its
             // length): below it is a freeze, and up from a freeze starts at 0.01×.
-            if speed > 0.0 && speed < schema::MIN_SPEED {
-                speed = if old == 0.0 { schema::MIN_SPEED } else { 0.0 };
-            }
-            let presets: &[f64] = if ramped { &[0.25, 0.5, 1.0, 2.0, 4.0] } else { &[0.0, 0.25, 0.5, 1.0, 2.0, 4.0] };
-            for &preset in presets {
-                if ui.small_button(trf("{preset}×", &[("preset", &preset.to_string())])).clicked() {
-                    if ramped {
-                        ramp_value = preset;
-                    } else {
-                        speed = preset;
-                    }
-                }
+            if speed != 0.0 && speed.abs() < schema::MIN_SPEED {
+                speed = if old == 0.0 { schema::MIN_SPEED * speed.signum() } else { 0.0 };
             }
             if r.drag_stopped() || r.lost_focus() {
                 self.editor.doc.seal();
@@ -1437,46 +1468,119 @@ impl App {
                 self.editor.doc.seal();
             }
         });
-        if reverse != reversed {
+        let wanted = if ramped { ramp_value } else { speed };
+        // The other way round: the same part of the file, played backwards (or forwards
+        // again), first; then the size of the speed.
+        if signed != 0.0 && wanted != 0.0 && (wanted < 0.0) != reversed {
             let ids: Vec<ItemId> = std::iter::once(item).chain(self.editor.linked.iter().copied().filter(|l| *l != item)).collect();
-            let ops: Vec<oa_doc::Op> = ids.iter().filter_map(|id| self.editor.item(*id)).filter_map(|it| oa_edit::timeline::reversed(it, reverse).map(|(range, time_map)| oa_doc::Op::SetItemTiming { seq: self.editor.seq, item: it.id, range, time_map })).collect();
-            if let Err(e) = self.editor.apply(if reverse { "Reverse clip" } else { tr("Play clip forwards") }, ops) {
+            let ops: Vec<oa_doc::Op> = ids.iter().filter_map(|id| self.editor.item(*id)).filter_map(|it| oa_edit::timeline::reversed(it, wanted < 0.0).map(|(range, time_map)| oa_doc::Op::SetItemTiming { seq: self.editor.seq, item: it.id, range, time_map })).collect();
+            if let Err(e) = self.editor.apply_drag(if wanted < 0.0 { "Reverse clip" } else { tr("Play clip forwards") }, "clip-speed", ops) {
                 self.error = Some(e.to_string());
+                return;
             }
-            return;
         }
         if ramped {
-            if (ramp_value - at_playhead).abs() > 1e-9 {
-                let v = ramp_value.clamp(schema::MIN_SPEED, schema::MAX_SPEED);
+            let v = ramp_value.abs().clamp(schema::MIN_SPEED, schema::MAX_SPEED);
+            if (v - at_playhead).abs() > 1e-9 {
                 self.editor.set_value_at(item, ParamTarget::Item, schema::SPEED, Value::Float(v), t, "clip-speed-ramp");
             }
             return;
         }
-        if (speed - old).abs() < 1e-9 || speed < 0.0 {
+        let speed_abs = speed.abs();
+        if (speed_abs - old).abs() < 1e-9 {
             return;
         }
         // Each selected clip: the same part of its file, played at the new speed (and the
-        // way it was going). A freeze (0×) holds the clip's first frame for the length it
+        // way it's going). A freeze (0×) holds the clip's first frame for the length it
         // has, and one set going again keeps that length too.
         let mut ops = Vec::new();
         for id in std::iter::once(item).chain(self.editor.linked.iter().copied().filter(|l| *l != item)) {
             let Some(it) = self.editor.item(id) else { continue };
             let was = it.time_map.speed.num() as f64 / it.time_map.speed.den().max(1) as f64;
-            let duration = if was == 0.0 || speed == 0.0 {
+            let duration = if was == 0.0 || speed_abs == 0.0 {
                 it.range.duration
             } else {
-                Time::from_seconds_f64(it.range.duration.as_seconds_f64() * was.abs() / speed).max(Time(1))
+                Time::from_seconds_f64(it.range.duration.as_seconds_f64() * was.abs() / speed_abs).max(Time(1))
             };
-            let milli = (speed * 1000.0).round() as i64 * if was < 0.0 { -1 } else { 1 };
+            let way = if was < 0.0 || (was == 0.0 && speed < 0.0) { -1 } else { 1 };
+            let milli = (speed_abs * 1000.0).round() as i64 * way;
             let time_map = oa_doc::TimeMap::new(it.time_map.source_in, oa_time::Rational::new(milli, 1000));
-            ops.push(oa_doc::Op::SetItemTiming { seq: self.editor.seq, item: id, range: oa_time::TimeRange::new(it.range.start, duration), time_map });
+            // Running into the next clip, it moves up a track (onto a temp layer if need be).
+            let mut after = it.clone();
+            after.range = oa_time::TimeRange::new(it.range.start, duration);
+            after.time_map = time_map;
+            let project = self.editor.doc.snapshot();
+            let doc = &mut self.editor.doc;
+            match oa_edit::timeline::retimed_in_place(&project, self.editor.seq, after, &mut || doc.alloc_id()) {
+                Ok(more) => ops.extend(more),
+                Err(e) => self.error = Some(format!("can't change the speed: {e}")),
+            }
         }
         if let Err(e) = self.editor.apply_drag("Clip speed", "clip-speed", ops) {
-            self.error = Some(format!("can't change the speed: {e} (make room after the clip first)"));
+            self.error = Some(format!("can't change the speed: {e}"));
         }
     }
 
     /// The clip's sound effects, in the same cards as its picture effects.
+    /// Under a Duplicate's card: the effects on the copy alone (each with its settings),
+    /// and a button to add more. They run after the effects the copy takes from the clip.
+    fn duplicate_effects(&mut self, ui: &mut egui::Ui, item: ItemId, dup: &oa_doc::EffectInstance, t: Time) {
+        use oa_doc::Op;
+        let Some(it) = self.editor.item(item) else { return };
+        let is_text = it.kind == ItemKind::Text;
+        let own: Vec<oa_doc::EffectInstance> = it.effects.iter().filter(|e| e.on_duplicate == Some(dup.id)).cloned().collect();
+        let count = it.effects.len();
+        let seq = self.editor.seq;
+        let mut ops: Option<(&str, Vec<Op>)> = None;
+        ui.add_space(crate::style::GAP_S);
+        ui.label(egui::RichText::new(tr("On the duplicate only")).small().strong());
+        ui.indent(("duplicate-own", dup.id.0), |ui| {
+            if own.is_empty() {
+                ui.label(egui::RichText::new(tr("Nothing yet: effects added here change the copy, not the clip.")).small().weak());
+            }
+            for fx in &own {
+                let d = self.registry.effect(&fx.type_id).cloned();
+                ui.push_id(("duplicate-effect", fx.id.0), |ui| {
+                    ui.horizontal(|ui| {
+                        let mut on = fx.enabled;
+                        if ui.checkbox(&mut on, "").on_hover_text(if on { tr("Turn off") } else { tr("Turn on") }).changed() {
+                            ops = Some(("Toggle effect", vec![Op::SetEffectEnabled { seq, item, effect: fx.id, enabled: on }]));
+                        }
+                        let name = d.as_ref().map_or(fx.type_id.as_str(), |d| d.name.as_str());
+                        let color = if fx.enabled { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+                        ui.label(egui::RichText::new(name).strong().color(color));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button(tr("✕")).on_hover_text(tr("Remove this effect")).clicked() {
+                                ops = Some(("Remove effect", vec![Op::RemoveEffect { seq, item, effect: fx.id }]));
+                            }
+                        });
+                    });
+                    if let Some(d) = &d {
+                        let target = ParamTarget::Effect(fx.id);
+                        for schema in &d.params {
+                            self.param_widget(ui, item, &target, schema, t, &fx.id.0.to_string());
+                        }
+                    }
+                });
+            }
+            crate::widgets::sticky_menu(ui, tr("+ Add effect to the duplicate"), |ui| {
+                let taken: Vec<String> = own.iter().map(|e| e.type_id.clone()).collect();
+                let used = |id: &str| taken.iter().any(|t| t == id);
+                if let Some(type_id) = self.effect_picker(ui, item, ThumbKind::Passive, oa_graph::registry::EffectUsage::Passive, is_text, &used) {
+                    let mut effect = oa_doc::EffectInstance::new(oa_doc::EffectId(self.editor.doc.alloc_id()), &type_id);
+                    effect.on_duplicate = Some(dup.id);
+                    ops = Some(("Add effect", vec![Op::InsertEffect { seq, item, index: count, effect }]));
+                    ui.close();
+                }
+            });
+        });
+        if let Some((label, ops)) = ops
+            && let Err(e) = self.editor.apply(label, ops)
+        {
+            self.error = Some(e.to_string());
+        }
+    }
+
     fn sound_effects_section(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
         self.effect_list(ui, item, List::Sound, t);
     }
@@ -1556,8 +1660,16 @@ impl App {
 
     /// A diamond: hollow gray (not keyframed), filled (a key at the playhead), hollow
     /// gold with a dot (keyframed, no key here).
+    /// A transform property's diamond: keys go where its edits go (this format's
+    /// override, when it has one or only it is being edited).
     fn key_toggle(&mut self, ui: &mut egui::Ui, item: ItemId, param: &str, default: Value, t: Time) {
-        self.key_toggle_for(ui, item, ParamTarget::Item, param, default, t);
+        let target = self.transform_target(item, param);
+        self.key_toggle_for(ui, item, target, param, default, t);
+    }
+
+    /// Where a transform property of `item` is edited from the format on screen.
+    fn transform_target(&self, item: ItemId, param: &str) -> ParamTarget {
+        transform::param_target(self.editor.doc.project(), self.editor.seq, item, self.variant_id(), self.transform_scope(), param)
     }
 
     fn key_toggle_for(&mut self, ui: &mut egui::Ui, item: ItemId, target: ParamTarget, param: &str, default: Value, t: Time) {
@@ -1566,8 +1678,8 @@ impl App {
         let local = t - it.range.start;
         let (state, tip) = match keys.len() {
             0 => (0, tr("Keyframe this property (adds a key at the playhead)")),
-            _ if keys.contains(&local) => (2, tr("Stop keyframing (keeps the current value)")),
-            _ => (1, tr("Keyframed: change the value to add a key here; click to stop keyframing")),
+            _ if keys.contains(&local) => (2, tr("Remove this key (with the last one, keyframing stops and the value stays)")),
+            _ => (1, tr("Keyframed: click (or change the value) to add a key here")),
         };
         let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
         let gold = crate::style::GOLD;
@@ -1809,6 +1921,13 @@ impl App {
                 self.editor.doc.seal();
                 ui.close();
             }
+            let keyframed = self.editor.param_source(item, target, param).is_some_and(|s| s.curve().is_some());
+            if keyframed && ui.button(tr("Stop keyframing")).on_hover_text(tr("All its keys go; the value at the playhead stays")).clicked() {
+                if let Err(e) = self.editor.stop_keyframing(item, target.clone(), param, t) {
+                    self.error = Some(e.to_string());
+                }
+                ui.close();
+            }
             if let Some((lo, hi)) = band {
                 ui.separator();
                 let band = crate::band::Band { target: target.clone(), param: param.to_string(), lo, hi };
@@ -1955,3 +2074,4 @@ impl App {
         self.apply_or_report(tr("Remove highlight when spoken"), ops);
     }
 }
+
