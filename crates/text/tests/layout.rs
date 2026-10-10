@@ -10,7 +10,42 @@ fn spec(content: &str) -> TextSpec {
         align: Align::Center,
         tracking: 0.0,
         line_height: 1.2,
+        wrap: None,
     }
+}
+
+/// Wrapped to a box: lines break between words to stay inside it, aligned within it;
+/// the cursor still finds every character; a word wider than the box is split.
+#[test]
+fn text_wraps_to_its_box() {
+    let one = layout(&spec("The quick brown fox jumps"));
+    assert_eq!(one.lines, 1);
+    let width = one.size[0] * 0.45;
+    let wrapped = layout(&TextSpec { wrap: Some(width), align: Align::Left, ..spec("The quick brown fox jumps") });
+    assert!(wrapped.lines >= 3, "{} lines", wrapped.lines);
+    assert_eq!(wrapped.glyphs.len(), one.glyphs.len(), "the same letters");
+    assert_eq!(wrapped.words, 5, "words are counted the same");
+    for g in &wrapped.glyphs {
+        assert!(g.ink[2] <= width + 2.0, "inside the box: {} > {width}", g.ink[2]);
+    }
+    // Rows break before words: each row's first letter starts a word.
+    for line in 1..wrapped.lines {
+        let first = wrapped.glyphs.iter().find(|g| g.line == line).unwrap();
+        let before = wrapped.glyphs.iter().rfind(|g| g.line == line - 1).unwrap();
+        assert_ne!(first.word, before.word, "row {line} starts a new word");
+    }
+    // Every character is somewhere for the cursor, in order.
+    let firsts: Vec<usize> = wrapped.carets.iter().map(|c| c.first_char).collect();
+    assert!(firsts.windows(2).all(|w| w[0] < w[1]), "{firsts:?}");
+    let chars: usize = wrapped.carets.iter().map(|c| c.xs.len() - 1).sum();
+    assert_eq!(chars, "The quick brown fox jumps".chars().count());
+    // Centered: each row in the middle of the box.
+    let centered = layout(&TextSpec { wrap: Some(width), ..spec("The quick brown fox jumps") });
+    assert!((centered.size[0] - width).abs() < 2.0, "the box is the width asked for");
+    // One long word: split across rows rather than spilling out.
+    let long = layout(&TextSpec { wrap: Some(150.0), ..spec("Supercalifragilistic") });
+    assert!(long.lines >= 3, "{} lines", long.lines);
+    assert!(long.glyphs.iter().all(|g| g.ink[2] <= 152.0));
 }
 
 #[test]

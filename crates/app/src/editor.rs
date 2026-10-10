@@ -5,7 +5,7 @@ use oa_doc::*;
 use oa_media::{Imported, MediaKind, MediaProbe};
 use oa_params::{KeyframeAnchor, ParamId, ParamSource, Value};
 use oa_time::{FrameRate, Time, TimeRange};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -111,8 +111,17 @@ impl Editor {
     }
 
     pub fn title(&self) -> String {
-        let name = self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
-        format!("{}{}", name.unwrap_or_else(|| "Untitled".into()), if self.dirty() { " •" } else { "" })
+        format!("{}{}", self.name(), if self.dirty() { " •" } else { "" })
+    }
+
+    /// What the project is called: its own name, or (for one without) its file's.
+    pub fn name(&self) -> String {
+        let named = self.doc.project().name.trim();
+        if !named.is_empty() {
+            return named.to_string();
+        }
+        let file = self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().trim_end_matches(".oaproj.json").to_string());
+        file.unwrap_or_else(|| crate::i18n::tr("Untitled").to_string())
     }
 
     /// A clip of the open timeline by id. Found through an index of where each clip is,
@@ -145,7 +154,15 @@ impl Editor {
     }
 
     /// Adds an imported file to the pool (deduplicating by fingerprint).
+    #[cfg(test)]
     pub fn add_media(&mut self, imported: Imported) -> Result<MediaId, EditError> {
+        self.add_media_into(imported, "", None)
+    }
+
+    /// Adds an imported file to the pool, into bin `folder` ("" the top). Edits with the
+    /// same `batch` key merge into one undo step (a batch of imports: one "Import media").
+    /// A file already in the project (the same fingerprint) isn't added twice.
+    pub fn add_media_into(&mut self, imported: Imported, folder: &str, batch: Option<&str>) -> Result<MediaId, EditError> {
         if let Some(existing) = self
             .doc
             .project()
@@ -178,10 +195,10 @@ impl Editor {
             fingerprint: Some(imported.fingerprint.clone()),
             info: Some(info),
             scaling: Default::default(),
-            folder: String::new(),
+            folder: folder.to_string(),
             color: Default::default(),
         };
-        self.doc.edit("Import media", vec![Op::AddMedia(Arc::new(media))])?;
+        self.doc.edit_coalesced("Import media", batch, vec![Op::AddMedia(Arc::new(media))])?;
         self.pool.push(PoolItem {
             id,
             name: imported.name(),
@@ -209,6 +226,68 @@ impl Editor {
         let item = Item::new(id, &name, ItemKind::Media { media }, TimeRange::new(start, duration.max(Time::from_seconds(1))));
         self.doc.edit("Add clip", vec![Op::InsertItem { seq: self.seq, track, item }])?;
         Ok(id)
+    }
+
+    /// Parts of a file, one after another at the end of its track (quick cut): each
+    /// `(from, length)` in the file's own time becomes a clip playing that stretch. One
+    /// undo step. Returns the new clips.
+    pub fn append_parts(&mut self, media: MediaId, parts: &[(Time, Time)]) -> Result<Vec<ItemId>, EditError> {
+        let pool = self.pool_item(media).ok_or(EditError::NotFound("media", media.0))?;
+        let (preferred, name) = (if pool.kind == MediaKind::Audio { self.audio_track } else { self.video_track }, pool.name.clone());
+        let kind = if pool.kind == MediaKind::Audio { TrackKind::Audio } else { TrackKind::Video };
+        let track = match self.sequence().track(preferred).map(|t| t.id).or_else(|| self.sequence().tracks.iter().find(|t| t.kind == kind && !t.effects).map(|t| t.id)) {
+            Some(t) => t,
+            None => self.add_track(kind)?,
+        };
+        let rate = self.sequence().rate;
+        let mut at = self.sequence().track(track).map_or(Time::ZERO, |t| t.items.last().map_or(Time::ZERO, |i| i.range.end()));
+        let (mut ops, mut ids) = (Vec::new(), Vec::new());
+        for &(from, length) in parts.iter().filter(|(_, l)| *l > Time::ZERO) {
+            // Each on whole frames of the timeline, at least one long.
+            let length = rate.frame_start(rate.frame_at(length).max(1));
+            let id = ItemId(self.doc.alloc_id());
+            let mut item = Item::new(id, &name, ItemKind::Media { media }, TimeRange::new(at, length));
+            item.time_map = oa_doc::TimeMap::new(from.max(Time::ZERO), oa_time::Rational::new(1, 1));
+            ops.push(Op::InsertItem { seq: self.seq, track, item });
+            ids.push(id);
+            at += length;
+        }
+        if !ops.is_empty() {
+            self.doc.edit("Add parts", ops)?;
+        }
+        Ok(ids)
+    }
+
+    /// How many clips use each file, and each compound clip, on every timeline (inside
+    /// compound clips too).
+    pub fn media_uses(&self) -> (HashMap<MediaId, usize>, HashMap<SeqId, usize>) {
+        let (mut files, mut compounds) = (HashMap::new(), HashMap::new());
+        for s in self.doc.project().sequences.values() {
+            for it in s.tracks.iter().flat_map(|t| t.items.iter()) {
+                match it.kind {
+                    ItemKind::Media { media } => *files.entry(media).or_insert(0) += 1,
+                    ItemKind::Nested { sequence } => *compounds.entry(sequence).or_insert(0) += 1,
+                    _ => {}
+                }
+            }
+        }
+        (files, compounds)
+    }
+
+    /// Takes files out of the project, with every clip that uses them (on any timeline):
+    /// one undo step, which brings them all back.
+    pub fn remove_media(&mut self, media: &[MediaId]) -> Result<(), EditError> {
+        let mut ops = Vec::new();
+        for (seq, s) in &self.doc.project().sequences {
+            for it in s.tracks.iter().flat_map(|t| t.items.iter()) {
+                if matches!(it.kind, ItemKind::Media { media: m } if media.contains(&m)) {
+                    ops.push(Op::RemoveItem { seq: *seq, item: it.id });
+                }
+            }
+        }
+        ops.extend(media.iter().filter(|m| self.doc.project().media(**m).is_some()).map(|m| Op::RemoveMedia(*m)));
+        let label = if media.len() == 1 { "Remove media" } else { "Remove media files" };
+        self.doc.edit(label, ops)
     }
 
     /// Adds a text clip at `at` on top of everything: on the topmost video track if it's
@@ -430,6 +509,7 @@ impl Editor {
         if ops.is_empty() {
             return Ok(());
         }
+        let ops = self.with_stretched_keys(ops, false);
         self.doc.edit(label, ops)
     }
 
@@ -439,6 +519,7 @@ impl Editor {
         if ops.is_empty() {
             return Ok(());
         }
+        let ops = self.with_stretched_keys(ops, false);
         self.doc.edit_coalesced(label, Some(key), ops)
     }
 
@@ -520,12 +601,76 @@ impl Editor {
         curve.keys.iter().map(|k| k.t + offset).collect()
     }
 
+    /// Clips these ops play at a new speed — and so make longer or shorter — have their
+    /// keys stretched with them, so the animation stays with the footage (unless the clip
+    /// keeps its key times). A trim (either end, or a length typed) leaves them where they
+    /// are: the clip shows more or less, at the same pace. `ramp`: the batch is an edit of
+    /// speed ramps (`with_speed_lengths`), whose new lengths are speed changes too. Not in
+    /// a batch that brings in a new clip: that's a cut (or a paste), and a cut's halves
+    /// carry the curve on exactly where it was. A clip moved to another track on the way
+    /// (re-inserted, same id) has its own keys stretched where it goes.
+    fn with_stretched_keys(&self, mut ops: Vec<Op>, ramp: bool) -> Vec<Op> {
+        let s = self.sequence();
+        if ops.iter().any(|op| matches!(op, Op::InsertItem { seq, item, .. } if *seq == self.seq && s.item(item.id).is_none())) {
+            return ops;
+        }
+        let factor = |old: &Item, new: Time, map: &oa_doc::TimeMap| {
+            let new_speed = ramp || map.speed != old.time_map.speed;
+            (new_speed && !old.keep_key_times && new != old.range.duration && old.range.duration > Time::ZERO && new > Time::ZERO).then(|| new.0 as f64 / old.range.duration.0 as f64)
+        };
+        let mut more = Vec::new();
+        for op in &mut ops {
+            match op {
+                Op::SetItemTiming { seq, item, range, time_map } if *seq == self.seq => {
+                    if let Some(old) = self.item(*item)
+                        && let Some(k) = factor(old, range.duration, time_map)
+                    {
+                        more.extend(self.stretch_ops(old, k));
+                    }
+                }
+                Op::InsertItem { seq, item, .. } if *seq == self.seq => {
+                    if let Some(old) = self.item(item.id)
+                        && let Some(k) = factor(old, item.range.duration, &item.time_map)
+                    {
+                        item.stretch_keys(k);
+                        more.extend(self.stretch_ops(old, k).into_iter().filter(|op| matches!(op, Op::SetParam { target: ParamTarget::VariantOverride(_), .. })));
+                    }
+                }
+                _ => {}
+            }
+        }
+        ops.extend(more);
+        ops
+    }
+
+    /// The edits stretching `old`'s keys by `factor` (`Item::stretch_keys`): its
+    /// properties', its effects' and its per-format overrides'.
+    fn stretch_ops(&self, old: &Item, factor: f64) -> Vec<Op> {
+        let mut new = old.clone();
+        new.stretch_keys(factor);
+        let set = |target: ParamTarget, param: &ParamId, source: &ParamSource| Op::SetParam { seq: self.seq, item: old.id, target, param: param.clone(), source: Some(source.clone()) };
+        let mut ops: Vec<Op> = new.params.0.iter().filter(|(id, src)| old.params.0.get(*id) != Some(*src)).map(|(id, src)| set(ParamTarget::Item, id, src)).collect();
+        for (fx, was) in new.effects.iter().zip(&old.effects) {
+            ops.extend(fx.params.0.iter().filter(|(id, src)| was.params.0.get(*id) != Some(*src)).map(|(id, src)| set(ParamTarget::Effect(fx.id), id, src)));
+        }
+        for v in &self.sequence().variants {
+            for (id, src) in v.overrides.get(&old.id).into_iter().flat_map(|o| o.0.iter()) {
+                let mut stretched = src.clone();
+                stretched.scale_clip_clock(factor);
+                if stretched != *src {
+                    ops.push(set(ParamTarget::VariantOverride(v.id), id, &stretched));
+                }
+            }
+        }
+        ops
+    }
+
     /// Edits of a clip's speed (its ramp) keep the clip playing the same part of its
     /// file: it grows as it slows and shrinks as it speeds up, moving up a track (onto a
     /// temp layer if need be) when it runs into the next clip. Other ops pass through.
     fn with_speed_lengths(&mut self, ops: Vec<Op>) -> Vec<Op> {
         if !ops.iter().any(|op| matches!(op, Op::SetParam { target: ParamTarget::Item, param, .. } if param.as_str() == oa_doc::schema::SPEED)) {
-            return ops;
+            return self.with_stretched_keys(ops, false);
         }
         let project = self.doc.snapshot();
         let mut out = Vec::new();
@@ -541,7 +686,7 @@ impl Editor {
                 other => out.push(other),
             }
         }
-        out
+        self.with_stretched_keys(out, true)
     }
 
     /// Every key of `param` goes; the value at `t` stays (procedural motion too).
@@ -594,13 +739,33 @@ impl Editor {
             let Some(it) = self.item(item) else { continue };
             let ctx = it.eval_context(t);
             let current = self.source_of(it, &target, param);
+            // A key added away from the clip's start gets one at the start too (if there's
+            // none), holding the value shown there — so what's typed at the playhead
+            // animates from how the clip begins, rather than holding all the way back.
+            let start = it.eval_context(it.range.start);
+            let keyed_at_start = |src: &mut ParamSource| {
+                let missing = src.curve().is_some_and(|c| !c.keys.iter().any(|k| k.t == c.clock(&start)));
+                if missing {
+                    let value = src.eval(&start);
+                    src.set_at(&start, value);
+                }
+            };
             let source = match (&action, current) {
                 (Diamond::Start, Some(src)) if src.curve().is_some() => continue,
-                (Diamond::Start, Some(src)) => src.keyframed(&ctx, anchor),
-                (Diamond::Start, None) => ParamSource::Static(default.clone()).keyframed(&ctx, anchor),
+                (Diamond::Start, Some(src)) => {
+                    let mut src = src.keyframed(&ctx, anchor);
+                    keyed_at_start(&mut src);
+                    src
+                }
+                (Diamond::Start, None) => {
+                    let mut src = ParamSource::Static(default.clone()).keyframed(&ctx, anchor);
+                    keyed_at_start(&mut src);
+                    src
+                }
                 (Diamond::AddKey, Some(mut src)) if src.curve().is_some() => {
                     src.confine(it.range.duration);
                     let value = src.eval(&ctx);
+                    keyed_at_start(&mut src);
                     src.set_at(&ctx, value);
                     src
                 }
@@ -716,10 +881,10 @@ impl Editor {
     }
 
     /// The trims giving `item` and the rest of the selection (`Editor::linked`) the length
-    /// `length(old)` says — `None`: as long as each can be — and how many fell short of it
+    /// `length(clip)` says — `None`: as long as each can be — and how many fell short of it
     /// (stopped by the file's end or the next clip). Each is worked out on the timeline as
     /// it is, so they never depend on one another.
-    pub fn length_ops(&self, item: ItemId, length: &dyn Fn(Time) -> Option<Time>) -> (Vec<oa_doc::Op>, usize) {
+    pub fn length_ops(&self, item: ItemId, length: &dyn Fn(&Item) -> Option<Time>) -> (Vec<oa_doc::Op>, usize) {
         let project = self.doc.project();
         let (seq, s) = (self.seq, self.sequence());
         let frame = s.rate.frame_start(1);
@@ -729,7 +894,7 @@ impl Editor {
         ids.extend(self.linked.iter().copied().filter(|l| *l != item));
         for id in ids {
             let Some(it) = self.item(id) else { continue };
-            let asked = length(it.range.duration).map(|l| oa_edit::timeline::snap_to_frame(s, it.range.start + l.max(frame)));
+            let asked = length(it).map(|l| oa_edit::timeline::snap_to_frame(s, it.range.start + l.max(frame)));
             // As far as it goes: the trim stops at the file's end and the next clip.
             let to = asked.unwrap_or(Time::from_seconds(1_000_000));
             match oa_edit::timeline::trim(project, seq, id, oa_edit::timeline::Edge::Tail, to) {
@@ -915,7 +1080,7 @@ impl Editor {
 
     /// Loads a project and re-establishes its media: relinking files that moved and
     /// re-importing each one (so conformed copies and frame indexes come back).
-    pub fn open(path: &Path, mut import: impl FnMut(&Path) -> Result<Imported, String>) -> Result<(Self, Vec<String>), String> {
+    pub fn open(path: &Path, import: impl Fn(&Path) -> Result<Imported, String> + Sync, progress: &(dyn Fn(usize, usize) + Sync)) -> Result<(Self, Vec<String>), String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let (mut project, report) = ProjectFile::load(&text).map_err(|e| e.to_string())?;
         let seq = *project.sequences.keys().next().ok_or("project has no sequences")?;
@@ -932,9 +1097,11 @@ impl Editor {
         warnings.extend(report.warnings.iter().cloned());
         let mut pool = Vec::new();
         let mut relinks = Vec::new();
+        // Where each file is (or was moved to)…
+        let mut found: Vec<Option<PathBuf>> = Vec::with_capacity(project.media.len());
         for media in project.media.values() {
             let stored = PathBuf::from(&media.path);
-            let found = if stored.is_file() {
+            found.push(if stored.is_file() {
                 Some(stored.clone())
             } else {
                 let relinked = media
@@ -946,8 +1113,13 @@ impl Editor {
                     relinks.push((media.id, found.clone()));
                 }
                 relinked
-            };
-            match found.as_deref().map(&mut import) {
+            });
+        }
+        // …then all of them taken in, several at once: one at a time, a project with a
+        // few hundred files took that many probes end to end.
+        let results = import_all(&found, &import, progress);
+        for (media, result) in project.media.values().zip(results) {
+            match result {
                 Some(Ok(imported)) => pool.push(PoolItem {
                     id: media.id,
                     name: imported.name(),
@@ -992,11 +1164,40 @@ impl Editor {
         for (id, found) in relinks {
             let media = doc.project().media(id).expect("in project").clone();
             let updated = MediaRef { path: found.to_string_lossy().to_string(), ..media };
-            let _ = doc.edit("Relink media", vec![Op::RemoveMedia(id), Op::AddMedia(Arc::new(updated))]);
+            let _ = doc.edit("Relink media", vec![Op::ReplaceMedia(Arc::new(updated))]);
         }
         let saved = Some(doc.snapshot());
         Ok((Editor { doc, seq, video_track, audio_track, pool, path: Some(path.to_path_buf()), saved, linked: Vec::new(), index: Default::default() }, warnings))
     }
+}
+
+/// Takes in each file found (`None`: not found, skipped), a few at a time on worker
+/// threads — as many as there are cores, two to eight — telling `progress` (done, of how
+/// many) as each finishes. The results are in the files' order.
+fn import_all(found: &[Option<PathBuf>], import: &(impl Fn(&Path) -> Result<Imported, String> + Sync), progress: &(dyn Fn(usize, usize) + Sync)) -> Vec<Option<Result<Imported, String>>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let total = found.len();
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8).min(total.max(1));
+    let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let results: Vec<std::sync::Mutex<Option<Result<Imported, String>>>> = (0..total).map(|_| std::sync::Mutex::new(None)).collect();
+    progress(0, total);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= total {
+                        break;
+                    }
+                    if let Some(path) = &found[i] {
+                        *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(import(path));
+                    }
+                    progress(done.fetch_add(1, Ordering::SeqCst) + 1, total);
+                }
+            });
+        }
+    });
+    results.into_iter().map(|r| r.into_inner().unwrap_or_else(|e| e.into_inner())).collect()
 }
 
 fn missing_item(media: &MediaRef) -> PoolItem {
@@ -1070,7 +1271,7 @@ mod tests {
         for (p, was, now) in [(schema::TEXT_BOLD, Value::Bool(false), Value::Bool(true)), (schema::TEXT_CONTENT, Value::Text("A".into()), Value::Text("B".into()))] {
             e.toggle_keyframing(clip, ParamTarget::Item, p, was.clone(), KeyframeAnchor::ClipStart, t1).unwrap();
             e.set_value_at(clip, ParamTarget::Item, p, now.clone(), t2, p);
-            assert_eq!(e.keyframe_times(clip, &ParamTarget::Item, p).len(), 2, "{p}: a key where it changed");
+            assert_eq!(e.keyframe_times(clip, &ParamTarget::Item, p).len(), 3, "{p}: the clip's start, where keying began, and where it changed");
             assert_eq!(e.param_value(clip, &ParamTarget::Item, p, t1), Some(was), "{p}: the first key kept");
             assert_eq!(e.param_value(clip, &ParamTarget::Item, p, t2), Some(now));
         }
@@ -1098,18 +1299,19 @@ mod tests {
         let at = |e: &Editor, t: Time| e.param_value(clip, &ParamTarget::Item, p, t).and_then(|v| v.as_vec2()).unwrap()[0];
         let keys = |e: &Editor, target: &ParamTarget| e.keyframe_times(clip, target, p).len();
         e.toggle_keyframing(clip, ParamTarget::Item, p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, t1).unwrap();
-        assert_eq!(keys(&e, &ParamTarget::Item), 1);
-        // Changed later: a second key, and the value moves between them.
+        assert_eq!(keys(&e, &ParamTarget::Item), 2, "here, and at the clip's start with the same value");
+        assert_eq!(e.keyframe_times(clip, &ParamTarget::Item, p)[0], Time::ZERO);
+        // Changed later: another key, and the value moves between them.
         e.set_value_at(clip, ParamTarget::Item, p, Value::Vec2([0.4, 0.0]), t2, "x");
-        assert_eq!(keys(&e, &ParamTarget::Item), 2);
+        assert_eq!(keys(&e, &ParamTarget::Item), 3);
         assert!((at(&e, t2) - 0.4).abs() < 1e-9 && at(&e, t1).abs() < 1e-9);
         // The diamond where there's no key: a key with the value there.
         let before = at(&e, t3);
         e.toggle_keyframing(clip, ParamTarget::Item, p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, t3).unwrap();
-        assert_eq!(keys(&e, &ParamTarget::Item), 3);
+        assert_eq!(keys(&e, &ParamTarget::Item), 4);
         assert!((at(&e, t3) - before).abs() < 1e-9);
         // On a key: that one goes; the last one leaves the value it had.
-        for t in [t3, t1] {
+        for t in [t3, t1, Time::ZERO] {
             e.toggle_keyframing(clip, ParamTarget::Item, p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, t).unwrap();
         }
         assert_eq!(keys(&e, &ParamTarget::Item), 1);
@@ -1123,11 +1325,11 @@ mod tests {
         let v = e.sequence().variants[1].id;
         let here = ParamTarget::VariantOverride(v);
         e.toggle_keyframing(clip, here.clone(), p, Value::Vec2([0.0; 2]), KeyframeAnchor::ClipStart, t1).unwrap();
-        assert_eq!(keys(&e, &here), 1);
+        assert_eq!(keys(&e, &here), 2);
         assert_eq!(keys(&e, &ParamTarget::Item), 0, "the clip's own value is untouched");
         e.set_value_at(clip, here.clone(), p, Value::Vec2([-0.2, 0.0]), t2, "y");
         let o = |t: Time| e.param_value(clip, &here, p, t);
-        assert_eq!(keys(&e, &here), 2);
+        assert_eq!(keys(&e, &here), 3);
         assert!(o(t1).is_some_and(|v| (v.as_vec2().unwrap()[0] - 0.4).abs() < 1e-9), "{:?}", o(t1));
         assert!(o(t2).is_some_and(|v| (v.as_vec2().unwrap()[0] + 0.2).abs() < 1e-9), "{:?}", o(t2));
     }
@@ -1266,7 +1468,7 @@ mod tests {
         assert!(!editor.dirty(), "saving marks the project clean");
 
         // Reopen: the pool and the timeline come back.
-        let (reopened, warnings) = Editor::open(&project_path, importer).expect("open");
+        let (reopened, warnings) = Editor::open(&project_path, importer, &|_, _| {}).expect("open");
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(reopened.pool.len(), 1);
         assert_eq!(reopened.pool[0].kind, MediaKind::Still);
@@ -1277,17 +1479,117 @@ mod tests {
 
         // Move the file somewhere the project searches: it should be found by content.
         std::fs::rename(&media_path, root.join("samples").join("E.png")).unwrap();
-        let (relinked, warnings) = Editor::open(&project_path, importer).expect("open after move");
+        let (relinked, warnings) = Editor::open(&project_path, importer, &|_, _| {}).expect("open after move");
         assert!(warnings.iter().any(|w| w.starts_with("relinked")), "{warnings:?}");
         assert!(!relinked.pool[0].missing, "relinked media is usable again");
         assert!(relinked.item(clip).is_some());
 
         // Delete it: the project still opens, with the media flagged as missing.
         std::fs::remove_file(root.join("samples").join("E.png")).unwrap();
-        let (broken, warnings) = Editor::open(&project_path, importer).expect("open with missing media");
+        let (broken, warnings) = Editor::open(&project_path, importer, &|_, _| {}).expect("open with missing media");
         assert!(warnings.iter().any(|w| w.starts_with("missing:")), "{warnings:?}");
         assert!(broken.pool[0].missing);
         assert!(broken.item(clip).is_some(), "the clip stays; only its media is missing");
+    }
+
+    /// A clip's keys stretch with it when its speed changes (and not when it keeps its
+    /// key times); a trim leaves them where they are; a cut leaves the curve exactly where
+    /// it was, on both halves.
+    #[test]
+    fn keys_stretch_with_the_speed_and_survive_a_cut() {
+        let mut e = Editor::new();
+        let clip = e.add_text(Time::ZERO, "A", Time::from_seconds(8)).unwrap();
+        let p = schema::OPACITY;
+        let s = Time::from_seconds;
+        let keyed = ParamSource::Animated(oa_params::Curve::new(KeyframeAnchor::ClipStart, vec![oa_params::Keyframe::linear(s(2), Value::Float(0.0)), oa_params::Keyframe::linear(s(6), Value::Float(1.0))]));
+        e.apply("keys", vec![Op::SetParam { seq: e.seq, item: clip, target: ParamTarget::Item, param: ParamId::new(p), source: Some(keyed) }]).unwrap();
+        let keys = |e: &Editor| e.keyframe_times(clip, &ParamTarget::Item, p);
+
+        // A trim: the clip shows less, at the same pace; the keys stay put.
+        let (ops, _) = e.length_ops(clip, &|_| Some(s(7)));
+        e.apply("Clip length", ops).unwrap();
+        assert_eq!(keys(&e), [s(2), s(6)], "steady through a trim");
+        let (ops, _) = e.length_ops(clip, &|_| Some(s(8)));
+        e.apply("Clip length", ops).unwrap();
+        // Twice as fast, half as long: the keys come in with it.
+        let speed = |e: &Editor, num: i64| {
+            let it = e.item(clip).unwrap();
+            let range = TimeRange::new(it.range.start, Time(it.range.duration.0 * it.time_map.speed.num() / num));
+            Op::SetItemTiming { seq: e.seq, item: clip, range, time_map: oa_doc::TimeMap::new(it.time_map.source_in, oa_time::Rational::new(num, 1)) }
+        };
+        let op = speed(&e, 2);
+        e.apply("Clip speed", vec![op]).unwrap();
+        assert_eq!(keys(&e), [s(1), s(3)], "stretched with the speed");
+        // Kept: a new speed leaves them where they are.
+        e.apply("keep", vec![Op::SetKeepKeyTimes { seq: e.seq, item: clip, keep: true }]).unwrap();
+        let op = speed(&e, 1);
+        e.apply("Clip speed", vec![op]).unwrap();
+        assert_eq!(keys(&e), [s(1), s(3)], "kept");
+        e.apply("stretch", vec![Op::SetKeepKeyTimes { seq: e.seq, item: clip, keep: false }]).unwrap();
+
+        // Cut in the middle of the ramp: both halves show what the whole did.
+        let before: Vec<f64> = [0.5, 1.5, 2.0, 2.5, 3.5].iter().map(|&t| e.param_value(clip, &ParamTarget::Item, p, Time::from_seconds_f64(t)).and_then(|v| v.as_float()).unwrap()).collect();
+        let back = e.split(Some(clip), s(2)).unwrap().expect("a back half");
+        let value = |e: &Editor, id: ItemId, t: f64| e.param_value(id, &ParamTarget::Item, p, Time::from_seconds_f64(t)).and_then(|v| v.as_float()).unwrap();
+        let after: Vec<f64> = [0.5, 1.5].iter().map(|&t| value(&e, clip, t)).chain([2.0, 2.5, 3.5].iter().map(|&t| value(&e, back, t))).collect();
+        for (a, b) in before.iter().zip(&after) {
+            assert!((a - b).abs() < 1e-9, "the curve goes on as it was: {before:?} vs {after:?}");
+        }
+        assert_eq!(keys(&e), [s(1), s(3)], "the front half's keys untouched by the cut");
+    }
+
+    /// Opening takes the files in several at once, but the results come back in the
+    /// files' order; a file not found is skipped; progress counts every file once.
+    #[test]
+    fn files_are_taken_in_together_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let found: Vec<Option<PathBuf>> = (0..40).map(|i| (i % 7 != 3).then(|| PathBuf::from(format!("clip{i}.mp4")))).collect();
+        let calls = AtomicUsize::new(0);
+        let import = |p: &Path| -> Result<Imported, String> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            Err(p.display().to_string())
+        };
+        let (last, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let results = super::import_all(&found, &import, &|done, total| {
+            assert_eq!(total, 40);
+            last.fetch_max(done, Ordering::SeqCst);
+            most.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), found.iter().flatten().count(), "each found file once");
+        for (f, r) in found.iter().zip(&results) {
+            match (f, r) {
+                (Some(p), Some(Err(e))) => assert_eq!(e, &p.display().to_string(), "in order"),
+                (None, None) => {}
+                _ => panic!("{f:?} → {r:?}"),
+            }
+        }
+        assert_eq!(last.load(Ordering::SeqCst), 40, "progress reaches every file");
+        assert_eq!(most.load(Ordering::SeqCst), 41, "once at the start, once per file");
+    }
+
+    /// Quick cut: parts of a file go one after another, each playing its own stretch;
+    /// removing the file takes its clips too, and one undo brings both back.
+    #[test]
+    fn parts_append_in_order_and_media_removes_with_its_clips() {
+        if !have_ffprobe() {
+            return;
+        }
+        let picture = test_picture(&std::env::temp_dir().join("oa-parts-test"));
+        let mut editor = Editor::new();
+        let media = editor.add_media(importer(&picture).expect("import")).expect("add");
+        let s = Time::from_seconds;
+        let parts = editor.append_parts(media, &[(s(1), s(2)), (s(5), s(1)), (s(9), Time::ZERO)]).expect("parts");
+        assert_eq!(parts.len(), 2, "an empty part is left out");
+        let (a, b) = (editor.item(parts[0]).unwrap().clone(), editor.item(parts[1]).unwrap().clone());
+        assert_eq!((a.range.start, a.range.duration, a.time_map.source_in), (Time::ZERO, s(2), s(1)));
+        assert_eq!((b.range.start, b.time_map.source_in), (s(2), s(5)), "the next right after, from its own point");
+        assert_eq!(editor.media_uses().0.get(&media), Some(&2));
+
+        editor.remove_media(&[media]).expect("remove");
+        assert!(editor.doc.project().media(media).is_none() && editor.item(parts[0]).is_none());
+        editor.doc.undo().unwrap();
+        assert!(editor.doc.project().media(media).is_some() && editor.item(parts[1]).is_some(), "one undo brings both back");
     }
 
     #[test]
@@ -1330,7 +1632,7 @@ mod tests {
         assert_eq!([a, b].map(|id| e.item(id).unwrap().range.duration), [Time::from_seconds(1); 2]);
         // Each one frame longer, from its own length.
         let frame = e.sequence().rate.frame_start(1);
-        let (ops, _) = e.length_ops(a, &|old| Some(old + frame));
+        let (ops, _) = e.length_ops(a, &|it| Some(it.range.duration + frame));
         e.doc.edit("frame", ops).unwrap();
         assert_eq!([a, b].map(|id| e.item(id).unwrap().range.duration), [Time::from_seconds(1) + frame; 2]);
         // 5 s each: B can, A stops at C (3 s in) — made as long as it can be, and counted.

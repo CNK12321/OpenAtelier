@@ -94,7 +94,7 @@ pub fn conform(path: &Path, fingerprint: &str) -> Result<PathBuf, MediaError> {
         return Ok(out);
     }
     let attempt = |args: &[&str]| -> Result<bool, MediaError> {
-        let result = crate::tool("ffmpeg")
+        let result = crate::background_tool("ffmpeg")
             .args(["-v", "error", "-nostdin", "-y", "-i"])
             .arg(path)
             .args(args)

@@ -193,7 +193,7 @@ impl App {
             ui.data_mut(|d| d.insert_temp(pending, scale));
         }
         ui.horizontal(|ui| {
-            ui.label(tr("Layout")).on_hover_text(tr("Where the viewer and the properties go. Each project can switch with the viewer's Vertical button, and remembers its choice."));
+            ui.label(tr("Layout")).on_hover_text(tr("Where the viewer and the properties go. Auto follows the format: vertical while it's taller than it is wide."));
             use crate::settings::Layout;
             for (l, name, tip) in [
                 (Layout::Standard, "Standard", tr("The viewer in the middle, the properties on the right")),
@@ -229,7 +229,7 @@ impl App {
         });
     }
 
-    /// Media: what's kept about pictures, video and sound, each in a section of its own.
+    /// Media: pictures and sound, each in a section of its own.
     fn settings_media(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(tr("Images")).default_open(true).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -237,27 +237,7 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.settings.still_seconds).range(0.1..=3600.0).speed(0.1).suffix(" s"));
             });
         });
-        egui::CollapsingHeader::new(tr("Videos")).default_open(true).show(ui, |ui| self.settings_proxies(ui));
         egui::CollapsingHeader::new(tr("Audio")).default_open(true).show(ui, |ui| self.settings_audio(ui));
-    }
-
-    /// Proxies: small copies of heavy footage for the viewer.
-    fn settings_proxies(&mut self, ui: &mut egui::Ui) {
-        let s = &mut self.settings;
-        ui.checkbox(&mut s.use_proxies, tr("Play proxies in the viewer"))
-            .on_hover_text(tr("Small copies of heavy footage play much more smoothly. Exports always use the original files. Turn off to judge fine detail or color."));
-        ui.checkbox(&mut s.auto_proxies, tr("Make proxies for 4K and 10-bit footage"))
-            .on_hover_text(tr("Made in the background after import (right-click a file in the media bin to make or remove one yourself)"));
-        let dir = oa_media::app_dir().join("proxies");
-        let bytes: u64 = std::fs::read_dir(&dir).map(|r| r.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(trf("Proxies on this computer: {0}", &[("0", &(crate::bytes(bytes)).to_string())])).small().weak());
-            if bytes > 0 && ui.small_button(tr("Delete all")).on_hover_text(tr("They're made again when needed")).clicked() {
-                let _ = std::fs::remove_dir_all(&dir);
-                self.proxies = crate::proxies::Proxies::default();
-                self.proxies_shown = !self.settings.use_proxies;
-            }
-        });
     }
 
     fn settings_audio(&mut self, ui: &mut egui::Ui) {

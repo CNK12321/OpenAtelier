@@ -119,6 +119,9 @@ pub const BG_COLOR: &str = "background.color";
 pub const BG_BLUR: &str = "background.blur";
 /// How much darker the blurred picture is: 0 = as is, 1 = black.
 pub const BG_DIM: &str = "background.dim";
+/// Blurred content made of one layer (a track's id, as text) rather than everything on
+/// screen ("" = everything).
+pub const BG_SOURCE: &str = "background.source";
 pub const BG_TEXTURE: &str = "background.texture";
 /// Tile height as a fraction of the canvas height.
 pub const BG_TILE: &str = "background.tile";
@@ -131,6 +134,7 @@ pub fn background() -> &'static [ParamSchema] {
             ParamSchema::new(BG_COLOR, Value::Gradient(Gradient::solid([0.0, 0.0, 0.0, 1.0])), Unit::None),
             ParamSchema::new(BG_BLUR, Value::Float(60.0), Unit::None).range(0.0, 300.0),
             ParamSchema::new(BG_DIM, Value::Float(0.2), Unit::None).range(0.0, 1.0),
+            ParamSchema::new(BG_SOURCE, Value::Text(String::new()), Unit::None).static_only(),
             ParamSchema::new(BG_TEXTURE, Value::Media(None), Unit::None).static_only(),
             ParamSchema::new(BG_TILE, Value::Float(0.25), Unit::None).range(0.02, 2.0),
         ]
@@ -238,6 +242,9 @@ pub const TEXT_ALIGN: &str = "text.align";
 pub const TEXT_TRACKING: &str = "text.tracking";
 /// Baseline-to-baseline distance, in ems.
 pub const TEXT_LINE_HEIGHT: &str = "text.line_height";
+/// The text box's width in canvas px: lines wrap to stay inside it (0 = no box: only
+/// line breaks start new lines).
+pub const TEXT_WRAP: &str = "text.box_width";
 /// Outline thickness in canvas px (0 = none).
 pub const TEXT_OUTLINE: &str = "text.outline";
 pub const TEXT_OUTLINE_COLOR: &str = "text.outline_color";
@@ -257,6 +264,7 @@ pub fn text() -> &'static [ParamSchema] {
             ParamSchema::new(TEXT_ALIGN, Value::Enum("center".into()), Unit::None).options(&["left", "center", "right"]).static_only(),
             ParamSchema::new(TEXT_TRACKING, Value::Float(0.0), Unit::None).range(-0.2, 1.0),
             ParamSchema::new(TEXT_LINE_HEIGHT, Value::Float(1.2), Unit::None).range(0.6, 3.0),
+            ParamSchema::new(TEXT_WRAP, Value::Float(0.0), Unit::None).range(0.0, 8000.0),
             ParamSchema::new(TEXT_OUTLINE, Value::Float(0.0), Unit::None).range(0.0, 40.0),
             ParamSchema::new(TEXT_OUTLINE_COLOR, Value::Gradient(Gradient::solid([0.0, 0.0, 0.0, 1.0])), Unit::None),
         ]

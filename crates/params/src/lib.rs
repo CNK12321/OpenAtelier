@@ -631,6 +631,16 @@ impl ParamSource {
             }
         }
     }
+
+    /// Its keys stretched by `factor` about the clip's start ([`Curve::scale_clip_clock`]).
+    /// Procedural motion keeps its own pace.
+    pub fn scale_clip_clock(&mut self, factor: f64) {
+        match self {
+            ParamSource::Static(_) => {}
+            ParamSource::Animated(c) => c.scale_clip_clock(factor),
+            ParamSource::Modulated { base, .. } => base.scale_clip_clock(factor),
+        }
+    }
 }
 
 /// Procedural motion layered on a parameter. Modulators are pure functions of

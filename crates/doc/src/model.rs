@@ -414,6 +414,10 @@ pub struct Item {
     /// limited to (see [`crate::mask`]). Their animated values are in `params`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub masks: Vec<crate::mask::Mask>,
+    /// Its keys keep their times when its speed changes. Off (the default), they stretch
+    /// with it, staying with the footage. (A trim never moves them.)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_key_times: bool,
 }
 
 impl Item {
@@ -428,6 +432,22 @@ impl Item {
         }
         for fx in &mut self.effects {
             fx.on_duplicate = fx.on_duplicate.and_then(|d| renamed.get(&d).copied());
+        }
+    }
+
+    /// Stretches its clip-timed keys by `factor` about its start (its properties' and its
+    /// effects'), so its animation spans a clip `factor` times as long the same way. The
+    /// speed ramp is left alone: it decides the length, rather than following it.
+    pub fn stretch_keys(&mut self, factor: f64) {
+        for (id, src) in self.params.0.iter_mut() {
+            if id.as_str() != crate::schema::SPEED {
+                src.scale_clip_clock(factor);
+            }
+        }
+        for fx in &mut self.effects {
+            for src in fx.params.0.values_mut() {
+                src.scale_clip_clock(factor);
+            }
         }
     }
 
@@ -447,6 +467,7 @@ impl Item {
             group: None,
             word_times: Vec::new(),
             masks: Vec::new(),
+            keep_key_times: false,
         }
     }
 

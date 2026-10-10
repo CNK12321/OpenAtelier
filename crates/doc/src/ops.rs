@@ -28,6 +28,9 @@ pub enum Op {
     RemoveSequence(SeqId),
     AddMedia(Arc<MediaRef>),
     RemoveMedia(MediaId),
+    /// Replaces a file's record (where it is, its fingerprint…) in place: a relink. The
+    /// clips using it keep using it.
+    ReplaceMedia(Arc<MediaRef>),
     /// How a file's pixels are scaled (pixel art / smooth / automatic).
     SetMediaScaling { media: MediaId, scaling: MediaScaling },
     /// Which media-bin folder a file sits in ("" is the top).
@@ -36,6 +39,8 @@ pub enum Op {
     SetMediaColor { media: MediaId, color: crate::color::InputColor },
     /// The media bin's folders (an empty folder is still a folder).
     SetBinFolders(Vec<String>),
+    /// The project's name (what the top bar and the projects list call it).
+    SetProjectName(String),
     /// Adds, replaces or (with `None`) removes a point track in the project's library.
     SetPointTrack { id: u64, track: Option<Arc<oa_params::PointTrack>> },
     InsertTrack { seq: SeqId, index: usize, track: Arc<Track> },
@@ -52,6 +57,8 @@ pub enum Op {
     /// Puts a clip in a group (clips sharing an id move and copy together) or, with
     /// `None`, takes it out.
     SetItemGroup { seq: SeqId, item: ItemId, group: Option<u64> },
+    /// Whether a clip's keys keep their times when its length changes (`Item::keep_key_times`).
+    SetKeepKeyTimes { seq: SeqId, item: ItemId, keep: bool },
     InsertItem { seq: SeqId, track: TrackId, item: Item },
     RemoveItem { seq: SeqId, item: ItemId },
     SetItemTiming { seq: SeqId, item: ItemId, range: TimeRange, time_map: TimeMap },
@@ -204,6 +211,11 @@ impl Op {
                 p.media.insert(id, m);
                 vec![Op::RemoveMedia(id)]
             }
+            Op::ReplaceMedia(m) => {
+                let old = p.media.get(&m.id).cloned().ok_or(EditError::NotFound("media", m.id.0))?;
+                p.media.insert(m.id, m);
+                vec![Op::ReplaceMedia(old)]
+            }
             Op::RemoveMedia(id) => {
                 let used = p.sequences.values().flat_map(|s| s.tracks.iter()).flat_map(|t| t.items.iter());
                 if used.into_iter().any(|i| i.kind == ItemKind::Media { media: id }) {
@@ -260,6 +272,11 @@ impl Op {
                 let it = item_mut(p, seq, item)?;
                 let old = std::mem::replace(&mut it.group, group);
                 vec![Op::SetItemGroup { seq, item, group: old }]
+            }
+            Op::SetKeepKeyTimes { seq, item, keep } => {
+                let it = item_mut(p, seq, item)?;
+                let old = std::mem::replace(&mut it.keep_key_times, keep);
+                vec![Op::SetKeepKeyTimes { seq, item, keep: old }]
             }
             Op::InsertItem { seq, track, item } => {
                 if item.range.duration <= oa_time::Time::ZERO {
@@ -470,6 +487,10 @@ impl Op {
             Op::SetBinFolders(folders) => {
                 let old = std::mem::replace(&mut p.bin_folders, folders);
                 vec![Op::SetBinFolders(old)]
+            }
+            Op::SetProjectName(name) => {
+                let old = std::mem::replace(&mut p.name, name);
+                vec![Op::SetProjectName(old)]
             }
             Op::SetPointTrack { id, track } => {
                 let old = match track {

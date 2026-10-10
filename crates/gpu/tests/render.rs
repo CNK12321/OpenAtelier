@@ -576,7 +576,7 @@ fn planned_crossfade_mixes_adjacent_clips() {
     let mut track = Track::new(track_id, "V1", TrackKind::Video);
     for (id, start, color) in [(10, 0.0, [1.0, 0.0, 0.0, 1.0]), (11, 2.0, [0.0, 0.0, 1.0, 1.0])] {
         let mut item = Item::new(ItemId(id), "solid", ItemKind::Solid, TimeRange::new(secs(start), secs(2.0)));
-        item.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color(color)));
+        item.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color(color.map(f64::from))));
         track.items.push(item);
     }
     track.items[1].transition_in = Some(oa_doc::Transition::new("oa.transition.crossfade", secs(1.0)));
@@ -663,6 +663,46 @@ fn effect_roles_follow_their_windows() {
     let p = project_with(vec![invert_out]);
     assert!(close(at(&p, 1.0, center), [1.0, 1.0, 1.0, 1.0], 0.001), "off as the outro starts");
     assert!(at(&p, 1.99, center)[0] < 0.05, "inverted as it leaves");
+    // Brightness, hue and saturation as channels to flip, on a clip of one color.
+    let flipped = |color: [f32; 4], channels: &str| {
+        let mut fx = EffectInstance::new(EffectId(25), "oa.color.invert");
+        fx.params.set("channels", ParamSource::Static(Value::Enum(channels.into())));
+        let mut p = project_with(vec![fx]);
+        let seq = Arc::make_mut(p.sequences.get_mut(&SeqId(1)).unwrap());
+        let item = &mut Arc::make_mut(&mut seq.tracks[0]).items[0];
+        item.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color(color.map(f64::from))));
+        p
+    };
+    let red = [1.0, 0.0, 0.0, 1.0];
+    let p = flipped(red, "hue");
+    assert!(close(at(&p, 0.5, center), [0.0, 1.0, 1.0, 1.0], 0.01), "red's opposite hue, as light: cyan: {:?}", at(&p, 0.5, center));
+    let p = flipped(red, "brightness");
+    assert!(close(at(&p, 0.5, center), red, 0.01), "pure red is half light: it stays: {:?}", at(&p, 0.5, center));
+    let p = flipped([0.0, 0.0, 0.0, 1.0], "brightness");
+    assert!(close(at(&p, 0.5, center), [1.0, 1.0, 1.0, 1.0], 0.01), "black turned over: white");
+    let p = flipped(red, "saturation");
+    let gray = at(&p, 0.5, center);
+    assert!(gray[0] > 0.05 && gray[0] < 0.95 && (gray[0] - gray[1]).abs() < 0.01 && (gray[1] - gray[2]).abs() < 0.01, "vivid red to gray: {gray:?}");
+    let p = flipped([0.5, 0.5, 0.5, 1.0], "saturation");
+    let still = at(&p, 0.5, center);
+    assert!((still[0] - still[1]).abs() < 0.01 && (still[1] - still[2]).abs() < 0.01, "a pure gray stays gray: {still:?}");
+
+    // Hue Anchor: green (a third of the way round from red) anchored to red — at
+    // distance 0 it's red, ½ yellow (a sixth of the way), 1 as it was, 2 blue (two thirds).
+    let anchored = |distance: f64| {
+        let mut fx = EffectInstance::new(EffectId(26), "oa.color.hue-anchor");
+        fx.params.set("anchor", ParamSource::Static(Value::Color([1.0, 0.0, 0.0, 1.0])));
+        fx.params.set("distance", ParamSource::Static(Value::Float(distance)));
+        let mut p = project_with(vec![fx]);
+        let seq = Arc::make_mut(p.sequences.get_mut(&SeqId(1)).unwrap());
+        let item = &mut Arc::make_mut(&mut seq.tracks[0]).items[0];
+        item.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color([0.0, 1.0, 0.0, 1.0])));
+        p
+    };
+    for (distance, want) in [(0.0, [1.0, 0.0, 0.0, 1.0]), (0.5, [1.0, 1.0, 0.0, 1.0]), (1.0, [0.0, 1.0, 0.0, 1.0]), (2.0, [0.0, 0.0, 1.0, 1.0])] {
+        let got = at(&anchored(distance), 0.5, center);
+        assert!(close(got, want, 0.02), "distance {distance}: {got:?}, wanted {want:?}");
+    }
 }
 
 /// A mask effect reads its matte from a second input: a 25%-gray matte leaves a quarter
@@ -1757,7 +1797,7 @@ fn an_effect_track_applies_to_everything_below_it() {
     let mut seq = Sequence::new(SeqId(1), "Main", FrameRate::FPS_30, variant);
     let solid = |id: u64, color: [f64; 4], scale: f64| {
         let mut it = Item::new(ItemId(id), "solid", ItemKind::Solid, TimeRange::new(Time::ZERO, Time::from_seconds(10)));
-        it.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color(color)));
+        it.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color(color.map(f64::from))));
         it.params.set(schema::SCALE, ParamSource::Static(Value::Vec2([scale, scale])));
         it
     };
@@ -2010,6 +2050,70 @@ fn a_tinted_background_renders() {
     p.sequences.insert(SeqId(1), Arc::new(seq));
     let blurred = render_project(&mut r, &p, Time::from_seconds(1));
     assert!(blurred[5][0] > blurred[5][2], "tinted orange: {:?}", blurred[5]);
+}
+
+/// Blurred content with a turned clip: the backdrop is enlarged by what's inside the
+/// clip's picture, not its turned bounding box, so the frame's edges are never empty.
+/// With a layer picked, the backdrop is made of that layer alone.
+#[test]
+fn blurred_content_fills_the_frame_and_can_use_one_layer() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let preset = AspectPreset::by_id("landscape-16x9").unwrap();
+    let variant = FormatVariant { id: VariantId(3), name: preset.name.into(), size: preset.size(360), overrides: BTreeMap::new() };
+    let mut seq = Sequence::new(SeqId(1), "Main", FrameRate::FPS_30, variant);
+    seq.params.set(schema::BG_MODE, ParamSource::Static(Value::Enum("blur".into())));
+    seq.params.set(schema::BG_BLUR, ParamSource::Static(Value::Float(0.0)));
+    seq.params.set(schema::BG_DIM, ParamSource::Static(Value::Float(0.0)));
+    let solid = |id: u64, color: [f64; 4], scale: f64, turn: f64| {
+        let mut it = Item::new(ItemId(id), "solid", ItemKind::Solid, TimeRange::new(Time::ZERO, Time::from_seconds(10)));
+        it.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color(color)));
+        it.params.set(schema::SCALE, ParamSource::Static(Value::Vec2([scale, scale])));
+        it.params.set(schema::ROTATION, ParamSource::Static(Value::Float(turn)));
+        it
+    };
+    let mut v1 = Track::new(TrackId(10), "V1", TrackKind::Video);
+    v1.items.push(solid(11, [0.0, 0.0, 1.0, 1.0], 0.4, 45.0));
+    let mut v2 = Track::new(TrackId(20), "V2", TrackKind::Video);
+    v2.items.push(solid(21, [1.0, 0.0, 0.0, 1.0], 0.15, 0.0));
+    seq.tracks = vec![Arc::new(v1), Arc::new(v2)];
+    let mut p = Project::new("bg");
+    p.sequences.insert(SeqId(1), Arc::new(seq.clone()));
+    let edges = |px: &[[f32; 4]]| [0, 639, 359 * 640, 359 * 640 + 639, 180 * 640, 320].map(|i| px[i]);
+    // Everything: the turned blue clip fills the frame, corners included.
+    let all = render_project(&mut r, &p, Time::from_seconds(1));
+    for c in edges(&all) {
+        assert!(c[2] > 0.5, "the edge is the blue clip, not empty: {c:?}");
+    }
+    // The red layer alone.
+    seq.params.set(schema::BG_SOURCE, ParamSource::Static(Value::Text("20".into())));
+    p.sequences.insert(SeqId(1), Arc::new(seq));
+    let red = render_project(&mut r, &p, Time::from_seconds(1));
+    for c in edges(&red) {
+        assert!(c[0] > 0.5 && c[2] < 0.2, "made of the red layer: {c:?}");
+    }
+
+    // A tall frame and a turned clip bigger than it, at the usual blur: the backdrop is
+    // made of the frame, so it's enlarged by what's inside both the clip and the frame —
+    // no dark corner where the clip runs off the frame.
+    let preset = AspectPreset::by_id("vertical-9x16").unwrap();
+    let tall = FormatVariant { id: VariantId(4), name: preset.name.into(), size: preset.size(360), overrides: BTreeMap::new() };
+    let [w, h] = [tall.size.width as usize, tall.size.height as usize];
+    let mut seq = Sequence::new(SeqId(1), "Tall", FrameRate::FPS_30, tall);
+    seq.params.set(schema::BG_MODE, ParamSource::Static(Value::Enum("blur".into())));
+    seq.params.set(schema::BG_DIM, ParamSource::Static(Value::Float(0.0)));
+    let mut v1 = Track::new(TrackId(10), "V1", TrackKind::Video);
+    let mut strip = solid(11, [0.0, 0.0, 1.0, 1.0], 1.0, 20.0);
+    // Big, turned and moved toward a corner, as in a real edit.
+    strip.params.set(schema::SCALE, ParamSource::Static(Value::Vec2([3.0, 1.2])));
+    strip.params.set(schema::POSITION, ParamSource::Static(Value::Vec2([-0.3, -0.25])));
+    v1.items.push(strip);
+    seq.tracks = vec![Arc::new(v1)];
+    p.sequences.insert(SeqId(1), Arc::new(seq));
+    let px = render_project(&mut r, &p, Time::from_seconds(1));
+    for i in [0, w - 1, (h - 1) * w, (h - 1) * w + w - 1, (h / 2) * w, (h / 2) * w + w - 1] {
+        assert!(px[i][2] > 0.6, "pixel {i} is the clip, not dark: {:?}", px[i]);
+    }
 }
 
 /// A white solid over the whole 640×360 frame (on black) with a mask over its left half.

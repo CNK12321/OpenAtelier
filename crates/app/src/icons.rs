@@ -165,7 +165,51 @@ icons! {
     VISIBLE = "visibility", '\u{e8f4}', Record;
     HIDDEN = "visibility_off", '\u{e8f5}', Stop;
     INVERT = "invert_colors", '\u{e891}', HalfCircle;
+    // The media bin's search, filters and views.
+    SEARCH = "search", '\u{e8b6}', Dropper;
+    CLOSE = "close", '\u{e14c}', Delete;
+    EVERYTHING = "apps", '\u{e5c3}', Library;
+    PICTURE = "image", '\u{e251}', Library;
+    UNUSED = "hide_source", '\u{f023}', HalfCircle;
+    LIST_VIEW = "view_list", '\u{e8ef}', Subtitles;
+    GRID_VIEW = "grid_view", '\u{e9b0}', Library;
+    SORT = "sort", '\u{e164}', Subtitles;
+    ARROW_UP = "arrow_upward", '\u{e5d8}', StepBack;
+    ARROW_DOWN = "arrow_downward", '\u{e5db}', StepOn;
+    CHECK = "check_circle", '\u{e86c}', Record;
+    RESET = "restart_alt", '\u{f053}', Refresh;
+    PASTE = "content_paste", '\u{e14f}', Copy;
+    // Titles.
+    BOLD = "format_bold", '\u{e238}', Title;
+    ITALIC = "format_italic", '\u{e23f}', Title;
+    ALIGN_LEFT = "format_align_left", '\u{e236}', Subtitles;
+    ALIGN_CENTER = "format_align_center", '\u{e234}', Subtitles;
+    ALIGN_RIGHT = "format_align_right", '\u{e237}', Subtitles;
+    WRAP = "wrap_text", '\u{e25b}', Subtitles;
+    STAR = "star", '\u{e838}', Star;
+    CURVES = "show_chart", '\u{e6e1}', Equalizer;
+    // The projects page.
+    MORE = "more_vert", '\u{e5d4}', Subtitles;
+    ARCHIVE = "archive", '\u{e149}', Folder;
+    UNARCHIVE = "unarchive", '\u{e169}', FolderOpen;
+    RESTORE = "restore_from_trash", '\u{e938}', Refresh;
+    MOVE_TO = "drive_file_move", '\u{e675}', Folder;
+    // The top bar.
+    EXPAND = "expand_more", '\u{e5cf}', StepOn;
+    MENU = "menu", '\u{e5d2}', Subtitles;
+    SAVED = "check", '\u{e5ca}', Record;
+    SAVING = "sync", '\u{e627}', Refresh;
+    EDITED = "edit", '\u{e3c9}', Title;
 }
+
+/// `icon` as text in the Material font, `size` points: for egui widgets that take text
+/// (a menu button's label, say) rather than a painter.
+pub fn rich(icon: Icon, size: f32) -> egui::RichText {
+    egui::RichText::new(icon.code.to_string()).font(egui::FontId::new(size, egui::FontFamily::Name("material".into())))
+}
+
+/// Relinking a missing file: the chain link (the same glyph as [`GROUP`]).
+pub const RELINK: Icon = GROUP;
 
 /// The subset font, built into the program: reading it from `assets/fonts` only worked
 /// when started from the source tree, so installed copies fell back to drawn shapes.

@@ -32,6 +32,7 @@ pub fn text_spec(values: &Evaluated) -> oa_text::TextSpec {
         align: oa_text::Align::parse(values.get(schema::TEXT_ALIGN).and_then(Value::as_enum).unwrap_or("center")),
         tracking: values.float(schema::TEXT_TRACKING),
         line_height: values.float(schema::TEXT_LINE_HEIGHT),
+        wrap: Some(values.float(schema::TEXT_WRAP)).filter(|w| *w > 0.0),
     }
 }
 

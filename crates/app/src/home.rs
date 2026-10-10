@@ -11,9 +11,6 @@ use crate::App;
 use eframe::egui;
 use std::path::Path;
 
-/// Project cards are this wide; their picture is 16:9.
-const CARD_W: f32 = 176.0;
-
 /// Reads one of our own thumbnails: (size, pixels).
 fn load_png(path: &Path) -> Option<([usize; 2], Vec<egui::Color32>)> {
     let file = std::fs::File::open(path).ok()?;
@@ -37,6 +34,36 @@ fn load_png(path: &Path) -> Option<([usize; 2], Vec<egui::Color32>)> {
         _ => return None,
     };
     Some(([info.width as usize, info.height as usize], pixels))
+}
+
+/// A project's picture, and a copy of it shrunk to a few pixels (drawn large, it's the
+/// picture blurred).
+pub type ProjectPicture = (egui::TextureHandle, egui::TextureHandle);
+
+/// A picture shrunk to `across` pixels wide (its shape kept), each pixel the average of
+/// the ones it covers.
+fn shrink(size: [usize; 2], pixels: &[egui::Color32], across: usize) -> egui::ColorImage {
+    let w = across.clamp(1, size[0].max(1));
+    let h = (size[1] * w / size[0].max(1)).max(1);
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let (x0, x1) = (x * size[0] / w, ((x + 1) * size[0] / w).max(x * size[0] / w + 1));
+            let (y0, y1) = (y * size[1] / h, ((y + 1) * size[1] / h).max(y * size[1] / h + 1));
+            let mut sum = [0u32; 4];
+            for yy in y0..y1.min(size[1]) {
+                for xx in x0..x1.min(size[0]) {
+                    let c = pixels[yy * size[0] + xx];
+                    for (s, v) in sum.iter_mut().zip([c.r(), c.g(), c.b(), c.a()]) {
+                        *s += v as u32;
+                    }
+                }
+            }
+            let n = ((x1 - x0) * (y1 - y0)).max(1) as u32;
+            out.push(egui::Color32::from_rgba_premultiplied((sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, (sum[3] / n) as u8));
+        }
+    }
+    egui::ColorImage { size: [w, h], pixels: out, source_size: egui::vec2(w as f32, h as f32) }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -66,24 +93,6 @@ struct Card {
     enabled: bool,
     /// It carries scripts (not built in): whether they're allowed.
     scripts: Option<bool>,
-}
-
-/// "3 min ago" for a file's last change.
-fn when(path: &Path) -> String {
-    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else { return t("home.missing").into() };
-    let secs = modified.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-    let ago = |key: &str, n: u64| args(key, &[("n", &n.to_string())]);
-    match secs {
-        0..=59 => t("time.moments").into(),
-        60..=3599 => ago("time.minutes", secs / 60),
-        3600..=86_399 => ago("time.hours", secs / 3600),
-        86_400..=604_799 => ago("time.days", secs / 86_400),
-        _ => ago("time.weeks", secs / 604_800),
-    }
-}
-
-fn name_of(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string())
 }
 
 impl App {
@@ -122,6 +131,12 @@ impl App {
             });
         });
         ui.add_space(crate::style::GAP_L);
+        // The Projects page lays itself out in the whole window (its sidebar and top stay
+        // put while the projects scroll).
+        if self.home_tab == HomeTab::Projects {
+            self.projects_page(ui);
+            return;
+        }
         // One centered column, at most 760 px wide. The inner ui keeps a top-down layout
         // of its own — inheriting the centering row's would lay everything out sideways.
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -131,180 +146,20 @@ impl App {
                 ui.add_space(left);
                 ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(width);
-                    match self.home_tab {
-                        HomeTab::Projects => self.home_projects(ui),
-                        HomeTab::Plugins => self.home_plugins(ui),
-                    }
+                    self.home_plugins(ui);
                     ui.add_space(crate::style::GAP_XL);
                 });
             });
         });
     }
 
-    fn home_projects(&mut self, ui: &mut egui::Ui) {
-        // Three ways in, as tiles.
-        let gap = crate::style::GAP;
-        let tile_w = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            if tile(ui, crate::icons::ADD, t("home.new_project"), t("home.new_project_hint"), true, tile_w).clicked() {
-                self.ask_new_project();
-            }
-            if tile(ui, crate::icons::FOLDER_OPEN, t("home.open"), t("home.open_hint"), false, tile_w).clicked()
-                && let Some(path) = rfd::FileDialog::new().add_filter(tr("OpenAtelier project"), &["json"]).set_directory(self.projects_dir()).pick_file()
-            {
-                self.open_project(&path);
-                self.screen = Screen::Editor;
-            }
-            if tile(ui, crate::icons::IMPORT, t("home.import"), t("home.import_hint"), false, tile_w).clicked()
-                && let Some(files) = rfd::FileDialog::new().add_filter(tr("Media"), crate::MEDIA_EXTENSIONS).pick_files()
-            {
-                self.open_paths(&files);
-                self.screen = Screen::Editor;
-            }
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-            crate::icons::paint(ui.painter(), r, crate::icons::INFO, ui.visuals().weak_text_color());
-            ui.label(egui::RichText::new(t("home.drop_hint")).small().weak());
-        });
-
-        // Sessions that ended without saving.
-        if !self.recoveries.is_empty() {
-            ui.add_space(crate::style::GAP_L);
-            section(ui, crate::icons::WARNING, t("home.unsaved"), None);
-            for r in self.recoveries.clone() {
-                self.recovery_card(ui, &r);
-                ui.add_space(4.0);
-            }
-        }
-
-        ui.add_space(crate::style::GAP_L);
-        let count = self.settings.recent.len();
-        section(ui, crate::icons::HISTORY, t("home.recent"), (count > 0).then(|| count.to_string()));
-        if self.settings.recent.is_empty() {
-            ui.label(egui::RichText::new(t("home.recent_empty")).weak());
-        }
-        // Cards: a frame from the project, what it's called, where it is and when it
-        // was last touched. Far easier to pick out than a list of file names.
-        let recent = self.settings.recent.clone();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(crate::style::GAP, crate::style::GAP);
-            for r in recent {
-                let exists = r.path.exists();
-                let (rect, response) = ui.allocate_exact_size(egui::vec2(CARD_W, CARD_W * 0.5625 + 44.0), egui::Sense::click());
-                if !ui.is_rect_visible(rect) {
-                    continue;
-                }
-                let thumb = egui::Rect::from_min_size(rect.min, egui::vec2(CARD_W, CARD_W * 0.5625));
-                let painter = ui.painter_at(rect);
-                let visuals = ui.visuals().clone();
-                painter.rect_filled(thumb, crate::style::ROUNDING, visuals.extreme_bg_color);
-                match self.project_thumb(ui.ctx(), &r) {
-                    Some(texture) => {
-                        // Fitted inside the card at its own shape (a vertical project is
-                        // a tall picture in the middle, not a squashed one).
-                        let size = texture.size_vec2();
-                        let k = (thumb.width() / size.x.max(1.0)).min(thumb.height() / size.y.max(1.0));
-                        let fitted = egui::Rect::from_center_size(thumb.center(), size * k);
-                        painter.image(texture.id(), fitted, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-                    }
-                    None => {
-                        let icon = if exists { crate::icons::VIDEO_TRACK } else { crate::icons::WARNING };
-                        let color = if exists { visuals.weak_text_color() } else { crate::style::ERROR };
-                        crate::icons::paint(&painter, egui::Rect::from_center_size(thumb.center(), egui::vec2(34.0, 34.0)), icon, color);
-                    }
-                }
-                let border = if !exists {
-                    egui::Stroke::new(1.5, crate::style::ERROR)
-                } else if response.hovered() {
-                    egui::Stroke::new(1.5, crate::style::ACCENT)
-                } else {
-                    egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color)
-                };
-                painter.rect_stroke(thumb, crate::style::ROUNDING, border, egui::StrokeKind::Inside);
-                // Flagged when an earlier session left unsaved changes to it (above).
-                let unsaved = self.recoveries.iter().any(|x| x.original.as_ref() == Some(&r.path));
-                if unsaved {
-                    let tag = egui::Rect::from_min_size(thumb.right_top() + egui::vec2(-30.0, 6.0), egui::vec2(24.0, 24.0));
-                    painter.rect_filled(tag, 6.0, crate::style::GOLD);
-                    crate::icons::paint(&painter, tag.shrink(4.0), crate::icons::WARNING, egui::Color32::BLACK);
-                    painter.rect_stroke(thumb, crate::style::ROUNDING, egui::Stroke::new(1.5, crate::style::GOLD), egui::StrokeKind::Inside);
-                }
-
-                let name = if r.name.is_empty() { name_of(&r.path) } else { r.name.clone() };
-                let mut job = egui::text::LayoutJob::simple_singleline(
-                    name,
-                    egui::FontId::proportional(crate::style::TEXT),
-                    if exists { visuals.text_color() } else { crate::style::ERROR },
-                );
-                job.wrap = egui::text::TextWrapping::truncate_at_width(CARD_W - 4.0);
-                let galley = painter.layout_job(job);
-                painter.galley(egui::pos2(rect.left() + 2.0, thumb.bottom() + 4.0), galley, visuals.text_color());
-                let when_text = if exists { when(&r.path) } else { t("home.missing").to_string() };
-                painter.text(
-                    egui::pos2(rect.left() + 2.0, thumb.bottom() + 6.0 + crate::style::TEXT + 2.0),
-                    egui::Align2::LEFT_TOP,
-                    when_text,
-                    egui::FontId::proportional(crate::style::TEXT_S),
-                    visuals.weak_text_color(),
-                );
-                let tip = if unsaved { format!("{}
-Has unsaved changes from an earlier session — see Unsaved work above", r.path.display()) } else { r.path.display().to_string() };
-                let response = response.on_hover_text(tip);
-                if response.clicked() && exists {
-                    self.open_project(&r.path);
-                    self.screen = Screen::Editor;
-                }
-                if response.hovered() && exists {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                crate::widgets::context_menu(&response, |ui| {
-                    if crate::icons::menu_item(ui, Some(crate::icons::FOLDER_OPEN), t("home.open"), "", exists).clicked() {
-                        self.open_project(&r.path);
-                        self.screen = Screen::Editor;
-                        ui.close();
-                    }
-                    if crate::icons::menu_item(ui, Some(crate::icons::DELETE), t("home.remove_from_list"), "", true).clicked() {
-                        self.settings.forget_project(&r.path);
-                        ui.close();
-                    }
-                });
-            }
-        });
-
-        // The language the app is shown in. Changing it takes effect next launch (the
-        // strings are picked once, at startup).
-        ui.add_space(crate::style::GAP_XL);
-        ui.separator();
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            crate::icons::paint(ui.painter(), r, crate::icons::LANGUAGE, ui.visuals().weak_text_color());
-            ui.label(egui::RichText::new(t("home.language")).weak());
-            let dir = crate::settings::config_dir().join("locales");
-            let langs = crate::i18n::available(&dir);
-            let mut picked = self.settings.language.clone().unwrap_or_else(|| crate::i18n::language().to_string());
-            let was = picked.clone();
-            egui::ComboBox::from_id_salt("home-language").selected_text(crate::i18n::name_of(&picked)).show_ui(ui, |ui| {
-                for lang in &langs {
-                    ui.selectable_value(&mut picked, lang.clone(), crate::i18n::name_of(lang));
-                }
-            });
-            if picked != was {
-                self.settings.set_language(Some(picked));
-                self.notify(t("home.language_hint"));
-            }
-        })
-        .response
-        .on_hover_text(t("home.language_hint"));
-    }
-
     /// The picture saved beside a project, loaded once and kept. It's read and decoded on
     /// a thread of its own (a start page of big PNGs would otherwise hitch as it opens);
     /// `None` until it's in, or if there's none.
-    fn project_thumb(&mut self, ctx: &egui::Context, r: &crate::settings::RecentProject) -> Option<egui::TextureHandle> {
-        let path = r.thumb.clone().unwrap_or_else(|| crate::thumbnail::path_for(&r.path));
+    /// With it, a copy shrunk to a few pixels across: drawn large (smoothly), it's the
+    /// picture blurred, behind it where its shape leaves room.
+    pub(crate) fn project_thumb(&mut self, ctx: &egui::Context, path: &Path) -> Option<(egui::TextureHandle, egui::TextureHandle)> {
+        let path = path.to_path_buf();
         let key = path.to_string_lossy().to_string();
         let slot = self.project_thumbs.entry(key.clone()).or_insert_with(|| {
             let slot = std::sync::Arc::new(std::sync::OnceLock::new());
@@ -312,8 +167,11 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
             let spawned = std::thread::Builder::new().name("oa-project-picture".into()).spawn(move || {
                 // egui takes textures from any thread; it uploads them with the next frame.
                 let loaded = load_png(&path).map(|(size, pixels)| {
+                    let small = shrink(size, &pixels, 12);
                     let image = egui::ColorImage { size, pixels, source_size: egui::vec2(size[0] as f32, size[1] as f32) };
-                    ctx.load_texture(format!("project-{key}"), image, egui::TextureOptions::LINEAR)
+                    let picture = ctx.load_texture(format!("project-{key}"), image, egui::TextureOptions::LINEAR);
+                    let blurred = ctx.load_texture(format!("project-blur-{key}"), small, egui::TextureOptions::LINEAR);
+                    (picture, blurred)
                 });
                 let _ = fill.set(loaded);
                 ctx.request_repaint();
@@ -561,18 +419,6 @@ Has unsaved changes from an earlier session — see Unsaved work above", r.path.
     }
 }
 
-/// A section's heading: its icon, its name and (when there's one) how many.
-fn section(ui: &mut egui::Ui, icon: crate::icons::Icon, title: &str, count: Option<String>) {
-    ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-        crate::icons::paint(ui.painter(), r, icon, ui.visuals().text_color());
-        ui.label(egui::RichText::new(title).size(crate::style::TEXT_L).strong());
-        if let Some(n) = count {
-            crate::widgets::pill(ui, &n, ui.visuals().weak_text_color());
-        }
-    });
-    ui.add_space(4.0);
-}
 
 /// How wide a tab of the segmented control is.
 fn tab_width(ui: &egui::Ui, text: &str) -> f32 {
@@ -604,7 +450,7 @@ fn tab_button(ui: &mut egui::Ui, icon: crate::icons::Icon, text: &str, selected:
 }
 
 /// A big button on the start page: an icon, what it does, and a line more about it.
-fn tile(ui: &mut egui::Ui, icon: crate::icons::Icon, title: &str, about: &str, primary: bool, width: f32) -> egui::Response {
+pub(crate) fn tile(ui: &mut egui::Ui, icon: crate::icons::Icon, title: &str, about: &str, primary: bool, width: f32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 76.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let v = ui.visuals();

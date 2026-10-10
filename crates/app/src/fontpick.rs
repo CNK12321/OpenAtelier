@@ -3,7 +3,8 @@
 //! The samples are rasterized by `oa-text` from the family's own outlines and uploaded
 //! as small textures, a few per frame and only for rows on screen, so opening the menu
 //! on a machine with a thousand fonts doesn't stall. A family whose sample isn't ready
-//! (or which can't draw its own name — symbol fonts) shows as plain text.
+//! (or which can't draw its own name — symbol fonts) shows as plain text. Starred fonts
+//! and the ones used lately (`Settings::favorite_fonts`, `recent_fonts`) come first.
 
 use crate::i18n::tr;
 use crate::App;
@@ -49,65 +50,131 @@ impl FontSamples {
 
 impl App {
     /// The font picker. `family` is the chosen family ("" = the default one); returns the
-    /// family picked, if it changed.
+    /// family picked, if it changed. Without a search it lists the default font, then the
+    /// starred fonts, the ones used lately, and every font; a search looks through them
+    /// all. Every row has a star (shown on hover, gold when on) to keep a font at the top.
     pub(crate) fn font_menu(&mut self, ui: &mut egui::Ui, id: egui::Id, family: &str) -> Option<String> {
+        /// A row of the list: a heading, or a font ("" the default).
+        enum Row {
+            Heading(&'static str),
+            Font(String),
+        }
         let default = oa_text::default_family();
-        let shown = if family.is_empty() { format!("{default} (default)") } else { family.to_string() };
+        let default_name = format!("{default} ({})", tr("default"));
+        let shown = if family.is_empty() { default_name.clone() } else { family.to_string() };
         let mut picked = None;
-        egui::ComboBox::from_id_salt(id).selected_text(shown).width(190.0).height(420.0).show_ui(ui, |ui| {
+        let width = ui.available_width().max(120.0);
+        // It stays open while you star fonts; picking one closes it.
+        let combo = egui::ComboBox::from_id_salt(id).selected_text(shown).width(width).height(460.0);
+        combo.close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show_ui(ui, |ui| {
             let search_id = id.with("search");
             let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
-            let r = ui.add(egui::TextEdit::singleline(&mut search).hint_text(tr("🔍 Search fonts")).desired_width(170.0));
-            r.request_focus();
+            let hint = tr("Search fonts");
+            let field = ui.id().with(("search-field", hint));
+            if ui.memory(|m| m.focused().is_none()) {
+                ui.memory_mut(|m| m.request_focus(field));
+            }
+            crate::widgets::search_field(ui, &mut search, hint, ui.available_width());
             let needle = search.trim().to_lowercase();
             ui.data_mut(|d| d.insert_temp(search_id, search));
-            ui.separator();
+            ui.add_space(4.0);
 
-            if needle.is_empty() && ui.selectable_label(family.is_empty(), format!("{default} (default)")).clicked() {
-                picked = Some(String::new());
-                ui.close();
+            let installed = oa_text::families();
+            let mut rows = Vec::new();
+            if needle.is_empty() {
+                rows.push(Row::Font(String::new()));
+                let favorites: Vec<&String> = self.settings.favorite_fonts.iter().filter(|f| installed.contains(f)).collect();
+                if !favorites.is_empty() {
+                    rows.push(Row::Heading("Favorites"));
+                    rows.extend(favorites.into_iter().map(|f| Row::Font(f.clone())));
+                }
+                let recent: Vec<&String> = self.settings.recent_fonts.iter().filter(|f| installed.contains(f) && !self.settings.favorite_fonts.contains(f)).collect();
+                if !recent.is_empty() {
+                    rows.push(Row::Heading("Recent"));
+                    rows.extend(recent.into_iter().map(|f| Row::Font(f.clone())));
+                }
+                rows.push(Row::Heading("All fonts"));
             }
-            let families: Vec<&String> =
-                oa_text::families().iter().filter(|f| needle.is_empty() || f.to_lowercase().contains(&needle)).collect();
-            if families.is_empty() {
+            rows.extend(installed.iter().filter(|f| needle.is_empty() || f.to_lowercase().contains(&needle)).map(|f| Row::Font(f.clone())));
+            if rows.is_empty() {
                 ui.label(egui::RichText::new(tr("No font by that name.")).weak());
             }
             // Only rows in view are drawn, so the samples are made for those.
             let row_height = SAMPLE_PX + 10.0;
-            egui::ScrollArea::vertical().max_height(360.0).show_rows(ui, row_height, families.len(), |ui, range| {
-                for f in &families[range] {
-                    let selected = *f == family;
+            let mut star: Option<String> = None;
+            egui::ScrollArea::vertical().max_height(400.0).show_rows(ui, row_height, rows.len(), |ui, range| {
+                let first = range.start;
+                for (n, row) in rows[range].iter().enumerate() {
                     let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_height), egui::Sense::click());
+                    let f = match row {
+                        Row::Heading(title) => {
+                            let at = egui::pos2(rect.left() + 6.0, rect.bottom() - 4.0);
+                            ui.painter().text(at, egui::Align2::LEFT_BOTTOM, tr(title), egui::FontId::proportional(crate::style::TEXT_S), ui.visuals().weak_text_color());
+                            continue;
+                        }
+                        Row::Font(f) => f,
+                    };
+                    let selected = f == family;
+                    // The star, on the right: registered after the row, so it takes the
+                    // pointer from it. Keyed by its row: a starred font is listed twice
+                    // (under Favorites and under All fonts).
+                    let star_rect = egui::Rect::from_center_size(egui::pos2(rect.right() - 14.0, rect.center().y), egui::vec2(20.0, 20.0));
+                    let starred = self.settings.favorite_fonts.contains(f);
+                    let star_r = (!f.is_empty()).then(|| ui.interact(star_rect, id.with(("star", first + n)), egui::Sense::click()));
                     if ui.is_rect_visible(rect) {
                         let visuals = ui.style().interact_selectable(&response, selected);
-                        if selected || response.hovered() {
-                            ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+                        let lit = selected || response.hovered() || star_r.as_ref().is_some_and(|r| r.hovered());
+                        if lit {
+                            ui.painter().rect_filled(rect, 3.0, if selected { visuals.bg_fill } else { ui.visuals().widgets.hovered.weak_bg_fill });
                         }
                         let at = egui::pos2(rect.left() + 6.0, rect.center().y);
-                        match self.font_samples.sample(ui.ctx(), f) {
+                        let sample = if f.is_empty() { None } else { self.font_samples.sample(ui.ctx(), f) };
+                        match sample {
                             Some(texture) => {
                                 let size = texture.size_vec2();
                                 let size = size * (SAMPLE_PX / size.y.max(1.0)).min(1.0);
+                                let size = size * ((rect.width() - 40.0) / size.x.max(1.0)).min(1.0);
                                 let dest = egui::Rect::from_min_size(egui::pos2(at.x, at.y - size.y / 2.0), size);
-                                ui.painter().image(
-                                    texture.id(),
-                                    dest,
-                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                    visuals.text_color(),
-                                );
+                                ui.painter().image(texture.id(), dest, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), visuals.text_color());
                             }
                             None => {
-                                ui.painter().text(at, egui::Align2::LEFT_CENTER, f, egui::FontId::proportional(13.0), visuals.text_color());
+                                let name = if f.is_empty() { default_name.as_str() } else { f.as_str() };
+                                ui.painter().text(at, egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(13.0), visuals.text_color());
                             }
                         }
+                        if let Some(r) = &star_r
+                            && (starred || lit)
+                        {
+                            let color = if starred {
+                                crate::style::GOLD
+                            } else if r.hovered() {
+                                ui.visuals().strong_text_color()
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            crate::icons::paint(ui.painter(), star_rect.shrink(2.0), crate::icons::STAR, color);
+                        }
+                    }
+                    if let Some(r) = star_r
+                        && r.on_hover_text(if starred { tr("Remove from favorites") } else { tr("Add to favorites: kept at the top") }).clicked()
+                    {
+                        star = Some(f.clone());
                     }
                     if response.clicked() {
-                        picked = Some((*f).clone());
+                        picked = Some(f.clone());
                         ui.close();
                     }
                 }
             });
+            if let Some(f) = star {
+                self.settings.toggle_favorite_font(&f);
+                self.settings.save();
+            }
         });
+        if let Some(p) = &picked {
+            self.settings.used_font(p);
+            self.settings.save();
+        }
         picked.filter(|p| p != family)
     }
 }

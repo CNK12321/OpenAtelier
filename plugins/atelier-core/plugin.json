@@ -385,6 +385,17 @@
       "shader": {"entry": "oa_color_hue", "file": "color/hue.wgsl"}
     },
     {
+      "id": "oa.color.hue-anchor", "name": "Hue Anchor", "off": {"amount": 0}, "kind": "point", "category": "Color", "space": "display",
+      "description": "Every color's hue measured from the anchor's, round the color wheel, and that distance scaled. At 1 nothing changes; above 1 the hues spread out and wrap round (colors repeat); below 1 they gather toward the anchor's (at 0, everything is its hue). Saturation and lightness stay.",
+      "preview": {"distance": 2.5},
+      "params": [
+        {"id": "anchor", "type": "color", "default": [1, 0.35, 0.1, 1]},
+        {"id": "distance", "type": "float", "default": 0.5, "min": 0, "max": 8},
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1}
+      ],
+      "shader": {"entry": "oa_color_hue_anchor", "file": "color/hue-anchor.wgsl"}
+    },
+    {
       "id": "oa.color.color-to", "name": "Color To", "kind": "point", "category": "Color", "preserves_opacity": false,
       "description": "Replaces one color with another: pixels within the tolerance of \"from\" become \"to\" (its opacity is how much). With \"offset from original\", each keeps its difference in hue, saturation and brightness from \"from\", so shading survives. With \"include alpha\", transparency counts too: pixels match on \"from\"'s opacity as well, and take on \"to\"'s (turn a color see-through with a \"to\" at 0 opacity).",
       "preview": {"tolerance": 0.45},
@@ -410,10 +421,10 @@
     },
     {
       "id": "oa.color.invert", "name": "Invert", "off": {"amount": 0}, "kind": "point", "category": "Color", "space": "display", "preserves_opacity": false,
-      "description": "Flips the channels chosen: red, green and blue by default. Magenta, cyan and yellow flip the two channels each is made of (magenta: red and blue; cyan: green and blue; yellow: red and green); alpha flips transparency.",
+      "description": "Flips the channels chosen: red, green and blue by default. Magenta, cyan and yellow flip the two channels each is made of (magenta: red and blue; cyan: green and blue; yellow: red and green); alpha flips transparency. Brightness flips light and dark but keeps the colors; hue turns each color to its opposite but keeps the light and dark; saturation swaps vivid and muted colors (pure grays stay gray).",
       "params": [
         {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1},
-        {"id": "channels", "type": "enum", "multiple": true, "options": ["red", "green", "blue", "magenta", "cyan", "yellow", "alpha"], "default": ["red", "green", "blue"]}
+        {"id": "channels", "type": "enum", "multiple": true, "options": ["red", "green", "blue", "magenta", "cyan", "yellow", "alpha", "brightness", "hue", "saturation"], "default": ["red", "green", "blue"]}
       ],
       "shader": {"entry": "oa_color_invert", "file": "color/invert.wgsl"}
     },

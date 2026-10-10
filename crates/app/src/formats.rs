@@ -38,10 +38,17 @@ impl App {
         let variants: Vec<FormatVariant> = self.editor.sequence().variants.clone();
         let current = self.variant.min(variants.len() - 1);
         let mut action: Option<Action> = None;
-        let title = format!("{}  ▾", variants[current].name);
+        // What it is at a glance: "Landscape 16:9 · 1080p · 30 fps".
+        let size = variants[current].size;
+        let rate = self.editor.sequence().rate;
+        let fps = rate.num as f64 / rate.den.max(1) as f64;
+        let fps = if rate.den == 1 { rate.num.to_string() } else { format!("{fps:.2}").trim_end_matches('0').trim_end_matches('.').to_string() };
+        let title = format!("{} · {}p · {fps} fps", variants[current].name, size.width.min(size.height));
+        let tip = format!("{}×{}  ·  {}", size.width, size.height, tr("The format being edited: click for every format in the project"));
         let custom_key = egui::Id::new("format-custom-size");
         let rename_key = egui::Id::new("format-rename");
-        crate::widgets::sticky_menu(ui, &title, |ui| {
+        let link = &mut self.link_formats;
+        crate::widgets::chip_menu(ui, &title, &tip, |ui| {
             ui.set_min_width(380.0);
             ui.label(egui::RichText::new(tr("Formats in this project")).small().weak());
             for (i, v) in variants.iter().enumerate() {
@@ -143,12 +150,14 @@ impl App {
                 }
             });
             ui.data_mut(|d| d.insert_temp(custom_key, custom));
+            // Away from the main format: whether transform edits go to every format.
+            if current > 0 {
+                ui.separator();
+                ui.checkbox(link, tr("Transform edits apply to all formats")).on_hover_text(tr("Off: moving, scaling or rotating a clip here changes only this format"));
+            }
         });
         if let Some(a) = action {
             self.format_action(a);
-        }
-        if self.variant > 0 {
-            ui.checkbox(&mut self.link_formats, tr("all formats")).on_hover_text(tr("Transform edits apply to every format, not just this one"));
         }
     }
 

@@ -43,6 +43,8 @@ pub const LIVE: u64 = 1;
 pub const CAPTION: u64 = 2;
 /// The slot of the project picture written on save.
 pub const PROJECT_PICTURE: u64 = 3;
+/// The slot of the quick cut window's preview.
+pub const QUICK_CUT: u64 = 4;
 
 /// One frame to render.
 pub struct Request {

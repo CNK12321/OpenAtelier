@@ -35,6 +35,7 @@ mod drop_in;
 mod eyedropper;
 mod winfocus;
 mod curves;
+mod keyframes;
 mod command;
 mod editor;
 mod export_dialog;
@@ -42,10 +43,13 @@ mod export_worker;
 mod fontpick;
 mod fullscreen;
 mod formats;
+mod gate;
 mod gpu_reset;
 mod gpu_watch;
 mod guard;
 mod home;
+mod library;
+mod project_page;
 mod icons;
 mod i18n;
 mod inspector;
@@ -54,6 +58,7 @@ mod notify;
 mod plugins;
 mod prefs;
 mod projects;
+mod quick_cut;
 mod picker;
 mod plan_ahead;
 mod plugin_previews;
@@ -125,6 +130,9 @@ struct Placing {
 /// During playback, how long the preview waits on a video frame before showing a
 /// stand-in instead: time for the decode-ahead to hand over a frame, never a stall.
 const PLAYBACK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The undo key a batch of imports shares: one "Import media" step for all of them.
+const IMPORT_BATCH: &str = "import-batch";
 
 const MEDIA_EXTENSIONS: &[&str] =
     &["mp4", "mov", "mkv", "m4v", "webm", "avi", "gif", "png", "jpg", "jpeg", "bmp", "webp", "svg", "mp3", "m4a", "wav", "flac", "aac", "ogg"];
@@ -392,10 +400,8 @@ struct App {
     project_view: settings::ProjectView,
     view_epoch: u64,
     view_key: Option<(PathBuf, String)>,
-    /// Proxies of heavy footage, which the viewer plays instead (`proxies.rs`), and
-    /// whether the viewer's files were last set with them on.
+    /// Proxies of heavy footage, which the viewer plays instead (`proxies.rs`).
     proxies: proxies::Proxies,
-    proxies_shown: bool,
     /// Where to put the playhead once the project being opened is in (a restart after
     /// the GPU was lost).
     resume_playhead: Option<Time>,
@@ -447,7 +453,9 @@ struct App {
     /// When the project file was last brought up to date (save as you go).
     last_saved: Instant,
     /// Project pictures on the start page, loaded once each (`None`: there isn't one).
-    project_thumbs: std::collections::HashMap<String, Arc<std::sync::OnceLock<Option<egui::TextureHandle>>>>,
+    project_thumbs: std::collections::HashMap<String, Arc<std::sync::OnceLock<Option<home::ProjectPicture>>>>,
+    /// The start page's Projects page: what it's showing, its search, sort, layout.
+    projects_page: project_page::ProjectsPage,
     /// Put the keyboard in the inspector's text box next frame (a title was just added).
     focus_text: bool,
     /// A title being typed into right on the canvas (double-click it in the viewer).
@@ -478,6 +486,8 @@ struct App {
     compound_trail: Vec<compound::Crumb>,
     /// The curve editor window, when open.
     curve_editor: Option<curves::CurveEditor>,
+    /// The keyframe editor (in place of the timeline's tracks while it's open).
+    keyframes: keyframes::KeyframeView,
     /// The wave (LFO) editor window, when open.
     wave_editor: Option<waves::WaveEditor>,
     /// The connection (property follows the sound) editor window, when open.
@@ -559,6 +569,8 @@ struct App {
     imports: std::collections::VecDeque<PendingImport>,
     /// A project being opened on a worker thread.
     opening: Option<(PathBuf, std::sync::mpsc::Receiver<Opened>)>,
+    /// How far its media has been read in: (done, of how many).
+    opening_progress: std::sync::Arc<[std::sync::atomic::AtomicUsize; 2]>,
     /// A save-as-you-go running on its own thread: the file, the snapshot being written.
     saving: Option<BackgroundSave>,
     /// The New project window, while it's open.
@@ -568,6 +580,11 @@ struct App {
     editing_background: bool,
     /// The viewer glow's colors, read from the picture.
     ambient: ambient::Ambient,
+    /// New files the decoders haven't been told of yet, and when they last were.
+    sources_due: bool,
+    sources_at: Instant,
+    /// Relinks being probed on worker threads (`App::relink`).
+    relinks: Vec<(oa_doc::MediaId, std::sync::mpsc::Receiver<Result<Imported, String>>)>,
 }
 
 impl App {
@@ -632,6 +649,7 @@ impl App {
             closing: false,
             last_saved: Instant::now(),
             project_thumbs: Default::default(),
+            projects_page: Default::default(),
             selection: None,
             selected: Default::default(),
             clipboard: Vec::new(),
@@ -661,7 +679,6 @@ impl App {
             view_epoch: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64),
             view_key: None,
             proxies: proxies::Proxies::default(),
-            proxies_shown: false,
             resume_playhead: None,
             fitted_room: egui::Vec2::ZERO,
             window_pending: None,
@@ -689,6 +706,7 @@ impl App {
             script_consent: None,
             compound_trail: Vec::new(),
             curve_editor: None,
+            keyframes: Default::default(),
             wave_editor: None,
             connection_editor: None,
             track_editor: None,
@@ -732,10 +750,14 @@ impl App {
             recovering: None,
             imports: Default::default(),
             opening: None,
+            opening_progress: Default::default(),
             saving: None,
             new_project_form: None,
             editing_background: false,
             ambient: Default::default(),
+            sources_due: false,
+            sources_at: Instant::now(),
+            relinks: Vec::new(),
         }
     }
 
@@ -886,14 +908,25 @@ impl App {
         if probe.video.as_ref().is_some_and(|v| v.has_alpha) {
             return true;
         }
+        // The answer is kept (by the file as it is now): finding it opens a hardware
+        // decoder and decodes a frame, for every video each time a project opened.
         #[cfg(windows)]
         if choice.hardware()
             && let (Some(bridge), Some(video)) = (choice.bridge.clone(), probe.video.as_ref())
         {
-            return match oa_media::windows::MfDecoder::open(bridge, path, video) {
+            let kept = previews::cache_key(path, "playable mf").map(|k| previews::cache_dir("playable").join(k));
+            if let Some(answer) = kept.as_ref().and_then(|f| std::fs::read(f).ok()) {
+                return answer == b"1";
+            }
+            let playable = match oa_media::windows::MfDecoder::open(bridge, path, video) {
                 Ok(mut decoder) => oa_media::VideoDecoder::next(&mut decoder).is_ok_and(|f| f.is_some()),
                 Err(_) => false,
             };
+            if let Some(file) = kept {
+                let _ = std::fs::create_dir_all(previews::cache_dir("playable"));
+                let _ = std::fs::write(file, if playable { "1" } else { "0" });
+            }
+            return playable;
         }
         let _ = (choice, path, probe);
         true
@@ -937,10 +970,6 @@ impl App {
 
     fn bridge(&self) -> oa_media::DecoderChoice {
         self.decoders.clone()
-    }
-
-    fn import_file(&mut self, path: &Path) -> Result<Imported, String> {
-        Self::import_with(self.bridge(), path)
     }
 
     /// Opens a project file, or imports media files into the media bin (only there: they
@@ -1013,7 +1042,9 @@ impl App {
         let bridge = self.bridge();
         let name = url.split(['?', '#']).next().unwrap_or(&url).rsplit('/').find(|s| !s.is_empty()).unwrap_or("download").to_string();
         let address = url.clone();
+        let ticket = gate::imports().ticket();
         std::thread::spawn(move || {
+            let _pass = ticket.wait();
             let result = drop_in::download(&address).and_then(|file| Self::import_with(bridge, &file));
             let _ = tx.send(result);
         });
@@ -1031,7 +1062,10 @@ impl App {
         for path in paths {
             let (tx, rx) = std::sync::mpsc::channel();
             let (bridge, file) = (self.bridge(), path.clone());
+            // A few at a time, in order: hundreds at once starved the editor.
+            let ticket = gate::imports().ticket();
             std::thread::spawn(move || {
+                let _pass = ticket.wait();
                 let _ = tx.send(Self::import_with(bridge, &file));
             });
             let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().to_string());
@@ -1055,17 +1089,12 @@ impl App {
                     let duration = if imported.kind == MediaKind::Still { self.still_length() } else { imported.default_duration() };
                     let conformed = imported.conformed.clone();
                     let name = imported.name();
-                    match self.editor.add_media(imported) {
+                    // Straight into its folder, and a whole batch is one undo step.
+                    match self.editor.add_media_into(imported, &job.folder, Some(IMPORT_BATCH)) {
                         Ok(media) => {
                             added = true;
                             if let Some(reason) = conformed {
                                 self.notify(trf("{name}: converted for playback ({reason})", &[("name", &name.to_string()), ("reason", &reason.to_string())]));
-                            }
-                            if !job.folder.is_empty() {
-                                let op = oa_doc::Op::SetMediaFolder { media, folder: job.folder.clone() };
-                                if let Err(e) = self.editor.apply(tr("Move to folder"), vec![op]) {
-                                    self.error = Some(e.to_string());
-                                }
                             }
                             if let Some(place) = &job.place {
                                 // Where it was dropped; the next one in the batch after it.
@@ -1089,8 +1118,18 @@ impl App {
                 Err(e) => self.error = Some(format!("{}: {e}", job.path.display())),
             }
         }
+        // The decoders learn of new files at most four times a second while a batch
+        // comes in (each time goes over every file), and once more when it's all in.
         if added {
+            self.sources_due = true;
+            if self.imports.is_empty() {
+                self.editor.doc.seal();
+            }
+        }
+        if self.sources_due && (self.imports.is_empty() || self.sources_at.elapsed() >= std::time::Duration::from_millis(250)) {
             self.add_new_sources();
+            self.sources_due = false;
+            self.sources_at = Instant::now();
         }
         if let Some((path, rx)) = &self.opening {
             let result = match rx.try_recv() {
@@ -1121,12 +1160,21 @@ impl App {
         }
     }
 
+    /// Opens a project on a worker thread. Until it's in, the workspace waits: playback
+    /// stops and the panels and shortcuts are off (they'd edit the project being left).
     pub(crate) fn open_project(&mut self, path: &Path) {
         let (tx, rx) = std::sync::mpsc::channel();
         let (bridge, file) = (self.bridge(), path.to_path_buf());
+        let progress = std::sync::Arc::new([std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)]);
+        self.opening_progress = progress.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Editor::open(&file, |p| Self::import_with(bridge.clone(), p)));
+            let tell = |done: usize, total: usize| {
+                progress[0].store(done, std::sync::atomic::Ordering::Relaxed);
+                progress[1].store(total, std::sync::atomic::Ordering::Relaxed);
+            };
+            let _ = tx.send(Editor::open(&file, |p| Self::import_with(bridge.clone(), p), &tell));
         });
+        self.set_playing(false);
         self.opening = Some((path.to_path_buf(), rx));
     }
 
@@ -1192,36 +1240,32 @@ impl App {
         self.add_new_sources();
     }
 
-    /// The files the viewer plays: each file's proxy where there's one ready and proxies
-    /// are on (the same times, a smaller picture), the file itself otherwise.
+    /// The files the viewer plays: each file's proxy where there's one ready (the same
+    /// times, a smaller picture), the file itself otherwise. Proxies aren't something you
+    /// see or set: heavy footage gets one, the viewer plays it, exports use the file.
     fn viewer_entries(&self) -> Vec<export_worker::MediaEntry> {
         let mut entries = self.media_entries();
-        if self.settings.use_proxies {
-            for e in &mut entries {
-                if let Some((path, track)) = self.editor.pool_item(oa_doc::MediaId(e.id)).and_then(|m| self.proxies.ready(&m.decode_path)) {
-                    e.path = path.to_path_buf();
-                    e.track = Some(track.clone());
-                }
+        for e in &mut entries {
+            if let Some((path, track)) = self.editor.pool_item(oa_doc::MediaId(e.id)).and_then(|m| self.proxies.ready(&m.decode_path)) {
+                e.path = path.to_path_buf();
+                e.track = Some(track.clone());
             }
         }
         entries
     }
 
-    /// Looks for each video file's proxy (making one for heavy footage, if that's on),
-    /// and when what the viewer plays changes — a proxy ready, proxies switched — starts
-    /// its decoders over on the new files.
+    /// Looks for each video file's proxy (making one for heavy footage), and when what
+    /// the viewer plays changes — a proxy ready — starts its decoders over on the new files.
     fn proxy_tick(&mut self) {
         for m in &self.editor.pool {
             if m.missing || m.kind != MediaKind::Video {
                 continue;
             }
             let Some(track) = &m.probe.video else { continue };
-            let make = self.settings.auto_proxies && proxies::heavy(track);
+            let make = proxies::heavy(track);
             self.proxies.find(&m.decode_path, make);
         }
-        let using = self.settings.use_proxies;
-        if self.proxies.poll() | (self.proxies_shown != using) {
-            self.proxies_shown = using;
+        if self.proxies.poll() {
             self.viewer_render.set_media(self.viewer_entries(), true);
             // The frame on screen came from the other files: rendered again (it stays
             // up meanwhile).
@@ -1953,14 +1997,52 @@ impl App {
 
     // ---- panels -----------------------------------------------------------
 
+    /// Points `media` at `file`: probed on a worker thread (a few at a time, like
+    /// imports), then taken in by [`App::poll_relinks`].
     pub(crate) fn relink(&mut self, media: oa_doc::MediaId, file: &Path) {
-        match self.import_file(file) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (bridge, file) = (self.bridge(), file.to_path_buf());
+        let ticket = gate::imports().ticket();
+        std::thread::spawn(move || {
+            let _pass = ticket.wait();
+            let _ = tx.send(Self::import_with(bridge, &file));
+        });
+        self.relinks.push((media, rx));
+    }
+
+    /// Takes in finished relinks; the decoders start over on the new files once they're
+    /// all in.
+    fn poll_relinks(&mut self) {
+        let mut done = Vec::new();
+        self.relinks.retain(|(media, rx)| match rx.try_recv() {
+            Ok(result) => {
+                done.push((*media, result));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                done.push((*media, Err("relinking stopped unexpectedly".into())));
+                false
+            }
+        });
+        let any = !done.is_empty();
+        for (media, result) in done {
+            self.take_relink(media, result);
+        }
+        if any && self.relinks.is_empty() {
+            self.rebuild_sources();
+        }
+    }
+
+    /// A probed file becomes `media`'s.
+    fn take_relink(&mut self, media: oa_doc::MediaId, result: Result<Imported, String>) {
+        match result {
             Ok(imported) => {
                 let path = imported.path.to_string_lossy().to_string();
                 let Some(old) = self.editor.doc.project().media(media).cloned() else { return };
                 let updated = oa_doc::MediaRef { path, fingerprint: Some(imported.fingerprint.clone()), ..old };
-                let ops = vec![oa_doc::Op::RemoveMedia(media), oa_doc::Op::AddMedia(Arc::new(updated))];
-                if let Err(e) = self.editor.doc.edit("Relink media", ops) {
+                // In place: the clips using it keep it (removing it first was refused).
+                if let Err(e) = self.editor.doc.edit("Relink media", vec![oa_doc::Op::ReplaceMedia(Arc::new(updated))]) {
                     self.error = Some(e.to_string());
                     return;
                 }
@@ -1972,7 +2054,6 @@ impl App {
                     item.name = name;
                 }
                 self.clip_previews.forget(media);
-                self.rebuild_sources();
             }
             Err(e) => self.error = Some(e),
         }
@@ -2000,6 +2081,10 @@ impl App {
         }
         // Typing into a title on the canvas: the keys (and copy/cut/paste) are its.
         if ctx.egui_wants_keyboard_input() || self.canvas_text.is_some() {
+            return;
+        }
+        // Quick cut takes the keys while it's open (Space, I, O, arrows, Delete).
+        if self.bin.quick_cut.is_some() {
             return;
         }
         let pressed = |m: M, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
@@ -2105,9 +2190,11 @@ impl App {
             self.add_transition_at_playhead();
         }
         // Over the curve editor, Delete removes its key, not the clip.
-        if !self.pointer_on_curve_editor(ctx) {
+        if !self.pointer_on_curve_editor(ctx) && !self.pointer_on_keyframes(ctx) {
+            // Over the bin with files picked, Delete is the bin's (it removes them).
+            let bins = self.bin.hovered && !self.bin.picked.is_empty();
             let ripple = pressed(M::SHIFT, Key::Delete) || pressed(M::SHIFT, Key::Backspace);
-            if ripple || pressed(M::NONE, Key::Delete) || pressed(M::NONE, Key::Backspace) {
+            if !bins && (ripple || pressed(M::NONE, Key::Delete) || pressed(M::NONE, Key::Backspace)) {
                 self.delete_selection(ripple);
             }
         }
@@ -2127,7 +2214,7 @@ impl App {
         if pressed(M::COMMAND, Key::Comma) {
             self.settings_open = !self.settings_open;
         }
-        if pressed(M::COMMAND, Key::A) {
+        if !self.bin.hovered && pressed(M::COMMAND, Key::A) {
             self.select_all();
         }
         if pressed(M::COMMAND, Key::D) {
@@ -2464,23 +2551,30 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
+        // While a project opens, the workspace waits: no shortcuts, drops or edits (they'd
+        // land in the project being left). Files dropped meanwhile wait their turn.
+        let loading = self.opening.is_some();
         // A drop the timeline didn't take last frame (it landed elsewhere, or the timeline
         // wasn't showing) goes into the bin; then this frame's drops, for the timeline.
-        if let Some((items, _)) = self.file_drop.take() {
-            self.take_dropped(items, None);
-        }
-        self.file_hover = self.drop_in.hover(ctx);
-        for (items, at) in self.drop_in.take(ctx) {
-            self.screen = home::Screen::Editor;
-            if let Some((earlier, _)) = self.file_drop.replace((items, at)) {
-                self.take_dropped(earlier, None);
+        if !loading {
+            if let Some((items, _)) = self.file_drop.take() {
+                self.take_dropped(items, None);
+            }
+            self.file_hover = self.drop_in.hover(ctx);
+            for (items, at) in self.drop_in.take(ctx) {
+                self.screen = home::Screen::Editor;
+                if let Some((earlier, _)) = self.file_drop.replace((items, at)) {
+                    self.take_dropped(earlier, None);
+                }
             }
         }
         // An effect drag the inspector didn't finish (its list went away) ends here.
         if self.effect_drag.is_some() && !ctx.input(|i| i.pointer.primary_down() || i.pointer.any_released()) {
             self.effect_drag = None;
         }
-        self.shortcuts(ctx);
+        if !loading {
+            self.shortcuts(ctx);
+        }
         // Something was copied inside the app: say so on the system clipboard too, so
         // Ctrl+V reaches the app (egui only reports it when there's text to paste).
         if let Some(note) = self.clipboard_note.take() {
@@ -2492,9 +2586,10 @@ impl App {
         self.thumbs_frame_start();
         self.font_samples.frame_start();
         self.poll_imports();
+        self.poll_relinks();
         self.poll_eyedropper();
         self.ambient_tick(ctx);
-        if !self.imports.is_empty() || self.opening.is_some() {
+        if !self.imports.is_empty() || !self.relinks.is_empty() || self.opening.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.proxy_tick();
@@ -2510,6 +2605,7 @@ impl App {
         self.poll_updates(ctx);
         self.settings_window(ctx);
         self.new_project_window(ctx);
+        self.quick_cut_window(ctx);
         self.script_consent_window(ctx);
         if self.screen == home::Screen::Home {
             self.update_banner(root);
@@ -2540,7 +2636,16 @@ impl App {
         }
         // The top bar: a shade darker than the panels, with room around its controls.
         let bar = egui::Frame::new().fill(root.visuals().panel_fill.lerp_to_gamma(root.visuals().extreme_bg_color, 0.45)).inner_margin(egui::Margin::symmetric(6, 5));
-        egui::Panel::top("menu").frame(bar).show(root, |ui| self.menu_bar(ui));
+        let shown = egui::Panel::top("menu").frame(bar).show(root, |ui| {
+            if loading {
+                ui.disable();
+            }
+            self.menu_bar(ui)
+        });
+        // A hairline under it, as under the viewer's bars.
+        let r = shown.response.rect;
+        let line = root.visuals().widgets.noninteractive.bg_stroke.color;
+        root.ctx().layer_painter(shown.response.layer_id).hline(r.x_range(), r.bottom() - 0.5, egui::Stroke::new(1.0, line));
         self.update_banner(root);
         self.deps_banner(root);
 
@@ -2567,6 +2672,13 @@ impl App {
             self.fitted_room = room;
             self.view_epoch += 1;
         }
+        // The layout follows the format: switching between a wide and a tall one moves
+        // the panels, sized afresh.
+        let was_vertical = egui::Id::new("was-vertical");
+        if root.data(|d| d.get_temp::<bool>(was_vertical)) != Some(vertical) {
+            root.data_mut(|d| d.insert_temp(was_vertical, vertical));
+            self.view_epoch += 1;
+        }
         let epoch = self.view_epoch;
         let (fit_right, fit_media, fit_timeline) = layout::fit_panels(&self.project_view, vertical, [room.x, room.y]);
         let right_range = if vertical { 220.0..=1600.0 } else { 260.0..=560.0 };
@@ -2575,12 +2687,18 @@ impl App {
             if vertical {
                 self.viewer_area(ui, frame);
             } else {
+                if loading {
+                    ui.disable();
+                }
                 self.inspector_panel(ui);
             }
         });
         let right_width = right.response.rect.width();
 
         let controls = egui::Panel::bottom(egui::Id::new(("controls", epoch))).resizable(true).default_size(fit_timeline).size_range(150.0..=760.0).show(root, |ui| {
+            if loading {
+                ui.disable();
+            }
             ui.add_space(style::GAP_S);
             // The tracks are as tall as the settings say.
             self.timeline_view.row_height = self.settings.track_height.min(timeline::ROW_HEIGHTS.len() - 1);
@@ -2634,7 +2752,19 @@ impl App {
             let bar_height = style::ICON + 2.0 * style::GAP_S + 4.0;
             let tracks = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), (area.bottom() - bar_height).max(area.top())));
             let bar = egui::Rect::from_min_max(egui::pos2(area.left(), tracks.bottom()), area.max);
+            // The keyframe editor, when it's open, takes the tracks' place.
+            if self.keyframes.open {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(tracks).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
+                    ui.set_clip_rect(tracks.intersect(ui.clip_rect()));
+                    self.keyframe_editor(ui);
+                });
+            } else {
+                self.keyframes.rect = None;
+            }
             ui.scope_builder(egui::UiBuilder::new().max_rect(tracks).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
+                if self.keyframes.open {
+                    return;
+                }
                 ui.set_clip_rect(tracks.intersect(ui.clip_rect()));
                 egui::ScrollArea::vertical().max_height(tracks.height()).min_scrolled_height(0.0).auto_shrink([false, false]).show(ui, |ui| {
                     self.timeline(ui);
@@ -2651,6 +2781,17 @@ impl App {
             });
             ui.scope_builder(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
                 ui.set_clip_rect(bar.intersect(ui.clip_rect()));
+                // The keyframe editor, for the selected clip (in the tracks' place).
+                if keyframes::ENABLED && (self.selection.is_some() || self.keyframes.open) {
+                    let open = self.keyframes.open;
+                    if icons::text_button(ui, icons::CURVES, if open { tr("Back to timeline") } else { tr("Keyframes") }, open)
+                        .on_hover_text(tr("The selected clip's keyframed properties as curves, in place of the timeline"))
+                        .clicked()
+                    {
+                        self.keyframes.open = !open;
+                    }
+                    ui.separator();
+                }
                 // Two clearly different buttons: a film strip for a video track, a note
                 // for an audio one, each with a small + drawn into the corner.
                 for (icon, kind) in [
@@ -2687,11 +2828,17 @@ impl App {
         });
 
         let media = egui::Panel::left(egui::Id::new(("media", epoch))).default_size(fit_media).size_range(220.0..=520.0).show(root, |ui| {
+            if loading {
+                ui.disable();
+            }
             self.media_panel(ui);
         });
 
         egui::CentralPanel::default().show(root, |ui| {
             if vertical {
+                if loading {
+                    ui.disable();
+                }
                 self.inspector_panel(ui);
             } else {
                 self.viewer_area(ui, frame);

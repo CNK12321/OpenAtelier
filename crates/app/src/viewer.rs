@@ -402,6 +402,20 @@ impl App {
         }
         frame_outline(&clip, rect, edges);
         self.draw_guides(&clip, rect);
+        // Bin cards dragged over the picture light it up; dropped, they go in at the
+        // playhead (on the first track with room, or a new one).
+        if response.dnd_hover_payload::<crate::bin::BinDrop>().is_some() {
+            let accent = ui.visuals().selection.stroke.color;
+            clip.rect_filled(rect, 0.0, accent.gamma_multiply(0.12));
+            clip.rect_stroke(rect, 0.0, egui::Stroke::new(2.5, accent), egui::StrokeKind::Inside);
+            let label = clip.layout_no_wrap(tr("Drop to add it at the playhead").into(), egui::FontId::proportional(13.0), egui::Color32::WHITE);
+            let bg = egui::Rect::from_center_size(rect.center(), label.size()).expand2(egui::vec2(8.0, 4.0));
+            clip.rect_filled(bg, 4.0, accent);
+            clip.galley(bg.min + egui::vec2(8.0, 4.0), label, egui::Color32::WHITE);
+        }
+        if let Some(drop) = response.dnd_release_payload::<crate::bin::BinDrop>() {
+            self.drop_bin_entry(&drop, self.playhead, None);
+        }
 
         self.display_scale = rect.width() / canvas[0] as f32 * ui.ctx().pixels_per_point();
         let zoom = rect.width() as f64 / canvas[0]; // screen px per canvas px

@@ -225,14 +225,21 @@ impl App {
         let arc: Vec<egui::Pos2> = (0..=24).map(|i| start + i as f32 / 24.0 * 1.6).map(|a| ring + egui::vec2(a.cos(), a.sin()) * r).collect();
         painter.add(egui::Shape::line(arc, egui::Stroke::new(3.0, crate::style::ACCENT)));
         painter.text(c + egui::vec2(0.0, 2.0), egui::Align2::CENTER_CENTER, title, egui::FontId::proportional(crate::style::TEXT_L), v.strong_text_color());
+        // How many of its files are in, once that's known.
+        let (done, total) = (self.opening_progress[0].load(std::sync::atomic::Ordering::Relaxed), self.opening_progress[1].load(std::sync::atomic::Ordering::Relaxed));
+        let name = if total > 0 { trf("{name} · media {done} of {total}", &[("name", &name), ("done", &done.to_string()), ("total", &total.to_string())]) } else { name };
         if !name.is_empty() {
             painter.text(c + egui::vec2(0.0, 22.0), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(crate::style::TEXT_S), v.weak_text_color());
         }
         let track = egui::Rect::from_center_size(c + egui::vec2(0.0, 42.0), egui::vec2(160.0, 3.0));
         painter.rect_filled(track, 1.5, v.widgets.noninteractive.bg_stroke.color);
-        let k = (time * 0.8).fract();
-        let x0 = track.left() + (track.width() + 50.0) * k - 50.0;
-        let bar = egui::Rect::from_x_y_ranges(x0.max(track.left())..=(x0 + 50.0).min(track.right()), track.y_range());
+        let bar = if total > 0 {
+            egui::Rect::from_min_size(track.min, egui::vec2(track.width() * done as f32 / total as f32, track.height()))
+        } else {
+            let k = (time * 0.8).fract();
+            let x0 = track.left() + (track.width() + 50.0) * k - 50.0;
+            egui::Rect::from_x_y_ranges(x0.max(track.left())..=(x0 + 50.0).min(track.right()), track.y_range())
+        };
         if bar.width() > 0.0 {
             painter.rect_filled(bar, 1.5, crate::style::ACCENT);
         }

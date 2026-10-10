@@ -1060,13 +1060,19 @@ impl App {
 
         // A media bin card dragged over the lane: where it would land; dropped: put there
         // (on another track, or a new one, if that spot is taken).
-        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| lane.contains(*p));
+        // Over a track's header, it lands against the header: at the left of what's in view.
+        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| full.contains(*p));
+        let in_header = pointer.is_some_and(|p| p.x < lane.left());
+        let pointer = pointer.map(|p| egui::pos2(p.x.max(lane.left()), p.y));
         // Over a clip showing media of the same kind (and without Shift): the card's media
         // goes into that clip instead, keeping everything done to the clip.
         let project = self.editor.doc.snapshot();
         let seq = self.editor.seq;
         let shift = ui.input(|i| i.modifiers.shift);
         let swap_target = |drop: &crate::bin::BinDrop, pos: egui::Pos2| -> Option<&ClipBox> {
+            if in_header {
+                return None;
+            }
             let kind = if drop.audio { TrackKind::Audio } else { TrackKind::Video };
             boxes
                 .iter()

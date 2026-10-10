@@ -33,6 +33,15 @@ pub struct Settings {
     /// Plugin ids the user turned off.
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
+    /// Font families starred in the font menu (shown first), in the order starred.
+    #[serde(default)]
+    pub favorite_fonts: Vec<String>,
+    /// Font families picked lately, most recent first (shown near the top).
+    #[serde(default)]
+    pub recent_fonts: Vec<String>,
+    /// Clip lengths shown and typed in frames rather than seconds (the Length section).
+    #[serde(default)]
+    pub length_in_frames: bool,
     /// The language to show the app in ("en", "fr"/"fr-CA"…). None: the system's.
     #[serde(default)]
     pub language: Option<String>,
@@ -87,7 +96,10 @@ pub struct Settings {
     pub still_seconds: f64,
     /// The Export window's last choices.
     pub export: ExportPrefs,
-    /// Where the viewer and the properties go, for projects that haven't picked.
+    /// Where the viewer and the properties go: by default (Auto) it follows the format
+    /// being edited. Kept under a new name: the old `layout` was written as Standard
+    /// before Auto was the default, and would have pinned everyone to it.
+    #[serde(rename = "panels")]
     pub layout: Layout,
     /// Each saved project's panel sizes, format and layout, by file path: reopening a
     /// project puts them back.
@@ -104,13 +116,6 @@ pub struct Settings {
     /// drivers whose decoder misbehaves).
     #[serde(default)]
     pub decode_with_ffmpeg: bool,
-    /// The viewer plays proxies (small copies) of files that have one; exports always
-    /// read the files themselves.
-    #[serde(default = "yes")]
-    pub use_proxies: bool,
-    /// Make proxies by themselves for heavy footage (bigger than 1440p, or 10-bit).
-    #[serde(default = "yes")]
-    pub auto_proxies: bool,
     /// Clips snap to each other's edges and the playhead while dragged (Ctrl flips it).
     #[serde(default = "yes")]
     pub snapping: bool,
@@ -149,9 +154,9 @@ pub struct Settings {
 #[serde(rename_all = "lowercase")]
 pub enum Layout {
     /// Vertical when the format being edited is taller than it is wide.
+    #[default]
     Auto,
     /// The viewer in the middle, the properties in the tall column on the right.
-    #[default]
     Standard,
     /// For vertical video: the viewer in the tall column on the right, the properties
     /// in the middle.
@@ -165,8 +170,6 @@ pub enum Layout {
 pub struct ProjectView {
     /// The format variant's id.
     pub variant: Option<u64>,
-    /// `None`: the default from Settings.
-    pub layout: Option<Layout>,
     pub inspector: f32,
     pub media: f32,
     pub timeline: f32,
@@ -176,7 +179,7 @@ pub struct ProjectView {
 
 impl Default for ProjectView {
     fn default() -> Self {
-        ProjectView { variant: None, layout: None, inspector: 420.0, media: 410.0, timeline: 335.0, viewer: 420.0 }
+        ProjectView { variant: None, inspector: 420.0, media: 410.0, timeline: 335.0, viewer: 420.0 }
     }
 }
 
@@ -356,6 +359,9 @@ impl Default for Settings {
         Settings {
             recent: Vec::new(),
             disabled_plugins: Vec::new(),
+            favorite_fonts: Vec::new(),
+            recent_fonts: Vec::new(),
+            length_in_frames: false,
             language: None,
             vram_budget_mb: None,
             preview_limit: full_hd(),
@@ -373,14 +379,12 @@ impl Default for Settings {
             ui_scale: 1.0,
             still_seconds: 5.0,
             export: ExportPrefs::default(),
-            layout: Layout::Standard,
+            layout: Layout::Auto,
             project_views: Default::default(),
             window: None,
             gpu_backend: auto(),
             gpu_adapter: String::new(),
             decode_with_ffmpeg: false,
-            use_proxies: true,
-            auto_proxies: true,
             snapping: true,
             track_height: 1,
             update_channel: default_channel(),
@@ -415,12 +419,48 @@ impl Settings {
         }
     }
 
+    /// Notes `family` as just used: first among the recent fonts (once), the list kept to
+    /// the last eight. The default font ("") isn't one.
+    pub fn used_font(&mut self, family: &str) {
+        if family.is_empty() {
+            return;
+        }
+        self.recent_fonts.retain(|f| f != family);
+        self.recent_fonts.insert(0, family.to_string());
+        self.recent_fonts.truncate(8);
+    }
+
+    /// Stars `family` in the font menu, or takes its star away.
+    pub fn toggle_favorite_font(&mut self, family: &str) {
+        match self.favorite_fonts.iter().position(|f| f == family) {
+            Some(i) => {
+                self.favorite_fonts.remove(i);
+            }
+            None => self.favorite_fonts.push(family.to_string()),
+        }
+    }
+
     /// Puts `path` at the top of the list (no duplicates), with what it's called and a
     /// picture of it if there is one, and saves.
     pub fn remember_project(&mut self, path: &Path, name: &str, thumb: Option<PathBuf>) {
         self.recent.retain(|r| r.path != path);
         self.recent.insert(0, RecentProject { path: path.to_path_buf(), name: name.to_string(), thumb });
         self.recent.truncate(RECENT_MAX);
+        self.save();
+    }
+
+    /// A project's file moved (renamed, sorted into a folder, archived…): the recent list
+    /// and its remembered view follow it. `old_key` is its view's key from before the
+    /// move (the file has to be there to work it out).
+    pub fn moved_project(&mut self, old: &Path, old_key: &str, new: &Path) {
+        for r in self.recent.iter_mut().filter(|r| r.path == old) {
+            r.path = new.to_path_buf();
+            r.name = crate::library::name_of(new);
+            r.thumb = Some(crate::thumbnail::path_for(new));
+        }
+        if let Some(view) = self.project_views.remove(old_key) {
+            self.project_views.insert(crate::layout::key(new), view);
+        }
         self.save();
     }
 
@@ -455,5 +495,31 @@ impl Settings {
             self.disabled_plugins.push(id.to_string());
         }
         self.save();
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::Settings;
+
+    /// Recent fonts: the last picked first, each once, eight at most, never the default;
+    /// a star goes on and comes off.
+    #[test]
+    fn fonts_remember_what_was_used_and_starred() {
+        let mut s = Settings::default();
+        for f in ["A", "B", "A", "", "C"] {
+            s.used_font(f);
+        }
+        assert_eq!(s.recent_fonts, ["C", "A", "B"]);
+        for i in 0..20 {
+            s.used_font(&format!("F{i}"));
+        }
+        assert_eq!(s.recent_fonts.len(), 8);
+        assert_eq!(s.recent_fonts[0], "F19");
+        s.toggle_favorite_font("Georgia");
+        s.toggle_favorite_font("Arial");
+        assert_eq!(s.favorite_fonts, ["Georgia", "Arial"]);
+        s.toggle_favorite_font("Georgia");
+        assert_eq!(s.favorite_fonts, ["Arial"]);
     }
 }

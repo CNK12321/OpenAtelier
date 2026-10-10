@@ -9,7 +9,8 @@
 //! keeps it.
 //!
 //! One thread does the work, in order: finding a proxy made earlier (the fingerprint
-//! reads a few megabytes), making one (ffmpeg, with progress), removing one.
+//! reads a few megabytes), making one (ffmpeg, with progress). None of it is shown: heavy
+//! footage gets a proxy by itself, and the viewer plays it once it's ready.
 
 use oa_media::VideoTrack;
 use std::collections::HashMap;
@@ -29,8 +30,6 @@ pub enum State {
     Checking,
     /// None made.
     Missing,
-    /// Waiting its turn to be made.
-    Queued,
     /// Being made: how far (0–1).
     Making(f32),
     Ready { path: PathBuf, track: Box<VideoTrack> },
@@ -40,8 +39,6 @@ pub enum State {
 enum Request {
     /// Look for a proxy made earlier; make one if there's none and `make`.
     Find { file: PathBuf, make: bool },
-    Make(PathBuf),
-    Remove(PathBuf),
 }
 
 pub struct Proxies {
@@ -87,6 +84,7 @@ impl Proxies {
     }
 
     /// Where `file`'s proxy stands (`None`: never asked about).
+    #[cfg(test)]
     pub fn state(&self, file: &Path) -> Option<&State> {
         self.states.get(file)
     }
@@ -109,19 +107,6 @@ impl Proxies {
         let _ = self.requests.send(Request::Find { file: file.to_path_buf(), make });
     }
 
-    /// Makes `file`'s proxy (again).
-    pub fn make(&mut self, file: &Path) {
-        if matches!(self.states.get(file), Some(State::Queued | State::Making(_))) {
-            return;
-        }
-        self.states.insert(file.to_path_buf(), State::Queued);
-        let _ = self.requests.send(Request::Make(file.to_path_buf()));
-    }
-
-    pub fn remove(&mut self, file: &Path) {
-        let _ = self.requests.send(Request::Remove(file.to_path_buf()));
-    }
-
     /// Takes in the thread's news. Returns whether a proxy became ready or went away
     /// (what the viewer plays changes).
     pub fn poll(&mut self) -> bool {
@@ -136,7 +121,7 @@ impl Proxies {
 
     /// Whether any proxy is being made or waiting to be (the UI keeps repainting).
     pub fn busy(&self) -> bool {
-        self.states.values().any(|s| matches!(s, State::Queued | State::Making(_) | State::Checking))
+        self.states.values().any(|s| matches!(s, State::Making(_) | State::Checking))
     }
 }
 
@@ -156,17 +141,7 @@ fn proxy_path(dir: &Path, file: &Path) -> Result<PathBuf, String> {
 fn work(dir: &Path, jobs: Receiver<Request>, tell: Sender<(PathBuf, State)>, running: Arc<Mutex<Option<Child>>>) {
     let _ = std::fs::create_dir_all(dir);
     for job in jobs {
-        let (file, make) = match job {
-            Request::Find { file, make } => (file, make),
-            Request::Make(file) => (file, true),
-            Request::Remove(file) => {
-                if let Ok(path) = proxy_path(dir, &file) {
-                    let _ = std::fs::remove_file(path);
-                }
-                let _ = tell.send((file, State::Missing));
-                continue;
-            }
-        };
+        let Request::Find { file, make } = job;
         let path = match proxy_path(dir, &file) {
             Ok(p) => p,
             Err(e) => {
@@ -203,15 +178,17 @@ fn probe_proxy(path: &Path) -> Result<VideoTrack, String> {
 pub fn make_proxy(file: &Path, to: &Path, running: &Mutex<Option<Child>>, progress: impl Fn(f32)) -> Result<(), String> {
     let duration = oa_media::probe(file).map_err(|e| e.to_string())?.duration.as_seconds_f64().max(1e-3);
     let part = to.with_extension("part.mkv");
-    let mut c = oa_media::tool("ffmpeg");
-    c.args(["-hide_banner", "-nostdin", "-v", "error", "-y", "-copyts", "-i"]).arg(file);
+    // Below normal priority and on half the cores at most: it runs while you edit.
+    let threads = (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2).max(1).to_string();
+    let mut c = oa_media::background_tool("ffmpeg");
+    c.args(["-hide_banner", "-nostdin", "-v", "error", "-y", "-copyts", "-threads", &threads, "-i"]).arg(file);
     c.args(["-map", "0:v:0", "-an", "-sn", "-dn"]);
     // The short side down to SHORT_SIDE (never up), even sizes; one frame for each of the
     // original's, at the original's times.
     let short = SHORT_SIDE;
     c.args(["-vf", &format!("scale='if(gt(iw,ih),-2,min({short},iw))':'if(gt(iw,ih),min({short},ih),-2)':flags=bicubic,format=yuv420p")]);
     c.args(["-fps_mode", "passthrough"]);
-    c.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g", "12", "-bf", "0", "-tune", "fastdecode"]);
+    c.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g", "12", "-bf", "0", "-tune", "fastdecode", "-threads", &threads]);
     c.args(["-progress", "pipe:1", "-nostats"]).arg(&part);
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().map_err(|e| format!("couldn't run ffmpeg: {e}"))?;
@@ -313,13 +290,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), made_at);
-        // Removed.
-        again.remove(&file);
-        while !matches!(again.state(&file), Some(State::Missing)) {
-            again.poll();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(!path.exists());
         drop((proxies, again));
         let _ = std::fs::remove_dir_all(&root);
     }

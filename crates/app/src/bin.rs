@@ -1,7 +1,10 @@
 //! The media bin: imported files and compound clips (groups made into media) as cards
-//! with a picture — hover a video to skim it — or a waveform for sound. Sort by when it
-//! was added, name, type or length; filter by name. Double-click a card (or its ＋) to
-//! add it to the timeline; right-click for more.
+//! with a picture — hover a video to skim it — or a waveform for sound, or as a list with
+//! details. Search by words, narrow with smart filters (kind, unused, missing),
+//! sort by when it was added, name, type or length. Click to pick (Ctrl adds, Shift picks
+//! a run); double-click or ＋ adds to the timeline, ＋ with scissors opens quick cut
+//! (`quick_cut.rs`); right-click for more. Missing files show a badge and relink; folders
+//! show a mosaic of what's inside and skim through it.
 
 use crate::i18n::{tr, trf};
 use crate::App;
@@ -48,9 +51,85 @@ pub enum BinTab {
     Assets,
 }
 
+/// A smart filter: what kind of thing, or what state it's in.
+#[derive(Copy, Clone, PartialEq, Eq, Default)]
+pub enum BinFilter {
+    #[default]
+    All,
+    Video,
+    Audio,
+    Pictures,
+    /// On no timeline yet.
+    Unused,
+    /// Its file can't be found.
+    Missing,
+}
+
+impl BinFilter {
+    const ALL: [BinFilter; 6] = [BinFilter::All, BinFilter::Video, BinFilter::Audio, BinFilter::Pictures, BinFilter::Unused, BinFilter::Missing];
+
+    fn label(self) -> &'static str {
+        match self {
+            BinFilter::All => tr("All"),
+            BinFilter::Video => tr("Video"),
+            BinFilter::Audio => tr("Audio"),
+            BinFilter::Pictures => tr("Pictures"),
+            BinFilter::Unused => tr("Unused"),
+            BinFilter::Missing => tr("Missing"),
+        }
+    }
+
+    fn icon(self) -> crate::icons::Icon {
+        use crate::icons;
+        match self {
+            BinFilter::All => icons::EVERYTHING,
+            BinFilter::Video => icons::VIDEO_TRACK,
+            BinFilter::Audio => icons::AUDIO_TRACK,
+            BinFilter::Pictures => icons::PICTURE,
+            BinFilter::Unused => icons::UNUSED,
+            BinFilter::Missing => icons::WARNING,
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            BinFilter::All => tr("Everything in this folder"),
+            BinFilter::Video => tr("Video files, everywhere in the bin"),
+            BinFilter::Audio => tr("Sound files, everywhere in the bin"),
+            BinFilter::Pictures => tr("Pictures, everywhere in the bin"),
+            BinFilter::Unused => tr("What isn't on any timeline yet"),
+            BinFilter::Missing => tr("Files that can't be found: relink them"),
+        }
+    }
+
+    /// Whether `card` passes.
+    fn keeps(self, card: &Card) -> bool {
+        match self {
+            BinFilter::All => true,
+            BinFilter::Video => !card.compound && card.kind == MediaKind::Video,
+            BinFilter::Audio => !card.compound && card.kind == MediaKind::Audio,
+            BinFilter::Pictures => !card.compound && card.kind == MediaKind::Still,
+            BinFilter::Unused => card.uses == 0,
+            BinFilter::Missing => card.missing,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct BinView {
     pub tab: BinTab,
+    /// The smart filter in use (anything but All looks in every folder).
+    pub filter: BinFilter,
+    /// Rows with details instead of picture cards.
+    pub list: bool,
+    /// The cards picked (Ctrl-click adds, Shift-click a run), in the order picked.
+    pub(crate) picked: Vec<Entry>,
+    /// Where a Shift-click run starts.
+    pub(crate) anchor: Option<Entry>,
+    /// The quick cut window, while it's open.
+    pub(crate) quick_cut: Option<crate::quick_cut::QuickCut>,
+    /// The pointer was over the bin last frame: its keys (Delete, Ctrl+A, Esc) are its own.
+    pub(crate) hovered: bool,
     /// Where you are in the asset library (its own folders).
     pub asset_folder: String,
     pub sort: BinSort,
@@ -64,8 +143,8 @@ pub struct BinView {
     pub naming_fresh: bool,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Entry {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Entry {
     Media(MediaId),
     Compound(SeqId),
 }
@@ -78,6 +157,8 @@ pub struct BinDrop {
     pub length: Time,
     /// It goes on an audio track.
     pub audio: bool,
+    /// The other cards picked with it, dragged along: they go after it.
+    pub rest: Vec<BinDrop>,
 }
 
 impl BinDrop {
@@ -90,6 +171,16 @@ impl BinDrop {
             _ => false,
         }
     }
+}
+
+/// What the pointer is over on a card or row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    None,
+    Listen,
+    Plus,
+    Cut,
+    Relink,
 }
 
 /// One card, gathered before drawing (so drawing can borrow the app mutably).
@@ -109,6 +200,8 @@ struct Card {
     sound: Option<(MediaId, PathBuf)>,
     /// The bin folder it's in (compounds are always at the top).
     folder: String,
+    /// How many clips use it, on every timeline.
+    uses: usize,
 }
 
 fn clock(t: Time) -> String {
@@ -117,11 +210,16 @@ fn clock(t: Time) -> String {
 }
 
 impl App {
-    fn bin_cards(&self) -> Vec<Card> {
+    /// Every card of the tab being shown, wherever it is.
+    fn tab_cards(&self) -> Vec<Card> {
+        let (uses, compound_uses) = self.editor.media_uses();
+        let project = self.editor.doc.project();
         let mut cards: Vec<Card> = self
             .editor
             .pool
             .iter()
+            // Taken out of the project (undo brings it back): not shown.
+            .filter(|m| project.media(m.id).is_some())
             .map(|m| {
                 let length = if m.kind == MediaKind::Still { self.still_length() } else { m.probe.duration };
                 let video = m.probe.video.as_ref().filter(|_| !m.missing);
@@ -141,6 +239,7 @@ impl App {
                     }),
                     sound: (m.kind == MediaKind::Audio && !m.missing).then(|| (m.id, m.decode_path.clone())),
                     folder: self.editor.doc.project().media(m.id).map(|r| r.folder.clone()).unwrap_or_default(),
+                    uses: uses.get(&m.id).copied().unwrap_or(0),
                 }
             })
             .collect();
@@ -175,14 +274,26 @@ impl App {
                 picture,
                 sound: None,
                 folder: String::new(),
+                uses: compound_uses.get(&s.id).copied().unwrap_or(0),
             });
         }
         // Media and compound clips each have their own tab.
         let compounds = self.bin.tab == BinTab::Compounds;
         cards.retain(|c| c.compound == compounds);
-        // Searching looks everywhere; otherwise you see the folder you're in.
+        cards
+    }
+
+    /// The cards shown: this tab's, through the smart filter and the search, in this
+    /// folder (unless searching or filtering), in the order chosen.
+    fn bin_cards(&self) -> Vec<Card> {
+        let compounds = self.bin.tab == BinTab::Compounds;
+        let mut cards = self.tab_cards();
+        // A smart filter keeps what passes it.
+        let filter = self.bin.filter;
+        cards.retain(|c| filter.keeps(c));
+        // Searching or filtering looks everywhere; otherwise you see the folder you're in.
         let needle = self.bin.search.trim().to_lowercase();
-        if needle.is_empty() && !compounds {
+        if needle.is_empty() && filter == BinFilter::All && !compounds {
             let here = self.bin.folder.clone();
             cards.retain(|c| c.folder == here);
         } else {
@@ -302,26 +413,27 @@ impl App {
         }
     }
 
-    /// Moves a file into `folder` ("" is the top).
-    fn move_to_folder(&mut self, media: MediaId, folder: &str) {
-        let op = oa_doc::Op::SetMediaFolder { media, folder: folder.to_string() };
-        if let Err(e) = self.editor.apply(tr("Move to folder"), vec![op]) {
+    /// Moves files into `folder` ("" is the top), as one undo step.
+    fn move_all_to_folder(&mut self, media: &[MediaId], folder: &str) {
+        let ops = media.iter().map(|&media| oa_doc::Op::SetMediaFolder { media, folder: folder.to_string() }).collect();
+        if let Err(e) = self.editor.apply(tr("Move to folder"), ops) {
             self.report_error(e.to_string());
         }
     }
 
     /// Menu entries for putting `media` somewhere: the top, an existing folder, or a new
     /// one typed in (made inside the folder being shown).
-    fn folder_menu(&mut self, ui: &mut egui::Ui, media: MediaId) {
-        let current = self.editor.doc.project().media(media).map(|m| m.folder.clone()).unwrap_or_default();
+    fn folder_menu(&mut self, ui: &mut egui::Ui, media: &[MediaId]) {
+        let Some(&first) = media.first() else { return };
+        let current = self.editor.doc.project().media(first).map(|m| m.folder.clone()).unwrap_or_default();
         ui.menu_button(tr("Move to folder"), |ui| {
             if ui.radio(current.is_empty(), "Media (top)").clicked() {
-                self.move_to_folder(media, "");
+                self.move_all_to_folder(media, "");
                 ui.close();
             }
             for f in self.bin_folders() {
                 if ui.radio(current == f, &f).clicked() {
-                    self.move_to_folder(media, &f);
+                    self.move_all_to_folder(media, &f);
                     ui.close();
                 }
             }
@@ -397,7 +509,100 @@ impl App {
         }
     }
 
-    /// One folder card: click to open it, drop a card on it to move that file in.
+    /// Pictures of what's in folder `path` (folders inside it too), at most `max`: each
+    /// file with a picture, and where in it to show.
+    fn folder_pictures(&self, path: &str, max: usize) -> Vec<(MediaId, PathBuf, [u32; 2], f64, f64)> {
+        let inside = format!("{path}/");
+        let project = self.editor.doc.project();
+        self.editor
+            .pool
+            .iter()
+            .filter(|m| !m.missing)
+            .filter(|m| project.media(m.id).is_some_and(|r| r.folder == path || r.folder.starts_with(&inside)))
+            .filter_map(|m| {
+                let v = m.probe.video.as_ref()?;
+                let d = if m.kind == MediaKind::Still { 0.0 } else { m.probe.duration.as_seconds_f64() };
+                Some((m.id, m.decode_path.clone(), [v.width, v.height], d, d * 0.1))
+            })
+            .take(max)
+            .collect()
+    }
+
+    /// A folder's face in `thumb`: a mosaic of what's in it (up to four), or — with the
+    /// pointer over it — one of them at a time, chosen by where the pointer is across, with
+    /// dots for which. Empty, or nothing with a picture: the folder icon.
+    fn paint_folder_face(&mut self, ui: &egui::Ui, painter: &egui::Painter, thumb: egui::Rect, path: &str, hover: Option<egui::Pos2>) {
+        let ctx = ui.ctx().clone();
+        let visuals = ui.visuals().clone();
+        painter.rect_filled(thumb, 4.0, visuals.faint_bg_color);
+        let pictures = self.folder_pictures(path, 12);
+        let draw = |app: &mut Self, cell: egui::Rect, p: &(MediaId, PathBuf, [u32; 2], f64, f64)| -> bool {
+            let Some(strip) = app.clip_previews.strip(&ctx, p.0, &p.1, p.2, p.3) else { return false };
+            // Filled (cropped to the cell), like a cover.
+            let (cw, ch) = (cell.width(), cell.height());
+            let uv = strip.uv(p.4);
+            let (aspect, cell_aspect) = (strip.aspect, cw / ch.max(1.0));
+            let uv = if aspect > cell_aspect {
+                let keep = cell_aspect / aspect;
+                let w = uv.width() * keep;
+                egui::Rect::from_min_size(egui::pos2(uv.center().x - w / 2.0, uv.top()), egui::vec2(w, uv.height()))
+            } else {
+                let keep = aspect / cell_aspect;
+                let h = uv.height() * keep;
+                egui::Rect::from_min_size(egui::pos2(uv.left(), uv.center().y - h / 2.0), egui::vec2(uv.width(), h))
+            };
+            painter.image(strip.texture.id(), cell, uv, egui::Color32::WHITE);
+            true
+        };
+        let hovering = hover.filter(|p| thumb.contains(*p));
+        if pictures.is_empty() {
+            crate::icons::paint(painter, thumb.shrink(thumb.height() * 0.28), crate::icons::FOLDER, visuals.weak_text_color());
+        } else if let Some(p) = hovering {
+            // Skimming: one at a time, by where the pointer is.
+            let n = pictures.len();
+            let i = (((p.x - thumb.left()) / thumb.width()) * n as f32).floor().clamp(0.0, (n - 1) as f32) as usize;
+            draw(self, thumb, &pictures[i]);
+            if n > 1 {
+                let dot = 5.0f32.min((thumb.width() - 16.0) / n as f32 - 2.0).max(2.0);
+                let total = n as f32 * (dot + 3.0) - 3.0;
+                let mut x = thumb.center().x - total / 2.0 + dot / 2.0;
+                for k in 0..n {
+                    let c = egui::pos2(x, thumb.bottom() - 7.0);
+                    painter.circle_filled(c, dot / 2.0 + 1.0, egui::Color32::from_black_alpha(120));
+                    painter.circle_filled(c, dot / 2.0, if k == i { egui::Color32::WHITE } else { egui::Color32::from_white_alpha(110) });
+                    x += dot + 3.0;
+                }
+            }
+        } else {
+            // A mosaic: 1 fills it, 2 side by side, 3 or 4 in a square.
+            let cells: Vec<egui::Rect> = match pictures.len() {
+                1 => vec![thumb],
+                2 => {
+                    let w = thumb.width() / 2.0;
+                    (0..2).map(|k| egui::Rect::from_min_size(thumb.min + egui::vec2(k as f32 * w, 0.0), egui::vec2(w, thumb.height()))).collect()
+                }
+                _ => {
+                    let (w, h) = (thumb.width() / 2.0, thumb.height() / 2.0);
+                    (0..4).map(|k| egui::Rect::from_min_size(thumb.min + egui::vec2((k % 2) as f32 * w, (k / 2) as f32 * h), egui::vec2(w, h))).collect()
+                }
+            };
+            for (cell, p) in cells.iter().zip(&pictures) {
+                draw(self, cell.shrink(0.5), p);
+            }
+            painter.rect_filled(thumb, 4.0, egui::Color32::from_black_alpha(40));
+        }
+        // The folder sign, so it reads as a folder over its pictures.
+        let tag = egui::Rect::from_min_size(thumb.left_top() + egui::vec2(4.0, 4.0), egui::vec2(20.0, 18.0));
+        if !pictures.is_empty() {
+            painter.rect_filled(tag, 4.0, egui::Color32::from_black_alpha(170));
+            crate::icons::paint(painter, tag.shrink(2.0), crate::icons::FOLDER, egui::Color32::WHITE);
+        }
+        if hovering.is_some() {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// One folder card: click to open it, drop cards on it to move those files in.
     fn folder_card(&mut self, ui: &mut egui::Ui, path: &str, count: usize) {
         let (rect, response) = ui.allocate_exact_size(egui::vec2(CARD_W, THUMB_H + 30.0), egui::Sense::click());
         if !ui.is_rect_visible(rect) {
@@ -408,9 +613,10 @@ impl App {
         let visuals = ui.visuals().clone();
         let taking_drop = response.contains_pointer() && egui::DragAndDrop::has_payload_of_type::<BinDrop>(ui.ctx());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(thumb, 4.0, visuals.faint_bg_color);
-        crate::icons::paint(&painter, thumb.shrink(THUMB_H * 0.28), crate::icons::FOLDER, visuals.weak_text_color());
-        let stroke = if taking_drop || response.hovered() {
+        self.paint_folder_face(ui, &painter, thumb, path, response.hover_pos());
+        let stroke = if taking_drop {
+            egui::Stroke::new(2.0, crate::style::ACCENT)
+        } else if response.hovered() {
             egui::Stroke::new(1.5, visuals.selection.stroke.color)
         } else {
             egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color)
@@ -419,17 +625,44 @@ impl App {
         painter.text(egui::pos2(rect.left() + 2.0, thumb.bottom() + 2.0), egui::Align2::LEFT_TOP, &name, egui::FontId::proportional(12.0), visuals.text_color());
         let n = format!("{count} item{}", if count == 1 { "" } else { "s" });
         painter.text(egui::pos2(rect.left() + 2.0, thumb.bottom() + 16.0), egui::Align2::LEFT_TOP, n, egui::FontId::proportional(10.0), visuals.weak_text_color());
+        self.folder_interact(&response, path);
+    }
 
+    /// One folder as a row of the list view.
+    fn folder_row(&mut self, ui: &mut egui::Ui, path: &str, count: usize) {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let visuals = ui.visuals().clone();
+        let painter = ui.painter_at(rect);
+        let taking_drop = response.contains_pointer() && egui::DragAndDrop::has_payload_of_type::<BinDrop>(ui.ctx());
+        if taking_drop {
+            painter.rect(rect, 5.0, crate::style::ACCENT.gamma_multiply(0.16), egui::Stroke::new(1.5, crate::style::ACCENT), egui::StrokeKind::Inside);
+        } else if response.hovered() {
+            painter.rect_filled(rect, 5.0, visuals.widgets.hovered.weak_bg_fill);
+        }
+        let thumb = egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 3.0), egui::vec2(56.0, rect.height() - 6.0));
+        self.paint_folder_face(ui, &painter, thumb, path, response.hover_pos());
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        painter.text(egui::pos2(thumb.right() + 8.0, rect.top() + 4.0), egui::Align2::LEFT_TOP, &name, egui::FontId::proportional(crate::style::TEXT), visuals.text_color());
+        let n = format!("{count} item{}", if count == 1 { "" } else { "s" });
+        painter.text(egui::pos2(thumb.right() + 8.0, rect.bottom() - 4.0), egui::Align2::LEFT_BOTTOM, n, egui::FontId::proportional(crate::style::TEXT_S), visuals.weak_text_color());
+        self.folder_interact(&response, path);
+    }
+
+    /// A folder card's or row's clicks, drops and menu.
+    fn folder_interact(&mut self, response: &egui::Response, path: &str) {
         if response.clicked() {
             self.bin.folder = path.to_string();
+            self.bin.picked.clear();
         }
-        if let Some(drop) = response.dnd_release_payload::<BinDrop>()
-            && let Entry::Media(id) = drop.entry
-        {
-            self.move_to_folder(id, path);
+        if let Some(drop) = response.dnd_release_payload::<BinDrop>() {
+            let media: Vec<MediaId> = std::iter::once(&*drop).chain(drop.rest.iter()).filter_map(|d| if let Entry::Media(id) = d.entry { Some(id) } else { None }).collect();
+            self.move_all_to_folder(&media, path);
         }
         let path = path.to_string();
-        crate::widgets::context_menu(&response, |ui| {
+        crate::widgets::context_menu(response, |ui| {
             if ui.button(tr("Open")).clicked() {
                 self.bin.folder = path.clone();
                 ui.close();
@@ -463,6 +696,7 @@ impl App {
 
     /// The bin beside its tabs: the tab's buttons, search and sorting, and its cards.
     fn media_body(&mut self, ui: &mut egui::Ui) {
+        self.bin.hovered = false;
         ui.set_max_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -532,23 +766,41 @@ impl App {
         // One row: the search filling what the order (on the right) leaves.
         ui.add_space(crate::style::GAP_S);
         ui.horizontal(|ui| {
-            let sort_width = 76.0 + 26.0 + 2.0 * ui.spacing().item_spacing.x;
+            let views = self.bin.tab != BinTab::Assets;
+            let buttons = if views { 3.0 } else { 2.0 };
+            let tools = buttons * (crate::style::ICON + ui.spacing().item_spacing.x);
             let hint = match self.bin.tab {
                 BinTab::Project => tr("Search media"),
                 BinTab::Compounds => tr("Search compound clips"),
                 BinTab::Assets => tr("Search assets"),
             };
-            crate::widgets::search_field(ui, &mut self.bin.search, hint, ui.available_width() - sort_width);
-            egui::ComboBox::from_id_salt("bin-sort").width(70.0).selected_text(self.bin.sort.label()).show_ui(ui, |ui| {
+            crate::widgets::search_field(ui, &mut self.bin.search, hint, ui.available_width() - tools);
+            // The order, from a menu; which way, a button; cards or rows, a button.
+            let r = crate::icons::button(ui, crate::icons::SORT, &trf("Order: {0}", &[("0", self.bin.sort.label())]), "", true);
+            egui::Popup::menu(&r).show(|ui| {
                 for s in BinSort::ALL {
-                    ui.selectable_value(&mut self.bin.sort, s, s.label());
+                    if ui.radio(self.bin.sort == s, s.label()).clicked() {
+                        self.bin.sort = s;
+                        ui.close();
+                    }
                 }
             });
-            let arrow = if self.bin.descending { "↓" } else { "↑" };
-            if crate::widgets::chip(ui, false, arrow).on_hover_text(tr("Reverse the order")).clicked() {
+            let (arrow, tip) = if self.bin.descending { (crate::icons::ARROW_DOWN, tr("Last first: click for first first")) } else { (crate::icons::ARROW_UP, tr("First first: click for last first")) };
+            if crate::icons::button(ui, arrow, tip, "", true).clicked() {
                 self.bin.descending = !self.bin.descending;
             }
+            if views {
+                let (icon, tip) = if self.bin.list { (crate::icons::GRID_VIEW, tr("Show as cards")) } else { (crate::icons::LIST_VIEW, tr("Show as a list, with details")) };
+                if crate::icons::button(ui, icon, tip, "", true).clicked() {
+                    self.bin.list = !self.bin.list;
+                }
+            }
         });
+        // Smart filters: what kind, and what state (unused, missing).
+        if self.bin.tab == BinTab::Project {
+            ui.add_space(4.0);
+            self.bin_filters(ui);
+        }
         ui.add_space(crate::style::GAP_S);
         if self.bin.tab == BinTab::Assets {
             self.assets_panel(ui);
@@ -579,6 +831,46 @@ impl App {
             };
             ui.label(egui::RichText::new(text).weak());
         }
+        // What a Shift-click run spans: the cards as shown.
+        let order: Vec<Entry> = cards.iter().map(|c| c.entry).collect();
+        // Keys over the bin: Delete removes what's picked (undoable), Esc lets go of it,
+        // Ctrl+A picks everything shown.
+        self.bin.hovered = ui.rect_contains_pointer(ui.max_rect());
+        if self.bin.hovered && !ui.ctx().egui_wants_keyboard_input() {
+            let (delete, escape, all) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::Delete), i.consume_key(egui::Modifiers::NONE, egui::Key::Escape), i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)));
+            if delete && !self.bin.picked.is_empty() {
+                let picked = self.bin.picked.clone();
+                self.remove_entries(&picked);
+            }
+            if escape {
+                self.bin.picked.clear();
+            }
+            if all {
+                self.bin.picked = order.clone();
+            }
+        }
+        self.bin.picked.retain(|e| order.contains(e) || matches!(e, Entry::Media(id) if self.editor.doc.project().media(*id).is_some()));
+        // As a list: folders, then a row per file.
+        if self.bin.list && self.bin.tab != BinTab::Assets {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for text in &loading {
+                    ui.label(egui::RichText::new(text).weak());
+                }
+                if self.bin.naming.is_some() && !compounds {
+                    self.naming_card(ui);
+                }
+                if self.bin.search.trim().is_empty() && self.bin.filter == BinFilter::All && !compounds {
+                    for (path, count) in self.child_folders(&self.bin.folder.clone()) {
+                        self.folder_row(ui, &path, count);
+                    }
+                }
+                for card in cards {
+                    self.bin_row(ui, card, &order);
+                }
+            });
+            return;
+        }
         // The bin fills its panel, top to bottom.
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -594,30 +886,28 @@ impl App {
                 if self.bin.naming.is_some() && !compounds {
                     self.naming_card(ui);
                 }
-                if self.bin.search.trim().is_empty() && !compounds {
+                if self.bin.search.trim().is_empty() && self.bin.filter == BinFilter::All && !compounds {
                     for (path, count) in self.child_folders(&self.bin.folder.clone()) {
                         self.folder_card(ui, &path, count);
                     }
                 }
                 for card in cards {
-                    self.bin_card(ui, card);
+                    self.bin_card(ui, card, &order);
                 }
             });
         });
     }
 
-    fn bin_card(&mut self, ui: &mut egui::Ui, card: Card) {
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(CARD_W, THUMB_H + 30.0), egui::Sense::click_and_drag());
-        if !ui.is_rect_visible(rect) {
-            return;
-        }
+    /// A card's picture in `thumb`: a compound clip's frames, a file's (skimmed with the
+    /// pointer at `hover`), a waveform for sound, or an icon.
+    fn paint_card_picture(&mut self, ui: &egui::Ui, painter: &egui::Painter, thumb: egui::Rect, card: &Card, hover: Option<egui::Pos2>) {
         let ctx = ui.ctx().clone();
-        let painter = ui.painter_at(rect);
-        let thumb = egui::Rect::from_min_size(rect.min, egui::vec2(CARD_W, THUMB_H));
         let visuals = ui.visuals().clone();
         painter.rect_filled(thumb, 4.0, visuals.extreme_bg_color);
-
-        // The picture: skims with the pointer over a video.
+        let skim = |duration: f64, rest: f64| match hover.filter(|p| thumb.contains(*p)) {
+            Some(p) if duration > 0.0 => ((p.x - thumb.left()) / thumb.width()).clamp(0.0, 1.0) as f64 * duration,
+            _ => rest,
+        };
         let mut drawn = false;
         // A compound clip: its own frames, rendered from the timeline inside it.
         if let Entry::Compound(seq) = card.entry {
@@ -625,37 +915,29 @@ impl App {
             let (picture, sound) = self.compound_look(seq);
             if !picture {
                 // Sound alone: its waveform across the card, and a note.
-                let band = thumb.shrink2(egui::vec2(6.0, 14.0));
-                self.paint_compound_sound(&ctx, &painter, &sound, band, |x| ((x - band.left()) / band.width().max(1.0)) as f64 * duration);
-                painter.text(thumb.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, tr("♪ sound only"), egui::FontId::proportional(10.0), visuals.weak_text_color());
+                let band = thumb.shrink2(egui::vec2(6.0, (thumb.height() * 0.2).min(14.0)));
+                self.paint_compound_sound(&ctx, painter, &sound, band, |x| ((x - band.left()) / band.width().max(1.0)) as f64 * duration);
                 drawn = true;
             } else if let Some(strip) = self.compound_strip(&ctx, seq) {
-                let at = match response.hover_pos() {
-                    Some(p) => ((p.x - thumb.left()) / thumb.width()).clamp(0.0, 1.0) as f64 * duration,
-                    None => duration * 0.1,
-                };
+                let at = skim(duration, duration * 0.1);
                 let h = thumb.height().min(thumb.width() / strip.aspect.max(0.01));
                 let dest = egui::Rect::from_center_size(thumb.center(), egui::vec2(h * strip.aspect, h));
                 painter.image(strip.texture.id(), dest, strip.uv(at), egui::Color32::WHITE);
                 drawn = true;
             } else if self.clip_previews.compound_pending(seq) {
-                crate::widgets::skeleton(ui, &painter, thumb);
+                crate::widgets::skeleton(ui, painter, thumb);
                 drawn = true;
             }
         }
         if let Some((media, path, size, duration, rest)) = card.picture.as_ref().filter(|_| !drawn) {
-            let at = match response.hover_pos() {
-                Some(p) if *duration > 0.0 => ((p.x - thumb.left()) / thumb.width()).clamp(0.0, 1.0) as f64 * duration,
-                _ => *rest,
-            };
+            let at = skim(*duration, *rest);
             if let Some(strip) = self.clip_previews.strip(&ctx, *media, path, *size, *duration) {
-                // Fit the frame inside the card.
                 let h = thumb.height().min(thumb.width() / strip.aspect.max(0.01));
                 let dest = egui::Rect::from_center_size(thumb.center(), egui::vec2(h * strip.aspect, h));
                 painter.image(strip.texture.id(), dest, strip.uv(at), egui::Color32::WHITE);
                 drawn = true;
             } else if self.clip_previews.strip_pending(*media) {
-                crate::widgets::skeleton(ui, &painter, thumb);
+                crate::widgets::skeleton(ui, painter, thumb);
                 drawn = true;
             }
         }
@@ -677,19 +959,137 @@ impl App {
             drawn = true;
         }
         if !drawn {
-            let icon = if card.compound {
-                "▣"
-            } else {
-                match card.kind {
-                    MediaKind::Video => "🎞",
-                    MediaKind::Still => "🖼",
-                    MediaKind::Audio => "🔊",
-                }
+            let icon = match (card.compound, card.kind) {
+                (true, _) => crate::icons::GROUP,
+                (_, MediaKind::Video) => crate::icons::VIDEO_TRACK,
+                (_, MediaKind::Still) => crate::icons::PICTURE,
+                (_, MediaKind::Audio) => crate::icons::AUDIO_TRACK,
             };
-            painter.text(thumb.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(24.0), visuals.weak_text_color());
+            let side = (thumb.height() * 0.4).min(28.0);
+            crate::icons::paint(painter, egui::Rect::from_center_size(thumb.center(), egui::vec2(side, side)), icon, visuals.weak_text_color());
         }
+        if card.missing {
+            painter.rect_filled(thumb, 4.0, egui::Color32::from_black_alpha(150));
+        }
+    }
+
+    /// The Missing badge in a picture's corner: a red pill with a warning sign.
+    fn paint_missing_badge(painter: &egui::Painter, corner: egui::Pos2, small: bool) {
+        let text = if small { String::new() } else { tr("Missing").to_string() };
+        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(10.0), egui::Color32::WHITE);
+        let w = 16.0 + if small { 0.0 } else { galley.size().x + 4.0 };
+        let r = egui::Rect::from_min_size(corner, egui::vec2(w + 4.0, 16.0));
+        painter.rect_filled(r, 8.0, crate::style::ERROR);
+        crate::icons::paint(painter, egui::Rect::from_min_size(r.min + egui::vec2(3.0, 2.0), egui::vec2(12.0, 12.0)), crate::icons::WARNING, egui::Color32::WHITE);
+        if !small {
+            painter.galley(egui::pos2(r.left() + 17.0, r.center().y - galley.size().y / 2.0), galley, egui::Color32::WHITE);
+        }
+    }
+
+    /// What clicks on a card or row do, given what was under the pointer.
+    fn card_clicks(&mut self, ui: &egui::Ui, response: &egui::Response, card: &Card, order: &[Entry], hit: Hit) {
+        let entry = card.entry;
+        if response.clicked() {
+            match hit {
+                Hit::Listen => {
+                    if let Some((_, path)) = &card.sound {
+                        let (path, length) = (path.clone(), card.length);
+                        self.audition(&path, length);
+                    }
+                }
+                Hit::Relink => {
+                    if let Entry::Media(id) = entry {
+                        self.ask_relink(id);
+                    }
+                }
+                Hit::Cut => {
+                    if let Entry::Media(id) = entry {
+                        self.open_quick_cut(id);
+                    }
+                }
+                Hit::Plus => {
+                    let acting = self.acting_on(entry, order);
+                    self.add_entries(&acting);
+                }
+                // The second click of a double-click adds it (below), leaving it picked.
+                Hit::None if !response.double_clicked() => {
+                    let mods = ui.input(|i| i.modifiers);
+                    self.pick_card(entry, order, mods);
+                }
+                Hit::None => {}
+            }
+        }
+        if response.double_clicked() && hit == Hit::None {
+            let acting = self.acting_on(entry, order);
+            self.add_entries(&acting);
+        }
+        // Right-clicking a card that isn't picked picks it alone.
+        if response.secondary_clicked() && !self.bin.picked.contains(&entry) {
+            self.bin.picked = vec![entry];
+            self.bin.anchor = Some(entry);
+        }
+        // Dragged onto the timeline, the viewer or a folder: it, and every other card
+        // picked if it's one of them. Dragging doesn't pick it (picking is a click, on
+        // release).
+        if response.drag_started() {
+            let acting = self.acting_on(entry, order);
+            if let Some(payload) = self.drag_payload(&acting) {
+                response.dnd_set_drag_payload(payload);
+            }
+        }
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+    }
+
+    /// The tooltip for a card or row.
+    fn card_tip(&self, card: &Card) -> String {
+        let mut tip = format!("{}\n{}", card.name, card.detail);
+        if card.missing {
+            tip.push_str(&format!("\n{}", tr("Missing: its file can't be found. Click Relink to point it at it.")));
+        }
+        match card.uses {
+            0 => tip.push_str(&format!("\n{}", tr("Not on any timeline yet"))),
+            1 => tip.push_str(&format!("\n{}", tr("On the timeline once"))),
+            n => tip.push_str(&format!("\n{}", trf("On the timeline {n} times", &[("n", &n.to_string())]))),
+        }
+        if let Some(reason) = &card.conformed {
+            tip.push_str(&format!("\nconverted for playback ({reason})"));
+        }
+        tip.push_str(&format!("\n{}", tr("Click to pick (Ctrl adds, Shift picks a run); double-click or ＋ adds to the timeline; right-click for more.")));
+        tip
+    }
+
+    /// Whether a card can be quick cut: a video or a sound file that's there.
+    fn cuttable(card: &Card) -> bool {
+        !card.compound && !card.missing && card.kind != MediaKind::Still
+    }
+
+    /// A ＋ button (with a scissors in its corner when `cut`) in `rect`.
+    fn paint_add_button(painter: &egui::Painter, rect: egui::Rect, hot: bool, cut: bool, visuals: &egui::Visuals) {
+        painter.rect_filled(rect, 4.0, if hot { visuals.selection.bg_fill } else { egui::Color32::from_black_alpha(170) });
+        let plus = if cut { egui::Rect::from_min_size(rect.min + egui::vec2(1.0, 1.0), rect.size() * 0.72) } else { rect.shrink(3.0) };
+        crate::icons::paint(painter, plus, crate::icons::ADD, egui::Color32::WHITE);
+        if cut {
+            let small = egui::Rect::from_min_max(rect.center() + egui::vec2(-0.5, -0.5), rect.max - egui::vec2(1.0, 1.0));
+            painter.circle_filled(small.center(), small.width() * 0.62, if hot { visuals.selection.bg_fill } else { egui::Color32::from_rgb(40, 40, 44) });
+            crate::icons::paint(painter, small, crate::icons::SPLIT, egui::Color32::WHITE);
+        }
+    }
+
+    fn bin_card(&mut self, ui: &mut egui::Ui, card: Card, order: &[Entry]) {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(CARD_W, THUMB_H + 30.0), egui::Sense::click_and_drag());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let painter = ui.painter_at(rect.expand(2.0));
+        let thumb = egui::Rect::from_min_size(rect.min, egui::vec2(CARD_W, THUMB_H));
+        let visuals = ui.visuals().clone();
+        let picked = self.bin.picked.contains(&card.entry);
+        let hover = response.hover_pos();
+        self.paint_card_picture(ui, &painter, thumb, &card, hover);
         if card.compound {
-            painter.text(thumb.left_top() + egui::vec2(4.0, 3.0), egui::Align2::LEFT_TOP, "▣", egui::FontId::proportional(12.0), crate::style::GOLD);
+            crate::icons::paint(&painter, egui::Rect::from_min_size(thumb.left_top() + egui::vec2(4.0, 4.0), egui::vec2(13.0, 13.0)), crate::icons::GROUP, crate::style::GOLD);
         }
         // Length, bottom right of the picture.
         if card.kind != MediaKind::Still || card.compound {
@@ -700,18 +1100,38 @@ impl App {
             painter.rect_filled(bg, 3.0, egui::Color32::from_black_alpha(150));
             painter.galley(bg.min + egui::vec2(3.0, 1.0), galley, egui::Color32::WHITE);
         }
-        let border = if card.missing {
-            egui::Stroke::new(1.5, egui::Color32::LIGHT_RED)
+        // Missing: the badge, and (on hover) the way to fix it.
+        let relink = egui::Rect::from_center_size(thumb.center() + egui::vec2(0.0, 6.0), egui::vec2(78.0, 22.0));
+        let over_relink = card.missing && hover.is_some_and(|p| relink.contains(p));
+        if card.missing {
+            Self::paint_missing_badge(&painter, thumb.left_top() + egui::vec2(3.0, 3.0), false);
+            if response.hovered() {
+                painter.rect_filled(relink, 11.0, if over_relink { crate::style::ACCENT } else { egui::Color32::from_black_alpha(200) });
+                crate::icons::paint(&painter, egui::Rect::from_min_size(relink.min + egui::vec2(8.0, 4.0), egui::vec2(14.0, 14.0)), crate::icons::RELINK, egui::Color32::WHITE);
+                painter.text(egui::pos2(relink.left() + 26.0, relink.center().y), egui::Align2::LEFT_CENTER, tr("Relink…"), egui::FontId::proportional(11.0), egui::Color32::WHITE);
+            }
+        }
+        // Picked: lit, with a check.
+        let border = if picked {
+            egui::Stroke::new(2.0, crate::style::ACCENT)
+        } else if card.missing {
+            egui::Stroke::new(1.5, crate::style::ERROR)
         } else if response.hovered() {
             egui::Stroke::new(1.5, visuals.selection.stroke.color)
         } else {
             egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color)
         };
+        if picked {
+            painter.rect_filled(thumb, 4.0, crate::style::ACCENT.gamma_multiply(0.12));
+            let check = egui::Rect::from_min_size(egui::pos2(thumb.right() - 18.0, thumb.bottom() - 34.0), egui::vec2(15.0, 15.0));
+            painter.circle_filled(check.center(), 8.0, egui::Color32::WHITE);
+            crate::icons::paint(&painter, check, crate::icons::CHECK, crate::style::ACCENT);
+        }
         painter.rect_stroke(thumb, 4.0, border, egui::StrokeKind::Inside);
 
         // Sound gets a play button, so you can hear it before using it.
         let listen = egui::Rect::from_min_size(thumb.left_top() + egui::vec2(3.0, 3.0), egui::vec2(19.0, 19.0));
-        let over_listen = card.sound.is_some() && response.hover_pos().is_some_and(|p| listen.contains(p));
+        let over_listen = card.sound.is_some() && hover.is_some_and(|p| listen.contains(p));
         if let Some((_, path)) = &card.sound {
             let playing = self.auditioning(path);
             if response.hovered() || playing {
@@ -720,17 +1140,21 @@ impl App {
                 crate::icons::paint(&painter, listen.shrink(3.0), icon, egui::Color32::WHITE);
             }
         }
-
-        // ＋ (on hover) adds it to the timeline.
+        // ＋ adds it to the timeline; the one with scissors beside it, quick cut.
         let plus = egui::Rect::from_min_size(thumb.right_top() + egui::vec2(-22.0, 3.0), egui::vec2(19.0, 19.0));
-        let over_plus = response.hover_pos().is_some_and(|p| plus.contains(p));
+        let cut = plus.translate(egui::vec2(-22.0, 0.0));
+        let cuttable = Self::cuttable(&card);
+        let over_plus = !card.missing && hover.is_some_and(|p| plus.contains(p));
+        let over_cut = cuttable && hover.is_some_and(|p| cut.contains(p));
         if response.hovered() && !card.missing {
-            painter.rect_filled(plus, 4.0, if over_plus { visuals.selection.bg_fill } else { egui::Color32::from_black_alpha(160) });
-            painter.text(plus.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::proportional(15.0), egui::Color32::WHITE);
+            Self::paint_add_button(&painter, plus, over_plus, false, &visuals);
+            if cuttable {
+                Self::paint_add_button(&painter, cut, over_cut, true, &visuals);
+            }
         }
 
         // Name and details.
-        let name_color = if card.missing { egui::Color32::LIGHT_RED } else { visuals.text_color() };
+        let name_color = if card.missing { crate::style::ERROR } else { visuals.text_color() };
         let line = |text: String, size: f32, color: egui::Color32| {
             let mut job = egui::text::LayoutJob::simple_singleline(text, egui::FontId::proportional(size), color);
             job.wrap = egui::text::TextWrapping::truncate_at_width(CARD_W - 4.0);
@@ -739,100 +1163,127 @@ impl App {
         let name = line(card.name.clone(), 12.0, name_color);
         let name_h = name.size().y;
         painter.galley(egui::pos2(rect.left() + 2.0, thumb.bottom() + 2.0), name, name_color);
-        let detail = if card.missing { "missing".to_string() } else { card.detail.split(" · ").take(2).collect::<Vec<_>>().join(" · ") };
+        let detail = if card.missing { tr("missing — relink it").to_string() } else { card.detail.split(" · ").take(2).collect::<Vec<_>>().join(" · ") };
         let weak = visuals.weak_text_color();
         painter.galley(egui::pos2(rect.left() + 2.0, thumb.bottom() + 3.0 + name_h), line(detail, 10.0, weak), weak);
-        let mut tip = format!("{}\n{}", card.name, card.detail);
-        if let Some(reason) = &card.conformed {
-            tip.push_str(&format!("\nconverted for playback ({reason})"));
-        }
-        // Its proxy: a small tag in the picture's corner ("P", or how far along).
-        if let Entry::Media(id) = card.entry
-            && let Some(state) = self.editor.pool_item(id).and_then(|m| self.proxies.state(&m.decode_path))
-        {
-            use crate::proxies::State;
-            let (tag, note) = match state {
-                State::Ready { .. } => ("P".to_string(), "plays a proxy in the viewer (a small copy; exports use the file)".to_string()),
-                State::Making(p) => (format!("{:.0}%", p * 100.0), format!("making a proxy: {:.0}%", p * 100.0)),
-                State::Queued => ("…".to_string(), "a proxy is waiting to be made".to_string()),
-                State::Failed(e) => ("!".to_string(), format!("couldn't make a proxy: {e}")),
-                State::Checking | State::Missing => (String::new(), String::new()),
-            };
-            if !tag.is_empty() {
-                let galley = painter.layout_no_wrap(tag, egui::FontId::proportional(10.0), egui::Color32::WHITE);
-                let r = egui::Rect::from_min_size(thumb.left_top() + egui::vec2(3.0, 3.0), galley.size() + egui::vec2(6.0, 2.0));
-                let fill = if matches!(state, State::Failed(_)) { crate::style::ERROR } else { crate::style::ACCENT.gamma_multiply(0.85) };
-                painter.rect_filled(r, 3.0, fill);
-                painter.galley(r.min + egui::vec2(3.0, 1.0), galley, egui::Color32::WHITE);
-                tip.push_str(&format!("\n{note}"));
-            }
-        }
-        tip.push_str("\nDouble-click or ＋ to add to the timeline; right-click for more.");
-        let response = response.on_hover_text(tip);
 
-        if response.clicked() && over_listen && let Some((_, path)) = &card.sound {
-            let (path, length) = (path.clone(), card.length);
-            self.audition(&path, length);
-        }
-        let add = !card.missing && !over_listen && ((response.clicked() && over_plus) || response.double_clicked());
-        if add {
-            self.add_bin_entry(card.entry, card.length);
-        }
-        // Drag a card onto the timeline to put it there.
-        if !card.missing && response.drag_started() {
-            response.dnd_set_drag_payload(BinDrop { entry: card.entry, name: card.name.clone(), length: card.length, audio: card.kind == MediaKind::Audio && !card.compound });
-        }
-        if response.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        }
+        let tip = self.card_tip(&card);
+        let hit = if over_listen {
+            Hit::Listen
+        } else if over_relink {
+            Hit::Relink
+        } else if over_cut && response.hovered() {
+            Hit::Cut
+        } else if over_plus && response.hovered() {
+            Hit::Plus
+        } else {
+            Hit::None
+        };
+        let response = match hit {
+            Hit::Cut => response.on_hover_text(tr("Quick cut: pick the parts to add, with a preview")),
+            Hit::Plus => response.on_hover_text(tr("Add to the timeline")),
+            Hit::Relink => response.on_hover_text(tr("Point it at its file")),
+            _ => response.on_hover_text(tip),
+        };
+        self.card_clicks(ui, &response, &card, order, hit);
         let entry = card.entry;
-        let (missing, length) = (card.missing, card.length);
-        let is_audio = card.kind == MediaKind::Audio;
-        crate::widgets::context_menu(&response, |ui| {
-            if ui.add_enabled(!missing, egui::Button::new(tr("Add to timeline"))).clicked() {
-                self.add_bin_entry(entry, length);
-                ui.close();
+        crate::widgets::context_menu(&response, |ui| self.card_menu(ui, entry, order));
+    }
+
+    /// One file as a row of the list view: a small picture, its name and what it is, how
+    /// long, whether it's used, and the same buttons, clicks and menu as a card.
+    fn bin_row(&mut self, ui: &mut egui::Ui, card: Card, order: &[Entry]) {
+        let width = ui.available_width();
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 38.0), egui::Sense::click_and_drag());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let visuals = ui.visuals().clone();
+        let painter = ui.painter_at(rect);
+        let picked = self.bin.picked.contains(&card.entry);
+        let hover = response.hover_pos();
+        if picked {
+            painter.rect(rect, 5.0, crate::style::ACCENT.gamma_multiply(0.16), egui::Stroke::new(1.0, crate::style::ACCENT), egui::StrokeKind::Inside);
+        } else if response.hovered() {
+            painter.rect_filled(rect, 5.0, visuals.widgets.hovered.weak_bg_fill);
+        }
+        let thumb = egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 3.0), egui::vec2(56.0, rect.height() - 6.0));
+        self.paint_card_picture(ui, &painter, thumb, &card, hover);
+        if card.missing {
+            Self::paint_missing_badge(&painter, thumb.left_top() + egui::vec2(2.0, 2.0), true);
+        }
+        // Right side, right to left: the buttons (on hover), then length and use.
+        let mut x = rect.right() - 6.0;
+        let plus = egui::Rect::from_min_size(egui::pos2(x - 20.0, rect.center().y - 10.0), egui::vec2(20.0, 20.0));
+        let cut = plus.translate(egui::vec2(-24.0, 0.0));
+        let relink = egui::Rect::from_min_size(egui::pos2(x - 74.0, rect.center().y - 10.0), egui::vec2(74.0, 20.0));
+        let cuttable = Self::cuttable(&card);
+        let over_plus = !card.missing && hover.is_some_and(|p| plus.contains(p));
+        let over_cut = cuttable && hover.is_some_and(|p| cut.contains(p));
+        let over_relink = card.missing && hover.is_some_and(|p| relink.contains(p));
+        if card.missing {
+            painter.rect_filled(relink, 10.0, if over_relink { crate::style::ACCENT } else { crate::style::ERROR.gamma_multiply(0.85) });
+            crate::icons::paint(&painter, egui::Rect::from_min_size(relink.min + egui::vec2(7.0, 3.0), egui::vec2(14.0, 14.0)), crate::icons::RELINK, egui::Color32::WHITE);
+            painter.text(egui::pos2(relink.left() + 25.0, relink.center().y), egui::Align2::LEFT_CENTER, tr("Relink…"), egui::FontId::proportional(11.0), egui::Color32::WHITE);
+            x = relink.left() - 10.0;
+        } else if response.hovered() {
+            Self::paint_add_button(&painter, plus, over_plus, false, &visuals);
+            if cuttable {
+                Self::paint_add_button(&painter, cut, over_cut, true, &visuals);
             }
-            match entry {
-                Entry::Media(id) => {
-                    if ui.button(tr("Save to assets")).on_hover_text(tr("Keeps a copy on this computer, for every project")).clicked() {
-                        let path = self.editor.pool_item(id).map(|m| m.decode_path.clone());
-                        if let Some(path) = path {
-                            let folder = self.bin.asset_folder.clone();
-                            match self.assets.add(&path, &folder) {
-                                Ok(_) => self.notify(tr("Saved to assets.")),
-                                Err(e) => self.report_error(e),
-                            }
-                        }
-                        ui.close();
-                    }
-                    self.folder_menu(ui, id);
-                    if !is_audio {
-                        self.proxy_menu(ui, id);
-                        self.scaling_menu(ui, id);
-                        if self.settings.advanced_color {
-                            self.color_menu(ui, id);
-                        }
-                    }
-                    if missing
-                        && ui.button(tr("Relink…")).clicked()
-                        && let Some(file) = rfd::FileDialog::new().add_filter(tr("Media"), crate::MEDIA_EXTENSIONS).pick_file()
-                    {
-                        self.relink(id, &file);
-                        ui.close();
-                    }
-                }
-                Entry::Compound(seq) => {
-                    let used = self.editor.doc.project().sequences.keys().any(|&s| s != seq && self.editor.doc.project().sequence_reaches(s, seq));
-                    if ui.add_enabled(!used, egui::Button::new(tr("Delete"))).on_disabled_hover_text(tr("A clip on the timeline uses it")).clicked() {
-                        if let Err(e) = self.editor.remove_compound(seq) {
-                            self.error = Some(e.to_string());
-                        }
-                        ui.close();
-                    }
-                }
-            }
-        });
+            x = if cuttable { cut.left() } else { plus.left() } - 10.0;
+        } else {
+            x -= 50.0;
+        }
+        let weak = visuals.weak_text_color();
+        let small = egui::FontId::proportional(crate::style::TEXT_S);
+        let used = match card.uses {
+            0 => tr("unused").to_string(),
+            n => trf("used {n}×", &[("n", &n.to_string())]),
+        };
+        let used_color = if card.uses == 0 { weak } else { crate::style::ACCENT };
+        let used_g = painter.layout_no_wrap(used, small.clone(), used_color);
+        painter.galley(egui::pos2(x - used_g.size().x, rect.center().y - used_g.size().y / 2.0), used_g.clone(), used_color);
+        x -= used_g.size().x + 12.0;
+        if card.kind != MediaKind::Still || card.compound {
+            let len = painter.layout_no_wrap(clock(card.length), egui::FontId::monospace(crate::style::TEXT_S), visuals.text_color());
+            painter.galley(egui::pos2(x - len.size().x, rect.center().y - len.size().y / 2.0), len.clone(), visuals.text_color());
+            x -= len.size().x + 12.0;
+        }
+        // Name over what it is.
+        let left = thumb.right() + 8.0;
+        let room = (x - left).max(20.0);
+        let line = |text: String, font: egui::FontId, color: egui::Color32| {
+            let mut job = egui::text::LayoutJob::simple_singleline(text, font, color);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+            painter.layout_job(job)
+        };
+        let name_color = if card.missing { crate::style::ERROR } else { visuals.text_color() };
+        let name = line(card.name.clone(), egui::FontId::proportional(crate::style::TEXT), name_color);
+        let name_h = name.size().y;
+        painter.galley(egui::pos2(left, rect.top() + 3.0), name, name_color);
+        let detail = if card.missing { tr("missing — relink it").to_string() } else { card.detail.clone() };
+        painter.galley(egui::pos2(left, rect.top() + 4.0 + name_h), line(detail, small, weak), weak);
+
+        let hit = if over_relink {
+            Hit::Relink
+        } else if over_cut && response.hovered() {
+            Hit::Cut
+        } else if over_plus && response.hovered() {
+            Hit::Plus
+        } else {
+            Hit::None
+        };
+        let tip = self.card_tip(&card);
+        let response = match hit {
+            Hit::Cut => response.on_hover_text(tr("Quick cut: pick the parts to add, with a preview")),
+            Hit::Plus => response.on_hover_text(tr("Add to the timeline")),
+            Hit::Relink => response.on_hover_text(tr("Point it at its file")),
+            _ => response.on_hover_text(tip),
+        };
+        self.card_clicks(ui, &response, &card, order, hit);
+        let entry = card.entry;
+        crate::widgets::context_menu(&response, |ui| self.card_menu(ui, entry, order));
     }
 
     /// A card dropped on the timeline at `at`, over `track` (if over one).
@@ -843,7 +1294,26 @@ impl App {
         };
         match self.editor.place_clip(&drop.name, kind, drop.length, at, track) {
             Ok(item) => {
-                self.selection = Some(item);
+                // The other cards dragged with it follow it, one after another.
+                let mut placed = vec![item];
+                let mut next = self.editor.item(item).map_or(at, |i| i.range.end());
+                let mut track = self.editor.sequence().find_item(item).map(|(t, _)| self.editor.sequence().tracks[t].id).or(track);
+                for more in &drop.rest {
+                    let kind = match more.entry {
+                        Entry::Media(media) => ItemKind::Media { media },
+                        Entry::Compound(sequence) => ItemKind::Nested { sequence },
+                    };
+                    match self.editor.place_clip(&more.name, kind, more.length, next, track) {
+                        Ok(id) => {
+                            next = self.editor.item(id).map_or(next, |i| i.range.end());
+                            track = self.editor.sequence().find_item(id).map(|(t, _)| self.editor.sequence().tracks[t].id).or(track);
+                            placed.push(id);
+                        }
+                        Err(e) => self.error = Some(e.to_string()),
+                    }
+                }
+                self.selected = placed.iter().copied().collect();
+                self.selection = placed.last().copied();
                 self.sync_selection();
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -880,6 +1350,296 @@ impl App {
         match added {
             Ok(item) => self.selection = Some(item),
             Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+}
+
+/// One smart filter chip: its icon, its name and how many pass it; lit when on, red when
+/// it's the Missing one and something is.
+fn filter_chip(ui: &mut egui::Ui, filter: BinFilter, count: usize, on: bool) -> egui::Response {
+    let v = ui.visuals().clone();
+    let warn = filter == BinFilter::Missing && count > 0;
+    let label = if filter == BinFilter::All { filter.label().to_string() } else { format!("{}  {count}", filter.label()) };
+    let galley = ui.painter().layout_no_wrap(label, egui::FontId::proportional(crate::style::TEXT_S + 0.5), egui::Color32::PLACEHOLDER);
+    let size = egui::vec2(galley.size().x + 14.0 + 4.0 + 16.0, 22.0);
+    let (rect, r) = ui.allocate_exact_size(size, egui::Sense::click());
+    let accent = if warn { crate::style::ERROR } else { crate::style::ACCENT };
+    let (fill, stroke, color) = if on {
+        (accent.gamma_multiply(0.22), egui::Stroke::new(1.0, accent), v.strong_text_color())
+    } else if r.hovered() {
+        (v.widgets.hovered.weak_bg_fill, egui::Stroke::new(1.0, v.widgets.hovered.bg_stroke.color), v.text_color())
+    } else {
+        (egui::Color32::TRANSPARENT, egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color), if warn { crate::style::ERROR } else { v.text_color() })
+    };
+    ui.painter().rect(rect, 11.0, fill, stroke, egui::StrokeKind::Inside);
+    let icon = egui::Rect::from_center_size(egui::pos2(rect.left() + 7.0 + 7.0, rect.center().y), egui::vec2(14.0, 14.0));
+    crate::icons::paint(ui.painter(), icon, filter.icon(), if on || warn { accent } else { v.weak_text_color() });
+    ui.painter().galley(egui::pos2(icon.right() + 4.0, rect.center().y - galley.size().y / 2.0), galley, color);
+    r.on_hover_text(filter.tip()).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+impl App {
+    /// The smart filter chips, each with how many pass it. Missing shows only when
+    /// something is.
+    fn bin_filters(&mut self, ui: &mut egui::Ui) {
+        let cards = self.tab_cards();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for f in BinFilter::ALL {
+                let count = cards.iter().filter(|c| f.keeps(c)).count();
+                if f == BinFilter::Missing && count == 0 && self.bin.filter != f {
+                    continue;
+                }
+                let on = self.bin.filter == f;
+                if filter_chip(ui, f, count, on).clicked() {
+                    // Clicking the one on goes back to everything.
+                    self.bin.filter = if on { BinFilter::All } else { f };
+                }
+            }
+        });
+    }
+
+    /// A click on a card: picks it alone, or with Ctrl adds or drops it, or with Shift
+    /// picks the run from the last one picked (`order`: the cards as shown).
+    fn pick_card(&mut self, entry: Entry, order: &[Entry], mods: egui::Modifiers) {
+        let b = &mut self.bin;
+        if mods.command {
+            match b.picked.iter().position(|e| *e == entry) {
+                Some(i) => {
+                    b.picked.remove(i);
+                }
+                None => b.picked.push(entry),
+            }
+            b.anchor = Some(entry);
+        } else if mods.shift
+            && let Some(from) = b.anchor.and_then(|a| order.iter().position(|e| *e == a))
+            && let Some(to) = order.iter().position(|e| *e == entry)
+        {
+            let (lo, hi) = (from.min(to), from.max(to));
+            b.picked = order[lo..=hi].to_vec();
+        } else if b.picked == [entry] {
+            // Clicked again: unpicked.
+            b.picked.clear();
+            b.anchor = None;
+        } else {
+            b.picked = vec![entry];
+            b.anchor = Some(entry);
+        }
+    }
+
+    /// What a card's action works on: every picked card (in the order shown) when it's
+    /// one of them, otherwise just it.
+    fn acting_on(&self, entry: Entry, order: &[Entry]) -> Vec<Entry> {
+        if self.bin.picked.len() > 1 && self.bin.picked.contains(&entry) {
+            order.iter().copied().filter(|e| self.bin.picked.contains(e)).collect()
+        } else {
+            vec![entry]
+        }
+    }
+
+    /// The length a card adds to the timeline with.
+    fn entry_length(&self, entry: Entry) -> Time {
+        match entry {
+            Entry::Media(id) => self.editor.pool_item(id).map_or(Time::from_seconds(5), |m| if m.kind == MediaKind::Still { self.still_length() } else { m.probe.duration }),
+            Entry::Compound(seq) => self.editor.doc.project().sequence(seq).map_or(Time::from_seconds(5), |s| s.duration()),
+        }
+    }
+
+    /// Adds cards to the timeline, one after another (missing files left out).
+    fn add_entries(&mut self, entries: &[Entry]) {
+        for &e in entries {
+            if let Entry::Media(id) = e
+                && self.editor.pool_item(id).is_none_or(|m| m.missing)
+            {
+                continue;
+            }
+            let length = self.entry_length(e);
+            self.add_bin_entry(e, length);
+        }
+    }
+
+    /// What a card dragged out carries: it, and every other picked card with it.
+    fn drag_payload(&self, entries: &[Entry]) -> Option<BinDrop> {
+        let mut drops: Vec<BinDrop> = entries
+            .iter()
+            .filter_map(|&e| {
+                let (name, audio, missing) = match e {
+                    Entry::Media(id) => {
+                        let m = self.editor.pool_item(id)?;
+                        (m.name.clone(), m.kind == MediaKind::Audio, m.missing)
+                    }
+                    Entry::Compound(seq) => (self.editor.doc.project().sequence(seq)?.name.clone(), false, false),
+                };
+                (!missing).then(|| BinDrop { entry: e, name, length: self.entry_length(e), audio, rest: Vec::new() })
+            })
+            .collect();
+        if drops.is_empty() {
+            return None;
+        }
+        let mut first = drops.remove(0);
+        first.rest = drops;
+        Some(first)
+    }
+
+    /// Takes files out of the project — with the clips that use them — as one undo step.
+    fn remove_entries(&mut self, entries: &[Entry]) {
+        let media: Vec<MediaId> = entries.iter().filter_map(|e| if let Entry::Media(id) = e { Some(*id) } else { None }).collect();
+        if media.is_empty() {
+            return;
+        }
+        let clips: usize = {
+            let (uses, _) = self.editor.media_uses();
+            media.iter().map(|m| uses.get(m).copied().unwrap_or(0)).sum()
+        };
+        match self.editor.remove_media(&media) {
+            Ok(()) => {
+                self.bin.picked.retain(|e| !entries.contains(e));
+                self.selected.retain(|id| self.editor.item(*id).is_some());
+                if self.selection.is_some_and(|id| self.editor.item(id).is_none()) {
+                    self.selection = None;
+                }
+                let what = if media.len() == 1 { tr("Removed it").to_string() } else { trf("Removed {n} files", &[("n", &media.len().to_string())]) };
+                let note = if clips > 0 { trf("{what} and the {n} clips using it. Ctrl+Z brings them back.", &[("what", &what), ("n", &clips.to_string())]) } else { trf("{what}. Ctrl+Z brings it back.", &[("what", &what)]) };
+                self.notify(note);
+            }
+            Err(e) => self.report_error(e.to_string()),
+        }
+    }
+
+    /// Relinks every missing file found by name in `dir` (and the folders in it).
+    pub(crate) fn relink_from_folder(&mut self, dir: &std::path::Path) {
+        let missing: Vec<(MediaId, String)> = self
+            .editor
+            .pool
+            .iter()
+            .filter(|m| m.missing)
+            .filter_map(|m| {
+                let path = self.editor.doc.project().media(m.id)?.path.clone();
+                let name = std::path::Path::new(&path).file_name()?.to_string_lossy().to_lowercase();
+                Some((m.id, name))
+            })
+            .collect();
+        let mut found = std::collections::HashMap::new();
+        let mut stack = vec![(dir.to_path_buf(), 0usize)];
+        let mut seen = 0usize;
+        while let Some((d, depth)) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            for e in entries.flatten() {
+                seen += 1;
+                if seen > 50_000 {
+                    break;
+                }
+                let p = e.path();
+                if p.is_dir() {
+                    if depth < 8 {
+                        stack.push((p, depth + 1));
+                    }
+                } else if let Some(n) = p.file_name().map(|n| n.to_string_lossy().to_lowercase()) {
+                    found.entry(n).or_insert(p);
+                }
+            }
+        }
+        let mut relinked = 0;
+        for (id, name) in missing.iter() {
+            if let Some(path) = found.get(name).cloned() {
+                self.relink(*id, &path);
+                relinked += 1;
+            }
+        }
+        let left = missing.len() - relinked;
+        // They're probed in the background; the cards update as each comes in.
+        if left == 0 {
+            self.notify(trf("Relinking {n} files…", &[("n", &relinked.to_string())]));
+        } else {
+            self.notify(trf("Relinking {n} files… {left} weren't found there.", &[("n", &relinked.to_string()), ("left", &left.to_string())]));
+        }
+    }
+
+    /// Asks for a file to relink `media` to.
+    fn ask_relink(&mut self, media: MediaId) {
+        if let Some(file) = rfd::FileDialog::new().add_filter(tr("Media"), crate::MEDIA_EXTENSIONS).pick_file() {
+            self.relink(media, &file);
+        }
+    }
+
+    /// A card's right-click menu: adding, assets, folders, scaling and color, relinking
+    /// and removing — for every picked card when it's one of them.
+    fn card_menu(&mut self, ui: &mut egui::Ui, entry: Entry, order: &[Entry]) {
+        let acting = self.acting_on(entry, order);
+        let many = acting.len() > 1;
+        if many {
+            ui.label(egui::RichText::new(trf("{n} picked", &[("n", &acting.len().to_string())])).small().weak());
+        }
+        let missing = matches!(entry, Entry::Media(id) if self.editor.pool_item(id).is_some_and(|m| m.missing));
+        if crate::icons::menu_item(ui, Some(crate::icons::ADD), if many { tr("Add them to the timeline") } else { tr("Add to timeline") }, "", !missing || many).clicked() {
+            self.add_entries(&acting);
+            ui.close();
+        }
+        if let Entry::Media(id) = entry
+            && !many
+            && self.editor.pool_item(id).is_some_and(|m| !m.missing && m.kind != MediaKind::Still)
+            && crate::icons::menu_item(ui, Some(crate::icons::SPLIT), tr("Quick cut…"), "", true).clicked()
+        {
+            self.open_quick_cut(id);
+            ui.close();
+        }
+        match entry {
+            Entry::Media(id) => {
+                if !many && ui.button(tr("Save to assets")).on_hover_text(tr("Keeps a copy on this computer, for every project")).clicked() {
+                    let path = self.editor.pool_item(id).map(|m| m.decode_path.clone());
+                    if let Some(path) = path {
+                        let folder = self.bin.asset_folder.clone();
+                        match self.assets.add(&path, &folder) {
+                            Ok(_) => self.notify(tr("Saved to assets.")),
+                            Err(e) => self.report_error(e),
+                        }
+                    }
+                    ui.close();
+                }
+                let media: Vec<MediaId> = acting.iter().filter_map(|e| if let Entry::Media(id) = e { Some(*id) } else { None }).collect();
+                self.folder_menu(ui, &media);
+                let is_audio = self.editor.pool_item(id).is_some_and(|m| m.kind == MediaKind::Audio);
+                if !is_audio && !many {
+                    self.scaling_menu(ui, id);
+                    if self.settings.advanced_color {
+                        self.color_menu(ui, id);
+                    }
+                }
+                ui.separator();
+                if crate::icons::menu_item(ui, Some(crate::icons::RELINK), tr("Relink…"), "", !many).on_hover_text(tr("Point it at its file (moved or renamed)")).clicked() {
+                    ui.close();
+                    self.ask_relink(id);
+                }
+                if self.editor.pool.iter().any(|m| m.missing)
+                    && crate::icons::menu_item(ui, Some(crate::icons::FOLDER_OPEN), tr("Find missing files in a folder…"), "", true).clicked()
+                {
+                    ui.close();
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        self.relink_from_folder(&dir);
+                    }
+                }
+                let (uses, _) = self.editor.media_uses();
+                let clips: usize = media.iter().map(|m| uses.get(m).copied().unwrap_or(0)).sum();
+                let label = match (many, clips) {
+                    (false, 0) => tr("Remove from project").to_string(),
+                    (false, n) => trf("Remove from project (and its {n} clips)", &[("n", &n.to_string())]),
+                    (true, 0) => trf("Remove {n} files from project", &[("n", &media.len().to_string())]),
+                    (true, n) => trf("Remove {0} files from project (and {n} clips)", &[("0", &media.len().to_string()), ("n", &n.to_string())]),
+                };
+                if crate::icons::menu_item(ui, Some(crate::icons::DELETE), &label, "", true).on_hover_text(tr("Takes it out of the bin (the file on disk stays). Ctrl+Z brings it back.")).clicked() {
+                    self.remove_entries(&acting);
+                    ui.close();
+                }
+            }
+            Entry::Compound(seq) => {
+                let used = self.editor.doc.project().sequences.keys().any(|&s| s != seq && self.editor.doc.project().sequence_reaches(s, seq));
+                if ui.add_enabled(!used, egui::Button::new(tr("Delete"))).on_disabled_hover_text(tr("A clip on the timeline uses it")).clicked() {
+                    if let Err(e) = self.editor.remove_compound(seq) {
+                        self.error = Some(e.to_string());
+                    }
+                    ui.close();
+                }
+            }
         }
     }
 }

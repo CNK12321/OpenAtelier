@@ -116,21 +116,19 @@ impl ClipPreviews {
         if !self.strips.contains_key(&media) && !self.strip_jobs.contains_key(&media) {
             let (tx, rx) = channel();
             let path = path.to_path_buf();
-            std::thread::spawn(move || make_strip(&path, size, duration, &tx));
+            // Two at a time: a bin full of new cards would start dozens of readers.
+            let ticket = crate::gate::previews().ticket();
+            std::thread::spawn(move || make_strip(&path, size, duration, &tx, ticket));
             self.strip_jobs.insert(media, rx);
         }
         // The strip arrives in stages (the first frame at once, the rest as they're
-        // found); each replaces the last.
+        // found); each replaces the last. Only the latest in is uploaded, into the
+        // texture already there.
+        let mut latest = None;
         while let Some(rx) = self.strip_jobs.get(&media) {
             match rx.try_recv() {
-                Ok(Some(px)) => {
-                    let texture = ctx.load_texture(format!("strip-{}", media.0), px.image, egui::TextureOptions::LINEAR);
-                    self.strips.insert(media, Slot::Ready(Strip { texture, frames: px.frames, duration: px.duration, aspect: px.aspect }));
-                }
+                Ok(Some(px)) => latest = Some(px),
                 Ok(None) | Err(TryRecvError::Disconnected) => {
-                    if !matches!(self.strips.get(&media), Some(Slot::Ready(_))) {
-                        self.strips.insert(media, Slot::Failed);
-                    }
                     self.strip_jobs.remove(&media);
                 }
                 Err(TryRecvError::Empty) => {
@@ -138,6 +136,18 @@ impl ClipPreviews {
                     break;
                 }
             }
+        }
+        if let Some(px) = latest {
+            if let Some(Slot::Ready(s)) = self.strips.get_mut(&media) {
+                s.texture.set(px.image, egui::TextureOptions::LINEAR);
+                (s.frames, s.duration, s.aspect) = (px.frames, px.duration, px.aspect);
+            } else {
+                let texture = ctx.load_texture(format!("strip-{}", media.0), px.image, egui::TextureOptions::LINEAR);
+                self.strips.insert(media, Slot::Ready(Strip { texture, frames: px.frames, duration: px.duration, aspect: px.aspect }));
+            }
+        }
+        if !self.strip_jobs.contains_key(&media) && !matches!(self.strips.get(&media), Some(Slot::Ready(_))) {
+            self.strips.insert(media, Slot::Failed);
         }
         match self.strips.get(&media) {
             Some(Slot::Ready(s)) => Some(s),
@@ -150,8 +160,20 @@ impl ClipPreviews {
         let slot = self.waves.entry(media).or_insert_with(|| {
             let (tx, rx) = channel();
             let path = path.to_path_buf();
+            let ticket = crate::gate::previews().ticket();
             std::thread::spawn(move || {
-                let _ = tx.send(make_peaks(&path).map(Arc::new));
+                // Read before: from the cache at once, without waiting in line.
+                let key = cache_key(&path, &format!("peaks {PEAKS_PER_SECOND}"));
+                if let Some(p) = key.as_deref().and_then(read_peaks) {
+                    let _ = tx.send(Some(Arc::new(p)));
+                    return;
+                }
+                let _pass = ticket.wait();
+                let peaks = make_peaks(&path);
+                if let (Some(k), Some(p)) = (&key, &peaks) {
+                    write_peaks(k, p);
+                }
+                let _ = tx.send(peaks.map(Arc::new));
             });
             Slot::Loading(rx)
         });
@@ -207,25 +229,175 @@ impl ClipPreviews {
 }
 
 fn ffmpeg(args: &[&str], input: &PathBuf, rest: &[&str]) -> Option<Vec<u8>> {
-    let out = oa_media::tool("ffmpeg").args(["-v", "error", "-nostdin"]).args(args).arg("-i").arg(input).args(rest).output().ok()?;
+    let out = oa_media::background_tool("ffmpeg").args(["-v", "error", "-nostdin"]).args(args).arg("-i").arg(input).args(rest).output().ok()?;
     out.status.success().then_some(out.stdout)
 }
 
 /// Frames fetched at once while making a strip.
 const STRIP_THREADS: usize = 4;
 
+/// Files up to this size have their filmstrip read in one pass over their keyframes;
+/// bigger ones (mostly long ones) seek to each frame, rather than read through it all.
+const ONE_PASS_BYTES: u64 = 2 << 30;
+
+/// Bump to throw away every cached filmstrip and waveform (their format changed).
+const CACHE_VERSION: u32 = 1;
+
+/// Where finished filmstrips and waveforms are kept: `<config>/cache/<kind>` (tests keep
+/// theirs in the temp folder).
+pub(crate) fn cache_dir(kind: &str) -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("oa-test-cache-{}", std::process::id())).join(kind);
+    }
+    crate::settings::config_dir().join("cache").join(kind)
+}
+
+/// A file's cache name for a preview: it changes with the file (its path, size and when
+/// it was last written) and with `extra` (what's made from it).
+pub(crate) fn cache_key(path: &Path, extra: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (path, meta.len(), modified, extra, CACHE_VERSION).hash(&mut h);
+    Some(format!("{:016x}", h.finish()))
+}
+
+/// Keeps the preview cache under 512 MB: once a session (on its first write), the oldest
+/// files go until it's under 384 MB.
+fn prune_cache() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(|| {
+            let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = ["strips", "peaks"]
+                .iter()
+                .flat_map(|k| std::fs::read_dir(cache_dir(k)).into_iter().flatten().flatten())
+                .filter_map(|e| {
+                    let m = e.metadata().ok()?;
+                    Some((m.modified().ok()?, m.len(), e.path()))
+                })
+                .collect();
+            let mut total: u64 = files.iter().map(|f| f.1).sum();
+            if total < 512 << 20 {
+                return;
+            }
+            files.sort();
+            for (_, len, path) in files {
+                if total < 384 << 20 {
+                    break;
+                }
+                if std::fs::remove_file(&path).is_ok() {
+                    total -= len;
+                }
+            }
+        });
+    });
+}
+
+/// A cached filmstrip, if there's one for `key` the size expected.
+fn read_strip(key: &str, size: [usize; 2]) -> Option<Vec<u8>> {
+    read_strip_in(&cache_dir("strips"), key, size)
+}
+
+fn read_strip_in(dir: &Path, key: &str, size: [usize; 2]) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(dir.join(format!("{key}.png"))).ok()?;
+    let mut reader = png::Decoder::new(std::io::BufReader::new(file)).read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let ok = info.color_type == png::ColorType::Rgba && [info.width as usize, info.height as usize] == size;
+    ok.then(|| buf[..size[0] * size[1] * 4].to_vec())
+}
+
+/// Keeps a finished filmstrip for next time (written aside, then moved into place).
+fn write_strip(key: &str, size: [usize; 2], rgba: &[u8]) {
+    if write_strip_in(&cache_dir("strips"), key, size, rgba) {
+        prune_cache();
+    }
+}
+
+/// Writes a filmstrip into `dir`; whether it was.
+fn write_strip_in(dir: &Path, key: &str, size: [usize; 2], rgba: &[u8]) -> bool {
+    let _ = std::fs::create_dir_all(dir);
+    let part = dir.join(format!("{key}.part"));
+    let written = (|| -> Option<()> {
+        let file = std::fs::File::create(&part).ok()?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), size[0] as u32, size[1] as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Fast);
+        enc.write_header().ok()?.write_image_data(rgba).ok()
+    })();
+    if written.is_some() && std::fs::rename(&part, dir.join(format!("{key}.png"))).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&part);
+    false
+}
+
+/// Cached waveform peaks: (low, high) pairs as little-endian floats.
+fn read_peaks(key: &str) -> Option<Vec<(f32, f32)>> {
+    let bytes = std::fs::read(cache_dir("peaks").join(format!("{key}.bin"))).ok()?;
+    (bytes.len() % 8 == 0).then(|| bytes.as_chunks::<8>().0.iter().map(|c| (f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]]))).collect())
+}
+
+fn write_peaks(key: &str, peaks: &[(f32, f32)]) {
+    let dir = cache_dir("peaks");
+    let _ = std::fs::create_dir_all(&dir);
+    let bytes: Vec<u8> = peaks.iter().flat_map(|(lo, hi)| lo.to_le_bytes().into_iter().chain(hi.to_le_bytes())).collect();
+    let part = dir.join(format!("{key}.part"));
+    if std::fs::write(&part, &bytes).is_ok() {
+        let _ = std::fs::rename(&part, dir.join(format!("{key}.bin")));
+        prune_cache();
+    }
+}
+
+/// The order a strip's frames are fetched in after the first: spread over the file and
+/// then filled in (every 8th, then every 4th, every 2nd, the rest), so skimming shows
+/// the whole file early and sharpens as it goes. Returns the levels, in order.
+pub fn coarse_to_fine(frames: usize) -> Vec<Vec<usize>> {
+    let mut done = vec![false; frames];
+    if frames > 0 {
+        done[0] = true;
+    }
+    let mut levels = Vec::new();
+    for step in [8, 4, 2, 1] {
+        let level: Vec<usize> = (0..frames).step_by(step).filter(|&i| !done[i]).collect();
+        for &i in &level {
+            done[i] = true;
+        }
+        if !level.is_empty() {
+            levels.push(level);
+        }
+    }
+    levels
+}
+
 /// Makes `path`'s filmstrip — one frame per second, 1 to 60, spread over the file — and
 /// sends it in stages: the first frame straight away (in every cell, so skimming shows
-/// something), then the whole strip. Each frame is its own quick seek, so a long or
-/// large file (hours, 4K, gigabytes) costs no more than a short one: nothing is decoded
-/// but the frames shown. Sends `None` if not even the first frame could be read.
-fn make_strip(path: &Path, size: [u32; 2], duration: f64, tx: &std::sync::mpsc::Sender<Option<StripPixels>>) {
+/// something), then the rest as they're read. A strip made before comes from the cache at
+/// once. Every frame is a keyframe (a thumbnail needn't be exact, and decoding to the
+/// exact frame cost up to a GOP per frame): most files are read in one ffmpeg pass that
+/// decodes only those ([`keyframes`]) — one process, not one per frame — and the rest
+/// (huge files, all-keyframe codecs) seek to each, coarse to fine. Everything runs below
+/// normal priority, so playback keeps the CPU. The first frame waits its turn with the
+/// other files' first frames (`ticket`); the rest wait again behind every first frame
+/// asked for meanwhile, so each card gets a picture before any fills in. Sends `None` if
+/// not even the first frame could be read.
+fn make_strip(path: &Path, size: [u32; 2], duration: f64, tx: &std::sync::mpsc::Sender<Option<StripPixels>>, ticket: crate::gate::Ticket<'static>) {
     let aspect = size[0].max(1) as f32 / size[1].max(1) as f32;
     let (w, h) = (FRAME_W as usize, ((FRAME_W as f32 / aspect / 2.0).round() as usize * 2).max(2));
     let frames = if duration <= 0.0 { 1 } else { (duration.ceil() as usize).clamp(1, 60) };
     let rows = frames.div_ceil(COLS);
     let (iw, ih) = (w * COLS, h * rows);
     let path = path.to_path_buf();
+    let send = |canvas: &[u8]| tx.send(Some(StripPixels { image: egui::ColorImage::from_rgba_unmultiplied([iw, ih], canvas), frames, duration: duration.max(1e-3), aspect }));
+    // Made before: straight from the cache, without waiting in line.
+    let key = cache_key(&path, &format!("strip {w}x{h} {frames} {duration:.3}"));
+    if let Some(cached) = key.as_deref().and_then(|k| read_strip(k, [iw, ih])) {
+        let _ = send(&cached);
+        return;
+    }
+    let pass = ticket.wait();
     let scale = format!("scale={w}:{h}");
     // One frame at `seconds` (in the middle of its share of the file), as RGBA.
     let frame_at = |i: usize| -> Option<Vec<u8>> {
@@ -234,7 +406,7 @@ fn make_strip(path: &Path, size: [u32; 2], duration: f64, tx: &std::sync::mpsc::
             return oa_media::svg::rasterize(&path, [w as u32, h as u32]).ok();
         }
         let seconds = if frames == 1 { 0.0 } else { (i as f64 + 0.5) * duration / frames as f64 };
-        let bytes = ffmpeg(&["-ss", &format!("{seconds:.3}")], &path, &["-frames:v", "1", "-vf", &scale, "-f", "rawvideo", "-pix_fmt", "rgba", "-"])?;
+        let bytes = ffmpeg(&["-threads", "1", "-noaccurate_seek", "-ss", &format!("{seconds:.3}")], &path, &["-an", "-sn", "-dn", "-frames:v", "1", "-vf", &scale, "-f", "rawvideo", "-pix_fmt", "rgba", "-"])?;
         (bytes.len() >= w * h * 4).then(|| bytes[..w * h * 4].to_vec())
     };
     let mut canvas = vec![0u8; iw * ih * 4];
@@ -245,7 +417,6 @@ fn make_strip(path: &Path, size: [u32; 2], duration: f64, tx: &std::sync::mpsc::
             canvas[at..at + w * 4].copy_from_slice(&px[y * w * 4..(y + 1) * w * 4]);
         }
     };
-    let send = |canvas: &[u8]| tx.send(Some(StripPixels { image: egui::ColorImage::from_rgba_unmultiplied([iw, ih], canvas), frames, duration: duration.max(1e-3), aspect }));
     let Some(first) = frame_at(0) else {
         let _ = tx.send(None);
         return;
@@ -253,23 +424,154 @@ fn make_strip(path: &Path, size: [u32; 2], duration: f64, tx: &std::sync::mpsc::
     for i in 0..frames {
         blit(&mut canvas, i, &first);
     }
-    if send(&canvas).is_err() || frames == 1 {
+    if send(&canvas).is_err() {
         return;
     }
-    // The rest, a few at a time; a frame that can't be read keeps the first one.
-    let rest: Vec<usize> = (1..frames).collect();
-    for batch in rest.chunks(STRIP_THREADS) {
-        let got: Vec<(usize, Option<Vec<u8>>)> = std::thread::scope(|s| {
-            let jobs: Vec<_> = batch.iter().map(|&i| (i, s.spawn(move || frame_at(i)))).collect();
-            jobs.into_iter().map(|(i, j)| (i, j.join().ok().flatten())).collect()
+    if frames == 1 {
+        if let Some(k) = &key {
+            write_strip(k, [iw, ih], &canvas);
+        }
+        return;
+    }
+    // The rest, behind every other file's first frame.
+    drop(pass);
+    let _pass = crate::gate::previews().ticket().wait();
+    let mut have = vec![false; frames];
+    have[0] = true;
+    // Until a cell has its own frame, it shows the nearest one before it that's in.
+    let shown = |canvas: &[u8], have: &[bool]| -> Vec<u8> {
+        let mut shown = canvas.to_vec();
+        let mut last = 0;
+        for (i, &got) in have.iter().enumerate() {
+            if got {
+                last = i;
+            } else {
+                let (c, r) = (last % COLS, last / COLS);
+                let px: Vec<u8> = (0..h).flat_map(|y| canvas[((r * h + y) * iw + c * w) * 4..((r * h + y) * iw + c * w + w) * 4].to_vec()).collect();
+                blit(&mut shown, i, &px);
+            }
+        }
+        shown
+    };
+    // A file of a sensible size: one pass over its keyframes, each cell taking the one
+    // nearest its middle. It gives up (leaving the rest to seeking) if they come too
+    // thick to be worth decoding — every frame a keyframe, as in ProRes.
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() <= ONE_PASS_BYTES) {
+        let slot = duration / frames as f64;
+        let middle = |i: usize| (i as f64 + 0.5) * slot;
+        // The first cell not settled yet, and the keyframe before the latest.
+        let mut next = 0;
+        let mut before: Option<(f64, Vec<u8>)> = None;
+        let (mut count, mut gone) = (0usize, false);
+        let mut sent = std::time::Instant::now();
+        let finished = keyframes(&path, w, h, |t, px| {
+            count += 1;
+            while next < frames && middle(next) < t {
+                let pick = match &before {
+                    Some((tb, pb)) if middle(next) - tb <= t - middle(next) => pb.as_slice(),
+                    _ => px,
+                };
+                blit(&mut canvas, next, pick);
+                have[next] = true;
+                next += 1;
+            }
+            before = Some((t, px.to_vec()));
+            if sent.elapsed() > std::time::Duration::from_millis(250) {
+                if send(&shown(&canvas, &have)).is_err() {
+                    gone = true;
+                    return false;
+                }
+                sent = std::time::Instant::now();
+            }
+            count <= 12 || count as f64 <= 3.0 * (t / slot + 1.0)
         });
-        for (i, px) in got {
-            if let Some(px) = px {
-                blit(&mut canvas, i, &px);
+        if gone {
+            return;
+        }
+        // To the end: the cells after the last keyframe take it.
+        if finished && let Some((_, pb)) = &before {
+            for (i, got) in have.iter_mut().enumerate().skip(next) {
+                blit(&mut canvas, i, pb);
+                *got = true;
             }
         }
     }
-    let _ = send(&canvas);
+    // What's left, coarse to fine, a few seeks at a time; a frame that can't be read keeps
+    // the one before it.
+    for level in coarse_to_fine(frames) {
+        let level: Vec<usize> = level.into_iter().filter(|&i| !have[i]).collect();
+        if level.is_empty() {
+            continue;
+        }
+        for batch in level.chunks(STRIP_THREADS) {
+            let got: Vec<(usize, Option<Vec<u8>>)> = std::thread::scope(|s| {
+                let jobs: Vec<_> = batch.iter().map(|&i| (i, s.spawn(move || frame_at(i)))).collect();
+                jobs.into_iter().map(|(i, j)| (i, j.join().ok().flatten())).collect()
+            });
+            for (i, px) in got {
+                if let Some(px) = px {
+                    blit(&mut canvas, i, &px);
+                    have[i] = true;
+                }
+            }
+        }
+        if send(&shown(&canvas, &have)).is_err() {
+            return;
+        }
+    }
+    if send(&shown(&canvas, &have)).is_err() {
+        return;
+    }
+    if let Some(k) = &key {
+        write_strip(k, [iw, ih], &canvas);
+    }
+}
+
+/// Reads every keyframe of `path`'s picture, scaled to `w`×`h`, in one pass that decodes
+/// nothing else, handing each (its time in seconds, RGBA) to `each` as it comes; `each`
+/// returns whether to go on. Whether it read to the end.
+fn keyframes(path: &Path, w: usize, h: usize, mut each: impl FnMut(f64, &[u8]) -> bool) -> bool {
+    use std::io::{BufRead, Read};
+    let Ok(mut child) = oa_media::background_tool("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-v", "info", "-threads", "2", "-skip_frame", "nokey", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-fps_mode", "passthrough", "-vf", &format!("scale={w}:{h},showinfo"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    // Each frame's time, from showinfo's report of it ("… pts_time:1.5 …").
+    let (tell, times) = channel::<f64>();
+    let stderr = child.stderr.take();
+    std::thread::spawn(move || {
+        let Some(stderr) = stderr else { return };
+        for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+            let t = line.split_once("pts_time:").and_then(|(_, rest)| rest.split_whitespace().next()?.parse::<f64>().ok());
+            if let Some(t) = t
+                && tell.send(t).is_err()
+            {
+                return;
+            }
+        }
+    });
+    let Some(mut stdout) = child.stdout.take() else { return false };
+    let mut px = vec![0u8; w * h * 4];
+    let mut stopped = false;
+    while stdout.read_exact(&mut px).is_ok() {
+        let Ok(t) = times.recv() else { break };
+        if !each(t, &px) {
+            stopped = true;
+            break;
+        }
+    }
+    if stopped {
+        let _ = child.kill();
+    }
+    let ok = child.wait().is_ok_and(|s| s.success());
+    ok && !stopped
 }
 
 /// `path`'s waveform: the lowest and highest sample of each 1/`PEAKS_PER_SECOND` s. The
@@ -279,7 +581,7 @@ fn make_peaks(path: &Path) -> Option<Vec<(f32, f32)>> {
     use std::io::Read;
     const RATE: f64 = 4000.0;
     let per = (RATE / PEAKS_PER_SECOND) as usize;
-    let mut child = oa_media::tool("ffmpeg")
+    let mut child = oa_media::background_tool("ffmpeg")
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
         .args(["-vn", "-ac", "1", "-ar", "4000", "-f", "f32le", "-"])
@@ -324,8 +626,10 @@ fn make_peaks(path: &Path) -> Option<Vec<(f32, f32)>> {
 mod tests {
     use super::*;
 
-    /// A strip comes in two stages — the first frame in every cell at once, then each
-    /// cell its own frame — and a file ffmpeg can't read says so rather than hanging.
+    /// A strip comes in stages — the first frame in every cell at once, then the rest
+    /// until each cell has its own frame — and comes from the cache the next time, at
+    /// once; a file ffmpeg can't read says so rather than hanging. Read in one pass over
+    /// the keyframes, or (every frame a keyframe) by seeking, the end is the same.
     #[test]
     fn strips_arrive_first_frame_first() {
         if !oa_media::tool("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success()) {
@@ -333,32 +637,73 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("oa-strip-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let clip = dir.join("counting.mp4");
-        // Five seconds whose brightness climbs second by second.
+        // Five seconds whose brightness climbs second by second: a keyframe a second, and
+        // every frame a keyframe.
+        for (name, gop) in [("counting.mp4", "10"), ("every.mp4", "1")] {
+            let clip = dir.join(name);
+            let made = oa_media::tool("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=160x90:r=10:d=5", "-vf", "geq=lum='20+T*40':cb=128:cr=128", "-c:v", "libx264", "-g", gop])
+                .arg(&clip)
+                .status()
+                .is_ok_and(|s| s.success());
+            if !made {
+                return;
+            }
+            let (tx, rx) = channel();
+            make_strip(&clip, [160, 90], 5.0, &tx, crate::gate::previews().ticket());
+            drop(tx);
+            let stages: Vec<StripPixels> = rx.iter().map(|s| s.expect("frames")).collect();
+            assert!(stages.len() >= 2, "{name}: the first frame, then the rest");
+            let brightness = |s: &StripPixels, i: usize| {
+                let (w, h) = (FRAME_W as usize, s.image.size[1]);
+                s.image.pixels[(h / 2) * s.image.size[0] + (i % COLS) * w + w / 2].r()
+            };
+            assert_eq!(stages[0].frames, 5);
+            assert!((1..5).all(|i| brightness(&stages[0], i) == brightness(&stages[0], 0)), "{name}: stage one, the first frame everywhere");
+            let last = stages.last().unwrap();
+            assert!((1..5).all(|i| brightness(last, i) > brightness(last, i - 1)), "{name}: in the end, each second its own frame");
+            // Again: from the cache, all at once.
+            let (tx, rx) = channel();
+            make_strip(&clip, [160, 90], 5.0, &tx, crate::gate::previews().ticket());
+            drop(tx);
+            let again: Vec<StripPixels> = rx.iter().map(|s| s.expect("frames")).collect();
+            assert_eq!(again.len(), 1, "{name}: one stage, the finished strip");
+            assert_eq!(again[0].image.pixels, last.image.pixels);
+        }
+
+        let (tx, rx) = channel();
+        make_strip(&dir.join("missing.mp4"), [160, 90], 5.0, &tx, crate::gate::previews().ticket());
+        assert!(rx.recv().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One pass hands over each keyframe once, in order, with its time.
+    #[test]
+    fn keyframes_come_in_order_with_their_times() {
+        if !oa_media::tool("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success()) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oa-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("keys.mp4");
         let made = oa_media::tool("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=160x90:r=10:d=5", "-vf", "geq=lum='20+T*40':cb=128:cr=128", "-c:v", "libx264", "-g", "10"])
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=gray:s=160x90:r=10:d=4", "-c:v", "libx264", "-g", "10", "-keyint_min", "10", "-sc_threshold", "0"])
             .arg(&clip)
             .status()
             .is_ok_and(|s| s.success());
         if !made {
             return;
         }
-        let (tx, rx) = channel();
-        make_strip(&clip, [160, 90], 5.0, &tx);
-        drop(tx);
-        let stages: Vec<StripPixels> = rx.iter().map(|s| s.expect("frames")).collect();
-        assert_eq!(stages.len(), 2);
-        let brightness = |s: &StripPixels, i: usize| {
-            let (w, h) = (FRAME_W as usize, s.image.size[1]);
-            s.image.pixels[(h / 2) * s.image.size[0] + (i % COLS) * w + w / 2].r()
-        };
-        assert_eq!(stages[0].frames, 5);
-        assert!((1..5).all(|i| brightness(&stages[0], i) == brightness(&stages[0], 0)), "stage one: the first frame everywhere");
-        assert!((1..5).all(|i| brightness(&stages[1], i) > brightness(&stages[1], i - 1)), "stage two: each second its own frame");
-
-        let (tx, rx) = channel();
-        make_strip(&dir.join("missing.mp4"), [160, 90], 5.0, &tx);
-        assert!(rx.recv().unwrap().is_none());
+        let mut times = Vec::new();
+        assert!(keyframes(&clip, 32, 18, |t, px| {
+            assert_eq!(px.len(), 32 * 18 * 4);
+            times.push(t);
+            true
+        }));
+        assert_eq!(times.len(), 4, "{times:?}");
+        assert!(times.iter().enumerate().all(|(i, t)| (t - i as f64).abs() < 0.05), "{times:?}");
+        // Stopped early: says so.
+        assert!(!keyframes(&clip, 32, 18, |_, _| false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -389,5 +734,48 @@ mod tests {
         assert!(loudest(200) > 0.9);
         assert!(make_peaks(&dir.join("missing.wav")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// After the first frame, the rest come spread over the file and then filled in,
+    /// each exactly once.
+    #[test]
+    fn strip_frames_come_coarse_to_fine() {
+        let levels = coarse_to_fine(20);
+        assert_eq!(levels[0], vec![8, 16], "every 8th first");
+        assert_eq!(levels[1], vec![4, 12], "then every 4th");
+        let mut all: Vec<usize> = levels.concat();
+        all.sort();
+        assert_eq!(all, (1..20).collect::<Vec<_>>(), "every frame but the first, once");
+        assert!(coarse_to_fine(1).is_empty());
+    }
+
+    /// A strip kept in the cache comes back as it was; one of another size doesn't.
+    #[test]
+    fn strips_come_back_from_the_cache() {
+        let dir = std::env::temp_dir().join(format!("oa-strip-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rgba: Vec<u8> = (0..4 * 3 * 4).map(|i| i as u8).collect();
+        assert!(write_strip_in(&dir, "k", [4, 3], &rgba));
+        assert_eq!(read_strip_in(&dir, "k", [4, 3]), Some(rgba));
+        assert_eq!(read_strip_in(&dir, "k", [3, 4]), None, "made for another size");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file's cache name changes when the file does.
+    #[test]
+    fn a_changed_file_gets_a_new_cache_name() {
+        let file = std::env::temp_dir().join(format!("oa-cache-key-{}.bin", std::process::id()));
+        std::fs::write(&file, b"one").unwrap();
+        let a = cache_key(&file, "strip").unwrap();
+        assert_eq!(cache_key(&file, "strip"), Some(a.clone()), "the same file, the same name");
+        assert_ne!(cache_key(&file, "peaks"), Some(a.clone()), "another kind of preview, another name");
+        std::fs::write(&file, b"longer now").unwrap();
+        assert_ne!(cache_key(&file, "strip"), Some(a), "written again: a new name");
+        let _ = std::fs::remove_file(&file);
     }
 }

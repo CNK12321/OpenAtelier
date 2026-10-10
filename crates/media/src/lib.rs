@@ -18,6 +18,7 @@ pub mod ffmpeg;
 mod fingerprint;
 pub mod import;
 mod probe;
+mod probe_cache;
 mod source;
 mod still;
 pub mod svg;
@@ -63,6 +64,34 @@ pub fn tool(program: &str) -> std::process::Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+/// A helper tool for background work (thumbnails, waveforms, proxies, conversions): like
+/// [`tool`], but below normal priority, so however many run they never take the CPU from
+/// playback or the editor.
+pub fn background_tool(program: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        let mut command = std::process::Command::new(program);
+        command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        // Through `nice` (which becomes the tool, so killing it kills the tool); without
+        // `nice`, at the usual priority.
+        static NICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NICE.get_or_init(|| std::process::Command::new("nice").args(["-n", "10", "true"]).output().is_ok_and(|o| o.status.success())) {
+            let mut command = std::process::Command::new("nice");
+            command.args(["-n", "10", program]);
+            command
+        } else {
+            tool(program)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

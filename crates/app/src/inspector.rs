@@ -54,18 +54,25 @@ pub(crate) fn set_compact(ui: &mut egui::Ui, on: bool) {
 /// A section heading with a one-line explanation (compact: a smaller heading, and the
 /// explanation shows on hover).
 pub(crate) fn section(ui: &mut egui::Ui, title: &str, hint: &str) {
-    if compact(ui) {
-        ui.add_space(3.0);
-        ui.separator();
-        let r = ui.label(egui::RichText::new(title).size(13.0).strong());
-        if !hint.is_empty() {
+    section_with(ui, title, hint, |_| {});
+}
+
+/// A section heading with controls at the right of it (a mode, a reset button), laid out
+/// right to left.
+pub(crate) fn section_with(ui: &mut egui::Ui, title: &str, hint: &str, right: impl FnOnce(&mut egui::Ui)) {
+    let compact = compact(ui);
+    ui.add_space(if compact { 3.0 } else { 8.0 });
+    ui.separator();
+    ui.horizontal(|ui| {
+        let r = ui.label(egui::RichText::new(title).size(if compact { 13.0 } else { 15.0 }).strong());
+        if compact && !hint.is_empty() {
             r.on_hover_text(hint);
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+    });
+    if compact {
         return;
     }
-    ui.add_space(8.0);
-    ui.separator();
-    ui.label(egui::RichText::new(title).size(15.0).strong());
     if !hint.is_empty() {
         ui.label(egui::RichText::new(hint).small().weak());
     }
@@ -304,7 +311,6 @@ impl App {
     /// then its transform.
     fn properties_tab(&mut self, ui: &mut egui::Ui, item: ItemId, visual: bool, t: Time) {
         let Some(it) = self.editor.item(item).cloned() else { return };
-        section(ui, tr("Length"), tr("How long the clip runs on the timeline: moves its end, frame by frame if you like. Not animated."));
         self.length_row(ui, item);
         // Footage plays at a speed; a title or a solid has nothing to speed up.
         if matches!(it.kind, ItemKind::Media { .. } | ItemKind::Nested { .. }) {
@@ -318,26 +324,25 @@ impl App {
         if visual {
             ui.separator();
             ui.horizontal(|ui| {
-                ui.strong("Transform");
+                ui.strong(tr("Transform"));
                 let scope = self.transform_scope();
-                ui.label(egui::RichText::new(match scope {
-                    transform::Scope::AllFormats => "all formats",
-                    transform::Scope::Variant(_) => "this format only",
-                }).small().weak());
-                if ui.small_button(tr("reset")).clicked() {
-                    match transform::reset_transform(self.editor.doc.project(), self.editor.seq, item, scope) {
-                        Ok(ops) => self.apply_or_report("Reset transform", ops),
-                        Err(e) => self.error = Some(e.to_string()),
+                // Reset, copy and paste, on the right.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let pastable = self.transform_clipboard.is_some();
+                    if crate::icons::button(ui, crate::icons::PASTE, tr("Paste the copied transform onto the selected clips"), "", pastable).clicked() {
+                        let targets = self.selected_clips();
+                        self.paste_transform(&targets);
                     }
-                }
-                if ui.small_button(tr("copy")).on_hover_text(tr("Copy this clip's transform (keyframes and per-format changes too)")).clicked() {
-                    self.copy_transform(item);
-                }
-                let pastable = self.transform_clipboard.is_some();
-                if ui.add_enabled(pastable, egui::Button::new(tr("paste")).small()).on_hover_text(tr("Paste the copied transform onto the selected clips")).clicked() {
-                    let targets = self.selected_clips();
-                    self.paste_transform(&targets);
-                }
+                    if crate::icons::button(ui, crate::icons::DUPLICATE, tr("Copy this clip's transform (keyframes and per-format changes too)"), "", true).clicked() {
+                        self.copy_transform(item);
+                    }
+                    if crate::icons::button(ui, crate::icons::RESET, tr("Reset the transform"), "", true).clicked() {
+                        match transform::reset_transform(self.editor.doc.project(), self.editor.seq, item, scope) {
+                            Ok(ops) => self.apply_or_report("Reset transform", ops),
+                            Err(e) => self.error = Some(e.to_string()),
+                        }
+                    }
+                });
             });
             let canvas = self.editor.sequence().variants[self.variant.min(self.editor.sequence().variants.len() - 1)].size;
             if let Ok(p) = transform::placement_of(self.editor.doc.project(), self.editor.seq, self.variant_id(), item, t) {
@@ -548,34 +553,52 @@ impl App {
         }
         self.seal_on_release(&r);
 
-        // Font family, with bold and italic.
+        // Style, alignment and wrapping, as icon strips; then the font, in the rest of the
+        // row (searchable, each name drawn in its own font, starred and recent ones first).
+        ui.add_space(2.0);
         let family = value(self, schema::TEXT_FONT).and_then(|v| v.as_text().map(str::to_string)).unwrap_or_default();
-        let mut chosen = family.clone();
+        let width = value(self, schema::TEXT_WRAP).and_then(|v| v.as_float()).unwrap_or(0.0);
+        let wrap = width > 0.0;
         ui.horizontal(|ui| {
-            // Searchable, with each name drawn in its own font.
-            if let Some(f) = self.font_menu(ui, egui::Id::new(("font", item.0)), &family) {
-                chosen = f;
+            let bold = matches!(value(self, schema::TEXT_BOLD), Some(Value::Bool(true)));
+            let italic = matches!(value(self, schema::TEXT_ITALIC), Some(Value::Bool(true)));
+            let style = [(crate::icons::BOLD, "Bold", bold), (crate::icons::ITALIC, "Italic", italic)];
+            if let Some(i) = crate::widgets::segmented(ui, egui::Id::new(("text-style", item.0)), &style) {
+                let (param, on) = if i == 0 { (schema::TEXT_BOLD, bold) } else { (schema::TEXT_ITALIC, italic) };
+                self.editor.set_value_at(item, target.clone(), param, Value::Bool(!on), t, param);
+                self.editor.doc.seal();
             }
-            for (param, label, tip) in [(schema::TEXT_BOLD, "B", "Bold"), (schema::TEXT_ITALIC, "I", "Italic")] {
-                let on = matches!(value(self, param), Some(Value::Bool(true)));
-                let text = if param == schema::TEXT_BOLD { egui::RichText::new(tr(label)).strong() } else { egui::RichText::new(tr(label)).italics() };
-                if ui.selectable_label(on, text).on_hover_text(tr(tip)).clicked() {
-                    self.editor.set_value_at(item, target.clone(), param, Value::Bool(!on), t, param);
-                    self.editor.doc.seal();
-                }
-            }
+            ui.add_space(crate::style::GAP);
             let align = value(self, schema::TEXT_ALIGN).and_then(|v| v.as_enum().map(str::to_string)).unwrap_or_else(|| "center".into());
-            for (option, label) in [("left", "Left"), ("center", "Center"), ("right", "Right")] {
-                if ui.selectable_label(align == option, tr(label)).clicked() && align != option {
-                    self.editor.set_value_at(item, target.clone(), schema::TEXT_ALIGN, Value::Enum(option.into()), t, "text-align");
-                    self.editor.doc.seal();
-                }
+            let options = ["left", "center", "right"];
+            let aligns = [
+                (crate::icons::ALIGN_LEFT, "Align left", align == "left"),
+                (crate::icons::ALIGN_CENTER, "Center", align == "center"),
+                (crate::icons::ALIGN_RIGHT, "Align right", align == "right"),
+            ];
+            if let Some(i) = crate::widgets::segmented(ui, egui::Id::new(("text-align", item.0)), &aligns)
+                && align != options[i]
+            {
+                self.editor.set_value_at(item, target.clone(), schema::TEXT_ALIGN, Value::Enum(options[i].into()), t, "text-align");
+                self.editor.doc.seal();
+            }
+            ui.add_space(crate::style::GAP);
+            // Wrapping: off, the lines are as long as they're typed; on, they wrap to a
+            // box (starting at 60% of the frame's width) whose width is set below.
+            let wraps = [(crate::icons::WRAP, "Wrap in a box: lines break between words to stay inside a box of the width you set", wrap)];
+            if crate::widgets::segmented(ui, egui::Id::new(("text-wrap", item.0)), &wraps).is_some() {
+                let canvas = self.editor.sequence().variants[self.variant.min(self.editor.sequence().variants.len() - 1)].size;
+                let to = if wrap { 0.0 } else { (canvas.width as f64 * 0.6).round() };
+                self.editor.set_value_at(item, target.clone(), schema::TEXT_WRAP, Value::Float(to), t, "text-wrap");
+                self.editor.doc.seal();
+            }
+            ui.add_space(crate::style::GAP);
+            if let Some(f) = self.font_menu(ui, egui::Id::new(("font", item.0)), &family) {
+                self.editor.set_value_at(item, target.clone(), schema::TEXT_FONT, Value::Text(f), t, "text-font");
+                self.editor.doc.seal();
             }
         });
-        if chosen != family {
-            self.editor.set_value_at(item, target.clone(), schema::TEXT_FONT, Value::Text(chosen), t, "text-font");
-            self.editor.doc.seal();
-        }
+        ui.add_space(4.0);
         for id in [
             schema::TEXT_SIZE,
             schema::TEXT_COLOR,
@@ -588,6 +611,10 @@ impl App {
             if id == schema::TEXT_OUTLINE_COLOR && value(self, schema::TEXT_OUTLINE).and_then(|v| v.as_float()).unwrap_or(0.0) <= 0.0 {
                 continue;
             }
+            self.param_widget(ui, item, &target, s, t, "text");
+        }
+        // Wrapping on: the box's width (keyframable).
+        if wrap && let Some(s) = schema::text().iter().find(|s| s.id.as_str() == schema::TEXT_WRAP) {
             self.param_widget(ui, item, &target, s, t, "text");
         }
     }
@@ -1351,71 +1378,92 @@ impl App {
         }
     }
 
-    /// The clip's length (not keyframable): where its end is, to the frame. The end moves
-    /// like a tail trim — it stops at the end of the file and at the next clip. With
-    /// several clips selected, a length typed or dragged is every one's length; ±1 frame
-    /// and "To the end" work on each clip for itself.
+    /// The clip's length (not keyframable): where its end is, to the frame, in seconds or
+    /// in frames (the heading switches; remembered). The end moves like a tail trim — it
+    /// stops at the end of the file and at the next clip. Reset makes it as long as it
+    /// starts out: footage as long as its file allows (or up to the next clip), a title or
+    /// a solid the length new ones get. With several clips selected, a length typed or
+    /// dragged is every one's length; reset works on each clip for itself.
     fn length_row(&mut self, ui: &mut egui::Ui, item: ItemId) {
         enum Change {
             Set(Time),
-            By(Time),
-            ToEnd,
+            Reset,
         }
         let Some(it) = self.editor.item(item) else { return };
         let (start, old) = (it.range.start, it.range.duration);
         let rate = self.editor.sequence().rate;
-        let frame = rate.frame_start(1);
         let limit = oa_edit::timeline::media_limits(self.editor.doc.project(), it).1.map(|end| end - start);
-        let mut seconds = old.as_seconds_f64();
         let (mut wanted, mut dragging) = (None, false);
+        let mut in_frames = self.settings.length_in_frames;
+        section_with(ui, tr("Length"), tr("How long the clip runs on the timeline: moves its end, frame by frame if you like. Not animated."), |ui| {
+            if crate::icons::button(ui, crate::icons::RESET, tr("Reset the length: footage as long as its file allows (or up to the next clip), anything else the length a new one gets"), "", true).clicked() {
+                wanted = Some(Change::Reset);
+            }
+            ui.add_space(crate::style::GAP_S);
+            // Right to left: Frames, then Seconds before it.
+            for (frames, label) in [(true, tr("Frames")), (false, tr("Seconds"))] {
+                if crate::widgets::chip(ui, in_frames == frames, label).clicked() {
+                    in_frames = frames;
+                }
+            }
+        });
+        if in_frames != self.settings.length_in_frames {
+            self.settings.length_in_frames = in_frames;
+            self.settings.save();
+        }
         ui.horizontal(|ui| {
             ui.add_space(24.0);
-            let r = ui
-                .add(egui::DragValue::new(&mut seconds).speed(1.0 / rate.as_f64().max(1.0)).range(0.0..=86_400.0).max_decimals(3).suffix(" s"))
-                .on_hover_text(tr("Seconds; the end snaps to a frame. Drag, or type a length."));
-            if r.changed() {
-                wanted = Some(Change::Set(Time::from_seconds_f64(seconds)));
-            }
+            let r = if in_frames {
+                let mut frames = rate.frame_at(old);
+                let r = ui.add(egui::DragValue::new(&mut frames).speed(0.25).range(0..=i64::MAX).suffix(tr(" frames"))).on_hover_text(tr("Frames. Drag, or type a length."));
+                if r.changed() {
+                    wanted = Some(Change::Set(rate.frame_start(frames)));
+                }
+                r
+            } else {
+                let mut seconds = old.as_seconds_f64();
+                let r = ui
+                    .add(egui::DragValue::new(&mut seconds).speed(1.0 / rate.as_f64().max(1.0)).range(0.0..=86_400.0).max_decimals(3).suffix(" s"))
+                    .on_hover_text(tr("Seconds; the end snaps to a frame. Drag, or type a length."));
+                if r.changed() {
+                    wanted = Some(Change::Set(Time::from_seconds_f64(seconds)));
+                }
+                r
+            };
             dragging = r.dragged();
             if r.drag_stopped() || r.lost_focus() {
                 self.editor.doc.seal();
             }
-            if ui.small_button(tr("−1 frame")).on_hover_text(tr("One frame shorter")).clicked() {
-                wanted = Some(Change::By(Time::ZERO - frame));
-            }
-            if ui.small_button(tr("+1 frame")).on_hover_text(tr("One frame longer")).clicked() {
-                wanted = Some(Change::By(frame));
-            }
-            if limit.is_some() && ui.add_enabled(limit.is_some_and(|max| max > old) || !self.editor.linked.is_empty(), egui::Button::new(tr("To the end")).small()).on_hover_text(tr("As long as the file allows (or up to the next clip)")).clicked() {
-                wanted = Some(Change::ToEnd);
-            }
         });
         ui.horizontal(|ui| {
             ui.add_space(24.0);
-            let frames = rate.frame_at(old);
-            let text = match limit {
-                Some(max) => format!("{frames} frames · the file allows up to {:.3} s", max.as_seconds_f64()),
-                None => format!("{frames} frames"),
+            // The other measure, and how long the file lets it be.
+            let text = match (in_frames, limit) {
+                (false, Some(max)) => trf("{frames} frames · the file allows up to {max} s", &[("frames", &rate.frame_at(old).to_string()), ("max", &format!("{:.3}", max.as_seconds_f64()))]),
+                (false, None) => trf("{frames} frames", &[("frames", &rate.frame_at(old).to_string())]),
+                (true, Some(max)) => trf("{s} s · the file allows up to {max} frames", &[("s", &format!("{:.3}", old.as_seconds_f64())), ("max", &rate.frame_at(max).to_string())]),
+                (true, None) => format!("{:.3} s", old.as_seconds_f64()),
             };
             ui.label(egui::RichText::new(text).small().weak());
         });
         let Some(wanted) = wanted else { return };
-        let (ops, short) = self.editor.length_ops(item, &wanted_length(wanted));
-        if short > 0 && !dragging {
+        // Each clip's new length (`None`: as far as it goes): reset works out each one's
+        // own — footage to its file's end, anything else the length a new one gets.
+        let (project, still) = (self.editor.doc.snapshot(), self.still_length());
+        let length = |clip: &oa_doc::Item| match wanted {
+            Change::Set(t) => Some(t),
+            Change::Reset if oa_edit::timeline::media_limits(&project, clip).1.is_some() => None,
+            Change::Reset => Some(still),
+        };
+        let reset = matches!(wanted, Change::Reset);
+        let (ops, short) = self.editor.length_ops(item, &length);
+        if short > 0 && !dragging && !reset {
             self.notify(trf("{short} of the clips couldn't be that long: the file ends, or the next clip is in the way.", &[("short", &short.to_string())]));
         }
-        if !ops.is_empty()
-            && let Err(e) = self.editor.apply_drag("Clip length", "clip-length", ops)
-        {
-            self.error = Some(e.to_string());
-        }
-
-        /// Each clip's new length, from the change asked for (`None`: as far as it goes).
-        fn wanted_length(change: Change) -> impl Fn(Time) -> Option<Time> {
-            move |old| match change {
-                Change::Set(t) => Some(t),
-                Change::By(d) => Some(old + d),
-                Change::ToEnd => None,
+        if !ops.is_empty() {
+            let applied = if reset { self.editor.apply(tr("Reset length"), ops) } else { self.editor.apply_drag("Clip length", "clip-length", ops) };
+            if let Err(e) = applied {
+                self.error = Some(e.to_string());
             }
         }
     }
@@ -1797,6 +1845,31 @@ impl App {
         match chosen.as_str() {
             "blur" => {
                 ui.label(egui::RichText::new(tr("The clips on screen, enlarged to fill the frame and blurred.")).small().weak());
+                // Made of everything, or of one layer (a track) — by its id.
+                let layers: Vec<(String, String)> = self
+                    .editor
+                    .sequence()
+                    .tracks
+                    .iter()
+                    .filter(|tr| tr.kind == oa_doc::TrackKind::Video && !tr.effects)
+                    .map(|tr| (tr.id.0.to_string(), tr.name.clone()))
+                    .collect();
+                let current = bg.get(schema::BG_SOURCE).and_then(|v| v.as_text()).unwrap_or_default().to_string();
+                let shown = layers.iter().find(|l| l.0 == current).map_or_else(|| tr("All content").to_string(), |l| l.1.clone());
+                let mut picked = current.clone();
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("background-source").selected_text(shown).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut picked, String::new(), tr("All content"));
+                        for (id, name) in &layers {
+                            ui.selectable_value(&mut picked, id.clone(), name);
+                        }
+                    });
+                    ui.label(tr("blur from")).on_hover_text(tr("What the backdrop is made of: everything on screen, or one layer (if it has nothing at that moment, everything)"));
+                });
+                if picked != current {
+                    self.editor.set_sequence_value(schema::BG_SOURCE, Value::Text(picked), t, "background-source");
+                    self.editor.doc.seal();
+                }
                 slider(self, ui, schema::BG_BLUR, "blur", 0.0..=300.0, 1.0, " px");
                 slider(self, ui, schema::BG_DIM, "darken", 0.0..=100.0, 100.0, " %");
             }

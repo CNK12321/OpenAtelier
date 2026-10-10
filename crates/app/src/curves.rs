@@ -40,10 +40,10 @@ impl CurveEditor {
 }
 
 /// Bezier handles: leaving x, y, arriving x, y (segment-normalized).
-type Handles4 = (f64, f64, f64, f64);
+pub(crate) type Handles4 = (f64, f64, f64, f64);
 
 /// Easing presets for the segment after a key (`None`: hold).
-const PRESETS: [(&str, Option<Handles4>); 6] = [
+pub(crate) const PRESETS: [(&str, Option<Handles4>); 6] = [
     ("Hold", None),
     ("Linear", Some((0.0, 0.0, 1.0, 1.0))),
     ("Ease in", Some((0.42, 0.0, 1.0, 1.0))),
@@ -52,7 +52,7 @@ const PRESETS: [(&str, Option<Handles4>); 6] = [
     ("Overshoot", Some((0.34, 0.0, 0.3, 1.35))),
 ];
 
-fn preset_interp(p: Option<Handles4>) -> Interp {
+pub(crate) fn preset_interp(p: Option<Handles4>) -> Interp {
     match p {
         None => Interp::Hold,
         Some((0.0, 0.0, 1.0, 1.0)) => Interp::Linear,

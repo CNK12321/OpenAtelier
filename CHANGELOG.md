@@ -4,6 +4,116 @@ Each release's section becomes its description on GitHub, and the app's update d
 lists its points. Name a section after the version as it's tagged (`0.1-beta.6`, the
 tag without its `v`) before tagging; until then it's **Unreleased**.
 
+## 0.1-beta.8 — Beta 8
+
+### New
+- **A new Projects page:**
+  - **Folders on the left**, like a file explorer: Recent, your own folders (+ New
+    folder; drag cards onto one to move them in; right-click to rename or remove),
+    Archived and Trash. They're real folders in the projects folder, so they travel
+    with it.
+  - **Every project in the projects folder** is listed, not just recently opened ones.
+  - **Search, sort** (last edited, name, date created) and **a list view**.
+  - **A ⋮ menu on each project** (and right-click): rename (its folder and file too),
+    duplicate, show in folder, move to a folder, archive, move to trash; in the trash,
+    restore or delete for good (and Empty trash), after asking.
+  - **Livelier cards:** they tip toward the pointer and their edge glows; vertical
+    projects sit on a blurred copy of their picture instead of black bars; projects
+    without a picture get their own color and initial; "Edited 2 h ago".
+  - **New project and Open or import** (one button for projects and media alike),
+    centered at the top.
+  - **Unsaved work shows on its project's card**, with Recover right there.
+- **A better media bin:**
+  - **Search** with Material icons and **smart filters** (Video, Audio, Pictures, Unused,
+    and Missing when there are any), each with how many pass it.
+  - **A list view** with details: what each file is, its length, and whether it's used.
+  - **Pick several** files (Ctrl-click, Shift-click a run, Ctrl+A) to add, drag onto the
+    timeline, move to a folder or remove together.
+  - **Remove from project** (with the clips that use a file; Ctrl+Z brings it all
+    back), from the right-click menu or with Delete.
+  - **Missing files** get a red badge and a Relink button, and **Find missing files in a
+    folder** relinks them all by name.
+  - **Folders** show a mosaic of what's in them, and skim through it under the pointer.
+- **Quick cut:** the ＋ with scissors on a video or sound file opens it with a preview. Play
+  it, drag on its strip (or press I and O) to keep the parts you want, and add them to
+  the timeline one after another.
+- **Text wraps to a box:** turn on wrapping (the wrap icon) in a title's Text section and
+  its lines break between words to fit the width you set (keyframable; a word too long for
+  the box is split). Alignment works within the box.
+- **Favorite and recent fonts:** star a font in the font menu to keep it at the top;
+  the fonts you used lately come next.
+- **Hue Anchor** (Color): pick an anchor color; every hue's distance from its hue is
+  scaled. Above 1 the hues spread out and repeat round the wheel; below 1 they gather
+  toward the anchor; at 0 everything takes its hue. Keyframable, and an intro/outro.
+- **Invert can flip brightness, hue and saturation** too (new choices beside red, green,
+  blue…): light and dark turned over with the colors kept, each color turned to its
+  opposite with the light kept, or vivid and muted swapped.
+- **Blurred content from one layer:** the background's "blur from" picks a layer to make
+  the backdrop of, instead of everything on screen.
+
+### Faster
+- **Importing many files at once** no longer bogs the editor down: files are probed and
+  converted a few at a time (as many as the computer has cores for, up to four) in the
+  order they were added, filmstrips and waveforms are read two at a time, and a whole
+  batch is one undo step ("Import media").
+- **Thumbnails load much faster:** a file's skimming frames are read in one pass that
+  decodes only its keyframes (one ffmpeg run per file, not one per frame); every card
+  gets its first picture before any fills in; and finished filmstrips and waveforms are
+  kept on disk — reopening a project shows them at once.
+- **Projects open much faster:** their files are read in several at once, each file's
+  probe (and whether it plays directly) is kept on disk so an unchanged file isn't probed
+  again, and the first probe of a long video is quicker. The loading screen counts the
+  files as they come in.
+- **Playback stays smooth while media loads:** thumbnails, waveforms, probing, proxies
+  and conversions run below normal priority (proxies on half the cores at most), so
+  they no longer take the CPU from the preview.
+
+### Changed
+- **Keys stretch with a new speed:** speeding a clip up or slowing it down (ramps too)
+  stretches its animation to match, so it stays with the footage. Trimming either end
+  leaves the keys where they are, and cutting a clip leaves the curve exactly where it
+  was on both halves.
+- **Starting keyframes away from a clip's start** also puts a key at its start, holding
+  the value shown there, so a change at the playhead animates from how the clip begins.
+- **A neater Text section:** bold/italic, alignment and wrapping as icon buttons, with
+  the font menu beside them.
+- **A tidier top bar**, in three parts:
+  - **Left:** the menus, now plain until you point at them (moving across them while
+    one is open opens the next) and folded into one ☰ menu when the window is narrow,
+    then undo and redo.
+  - **Middle:** the project's name (click to rename it; it undoes), whether it's saved
+    ("Saved 2 min ago", "Edited", "Saving…", or "Not saved" when it won't save itself)
+    and the format, which now says what it is ("Landscape 16:9 · 1080p · 30 fps"); "all
+    formats" moved into its menu.
+  - **Right:** Export, the one button in the accent color, and Home.
+  - It's a little taller, with a hairline under it, and the menu text is all translated.
+- **Transform's reset, copy and paste are icon buttons**, and its "all formats" / "this
+  format only" note is gone (the format menu has the switch).
+- **Length in seconds or frames:** the Length section's heading switches between them
+  (remembered), and a reset button there puts the length back (footage as long as its
+  file allows, titles and solids the default length). The ±1 frame and "To the end"
+  buttons are gone.
+- **The layout follows the format:** a tall format gets the vertical layout and a wide
+  one the standard, with no button to press. Settings can still pin one.
+- **Proxies work out of sight:** heavy footage still gets a small copy the viewer plays
+  (exports always use the original), but there's nothing to see or set about them — no
+  tags in the bin, menu entries or settings.
+
+### Fixed
+- **The workspace waits while a project opens:** the timeline, bin, properties, menus,
+  shortcuts and file drops are off until it's in (they used to edit the project being
+  left), and playback stops.
+- **Blurred content with a turned or moved clip** no longer leaves empty corners: the
+  backdrop is enlarged by what's surely inside both the clip's picture and the frame.
+- **Relinking a missing file that's on the timeline** works (it was refused with "media
+  in use"), runs in the background, and projects that find moved files on opening now
+  point at their new place.
+- **Bin cards dropped on the viewer** go in at the playhead.
+- **Picking in the bin** happens on release, so dragging a card doesn't pick it, and
+  clicking the only picked card again unpicks it.
+- **Dropping a bin card on a track's header** no longer cancels the drop: the clip lands
+  on that track, against the header (at the left of what's in view).
+
 ## 0.1-beta.7 — Beta 7
 
 ### New

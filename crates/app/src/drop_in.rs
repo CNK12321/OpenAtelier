@@ -14,8 +14,10 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// One thing dropped.
+/// One thing dropped. (Only Windows' own drop handling hands over data and addresses;
+/// elsewhere egui's drops are files.)
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum Dropped {
     File(PathBuf),
     /// A file with no place on disk (a picture dragged out of a browser).

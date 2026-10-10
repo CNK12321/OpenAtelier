@@ -166,8 +166,6 @@ impl FrameIndex {
 struct Probe {
     #[serde(default)]
     streams: Vec<Stream>,
-    #[serde(default)]
-    packets: Vec<Packet>,
     format: Option<Format>,
 }
 
@@ -199,10 +197,15 @@ struct SideData {
     rotation: Option<f64>,
 }
 
-#[derive(Deserialize)]
-struct Packet {
-    pts: Option<i64>,
-    flags: Option<String>,
+/// Packets from ffprobe's CSV ("pts,flags" a line; "N/A" for a packet without a time):
+/// (pts, keyframe) for each one with a time.
+fn packets(csv: &str) -> Vec<(i64, bool)> {
+    csv.lines()
+        .filter_map(|line| {
+            let (pts, flags) = line.trim().split_once(',').unwrap_or((line.trim(), ""));
+            Some((pts.parse::<i64>().ok()?, flags.starts_with('K')))
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -220,8 +223,10 @@ fn ratio(s: &str) -> Option<(i64, i64)> {
     (b != 0 && a != 0).then_some((a, b))
 }
 
+/// Runs ffprobe below normal priority: probing (the packet scan above all) runs while you
+/// edit and play.
 fn run(args: &[&str], path: &Path) -> Result<Probe, MediaError> {
-    let out = crate::tool("ffprobe")
+    let out = crate::background_tool("ffprobe")
         .args(["-v", "error", "-of", "json"])
         .args(args)
         .arg(path)
@@ -233,10 +238,24 @@ fn run(args: &[&str], path: &Path) -> Result<Probe, MediaError> {
     serde_json::from_slice(&out.stdout).map_err(|e| MediaError::Probe(format!("unexpected ffprobe output: {e}")))
 }
 
+/// What `path` holds. Kept on disk once made (`probe_cache`): the same file, unchanged,
+/// isn't probed again — reopening a project with hundreds of files reads them back.
 pub fn probe(path: &Path) -> Result<MediaProbe, MediaError> {
     if crate::svg::is_svg(path) {
         return crate::svg::probe(path);
     }
+    let key = crate::probe_cache::key(path);
+    if let Some(kept) = key.as_deref().and_then(crate::probe_cache::read) {
+        return Ok(kept);
+    }
+    let probe = probe_file(path)?;
+    if let Some(k) = &key {
+        crate::probe_cache::write(k, &probe);
+    }
+    Ok(probe)
+}
+
+fn probe_file(path: &Path) -> Result<MediaProbe, MediaError> {
     let all = run(
         &[
             "-show_entries",
@@ -280,12 +299,17 @@ fn video_track(path: &Path, s: Stream) -> Result<VideoTrack, MediaError> {
     let index = if still {
         FrameIndex { time_base, pts: vec![0], keyframes: vec![0] }
     } else {
-        let scanned = run(&["-select_streams", "v:0", "-show_entries", "packet=pts,flags"], path)?;
-        let mut frames: Vec<(i64, bool)> = scanned
-            .packets
-            .iter()
-            .filter_map(|p| Some((p.pts?, p.flags.as_deref().is_some_and(|f| f.starts_with('K')))))
-            .collect();
+        // A line per packet ("pts,flags"): JSON took ffprobe (and us) several times as
+        // long for a file with hundreds of thousands of packets.
+        let out = crate::background_tool("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts,flags", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .map_err(|e| MediaError::Probe(format!("could not run ffprobe: {e}")))?;
+        if !out.status.success() {
+            return Err(MediaError::Probe(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+        }
+        let mut frames: Vec<(i64, bool)> = packets(&String::from_utf8_lossy(&out.stdout));
         frames.sort_by_key(|f| f.0);
         frames.dedup_by_key(|f| f.0);
         if frames.is_empty() {

@@ -393,36 +393,6 @@ impl App {
         }
     }
 
-    /// Menu entries for `media`'s proxy: make one (or again), or remove it.
-    pub(crate) fn proxy_menu(&mut self, ui: &mut eframe::egui::Ui, media: oa_doc::MediaId) {
-        use crate::proxies::State;
-        let Some(m) = self.editor.pool_item(media).filter(|m| !m.missing && m.kind == oa_media::MediaKind::Video) else { return };
-        if m.probe.video.as_ref().is_some_and(|v| v.has_alpha) {
-            return; // a proxy would lose the transparency
-        }
-        let file = m.decode_path.clone();
-        match self.proxies.state(&file).cloned() {
-            Some(State::Ready { .. }) => {
-                if ui.button(tr("Remove proxy")).on_hover_text(tr("The viewer plays the file itself again")).clicked() {
-                    self.proxies.remove(&file);
-                    ui.close();
-                }
-            }
-            Some(State::Making(p)) => {
-                ui.add_enabled(false, eframe::egui::Button::new(trf("Making a proxy… {p}%", &[("p", &format!("{:.0}", p * 100.0))])));
-            }
-            Some(State::Queued | State::Checking) => {
-                ui.add_enabled(false, eframe::egui::Button::new(tr("Proxy waiting…")));
-            }
-            _ => {
-                if ui.button(tr("Make proxy")).on_hover_text(tr("A small copy the viewer plays smoothly; exports use the file itself")).clicked() {
-                    self.proxies.make(&file);
-                    ui.close();
-                }
-            }
-        }
-    }
-
     /// Menu entries choosing how `media`'s pixels are scaled.
     pub(crate) fn scaling_menu(&mut self, ui: &mut eframe::egui::Ui, media: oa_doc::MediaId) {
         use oa_doc::MediaScaling;

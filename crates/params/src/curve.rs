@@ -197,6 +197,27 @@ impl Curve {
         }
     }
 
+    /// Stretches (or squeezes) a clip-timed curve by `factor` about the clip's start:
+    /// every key's time scaled, so the animation spans a longer (or shorter) clip the
+    /// same way. Easing is relative to each stretch between keys, so it keeps its shape.
+    /// Keys timed to the source media are left alone (they follow the footage).
+    pub fn scale_clip_clock(&mut self, factor: f64) {
+        if self.anchor != KeyframeAnchor::ClipStart || !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        for k in &mut self.keys {
+            k.t = Time((k.t.0 as f64 * factor).round() as i64);
+        }
+        // Squeezed hard, two keys can land on one instant: the later one stays.
+        self.keys.dedup_by(|later, earlier| {
+            let same = later.t == earlier.t;
+            if same {
+                std::mem::swap(later, earlier);
+            }
+            same
+        });
+    }
+
     pub fn eval(&self, ctx: &EvalContext) -> Value {
         let t = match self.anchor {
             KeyframeAnchor::ClipStart => ctx.clip_time,

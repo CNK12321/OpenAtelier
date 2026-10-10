@@ -5,7 +5,7 @@ Where things stand and what's next. Architecture and rationale live in
 
 ## State
 
-16 crates, ~46k lines of Rust, **374 tests passing, clippy clean** (as of this note):
+16 crates, ~46k lines of Rust, **502 tests passing, clippy clean on Windows and Linux** (as of Beta 8):
 
 | Crate | What works |
 |---|---|
@@ -131,7 +131,7 @@ so test runs don't leave recovery banners in your real autosave folder.
    imports that wait in the bin, reverse playback with sound (2026-09-27). Left: solo,
    dragging a transition band's edges, media-level crop (crop is per clip now).
 5. **Text, next steps** (text layers ✅ 2026-09-18, DESIGN §17; on-canvas editing ✅,
-   its double-click made dependable 2026-09-26): wrapping to a box width, rich text (per-range
+   its double-click made dependable 2026-09-26; ✅ wrapping to a box width 2026-10-10, `TextSpec::wrap`): rich text (per-range
    style), color emoji, font weight picker beyond bold (faces have weights), glyph atlas
    eviction. (Text effects as shader plugins: done — `glyph`/`glyph_pixel`.) ✅ Done this session: text layers with
    the three-level shader controller (per pixel `GlyphPixel`: Shimmer, Glow; per letter
@@ -159,7 +159,7 @@ so test runs don't leave recovery banners in your real autosave folder.
 10. **Editing UI** ✅ 2026-09-20 (DESIGN §5, §11b): curve editor window (`curves.rs`),
     editing inside compound clips with breadcrumbs (`compound.rs`), on-canvas title
     typing (double-click in the viewer), the format picker (`formats.rs`) with platform
-    safe zones. Left: curve editor for vector properties and several curves at once;
+    safe zones. Left: curve editor for vector properties and several curves at once (✅ 2026-10-10: the keyframe editor in the timeline's place, `keyframes.rs`, and keys that stretch with a new speed, `Item::keep_key_times`);
     selecting several keys on the timeline.
 11. **Masks** ✅ 2026-09-27 (DESIGN §17b, `oa_doc::mask`, `app/masks.rs`; Settings →
     Masking): several masks per clip drawn with rectangle, ellipse, brush/eraser, fill

@@ -268,11 +268,10 @@ pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32
     let visuals = ui.visuals().clone();
     let stroke = if focused { egui::Stroke::new(1.5, crate::style::ACCENT) } else { egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color) };
     ui.painter().rect(rect, height / 2.0, visuals.extreme_bg_color, stroke, egui::StrokeKind::Inside);
-    // The glass.
-    let c = egui::pos2(rect.left() + 14.0, rect.center().y - 1.0);
+    // The glass (lit while typing).
     let weak = visuals.weak_text_color();
-    ui.painter().circle_stroke(c, 4.5, egui::Stroke::new(1.5, weak));
-    ui.painter().line_segment([c + egui::vec2(3.2, 3.2), c + egui::vec2(7.0, 7.0)], egui::Stroke::new(1.8, weak));
+    let glass = egui::Rect::from_center_size(egui::pos2(rect.left() + 15.0, rect.center().y), egui::vec2(16.0, 16.0));
+    crate::icons::paint(ui.painter(), glass, crate::icons::SEARCH, if focused { crate::style::ACCENT } else { weak });
     let clear = !text.is_empty();
     let field = egui::Rect::from_min_max(egui::pos2(rect.left() + 26.0, rect.top()), egui::pos2(rect.right() - if clear { 26.0 } else { 10.0 }, rect.bottom()));
     let before = text.clone();
@@ -289,10 +288,8 @@ pub fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32
         if b.hovered() {
             ui.painter().circle_filled(x.center(), 9.0, visuals.widgets.hovered.weak_bg_fill);
         }
-        let s = 3.5;
         let color = if b.hovered() { visuals.strong_text_color() } else { weak };
-        ui.painter().line_segment([x.center() + egui::vec2(-s, -s), x.center() + egui::vec2(s, s)], egui::Stroke::new(1.5, color));
-        ui.painter().line_segment([x.center() + egui::vec2(-s, s), x.center() + egui::vec2(s, -s)], egui::Stroke::new(1.5, color));
+        crate::icons::paint(ui.painter(), x.shrink(2.0), crate::icons::CLOSE, color);
         if b.clicked() {
             text.clear();
         }
@@ -319,6 +316,69 @@ pub fn chip(ui: &mut egui::Ui, on: bool, text: &str) -> egui::Response {
         ui.painter().galley(rect.center() - galley.size() * 0.5, galley, color);
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A chip that opens a menu below it: lit while it's open, which it stays while you work
+/// in it (a click outside closes it).
+pub fn chip_menu<R>(ui: &mut egui::Ui, label: &str, tip: &str, add: impl FnOnce(&mut egui::Ui) -> R) {
+    let galley = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(crate::style::TEXT_S + 0.5), egui::Color32::PLACEHOLDER);
+    let size = egui::vec2(galley.size().x + 10.0 + 18.0, 24.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let (fill, stroke) = if open {
+            (crate::style::ACCENT.gamma_multiply(0.22), egui::Stroke::new(1.0, crate::style::ACCENT.gamma_multiply(0.8)))
+        } else if response.hovered() {
+            (visuals.widgets.hovered.weak_bg_fill, egui::Stroke::new(1.0, visuals.widgets.hovered.bg_stroke.color))
+        } else {
+            (egui::Color32::TRANSPARENT, egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color))
+        };
+        let color = visuals.text_color();
+        ui.painter().rect(rect, 5.0, fill, stroke, egui::StrokeKind::Inside);
+        ui.painter().galley(egui::pos2(rect.left() + 9.0, rect.center().y - galley.size().y / 2.0), galley, color);
+        let chevron = egui::Rect::from_center_size(egui::pos2(rect.right() - 11.0, rect.center().y), egui::vec2(14.0, 14.0));
+        crate::icons::paint(ui.painter(), chevron, crate::icons::EXPAND, visuals.weak_text_color());
+    }
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let response = if open || tip.is_empty() { response } else { response.on_hover_text(tip) };
+    egui::Popup::menu(&response).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).info(egui::UiStackInfo::new(egui::UiKind::Menu)).show(add);
+}
+
+/// Icon buttons joined in one rounded strip (bold and italic, or the alignments), each
+/// lit while it's on. Returns which was clicked.
+pub fn segmented(ui: &mut egui::Ui, id: egui::Id, items: &[(crate::icons::Icon, &str, bool)]) -> Option<usize> {
+    let cell = egui::vec2(28.0, 24.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(cell.x * items.len() as f32, cell.y), egui::Sense::hover());
+    let visuals = ui.visuals().clone();
+    let r = crate::style::ROUNDING;
+    ui.painter().rect(rect, r, visuals.extreme_bg_color, egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color), egui::StrokeKind::Inside);
+    let mut clicked = None;
+    for (i, (icon, tip, on)) in items.iter().enumerate() {
+        let at = egui::Rect::from_min_size(rect.min + egui::vec2(cell.x * i as f32, 0.0), cell);
+        let response = ui.interact(at, id.with(i), egui::Sense::click()).on_hover_text(crate::i18n::tx(tip)).on_hover_cursor(egui::CursorIcon::PointingHand);
+        // The ends keep the strip's rounding.
+        let corners = egui::CornerRadius {
+            nw: if i == 0 { r as u8 } else { 0 },
+            sw: if i == 0 { r as u8 } else { 0 },
+            ne: if i + 1 == items.len() { r as u8 } else { 0 },
+            se: if i + 1 == items.len() { r as u8 } else { 0 },
+        };
+        if *on {
+            ui.painter().rect_filled(at.shrink(1.0), corners, crate::style::ACCENT.gamma_multiply(0.3));
+        } else if response.hovered() {
+            ui.painter().rect_filled(at.shrink(1.0), corners, visuals.widgets.hovered.weak_bg_fill);
+        }
+        if i > 0 {
+            ui.painter().vline(at.left(), at.y_range().shrink(5.0), egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color));
+        }
+        let color = if *on { visuals.strong_text_color() } else { visuals.widgets.inactive.fg_stroke.color };
+        crate::icons::paint(ui.painter(), egui::Rect::from_center_size(at.center(), egui::vec2(18.0, 18.0)), *icon, color);
+        if response.clicked() {
+            clicked = Some(i);
+        }
+    }
+    clicked
 }
 
 /// A small rounded label ("Built-in", "v1.2").

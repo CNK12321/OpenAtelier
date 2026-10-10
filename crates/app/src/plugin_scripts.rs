@@ -122,8 +122,8 @@ impl App {
         }
     }
 
-    /// The Plugins menu: each allowed plugin's actions (run over the selection) and
-    /// overlays (on or off), and the plugins still waiting to be allowed.
+    /// What's in the Plugins menu: each allowed plugin's actions (run over the selection)
+    /// and overlays (on or off), and the plugins still waiting to be allowed.
     pub(crate) fn plugins_menu(&mut self, ui: &mut egui::Ui) {
         let scripted: Vec<(String, String, bool, Vec<Arc<PluginScript>>)> = self
             .plugins
@@ -131,7 +131,7 @@ impl App {
             .filter(|p| !p.scripts.is_empty() || (!p.builtin && p.has_scripts()))
             .map(|p| (p.id.clone(), p.name.clone(), self.scripts_allowed(p), p.scripts.clone()))
             .collect();
-        ui.menu_button(tr("Plugins"), |ui| {
+        {
             ui.set_min_width(260.0);
             if scripted.is_empty() {
                 ui.label(egui::RichText::new(tr("No plugin actions or overlays")).weak());
@@ -179,7 +179,7 @@ impl App {
                 self.home_tab = crate::home::HomeTab::Plugins;
                 ui.close();
             }
-        });
+        }
     }
 
     /// Draws the overlays that are on (from allowed plugins) over the viewer.

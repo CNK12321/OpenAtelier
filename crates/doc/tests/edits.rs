@@ -307,6 +307,17 @@ fn the_bin_keeps_its_folders() {
     assert!(doc.project().bin_folders.is_empty());
 }
 
+/// Renaming the project is an edit like any other: undone, the old name is back.
+#[test]
+fn the_project_renames_and_undoes() {
+    let mut doc = base();
+    let before = doc.project().name.clone();
+    doc.edit("Rename project", vec![Op::SetProjectName("Trip to the coast".into())]).expect("rename");
+    assert_eq!(doc.project().name, "Trip to the coast");
+    doc.undo().expect("undo");
+    assert_eq!(doc.project().name, before);
+}
+
 /// The background is edited like a clip (id `BACKGROUND`): effects go on it, its params
 /// keyframe, undo takes them off, and a plain one isn't written to the file.
 #[test]
@@ -410,4 +421,20 @@ fn temp_layers_survive_saving() {
     doc.edit("paste", vec![Op::InsertTrack { seq: SEQ, index: 1, track: Arc::new(track) }, Op::InsertItem { seq: SEQ, track: layer, item: clip(51, 0, 2) }]).unwrap();
     let back = ProjectFile::from_json(&ProjectFile::to_json(doc.project()).unwrap()).unwrap();
     assert!(back.sequence(SEQ).unwrap().track(layer).is_some_and(|t| t.temp));
+}
+
+/// A relink replaces a file's record in place, even while clips use it (taking it out
+/// first was refused); undo puts the old one back.
+#[test]
+fn media_relinks_in_place_while_clips_use_it() {
+    let mut doc = base();
+    insert(&mut doc, clip(40, 0, 2)).unwrap();
+    let old = doc.project().media(MEDIA).unwrap().clone();
+    let moved = MediaRef { path: "elsewhere/clip.mp4".into(), ..old.clone() };
+    assert!(doc.edit("remove", vec![Op::RemoveMedia(MEDIA)]).is_err(), "can't take out what's used");
+    doc.edit("Relink media", vec![Op::ReplaceMedia(Arc::new(moved))]).unwrap();
+    assert_eq!(doc.project().media(MEDIA).unwrap().path, "elsewhere/clip.mp4");
+    assert!(doc.project().sequence(SEQ).unwrap().item(ItemId(40)).is_some(), "the clip stays");
+    doc.undo().unwrap();
+    assert_eq!(doc.project().media(MEDIA).unwrap().path, old.path);
 }

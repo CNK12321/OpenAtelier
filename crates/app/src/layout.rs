@@ -3,10 +3,10 @@
 //! Two layouts: **Standard** (the viewer in the middle, the properties in the tall column
 //! on the right) and **Vertical**, for 9:16 work, which swaps them — the tall column is
 //! just the shape of a phone video. **Auto** picks Vertical while the format being
-//! edited is taller than it is wide. A project can pick its own (the viewer's toolbar);
-//! otherwise Settings' default applies.
+//! edited is taller than it is wide, and is the default: the layout follows the format,
+//! with nothing to switch. Settings can pin Standard or Vertical instead.
 //!
-//! Each saved project also remembers its panel sizes, its layout and the format it was
+//! Each saved project also remembers its panel sizes and the format it was
 //! showing (`Settings::project_views`, by file path), put back when it's opened again.
 //! Panels are keyed by an epoch that changes on every restore, so egui takes the saved
 //! sizes as fresh defaults instead of the sizes it remembered for the last project.
@@ -16,9 +16,9 @@ use crate::App;
 use eframe::egui;
 
 impl App {
-    /// The layout in effect: the project's own, or the default from Settings.
+    /// The layout in effect (Settings'; Auto unless one was picked there).
     pub(crate) fn layout(&self) -> Layout {
-        self.project_view.layout.unwrap_or(self.settings.layout)
+        self.settings.layout
     }
 
     /// Whether the viewer is in the tall right-hand column.
@@ -32,13 +32,6 @@ impl App {
                 size.height > size.width
             }
         }
-    }
-
-    /// Switches this project between the standard and vertical layouts.
-    pub(crate) fn toggle_layout(&mut self) {
-        let vertical = self.vertical_layout();
-        self.project_view.layout = Some(if vertical { Layout::Standard } else { Layout::Vertical });
-        self.view_epoch += 1;
     }
 
     /// Puts back how the open project was last seen (sizes, layout, format), or the
@@ -217,7 +210,7 @@ impl App {
     }
 }
 
-fn key(path: &std::path::Path) -> String {
+pub(crate) fn key(path: &std::path::Path) -> String {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().to_string()
 }
 

@@ -273,6 +273,8 @@ impl Planner<'_> {
         };
         let mut inputs = Vec::new();
         let mut layers = Vec::new();
+        // With blurred content: the clips drawn, for the backdrop to be made of.
+        let mut drawn: Vec<Drawn> = Vec::new();
         if let Some(node) = under {
             inputs.push(node);
             layers.push(LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false });
@@ -334,6 +336,12 @@ impl Planner<'_> {
             // built with only those before it.
             let split = self.blend_split(item);
             let Some((node, info)) = self.layer(split.as_ref().map_or(item, |s| &s.0), v, t, scale, depth) else { continue };
+            if blurred {
+                // Where it sits (canvas px at this scale), for filling the frame with it.
+                let quad = scene::placement(self.project, track.id, item, v, t).ok().map(|p| p.corners().map(|[x, y]| [x * scale, y * scale]));
+                let solid = matches!(item.kind, ItemKind::Media { .. } | ItemKind::Nested { .. } | ItemKind::Solid);
+                drawn.push(Drawn { track: track.id, node, info, quad, solid });
+            }
             let ctx = item.eval_context(t);
             let mode = schema::blend_mode(item, &ctx);
             if split.is_none() && schema::backdrop_blend(&mode).is_none() {
@@ -368,11 +376,27 @@ impl Planner<'_> {
         if top && !inputs.is_empty() {
             let bg = s.params.eval(schema::background(), None, &oa_params::EvalContext::at(t, t));
             if matches!(bg.get(schema::BG_MODE), Some(Value::Enum(m)) if m == "blur") {
-                // Blurred content: the frame itself (every layer, as placed), enlarged
-                // behind itself until its content covers the canvas.
+                // Blurred content: the frame itself (every layer, as placed) — or one layer
+                // of it, if one is picked — enlarged behind itself until it covers the
+                // canvas. Enlarged by what's surely filled — the biggest frame-shaped
+                // rectangle inside a clip's picture (a turned clip's corners are empty) —
+                // so nothing see-through is left at the edges.
                 let front = self.b.add(NodeOp::Composite { size, background: [0.0; 4], layers }, inputs, canvas, false);
-                let content = self.content_bounds(front, canvas);
-                let back = content.and_then(|c| self.blurred_backdrop(front, c, size, scale, bg.float(schema::BG_BLUR), bg.float(schema::BG_DIM)));
+                let source = bg.get(schema::BG_SOURCE).and_then(Value::as_text).and_then(|s| s.parse::<u64>().ok());
+                let (picture, fill) = match drawn.iter().find(|d| Some(d.track.0) == source) {
+                    Some(d) => {
+                        let one = vec![LayerInfo { opacity: 1.0, ..d.info }];
+                        let picture = self.b.add(NodeOp::Composite { size, background: [0.0; 4], layers: one }, vec![d.node], canvas, false);
+                        (picture, d.quad.and_then(|q| filled_rect(q, size)))
+                    }
+                    // Everything: filled by its biggest picture (titles have gaps).
+                    None => {
+                        let biggest = drawn.iter().filter(|d| d.solid).filter_map(|d| d.quad.and_then(|q| filled_rect(q, size))).max_by(|a, b| (a.x1 - a.x0).total_cmp(&(b.x1 - b.x0)));
+                        (front, biggest)
+                    }
+                };
+                let content = fill.or_else(|| self.content_bounds(picture, canvas));
+                let back = content.and_then(|c| self.blurred_backdrop(picture, c, size, scale, bg.float(schema::BG_BLUR), bg.float(schema::BG_DIM)));
                 let back = back.map(|b| if self.has_background_effects(s) { self.background_effects(s, t, scale, size, b, depth) } else { b });
                 let (inputs, layers): (Vec<NodeId>, Vec<LayerInfo>) =
                     back.into_iter().chain([front]).map(|n| (n, LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false })).unzip();
@@ -1364,6 +1388,74 @@ impl Planner<'_> {
         // Pixel art (or media set to pixel scaling) stays crisp when enlarged.
         Some((node, LayerInfo { opacity: opacity as f32, blend: blend_of(item, &ctx), pixelated }))
     }
+}
+
+/// A clip as drawn, kept for a blurred-content background to be made of.
+struct Drawn {
+    track: oa_doc::TrackId,
+    node: NodeId,
+    info: LayerInfo,
+    /// Its picture's corners on the canvas (px at the planning scale), if it's placed.
+    quad: Option<[[f64; 2]; 4]>,
+    /// A picture that fills its box (footage, a compound clip, a solid) — not a title,
+    /// which is mostly gaps.
+    solid: bool,
+}
+
+/// The biggest rectangle of the canvas's shape (`size`), upright, inside both `quad` (a
+/// clip's corners, turned, scaled or sheared any way) and the canvas — the backdrop is
+/// made of the frame, which has nothing past its edges: where the picture surely is.
+/// Centered on the middle of where the clip is on the canvas. `None` if there's too
+/// little of it.
+fn filled_rect(quad: [[f64; 2]; 4], size: [u32; 2]) -> Option<Rect> {
+    let (w, h) = (size[0] as f64, size[1] as f64);
+    // The clip's part of the canvas: the quad clipped to it, edge by edge.
+    let mut poly: Vec<[f64; 2]> = quad.to_vec();
+    let edges: [(usize, f64, bool); 4] = [(0, 0.0, true), (0, w, false), (1, 0.0, true), (1, h, false)];
+    for (axis, at, keep_above) in edges {
+        let keep = |p: [f64; 2]| if keep_above { p[axis] >= at } else { p[axis] <= at };
+        let mut out = Vec::new();
+        for i in 0..poly.len() {
+            let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+            if keep(a) {
+                out.push(a);
+            }
+            if keep(a) != keep(b) {
+                let k = (at - a[axis]) / (b[axis] - a[axis]);
+                out.push([a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k]);
+            }
+        }
+        poly = out;
+        if poly.len() < 3 {
+            return None;
+        }
+    }
+    let n = poly.len() as f64;
+    let c = poly.iter().fold([0.0, 0.0], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
+    let aspect = h / w.max(1.0);
+    // Inside a convex polygon: on the same side of every edge.
+    let inside = |p: [f64; 2]| {
+        let sides: Vec<f64> = (0..poly.len())
+            .map(|i| {
+                let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+                let len = (b[0] - a[0]).hypot(b[1] - a[1]).max(1e-9);
+                ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / len
+            })
+            .collect();
+        sides.iter().all(|v| *v >= -1e-9) || sides.iter().all(|v| *v <= 1e-9)
+    };
+    let fits = |half: f64| [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]].iter().all(|[sx, sy]| inside([c[0] + sx * half, c[1] + sy * half * aspect]));
+    let reach = poly.iter().map(|p| (p[0] - c[0]).hypot(p[1] - c[1])).fold(0.0, f64::max);
+    let (mut lo, mut hi) = (0.0, reach);
+    for _ in 0..40 {
+        let mid = (lo + hi) / 2.0;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo >= 1.0).then(|| Rect::new(c[0] - lo, c[1] - lo * aspect, c[0] + lo, c[1] + lo * aspect))
 }
 
 /// A clip's (or container's) blend mode: its Blend effect's, or normal.

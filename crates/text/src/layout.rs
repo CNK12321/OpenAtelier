@@ -44,6 +44,10 @@ pub struct TextSpec {
     pub tracking: f64,
     /// Baseline-to-baseline distance, in ems.
     pub line_height: f64,
+    /// The box's width, px: lines wrap between words to stay inside it (a word too long
+    /// for a line of its own is split), and are aligned within it. `None`: each line is
+    /// as long as it is, and only line breaks start new ones.
+    pub wrap: Option<f64>,
 }
 
 impl Hash for TextSpec {
@@ -53,7 +57,7 @@ impl Hash for TextSpec {
         self.bold.hash(h);
         self.italic.hash(h);
         self.align.hash(h);
-        for x in [self.size, self.tracking, self.line_height] {
+        for x in [self.size, self.tracking, self.line_height, self.wrap.unwrap_or(-1.0)] {
             x.to_bits().hash(h);
         }
     }
@@ -204,6 +208,78 @@ fn shape_line(primary: &'static Face, line: &str, spec: &TextSpec, word: &mut u3
     out
 }
 
+/// A line as drawn: a whole paragraph, or (wrapped) part of one.
+struct Row {
+    /// Its glyphs, x measured from the row's start.
+    glyphs: Vec<Shaped>,
+    /// What it's aligned by: where its last glyph ends — a wrapped row's last word, not
+    /// the spaces after it.
+    width: f64,
+    /// Where its last glyph ends, spaces too (the cursor after its last character).
+    extent: f64,
+    /// Its text: a byte range of its paragraph's (the glyphs' clusters are offsets into
+    /// the paragraph).
+    bytes: std::ops::Range<usize>,
+    /// The content's character index of its first character.
+    first_char: usize,
+}
+
+/// Where a shaped paragraph breaks into rows no wider than `width`: before the word that
+/// would cross it, or — a word too long for a row of its own — before the letter that
+/// would (never inside a cluster: a base and its marks stay together). Returns the
+/// indices of the glyphs that start rows, the first always 0.
+fn breaks(glyphs: &[Shaped], width: Option<f64>) -> Vec<usize> {
+    let mut cuts = vec![0];
+    let Some(width) = width.filter(|w| *w > 0.0) else { return cuts };
+    let (mut start, mut word_start) = (0, None);
+    let mut i = 0;
+    while i < glyphs.len() {
+        let g = &glyphs[i];
+        if i > start && !g.blank && glyphs[i - 1].blank {
+            word_start = Some(i);
+        }
+        if i > start && !g.blank && g.x + g.advance - glyphs[start].x > width {
+            let mut at = word_start.filter(|&b| b > start).unwrap_or(i);
+            while at > start + 1 && glyphs[at].cluster == glyphs[at - 1].cluster {
+                at -= 1;
+            }
+            cuts.push(at);
+            (start, word_start) = (at, None);
+            // Measured again from the new row's start (it may need breaking again).
+            if at < i {
+                continue;
+            }
+        }
+        i += 1;
+    }
+    cuts
+}
+
+/// A paragraph's rows: all of it, or wrapped at `breaks`.
+fn rows(glyphs: Vec<Shaped>, text: &str, first_char: usize, width: Option<f64>) -> Vec<Row> {
+    let cuts = breaks(&glyphs, width);
+    let mut out = Vec::with_capacity(cuts.len());
+    let mut glyphs = glyphs.into_iter();
+    for (n, &at) in cuts.iter().enumerate() {
+        let last = n + 1 == cuts.len();
+        let count = cuts.get(n + 1).map_or(usize::MAX, |next| next - at);
+        let mut row: Vec<Shaped> = glyphs.by_ref().take(count).collect();
+        let x0 = row.first().map_or(0.0, |g| g.x);
+        for g in &mut row {
+            g.x -= x0;
+        }
+        let extent = row.last().map_or(0.0, |g| g.x + g.advance);
+        // A row that wraps is aligned by its words, not the space it breaks at.
+        let width = if last { extent } else { row.iter().rev().find(|g| !g.blank).map_or(0.0, |g| g.x + g.advance) };
+        let from = if n == 0 { 0 } else { row.first().map_or(text.len(), |g| g.cluster) };
+        out.push(Row { glyphs: row, width, extent, bytes: from..text.len(), first_char: first_char + text[..from].chars().count() });
+        if let Some(prev) = out.len().checked_sub(2) {
+            out[prev].bytes.end = from;
+        }
+    }
+    out
+}
+
 fn build(spec: &TextSpec) -> Layout {
     let primary = fonts::resolve(&spec.family, spec.bold, spec.italic);
     let k = spec.size / primary.units_per_em() as f64;
@@ -212,47 +288,49 @@ fn build(spec: &TextSpec) -> Layout {
     let line_h = spec.line_height * spec.size;
 
     let (mut word, mut in_word) = (0u32, false);
-    let lines: Vec<Vec<Shaped>> = spec
-        .content
-        .split('\n')
-        .map(|l| {
-            // A line break ends a word.
-            if std::mem::take(&mut in_word) {
-                word += 1;
-            }
-            shape_line(primary, l.trim_end_matches('\r'), spec, &mut word, &mut in_word)
-        })
-        .collect();
-    // Width of a line: where its last glyph's advance ends (trailing letter spacing excluded).
-    let widths: Vec<f64> = lines.iter().map(|l| l.last().map_or(0.0, |g| g.x + g.advance)).collect();
-    let box_w = widths.iter().copied().fold(0.0, f64::max);
+    let mut first_char = 0;
+    let mut paragraphs: Vec<(&str, Vec<Row>)> = Vec::new();
+    for raw in spec.content.split('\n') {
+        // A line break ends a word.
+        if std::mem::take(&mut in_word) {
+            word += 1;
+        }
+        let text = raw.trim_end_matches('\r');
+        let shaped = shape_line(primary, text, spec, &mut word, &mut in_word);
+        paragraphs.push((text, rows(shaped, text, first_char, spec.wrap)));
+        first_char += raw.chars().count() + 1;
+    }
+    let lines: Vec<(&str, &Row)> = paragraphs.iter().flat_map(|(text, rows)| rows.iter().map(move |r| (*text, r))).collect();
+    // Wrapping: the box is as wide as asked (wider only for a word that can't be split
+    // narrower, e.g. one letter wider than the box).
+    let widest = lines.iter().map(|(_, r)| r.width).fold(0.0, f64::max);
+    let box_w = spec.wrap.filter(|w| *w > 0.0).map_or(widest, |w| w.max(widest));
     let box_h = (lines.len().saturating_sub(1)) as f64 * line_h + (ascent - descent);
 
     let mut glyphs = Vec::new();
     let mut carets = Vec::new();
     let mut ink_box = [0.0, 0.0, box_w, box_h];
     let mut index = 0;
-    let mut first_char = 0;
-    for (n, ((line, width), raw)) in lines.iter().zip(&widths).zip(spec.content.split('\n')).enumerate() {
+    for (n, (text, row)) in lines.iter().enumerate() {
         let x0 = match spec.align {
             Align::Left => 0.0,
-            Align::Center => (box_w - width) / 2.0,
-            Align::Right => box_w - width,
+            Align::Center => (box_w - row.width) / 2.0,
+            Align::Right => box_w - row.width,
         };
         let baseline = ascent + n as f64 * line_h;
         // Cursor positions: before each character where its glyphs start (inside a
-        // ligature, where the one before is), and after the line.
-        let text = raw.trim_end_matches('\r');
-        let mut xs = Vec::with_capacity(text.chars().count() + 1);
+        // ligature, where the one before is), and after the row.
+        let line = &row.glyphs;
+        let part = &text[row.bytes.clone()];
+        let mut xs = Vec::with_capacity(part.chars().count() + 1);
         let mut prev = x0;
-        for (b, _) in text.char_indices() {
-            let at = line.iter().filter(|g| g.cluster == b).map(|g| g.x).fold(f64::INFINITY, f64::min);
+        for (b, _) in part.char_indices() {
+            let at = line.iter().filter(|g| g.cluster == row.bytes.start + b).map(|g| g.x).fold(f64::INFINITY, f64::min);
             prev = if at.is_finite() { x0 + at } else { prev };
             xs.push(prev);
         }
-        xs.push(x0 + width);
-        carets.push(LineCarets { first_char, xs, top: baseline - ascent, bottom: baseline - descent });
-        first_char += raw.chars().count() + 1;
+        xs.push(x0 + row.extent);
+        carets.push(LineCarets { first_char: row.first_char, xs, top: baseline - ascent, bottom: baseline - descent });
         for g in line.iter().filter(|g| !g.blank) {
             let face = fonts::face(g.font);
             let Some(outline) = face.font.outline(ab_glyph::GlyphId(g.glyph)) else { continue };
