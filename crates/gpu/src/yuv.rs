@@ -60,6 +60,9 @@ pub struct Nv12Frame<'a> {
     /// Transparency (`R8Unorm`, the luma plane's size) for video that has it — animated
     /// GIFs, ProRes 4444, VP9 with alpha. `None`: opaque.
     pub alpha: Option<&'a wgpu::Texture>,
+    /// The transparency is packed below the picture as brightness (a packed proxy):
+    /// `visible_size` is the picture, the top half; the bottom half is its alpha.
+    pub packed_alpha: bool,
     pub coded_size: [u32; 2],
     /// Picture size inside the coded surface, before rotation.
     pub visible_size: [u32; 2],
@@ -115,6 +118,7 @@ pub(crate) fn uniforms(frame: &Nv12Frame<'_>, out_size: [u32; 2]) -> [f32; 64] {
     // 16-bit planes (10- and 12-bit video): video range sits at the 16-bit codes
     // (16 << 8 = 4096 for black, 64 << 6 in 10 bits), not at n/255.
     u[10] = (frame.texture.format() == wgpu::TextureFormat::R16Unorm) as u8 as f32;
+    u[11] = frame.packed_alpha as u8 as f32;
     u
 }
 
@@ -186,7 +190,15 @@ fn fs_main(@builtin(position) fc: vec4f) -> @location(0) vec4f {
         rgb = linearize(yuv_to_rgb(uv));
     }
     // Premultiplied, as everything downstream expects (opaque video binds a white 1×1).
-    let a = textureSampleLevel(alpha, samp, uv, 0.0).r;
+    var a = textureSampleLevel(alpha, samp, uv, 0.0).r;
+    if (P.h[2].w > 0.5) {
+        // A packed proxy: the transparency is the brightness just below the picture.
+        var y = textureSampleLevel(luma, samp, uv + vec2f(0.0, crop.y), 0.0).r;
+        if (P.h[1].z < 0.5) {
+            y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+        }
+        a = clamp(y, 0.0, 1.0);
+    }
     return vec4f(rgb * a, a);
 }
 "#;

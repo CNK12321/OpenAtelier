@@ -197,3 +197,27 @@ fn old_dividers_are_ignored() {
     let saved = ProjectFile::to_json(&p).unwrap();
     assert!(!saved.contains("dividers"));
 }
+
+/// An old Mirror (upright or flat at a position) opens as a line through a point at an
+/// angle — upright points down, flat points left — keyframed positions keeping their keys.
+#[test]
+fn old_mirrors_become_lines() {
+    let mut p = healthy();
+    let s = Arc::make_mut(p.sequences.get_mut(&SeqId(1)).unwrap());
+    let track = Arc::make_mut(&mut s.tracks[0]);
+    let mut upright = EffectInstance::new(EffectId(20), "oa.warp.mirror");
+    upright.params.set("position", ParamSource::Static(Value::Float(0.3)));
+    let mut flat = EffectInstance::new(EffectId(21), "oa.warp.mirror");
+    flat.params.set("axis", ParamSource::Static(Value::Enum("horizontal".into())));
+    flat.params.set("position", ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, vec![oa_params::Keyframe::linear(secs(0), Value::Float(0.2)), oa_params::Keyframe::linear(secs(2), Value::Float(0.8))])));
+    track.items[0].effects = vec![upright, flat];
+    let r = repair(&mut p);
+    assert!(r.is_clean(), "an upgrade, not damage: {r:?}");
+    let fx = &p.sequence(SeqId(1)).unwrap().tracks[0].items[0].effects;
+    assert_eq!(fx[0].params.get("point"), Some(&ParamSource::Static(Value::Vec2([0.3, 0.5]))));
+    assert_eq!(fx[0].params.get("angle"), Some(&ParamSource::Static(Value::Float(90.0))));
+    assert!(fx[0].params.get("position").is_none() && fx[1].params.get("axis").is_none());
+    assert_eq!(fx[1].params.get("angle"), Some(&ParamSource::Static(Value::Float(180.0))));
+    let at = |t: i64| fx[1].params.get("point").unwrap().eval(&oa_params::EvalContext::at(secs(t), secs(t)));
+    assert_eq!(at(2), Value::Vec2([0.5, 0.8]), "the keys come along");
+}

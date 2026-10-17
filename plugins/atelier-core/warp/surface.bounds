@@ -1,23 +1,26 @@
-// Surface draws wherever its points are: each point rests at its place on the grid
-// (0..1 across the layer) and is moved by its offset. Points past the grid's size are
-// left at a corner, inside the box already.
+// Surface draws wherever its points are: each point rests at its place on the grid,
+// spread over the picture's box (the clip's crop: crop_lo to crop_hi, fractions of the
+// layer), and is moved by its offset. Points past the grid's size are left at a corner,
+// inside the box already.
 let n = grid + 2;
 let side = n - 1;
 let w = x1 - x0;
 let h = y1 - y0;
-grow(select(n > 0, x0 + (0 / side + p00_x) * w, x0), select(n > 0, y0 + (0 / side + p00_y) * h, y0));
-grow(select(n > 1, x0 + (1 / side + p01_x) * w, x0), select(n > 1, y0 + (0 / side + p01_y) * h, y0));
-grow(select(n > 2, x0 + (2 / side + p02_x) * w, x0), select(n > 2, y0 + (0 / side + p02_y) * h, y0));
-grow(select(n > 3, x0 + (3 / side + p03_x) * w, x0), select(n > 3, y0 + (0 / side + p03_y) * h, y0));
-grow(select(n > 1, x0 + (0 / side + p10_x) * w, x0), select(n > 1, y0 + (1 / side + p10_y) * h, y0));
-grow(select(n > 1, x0 + (1 / side + p11_x) * w, x0), select(n > 1, y0 + (1 / side + p11_y) * h, y0));
-grow(select(n > 2, x0 + (2 / side + p12_x) * w, x0), select(n > 2, y0 + (1 / side + p12_y) * h, y0));
-grow(select(n > 3, x0 + (3 / side + p13_x) * w, x0), select(n > 3, y0 + (1 / side + p13_y) * h, y0));
-grow(select(n > 2, x0 + (0 / side + p20_x) * w, x0), select(n > 2, y0 + (2 / side + p20_y) * h, y0));
-grow(select(n > 2, x0 + (1 / side + p21_x) * w, x0), select(n > 2, y0 + (2 / side + p21_y) * h, y0));
-grow(select(n > 2, x0 + (2 / side + p22_x) * w, x0), select(n > 2, y0 + (2 / side + p22_y) * h, y0));
-grow(select(n > 3, x0 + (3 / side + p23_x) * w, x0), select(n > 3, y0 + (2 / side + p23_y) * h, y0));
-grow(select(n > 3, x0 + (0 / side + p30_x) * w, x0), select(n > 3, y0 + (3 / side + p30_y) * h, y0));
-grow(select(n > 3, x0 + (1 / side + p31_x) * w, x0), select(n > 3, y0 + (3 / side + p31_y) * h, y0));
-grow(select(n > 3, x0 + (2 / side + p32_x) * w, x0), select(n > 3, y0 + (3 / side + p32_y) * h, y0));
-grow(select(n > 3, x0 + (3 / side + p33_x) * w, x0), select(n > 3, y0 + (3 / side + p33_y) * h, y0));
+let bw = crop_hi_x - crop_lo_x;
+let bh = crop_hi_y - crop_lo_y;
+grow(select(n > 0, x0 + (crop_lo_x + 0 / side * bw + p00_x) * w, x0), select(n > 0, y0 + (crop_lo_y + 0 / side * bh + p00_y) * h, y0));
+grow(select(n > 1, x0 + (crop_lo_x + 1 / side * bw + p01_x) * w, x0), select(n > 1, y0 + (crop_lo_y + 0 / side * bh + p01_y) * h, y0));
+grow(select(n > 2, x0 + (crop_lo_x + 2 / side * bw + p02_x) * w, x0), select(n > 2, y0 + (crop_lo_y + 0 / side * bh + p02_y) * h, y0));
+grow(select(n > 3, x0 + (crop_lo_x + 3 / side * bw + p03_x) * w, x0), select(n > 3, y0 + (crop_lo_y + 0 / side * bh + p03_y) * h, y0));
+grow(select(n > 1, x0 + (crop_lo_x + 0 / side * bw + p10_x) * w, x0), select(n > 1, y0 + (crop_lo_y + 1 / side * bh + p10_y) * h, y0));
+grow(select(n > 1, x0 + (crop_lo_x + 1 / side * bw + p11_x) * w, x0), select(n > 1, y0 + (crop_lo_y + 1 / side * bh + p11_y) * h, y0));
+grow(select(n > 2, x0 + (crop_lo_x + 2 / side * bw + p12_x) * w, x0), select(n > 2, y0 + (crop_lo_y + 1 / side * bh + p12_y) * h, y0));
+grow(select(n > 3, x0 + (crop_lo_x + 3 / side * bw + p13_x) * w, x0), select(n > 3, y0 + (crop_lo_y + 1 / side * bh + p13_y) * h, y0));
+grow(select(n > 2, x0 + (crop_lo_x + 0 / side * bw + p20_x) * w, x0), select(n > 2, y0 + (crop_lo_y + 2 / side * bh + p20_y) * h, y0));
+grow(select(n > 2, x0 + (crop_lo_x + 1 / side * bw + p21_x) * w, x0), select(n > 2, y0 + (crop_lo_y + 2 / side * bh + p21_y) * h, y0));
+grow(select(n > 2, x0 + (crop_lo_x + 2 / side * bw + p22_x) * w, x0), select(n > 2, y0 + (crop_lo_y + 2 / side * bh + p22_y) * h, y0));
+grow(select(n > 3, x0 + (crop_lo_x + 3 / side * bw + p23_x) * w, x0), select(n > 3, y0 + (crop_lo_y + 2 / side * bh + p23_y) * h, y0));
+grow(select(n > 3, x0 + (crop_lo_x + 0 / side * bw + p30_x) * w, x0), select(n > 3, y0 + (crop_lo_y + 3 / side * bh + p30_y) * h, y0));
+grow(select(n > 3, x0 + (crop_lo_x + 1 / side * bw + p31_x) * w, x0), select(n > 3, y0 + (crop_lo_y + 3 / side * bh + p31_y) * h, y0));
+grow(select(n > 3, x0 + (crop_lo_x + 2 / side * bw + p32_x) * w, x0), select(n > 3, y0 + (crop_lo_y + 3 / side * bh + p32_y) * h, y0));
+grow(select(n > 3, x0 + (crop_lo_x + 3 / side * bw + p33_x) * w, x0), select(n > 3, y0 + (crop_lo_y + 3 / side * bh + p33_y) * h, y0));

@@ -47,6 +47,10 @@ pub fn repair(p: &mut Project) -> Report {
         if !s.background_in_sync() {
             std::sync::Arc::make_mut(s).sync_background();
         }
+        // The background's effects are upgraded as a clip's are.
+        if s.background.effects.iter().any(|e| e.type_id == "oa.warp.mirror" && e.params.get("axis").or(e.params.get("position")).is_some()) {
+            std::sync::Arc::make_mut(s).background.effects.iter_mut().for_each(upgrade_mirror);
+        }
     }
 
     // Ids must stay below `next_id`, or new objects would collide with old ones.
@@ -227,7 +231,39 @@ fn repair_item(item: &mut Item, fresh: &mut impl FnMut() -> u64, r: &mut Report)
             effect_ids.insert(new);
         }
         sanitize_params(&mut fx.params, &format!("{what} effect {}", fx.type_id), r);
+        upgrade_mirror(fx);
     }
+}
+
+/// Mirror was upright or flat at a `position` (`axis`); it's a line through a `point` at
+/// an `angle` now: upright is a line pointing down (90°), mirroring left onto right; flat
+/// one pointing left (180°), mirroring the top onto the bottom. Keyframed positions keep
+/// their keys. An upgrade, not damage: not reported.
+fn upgrade_mirror(fx: &mut EffectInstance) {
+    use oa_params::{ParamId, ParamSource, Value};
+    if fx.type_id != "oa.warp.mirror" {
+        return;
+    }
+    let axis = fx.params.0.remove(&ParamId::new("axis"));
+    let position = fx.params.0.remove(&ParamId::new("position"));
+    if axis.is_none() && position.is_none() {
+        return;
+    }
+    let flat = matches!(&axis, Some(ParamSource::Static(Value::Enum(a))) if a == "horizontal");
+    let place = |x: &Value| {
+        let x = x.as_float().unwrap_or(0.5);
+        Value::Vec2(if flat { [0.5, x] } else { [x, 0.5] })
+    };
+    let point = match position {
+        Some(ParamSource::Animated(mut curve)) => {
+            curve.keys.iter_mut().for_each(|k| k.value = place(&k.value));
+            ParamSource::Animated(curve)
+        }
+        Some(src) => ParamSource::Static(place(&src.eval(&oa_params::EvalContext::at(Time::ZERO, Time::ZERO)))),
+        None => ParamSource::Static(place(&Value::Float(0.5))),
+    };
+    fx.params.set("point", point);
+    fx.params.set("angle", ParamSource::Static(Value::Float(if flat { 180.0 } else { 90.0 })));
 }
 
 fn sanitize_params(set: &mut oa_params::ParamSet, what: &str, r: &mut Report) {

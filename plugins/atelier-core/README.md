@@ -23,5 +23,5 @@ across all effects).
 | `sound` | Sound shaders (`.oasound`) and how long each rings on (`.tail`) |
 
 Scripts beside the shaders: `light/glow.passes` and `light/glow.divisor` (how many
-passes Glow runs and how coarse), `warp/surface.bounds` and `depth/slab.bounds` (where
+passes Glow runs and how coarse; Bloom's `light/bloom.*` the same), `warp/surface.bounds` and `depth/slab.bounds` (where
 Surface and Depth may draw).

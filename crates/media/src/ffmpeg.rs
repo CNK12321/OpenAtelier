@@ -51,6 +51,8 @@ pub struct FfmpegDecoder {
     /// The file's size before rotation.
     native: [u32; 2],
     divisor: u32,
+    /// Only every `stride`-th frame from the start (or a seek) is handed over (`set_stride`).
+    stride: usize,
     rotation: u32,
     color: VideoColor,
     /// The video has transparency (an animated GIF, ProRes 4444, VP9 with alpha): ffmpeg
@@ -96,6 +98,7 @@ impl FfmpegDecoder {
             chroma: [w.div_ceil(2), h.div_ceil(2)],
             native: [w, h],
             divisor: 1,
+            stride: 1,
             rotation: video.rotation_quarter_turns % 4,
             // With transparency, ffmpeg converts to BT.709 video range (a GIF is RGB):
             // that's what the frames then are.
@@ -165,6 +168,11 @@ impl FfmpegDecoder {
         // With transparency: kept, in the colors `open` says the frames are in.
         let colors = "out_color_matrix=bt709:out_range=tv";
         let mut filters = Vec::new();
+        // Played at 2×, 4×…: only the frames shown, dropped right after decoding — before
+        // they're scaled, converted and piped over (a 1080p ProRes 4444 frame is 16 MB).
+        if self.stride > 1 {
+            filters.push(format!("select=not(mod(n\\,{}))", self.stride));
+        }
         match (self.divisor > 1, self.alpha) {
             (true, false) => filters.push(format!("scale={}:{}:flags=area", self.size[0], self.size[1])),
             (true, true) => filters.push(format!("scale={}:{}:flags=area:{colors}", self.size[0], self.size[1])),
@@ -313,6 +321,17 @@ impl VideoDecoder for FfmpegDecoder {
     /// with its size: ~100 frames at 360p, ~15 at 4K).
     fn seek_cost(&self) -> usize {
         (self.restart_cost / self.frame_cost.max(1e-4)).clamp(8.0, 240.0) as usize
+    }
+
+    fn set_stride(&mut self, stride: usize) -> bool {
+        let stride = stride.clamp(1, 64);
+        if stride == self.stride {
+            return false;
+        }
+        self.stride = stride;
+        self.stop();
+        self.last = None;
+        true
     }
 
     fn set_scale_divisor(&mut self, divisor: u32) -> bool {

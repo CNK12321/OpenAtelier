@@ -26,6 +26,7 @@ pub struct PlanKey {
     pub variant: u64,
     pub see_through: bool,
     pub reference: bool,
+    pub solo: Option<u64>,
     pub follow: usize,
     pub text_supersample: u32,
 }
@@ -118,7 +119,7 @@ mod tests {
         p.sequences.insert(SeqId(1), Arc::new(seq));
         let project = Arc::new(p);
         let registry = Arc::new(Registry::with_builtins());
-        let key = |t: Time| PlanKey { document: Arc::as_ptr(&project) as usize, seq: SeqId(1), t, scale: 0, variant: 3, see_through: false, reference: false, follow: 0, text_supersample: 1 };
+        let key = |t: Time| PlanKey { document: Arc::as_ptr(&project) as usize, seq: SeqId(1), t, scale: 0, variant: 3, see_through: false, solo: None, reference: false, follow: 0, text_supersample: 1 };
         let job = |t: Time| Job { key: key(t), project: project.clone(), opts: PlanOptions { variant: Some(VariantId(3)), ..Default::default() }, registry: registry.clone(), follower: None };
 
         let mut ahead = PlanAhead::start();

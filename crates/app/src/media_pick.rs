@@ -179,7 +179,10 @@ impl App {
         painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
         let at = skim.map_or(c.length * 0.1, |s| s as f64 * c.length);
         let strip = match &c.file {
-            Some((path, size, seconds)) => self.clip_previews.strip(&ctx, oa_doc::MediaId(c.id), path, *size, *seconds).cloned(),
+            Some((path, size, seconds)) => {
+                let scaling = self.media_scaling(oa_doc::MediaId(c.id));
+                self.clip_previews.strip(&ctx, oa_doc::MediaId(c.id), path, *size, *seconds, scaling).cloned()
+            }
             None => self.compound_strip(&ctx, oa_doc::SeqId(c.id)),
         };
         match strip {

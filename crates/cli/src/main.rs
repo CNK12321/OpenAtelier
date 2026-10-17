@@ -41,7 +41,7 @@ fn main() -> ExitCode {
         Some("gpu") => gpu_cmd(),
         _ => {
             eprintln!(
-                "usage:\n  oa presets\n  oa probe <video>\n  oa demo [out.oaproj.json] [--media <video>]\n  oa plan <project> <seconds> [--variant <name>] [--scale <s>] [--reference]\n  oa render <project> <seconds> <out.png> [--variant <name>] [--scale <s>] [--reference]\n  oa bench <project> <seconds> [--variant <name>] [--scale <s>] [--reference]
+                "usage:\n  oa presets\n  oa probe <video>\n  oa demo [out.oaproj.json] [--media <video>]\n  oa plan <project> <seconds> [--variant <name>] [--scale <s>] [--reference]\n  oa render <project> <seconds> <out.png> [--variant <name>] [--scale <s>] [--reference]\n  oa bench <project> <seconds> [--order forward|back|jumps] [--variant <name>] [--scale <s>] [--reference]
   oa export <project> <out.mp4> [--variant <name>] [--scale <s>] [--codec h264|hevc|prores|png|audio] [--crf <n>] [--encoder auto|mf|ffmpeg] [--no-text-aa] [--reference]
   oa stress <minutes> [--intensity 0..1] [--media <files>...] [--sample <s> | --full] [--seed <n>] [--size WxH] [--fps <n>] [--encoder auto|mf|ffmpeg] [--out project.json] [--export out.mp4]"
             );
@@ -147,6 +147,8 @@ fn demo(args: &[String]) -> Res {
         params: Default::default(),
         role: Default::default(),
         on_duplicate: None,
+        group: None,
+        shown: Vec::new(),
     });
     item.effects.push(EffectInstance {
         id: EffectId(doc.alloc_id()),
@@ -156,6 +158,8 @@ fn demo(args: &[String]) -> Res {
         params: Default::default(),
         role: Default::default(),
         on_duplicate: None,
+        group: None,
+        shown: Vec::new(),
     });
     // Blur intensity is keyframed: sharp at 0s, soft by 6s.
     let mut blur = oa_params::ParamSet::default();
@@ -174,6 +178,8 @@ fn demo(args: &[String]) -> Res {
         params: blur,
         role: Default::default(),
         on_duplicate: None,
+        group: None,
+        shown: Vec::new(),
     });
     let mut card = Item::new(title, "Color card", ItemKind::Solid, TimeRange::new(secs(2), secs(3)));
     card.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color([0.9, 0.3, 0.1, 1.0])));
@@ -437,20 +443,38 @@ fn render(args: &[String]) -> Res {
 /// waiting for the GPU after each frame so timings are real.
 fn bench(args: &[String]) -> Res {
     let [path, seconds, rest @ ..] = args else {
-        return Err("usage: oa bench <project> <seconds> [--variant <name>] [--scale <s>] [--reference]".into());
+        return Err("usage: oa bench <project> <seconds> [--order forward|back|jumps] [--variant <name>] [--scale <s>] [--reference]".into());
     };
-    let s = session(path, rest)?;
+    // `--order back` plays it backwards a frame at a time (scrubbing back); `--order
+    // jumps` lands all over it (scrubbing about). The default plays it forwards.
+    let mut order = "forward".to_string();
+    let mut session_args = Vec::new();
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--order" => order = it.next().ok_or("--order needs forward, back or jumps")?.clone(),
+            _ => session_args.push(flag.clone()),
+        }
+    }
+    let s = session(path, &session_args)?;
     let registry = Registry::with_builtins();
     let ctx = Arc::new(GpuContext::new_headless()?);
     let mut renderer = s.renderer(&ctx, &registry)?;
     let mut source = media_source(&s.project, &ctx);
     let rate = s.sequence().rate;
     let frames = (seconds.parse::<f64>()? * rate.as_f64()).round() as i64;
+    let sequence: Vec<i64> = match order.as_str() {
+        "forward" => (0..frames).collect(),
+        "back" => (0..frames).rev().collect(),
+        // A fixed scatter (the same every run), a frame or two up to a second apart.
+        "jumps" => (0..frames).map(|i| (i * 7919 + 13) % frames.max(1)).collect(),
+        other => return Err(format!("unknown order {other:?}").into()),
+    };
 
     let mut times = Vec::with_capacity(frames as usize);
     let mut size = [0, 0];
     let total = std::time::Instant::now();
-    for f in 0..frames {
+    for f in sequence {
         let started = std::time::Instant::now();
         let planned = s.plan(rate.frame_start(f), &registry)?;
         let image = renderer.render(&planned.graph, &registry, source.as_mut())?;

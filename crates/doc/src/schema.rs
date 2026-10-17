@@ -29,11 +29,16 @@ pub const BLEND_MODE: &str = "mode";
 /// The Duplicate effect: the clip drawn a second time, with its own transform (`offset`,
 /// a canvas fraction; `scale`; `rotation`; `opacity`) in front of it or behind
 /// (`in_front`). Its picture runs the clip's effects ([`DUPLICATE_INHERIT`]), only those
-/// listed above the Duplicate ([`DUPLICATE_PREVIOUS`]) or none — and then its own, the
-/// effects whose `on_duplicate` is this one. Same id as `oa_graph::registry::DUPLICATE`.
+/// listed above the Duplicate ([`DUPLICATE_PREVIOUS`]) or none — and its own, the effects
+/// whose `on_duplicate` is this one: after those, or before them ([`DUPLICATE_OWN`]).
+/// Same id as `oa_graph::registry::DUPLICATE`.
 pub const DUPLICATE_EFFECT: &str = "oa.composite.duplicate";
 pub const DUPLICATE_INHERIT: &str = "inherit effects";
 pub const DUPLICATE_PREVIOUS: &str = "copy previous effects";
+/// Where a Duplicate's own effects run among the ones its copy takes from the clip.
+pub const DUPLICATE_OWN: &str = "own_effects";
+pub const DUPLICATE_OWN_LAST: &str = "run last";
+pub const DUPLICATE_OWN_FIRST: &str = "run first";
 
 /// The modes the compositor draws directly (`oa_graph::BlendMode`).
 pub const BLEND_MODES: [&str; 6] = ["normal", "add", "multiply", "screen", "darken", "lighten"];
@@ -41,6 +46,25 @@ pub const BLEND_MODES: [&str; 6] = ["normal", "add", "multiply", "screen", "dark
 /// with the layer in a pass of its own (display-referred, like other editors' modes).
 /// `invert` inverts what's under the layer's shape, whatever the layer's colors.
 pub const BACKDROP_BLEND_MODES: [&str; 8] = ["difference", "exclusion", "invert", "overlay", "soft light", "hard light", "color dodge", "color burn"];
+
+/// An effect used with a blend (its right-click menu → Use with blend…): how its result
+/// mixes with the picture that went into it — a blend mode, as the Blend effect's — and
+/// how much (0–100). Kept in the effect's own settings; without them, its result simply
+/// replaces the picture.
+pub const EFFECT_BLEND_MODE: &str = "blend.mode";
+pub const EFFECT_BLEND_MIX: &str = "blend.mix";
+
+/// An effect's blend settings ([`EFFECT_BLEND_MODE`], [`EFFECT_BLEND_MIX`]).
+pub fn effect_blend() -> &'static [ParamSchema] {
+    static S: OnceLock<Vec<ParamSchema>> = OnceLock::new();
+    S.get_or_init(|| {
+        let modes: Vec<&str> = BLEND_MODES.iter().chain(BACKDROP_BLEND_MODES.iter()).copied().collect();
+        vec![
+            ParamSchema::new(EFFECT_BLEND_MODE, Value::Enum("normal".into()), Unit::None).options(&modes).static_only(),
+            ParamSchema::new(EFFECT_BLEND_MIX, Value::Float(100.0), Unit::None).range(0.0, 100.0),
+        ]
+    })
+}
 
 /// Which [`BACKDROP_BLEND_MODES`] `mode` is, if it's one.
 pub fn backdrop_blend(mode: &str) -> Option<usize> {
@@ -56,7 +80,7 @@ pub fn blend_index(mode: &str) -> usize {
 /// The blend mode the item's Blend effect sets at `ctx` (the last one on, if several);
 /// `normal` without one.
 pub fn blend_mode(item: &crate::Item, ctx: &oa_params::EvalContext) -> String {
-    let Some(fx) = item.effects.iter().rev().find(|e| e.enabled && e.on_duplicate.is_none() && e.type_id == BLEND_EFFECT) else { return "normal".into() };
+    let Some(fx) = item.effects.iter().rev().find(|e| item.effect_on(e) && e.on_duplicate.is_none() && e.type_id == BLEND_EFFECT) else { return "normal".into() };
     // Unset: the effect's default.
     fx.params.get(BLEND_MODE).and_then(|s| s.eval(ctx).as_enum().map(str::to_string)).unwrap_or_else(|| "add".into())
 }
@@ -197,6 +221,16 @@ pub fn bounds() -> &'static [ParamSchema] {
             ParamSchema::new(BOUND_BLEND, Value::Float(0.0), Unit::None).range(0.0, 50.0),
         ]
     })
+}
+
+/// An effect group's mix (`crate::EffectGroup`), 0–100: how much of what its effects
+/// make shows over the picture (or sound) that went into them. 0 is off.
+pub const GROUP_MIX: &str = "mix";
+
+/// An effect group's own parameters: its mix, keyframable like any other.
+pub fn group() -> &'static [ParamSchema] {
+    static S: OnceLock<Vec<ParamSchema>> = OnceLock::new();
+    S.get_or_init(|| vec![ParamSchema::new(GROUP_MIX, Value::Float(100.0), Unit::None).range(0.0, 100.0)])
 }
 
 /// A bounded effect's range, in letters from the text's start (letter `i` spans `i`

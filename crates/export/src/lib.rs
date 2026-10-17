@@ -100,8 +100,8 @@ fn sound_layer(s: &oa_doc::Sequence, track: &oa_doc::Track) -> u32 {
 fn sound_effects(item: &oa_doc::Item) -> Vec<oa_audio::AudioEffect> {
     item.active_effects()
         .iter()
-        .filter(|e| e.enabled && oa_audio::fx::info(&e.type_id).is_some())
-        .map(|e| oa_audio::AudioEffect { role: e.role, ..oa_audio::AudioEffect::new(e.id.0, &e.type_id, e.params.clone()) })
+        .filter(|e| item.effect_on(e) && oa_audio::fx::info(&e.type_id).is_some())
+        .map(|e| oa_audio::AudioEffect { role: e.role, group: item.group_of(e).cloned(), ..oa_audio::AudioEffect::new(e.id.0, &e.type_id, e.params.clone()) })
         .collect()
 }
 
@@ -599,6 +599,7 @@ impl Exporter {
                 key_context: KeyContext::default(),
                 text_supersample: if options.text_antialias { 2 } else { 1 },
                 see_through: false,
+                solo: None,
             },
             level: if options.reference { OptLevel::Reference } else { OptLevel::Full },
             rate,

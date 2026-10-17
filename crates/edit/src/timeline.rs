@@ -415,31 +415,49 @@ pub fn arrange(p: &Project, seq: SeqId, items: &[ItemId], how: Arrange) -> R<Vec
     }
     clips.sort_by_key(|(_, it)| (it.range.start, it.id.0));
     let Some(earliest) = clips.first().map(|(_, it)| it.range.start) else { return Ok(Vec::new()) };
-    let starts: Vec<Time> = match how {
+    // On frames — but never so a clip starts before the one ahead of it on its track ends:
+    // footage is rarely a whole number of frames long, and rounding to the nearest frame
+    // would tuck it under its neighbor's last fraction of a frame.
+    let rate = s.rate;
+    let frame_after = |t: Time| {
+        let f = rate.frame_start(rate.frame_at(t));
+        if f >= t { f } else { rate.frame_start(rate.frame_at(t) + 1) }
+    };
+    let snapped: Vec<Time> = match how {
         Arrange::Together => {
             let mut last_end: std::collections::HashMap<TrackId, Time> = Default::default();
             clips
                 .iter()
                 .map(|(track, it)| {
-                    let start = last_end.get(track).copied().unwrap_or(it.range.start);
+                    let start = last_end.get(track).map_or(it.range.start, |end| frame_after(*end));
                     last_end.insert(*track, start + it.range.duration);
                     start
                 })
                 .collect()
         }
         Arrange::LineUpStarts => clips.iter().map(|_| earliest).collect(),
-        Arrange::StartAt(at) => clips.iter().map(|(_, it)| it.range.start - earliest + at).collect(),
+        // As a block, by a whole number of frames from the earliest (onto the playhead's
+        // frame): the spacing is kept exactly.
+        Arrange::StartAt(at) => {
+            let shift = snap_to_frame(s, at) - earliest;
+            clips.iter().map(|(_, it)| it.range.start + shift).collect()
+        }
         Arrange::SpaceEvenly => {
             let n = clips.len();
             let last = clips[n - 1].1.range.start;
+            let mut last_end: std::collections::HashMap<TrackId, Time> = Default::default();
             clips
                 .iter()
                 .enumerate()
-                .map(|(i, (_, it))| if n < 3 { it.range.start } else { earliest + Time::from_rational_floor((last - earliest).as_rational() * oa_time::Rational::new(i as i64, (n - 1) as i64)) })
+                .map(|(i, (track, it))| {
+                    let even = if n < 3 || i == 0 || i == n - 1 { it.range.start } else { snap_to_frame(s, earliest + Time::from_rational_floor((last - earliest).as_rational() * oa_time::Rational::new(i as i64, (n - 1) as i64))) };
+                    let start = last_end.get(track).map_or(even, |end| even.max(frame_after(*end)));
+                    last_end.insert(*track, start + it.range.duration);
+                    start
+                })
                 .collect()
         }
     };
-    let snapped: Vec<Time> = starts.iter().map(|t| snap_to_frame(s, *t)).collect();
     let moved: Vec<(TrackId, &Item, TimeRange)> = clips.iter().zip(&snapped).map(|((track, it), start)| (*track, *it, TimeRange::new(*start, it.range.duration))).collect();
     for (i, (track, it, range)) in moved.iter().enumerate() {
         if range.start < Time::ZERO {
@@ -452,11 +470,12 @@ pub fn arrange(p: &Project, seq: SeqId, items: &[ItemId], how: Arrange) -> R<Vec
             return Err(EditError::Overlap);
         }
     }
-    Ok(moved
-        .into_iter()
-        .filter(|(_, it, range)| *range != it.range)
-        .map(|(_, it, range)| Op::SetItemTiming { seq, item: it.id, range, time_map: it.time_map })
-        .collect())
+    // All taken off, then all put back where they go: moved one at a time, a clip could
+    // land where the next still is before that one moves.
+    let changed: Vec<&(TrackId, &Item, TimeRange)> = moved.iter().filter(|(_, it, range)| *range != it.range).collect();
+    let mut ops: Vec<Op> = changed.iter().map(|(_, it, _)| Op::RemoveItem { seq, item: it.id }).collect();
+    ops.extend(changed.iter().map(|(track, it, range)| Op::InsertItem { seq, track: *track, item: Item { range: *range, ..(*it).clone() } }));
+    Ok(ops)
 }
 
 /// Pastes copies of `clips` (each with the track it came from) so the earliest starts at

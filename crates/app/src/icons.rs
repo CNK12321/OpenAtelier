@@ -200,6 +200,14 @@ icons! {
     SAVED = "check", '\u{e5ca}', Record;
     SAVING = "sync", '\u{e627}', Refresh;
     EDITED = "edit", '\u{e3c9}', Title;
+    // Effect groups and presets.
+    LOCK = "lock", '\u{e897}', Stop;
+    LAYERS = "layers", '\u{e53b}', Library;
+    UNGROUP = "link_off", '\u{e16f}', Group;
+    COLLAPSE_ALL = "unfold_less", '\u{e5d6}', StepBack;
+    EXPAND_ALL = "unfold_more", '\u{e5d7}', StepOn;
+    ONLY_PICKED = "filter_list", '\u{e152}', Subtitles;
+    APPLY_TO_SELECTED = "library_add", '\u{e02e}', Add;
 }
 
 /// `icon` as text in the Material font, `size` points: for egui widgets that take text

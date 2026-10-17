@@ -16,6 +16,15 @@ impl App {
 
     /// Puts the settings that live outside the settings file into effect.
     pub(crate) fn apply_settings(&mut self, ctx: &egui::Context) {
+        let theme = self.settings.theme.preference();
+        if ctx.options(|o| o.theme_preference) != theme {
+            ctx.set_theme(theme);
+        }
+        // Black is the dark theme with black panels.
+        let black = self.settings.theme == crate::settings::Theme::Black;
+        if crate::style::is_black(ctx) != black {
+            crate::style::dark(ctx, black);
+        }
         oa_params::set_default_interp(self.settings.default_curve.interp());
         let scale = if self.settings.ui_scale.is_finite() { self.settings.ui_scale.clamp(0.6, 2.0) } else { 1.0 };
         if (ctx.zoom_factor() - scale).abs() > 1e-3 {
@@ -68,6 +77,7 @@ impl App {
                         egui::ScrollArea::vertical().id_salt(("settings-scroll", page as u8)).auto_shrink([false, false]).show(ui, |ui| match page {
                             Page::Editing => self.settings_editing(ui),
                             Page::Interface => self.settings_interface(ui),
+                            Page::Shortcuts => self.keybind_list(ui),
                             Page::Performance => self.settings_performance(ui),
                             Page::Graphics => self.settings_graphics(ui),
                             Page::Media => self.settings_media(ui),
@@ -159,6 +169,20 @@ impl App {
     }
 
     fn settings_interface(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(tr("Theme"));
+            use crate::settings::Theme;
+            for (theme, name, tip) in [
+                (Theme::Auto, tr("Automatic"), tr("Dark or light as your system is set")),
+                (Theme::Dark, tr("Dark"), tr("Light text on dark panels")),
+                (Theme::Light, tr("Light"), tr("Dark text on light panels")),
+                (Theme::Black, tr("Black"), tr("Dark, with true-black panels: for OLED screens and dim rooms")),
+            ] {
+                ui.selectable_value(&mut self.settings.theme, theme, name).on_hover_text(tip);
+            }
+        });
+        ui.checkbox(&mut self.settings.ui_effects, tr("UI effects"))
+            .on_hover_text(tr("The glow around the viewer in the picture's colors, and project cards that lift and tilt toward the pointer. Off: plain frames and outlines."));
         // The language: built in (English, Spanish) or a file dropped into the locales
         // folder. Strings are picked at startup, so it applies on the next one.
         ui.horizontal(|ui| {
@@ -237,6 +261,10 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.settings.still_seconds).range(0.1..=3600.0).speed(0.1).suffix(" s"));
             });
         });
+        egui::CollapsingHeader::new(tr("Moved files")).default_open(true).show(ui, |ui| {
+            ui.checkbox(&mut self.settings.smart_relink, tr("Smart relink: find moved files when a project opens"))
+                .on_hover_text(tr("Files a project uses that aren't where they were are looked for on this computer: around where they were, by the project, in your Videos, Desktop, Downloads and other folders, then the drives — by name and content, or by content alone if renamed (a quick fingerprint of each file, taken when it was imported)"));
+        });
         egui::CollapsingHeader::new(tr("Audio")).default_open(true).show(ui, |ui| self.settings_audio(ui));
     }
 
@@ -312,10 +340,11 @@ enum Page {
     Media,
     Updates,
     Tracker,
+    Shortcuts,
 }
 
 impl Page {
-    const ALL: [Page; 7] = [Page::Editing, Page::Interface, Page::Media, Page::Performance, Page::Graphics, Page::Updates, Page::Tracker];
+    const ALL: [Page; 8] = [Page::Editing, Page::Interface, Page::Shortcuts, Page::Media, Page::Performance, Page::Graphics, Page::Updates, Page::Tracker];
 
     fn name(self) -> &'static str {
         match self {
@@ -326,6 +355,7 @@ impl Page {
             Page::Media => tr("Media"),
             Page::Updates => tr("Updates"),
             Page::Tracker => tr("AI tracker"),
+            Page::Shortcuts => tr("Shortcuts"),
         }
     }
 }

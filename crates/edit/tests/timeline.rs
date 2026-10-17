@@ -69,6 +69,21 @@ fn selected_clips_arrange_together() {
     // In the way: moved to 6 s, 10 would land on 11 (not chosen), and nothing moves.
     let doc = doc_with(&base);
     assert!(timeline::arrange(doc.project(), SEQ, &[ItemId(10), ItemId(12)], Arrange::StartAt(secs(6.0))).is_err());
+
+    // Footage isn't a whole number of frames long: closing up and moving as a block
+    // still never overlap (a clip starts on the frame after the one ahead ends), and a
+    // block moved later, onto where its own clips are, moves whole.
+    let odd = [(V1, 10, STILL, 1.0, 2.01, 0.0), (V1, 11, STILL, 4.0, 1.37, 0.0), (V1, 12, STILL, 6.0, 0.99, 0.0)];
+    let mut doc = doc_with(&odd);
+    let ops = timeline::arrange(doc.project(), SEQ, &chosen, Arrange::Together).unwrap();
+    apply(&mut doc, ops);
+    let [a, b, c] = [10, 11, 12].map(|id| item(&doc, id).range);
+    assert!(b.start >= a.end() && c.start >= b.end(), "no overlap: {a:?} {b:?} {c:?}");
+    assert!(b.start - a.end() < secs(0.05), "but no real gap either");
+    let ops = timeline::arrange(doc.project(), SEQ, &chosen, Arrange::StartAt(secs(2.0))).unwrap();
+    apply(&mut doc, ops);
+    assert_eq!(item(&doc, 10).range.start, secs(2.0), "the block, moved later over itself");
+    assert_eq!(item(&doc, 11).range.start - item(&doc, 10).range.start, b.start - a.start, "its spacing kept exactly");
 }
 
 /// Reversing plays the same part of the file backwards — the first frame shown is the
@@ -154,6 +169,8 @@ fn split_changes_no_frame() {
         },
         role: Default::default(),
         on_duplicate: None,
+        group: None,
+        shown: Vec::new(),
     };
     let set = |param: &str, target: ParamTarget, source: ParamSource| Op::SetParam {
         seq: SEQ,

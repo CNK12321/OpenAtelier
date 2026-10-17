@@ -157,8 +157,10 @@ impl App {
                 let end = a.editor.duration();
                 a.set_playhead(end);
             }),
-            cmd("view.clip_start", tr("Go to the start of the clip"), Group::View, "Ctrl+←", None, true, false, |a| a.go_to_clip_edge(true)),
-            cmd("view.clip_end", tr("Go to the end of the clip"), Group::View, "Ctrl+→", None, true, false, |a| a.go_to_clip_edge(false)),
+            cmd("view.clip_start", tr("Previous keyframe or clip edge"), Group::View, "Ctrl+←", None, true, false, |a| a.step_to_stop(false, true)),
+            cmd("view.clip_first", tr("Go to the start of the clip"), Group::View, "Ctrl+Shift+←", None, true, false, |a| a.step_to_stop(false, false)),
+            cmd("view.clip_end", tr("Next keyframe or clip edge"), Group::View, "Ctrl+→", None, true, false, |a| a.step_to_stop(true, true)),
+            cmd("view.clip_last", tr("Go to the end of the clip"), Group::View, "Ctrl+Shift+→", None, true, false, |a| a.step_to_stop(true, false)),
             cmd("view.zoom_fit", tr("Fit the viewer"), Group::View, "Ctrl+0", None, true, false, |a| a.view.zoom = None),
             cmd("view.actual_size", tr("Viewer at 100%"), Group::View, "Ctrl+1", None, true, false, |a| a.view.zoom = Some(1.0)),
             cmd("view.thirds", tr("Rule-of-thirds guides"), Group::View, "", None, true, false, |a| a.view.thirds = !a.view.thirds),

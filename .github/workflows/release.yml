@@ -117,7 +117,10 @@ jobs:
             chmod +x "dist/$PACKAGE/openatelier" "dist/$PACKAGE/oa" "dist/$PACKAGE/install.sh"
           fi
           cp LICENSE README.md "dist/$PACKAGE/"
-          cp -r plugins "dist/$PACKAGE/plugins"
+          # The plugin guide only: Atelier Core is built into the program, and the example
+          # plugin is for people writing their own (it's in the repository).
+          mkdir -p "dist/$PACKAGE/plugins"
+          cp plugins/README.md "dist/$PACKAGE/plugins/"
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a -tzip "$PACKAGE.zip" "$PACKAGE" > /dev/null

@@ -22,7 +22,7 @@ pub const EDITOR_SURFACE: &str = "surface";
 /// `low_freq`/`low_gain`, `p1_freq`/`p1_gain`/`p1_q` … `p3_*`, `high_freq`/`high_gain`).
 pub const EDITOR_EQUALIZER: &str = "equalizer";
 /// The viewer draws the effect's cut line through its point (a `vec2` param) at its
-/// `angle`, with a handle to turn it (Slice).
+/// `angle`, with a handle to turn it (Slice, Mirror).
 pub const EDITOR_LINE: &str = "line";
 /// Edited in the Color tab (wheels, curves, the HSL mixer), not as a list of sliders.
 pub const EDITOR_COLOR: &str = "color";
@@ -387,6 +387,10 @@ pub const GLOW: &str = "oa.light.glow";
 /// **Motion Blur**: not a shader pass — the planner builds the clip at moments across its
 /// shutter and averages them (`samples`, `shutter_angle`).
 pub const MOTION_BLUR: &str = "oa.motion.motion-blur";
+/// **Echo**: not a shader pass — the planner draws the clip again at moments before
+/// and/or after (`copies`, `spacing` in frames, `direction`), each fainter (`decay`),
+/// laid together by `mix`.
+pub const ECHO: &str = "oa.motion.echo";
 /// **Blend**: not a shader pass — its `mode` is how the compositor lays the clip's layer
 /// (or an effect container's result) over what's under it.
 /// (Also `oa_doc::schema::BLEND_EFFECT`, which old projects' blend property becomes.)
@@ -414,16 +418,19 @@ pub fn surface_grid(values: &Evaluated) -> usize {
     SURFACE_GRIDS.iter().position(|g| *g == key).unwrap_or(0) + 2
 }
 
-/// Where a surface's points are, in fractions of the layer (0..1 at rest), row by row
-/// from the top left: `(points a side, points)`.
+/// Where a surface's points are, in fractions of the layer, row by row from the top
+/// left: `(points a side, points)`. At rest they're spread over the picture's box
+/// (`crop_lo` to `crop_hi`: the clip's crop, 0..1 uncropped).
 pub fn surface_points(values: &Evaluated) -> (usize, Vec<[f64; 2]>) {
     let n = surface_grid(values);
     let side = (n - 1) as f64;
+    let lo = values.get("crop_lo").and_then(Value::as_vec2).unwrap_or([0.0; 2]);
+    let hi = values.get("crop_hi").and_then(Value::as_vec2).unwrap_or([1.0; 2]);
     let points = (0..n * n)
         .map(|i| {
             let (r, c) = (i / n, i % n);
             let o = values.get(&surface_point_id(r, c)).and_then(Value::as_vec2).unwrap_or([0.0; 2]);
-            [c as f64 / side + o[0], r as f64 / side + o[1]]
+            [lo[0] + c as f64 / side * (hi[0] - lo[0]) + o[0], lo[1] + r as f64 / side * (hi[1] - lo[1]) + o[1]]
         })
         .collect();
     (n, points)
@@ -466,6 +473,9 @@ pub const BLUR: &str = "oa.internal.blur";
 pub const MASK_KEEP: &str = "oa.internal.mask_keep";
 pub const MASK_DROP: &str = "oa.internal.mask_drop";
 pub const ADD: &str = "oa.internal.add";
+/// An effect group's result (input) mixed with the picture that went into it (second
+/// input) by its mix, uniform 0 (0: the picture as it came, 1: the group's result).
+pub const MIX: &str = "oa.internal.mix";
 /// A clip mask placed over its layer (`oa_doc::mask`): the input is the drawing's
 /// coverage ([`crate::NodeOp::MaskPixels`]); uniforms are the layer's raster size (2),
 /// the mask's center offset (2, layer fractions), scale, rotation (radians), harshness,
@@ -862,6 +872,10 @@ pub(crate) fn host_effects() -> Vec<EffectDescriptor> {
             shader: wgsl("oa_internal_add", 1, "fn oa_internal_add(pos: vec2f, base: u32) -> vec4f { return sample_input(pos) + sample_media(pos); }"),
             ..descriptor(ADD, "Add", EffectKind::Spatial { expand: None }, vec![])
         },
+        EffectDescriptor {
+            shader: wgsl("oa_internal_mix", 1, "fn oa_internal_mix(pos: vec2f, base: u32) -> vec4f { return mix(sample_media(pos), sample_input(pos), clamp(u(base), 0.0, 1.0)); }"),
+            ..descriptor(MIX, "Mix", EffectKind::Spatial { expand: None }, vec![])
+        },
         // Clip masks (`MASK_SHAPE`…).
         EffectDescriptor {
             shader: wgsl(
@@ -1044,6 +1058,12 @@ mod tests {
         let v = set.eval(&surface.params, None, &at);
         assert_eq!(surface_points(&v).1[3], [1.5, 0.8]);
         assert_eq!(surface.grown_bounds(&v, 1.0, layer), Rect::new(0.0, 0.0, 150.0, 50.0));
+        // Cropped to its right half: the points rest on what's left, and the box follows.
+        set.set("crop_lo", ParamSource::Static(Value::Vec2([0.5, 0.0])));
+        let v = set.eval(&surface.params, None, &at);
+        assert_eq!(surface_points(&v).1[0], [0.5, 0.0], "the top left rests at the crop");
+        assert_eq!(surface_points(&v).1[3], [1.5, 0.8], "the bottom right where it was");
+        assert_eq!(surface.grown_bounds(&v, 1.0, layer), Rect::new(0.0, 0.0, 150.0, 50.0));
 
         let depth = r.effect(DEPTH).unwrap();
         let mut set = ParamSet::default();
@@ -1075,6 +1095,31 @@ mod tests {
         assert_eq!(divisor(400.0, 0), 8, "capped");
         assert_eq!(count(1e9), 14, "capped");
         assert_eq!((divisor(30.0, 0), divisor(30.0, 5), divisor(30.0, 6)), (2, 2, 1), "the last pass draws at full size");
+    }
+
+    /// Bloom runs four passes: the first three on a grid coarser for wider blooms (the
+    /// shader doubles its way to the same cell size), the last at full size.
+    #[test]
+    fn bloom_blurs_on_a_coarser_grid_the_wider_it_is() {
+        let bloom = Registry::with_builtins().effect("oa.light.bloom").unwrap().clone();
+        // Uniforms: threshold, softness, radius, intensity, tint.
+        let at = |radius: f32| [0.8, 0.5, radius, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let count = bloom.pass_count.as_ref().unwrap().count(&at(40.0));
+        assert_eq!(count, 4);
+        let divisor = |radius: f32, pass: u32| bloom.pass_divisor.as_ref().unwrap().divisor(&at(radius), pass, count);
+        // As the shader's `oa_bloom_cell`: doubling while twice the cell × 16 fits.
+        let cell = |radius: f32| {
+            let mut k = 1;
+            while (k * 32) as f32 <= radius && k < 8 {
+                k *= 2;
+            }
+            k
+        };
+        for radius in [0.0, 10.0, 31.0, 32.0, 63.0, 64.0, 100.0, 255.0, 256.0, 400.0] {
+            assert_eq!(divisor(radius, 0), cell(radius), "radius {radius}");
+            assert_eq!(divisor(radius, 2), cell(radius));
+            assert_eq!(divisor(radius, 3), 1, "the last pass draws at full size");
+        }
     }
 
     #[test]

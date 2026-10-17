@@ -79,40 +79,22 @@ pub(crate) fn section_with(ui: &mut egui::Ui, title: &str, hint: &str, right: im
     ui.add_space(2.0);
 }
 
-/// Dragging the effect shown `from`-th to before the one shown `slot`-th (or past the
-/// last): its new index in the clip's whole effect list, counted after taking it out.
-/// `positions` are the shown effects' indices in that list (other kinds sit between).
-/// `None` when it wouldn't move.
-fn move_target(positions: &[usize], from: usize, slot: usize) -> Option<usize> {
-    if from >= positions.len() || slot == from || slot == from + 1 {
-        return None;
-    }
-    let src = positions[from];
-    let at = positions.get(slot).copied().unwrap_or_else(|| positions.last().map_or(0, |i| i + 1));
-    Some(if src < at { at - 1 } else { at })
+/// One place in an effect list while something is dragged: a card, or a whole collapsed
+/// group, with the positions (in the list's effects) it covers.
+struct Unit {
+    rect: egui::Rect,
+    first: usize,
+    last: usize,
+    group: Option<u64>,
+    /// An expanded group's effect (dropping between two of them joins the group).
+    member: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::move_target;
-
-    /// Moves in a list shaped [intro, A, B, sound, C]: A B C are the shown effects.
-    #[test]
-    fn drag_targets() {
-        let shown = [1, 2, 4];
-        let apply = |from: usize, slot: usize| {
-            let mut list = vec!["intro", "A", "B", "sound", "C"];
-            let at = move_target(&shown, from, slot)?;
-            let x = list.remove(shown[from]);
-            list.insert(at, x);
-            Some(list)
-        };
-        assert_eq!(apply(0, 3), Some(vec!["intro", "B", "sound", "C", "A"]), "A to the end");
-        assert_eq!(apply(2, 0), Some(vec!["intro", "C", "A", "B", "sound"]), "C to the top");
-        assert_eq!(apply(0, 2), Some(vec!["intro", "B", "sound", "A", "C"]), "A between B and C");
-        assert_eq!(apply(1, 1), None);
-        assert_eq!(apply(1, 2), None, "just below itself is where it already is");
-    }
+/// What's being dragged in an effect list: the effects at some positions (one, or the
+/// picked ones), or a group.
+enum Moving {
+    Effects(Vec<usize>),
+    Group(u64),
 }
 
 /// An effect being dragged out of the inspector (`App::effect_drag`): let go over
@@ -123,6 +105,10 @@ mod tests {
 pub struct EffectDrag {
     pub from: ItemId,
     pub effect: oa_doc::EffectInstance,
+    /// A whole group is dragged (its head's grip): `effect` is its first effect.
+    pub group: Option<oa_doc::EffectGroup>,
+    /// The other picked effects dragged with `effect` (in list order).
+    pub more: Vec<oa_doc::EffectInstance>,
 }
 
 /// Which of a clip's effects a list of effect cards shows.
@@ -135,6 +121,61 @@ enum List {
     /// Picture intros and outros.
     Intro,
     Outro,
+    /// The effects on a Duplicate's copy alone (under the Duplicate's card).
+    Copy(oa_doc::EffectId),
+}
+
+/// A dot on a stepped slider's rail at each step (when there are few enough to tell
+/// apart), those up to `value` in the accent; none under the handle. `rect`: the
+/// slider's response (its rail first, `slider_width` wide).
+fn slider_ticks(ui: &egui::Ui, rect: egui::Rect, lo: f64, hi: f64, step: f64, value: f64) {
+    let steps = ((hi - lo) / step).round();
+    let width = ui.spacing().slider_width;
+    // The handle's travel: the rail less the handle's radius at each end (as egui lays it).
+    let radius = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body)) / 2.5;
+    let (x0, x1) = (rect.left() + radius, rect.left() + width - radius);
+    if !(1.0..=40.0).contains(&steps) || (x1 - x0) / (steps as f32) < 5.0 {
+        return;
+    }
+    let y = rect.center().y;
+    let at = |v: f64| x0 + (x1 - x0) * ((v - lo) / (hi - lo)).clamp(0.0, 1.0) as f32;
+    let handle = at(value);
+    for i in 0..=steps as usize {
+        let v = lo + i as f64 * step;
+        let x = at(v);
+        if (x - handle).abs() < radius {
+            continue;
+        }
+        let color = if v <= value { crate::style::ACCENT } else { ui.visuals().widgets.inactive.fg_stroke.color.gamma_multiply(0.7) };
+        ui.painter().circle_filled(egui::pos2(x, y), 2.2, color);
+    }
+}
+
+/// How many effects a Duplicate's copy has, as a small pill.
+fn copy_badge(ui: &mut egui::Ui, n: usize) {
+    ui.label(egui::RichText::new(trf("{n} on the copy", &[("n", &n.to_string())])).small().color(crate::style::ACCENT))
+        .on_hover_text(tr("Effects on the duplicate only"));
+}
+
+/// The label that follows the pointer while effects are dragged.
+fn drag_label(ui: &egui::Ui, id: egui::Id, at: egui::Pos2, text: String) {
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, id));
+    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.0), egui::Color32::WHITE);
+    let at = at + egui::vec2(14.0, 10.0);
+    painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(8.0, 4.0)), 4.0, crate::style::ACCENT.gamma_multiply(0.9));
+    painter.galley(at, galley, egui::Color32::WHITE);
+}
+
+/// Forgets the drags `owner`'s effect lists remember (a drop another list took): its
+/// tabs' lists, and the copy list `copy` if the drag came from one.
+fn forget_drags(ui: &egui::Ui, owner: ItemId, copy: Option<oa_doc::EffectId>) {
+    let lists = [List::Effects, List::Intro, List::Outro, List::Sound].into_iter().chain(copy.map(List::Copy));
+    ui.data_mut(|d| {
+        for l in lists {
+            d.remove::<u64>(egui::Id::new(("effect-drag", owner.0, l)));
+            d.remove::<u64>(egui::Id::new(("group-drag", owner.0, l)));
+        }
+    });
 }
 
 /// A framed box grouping one effect's controls.
@@ -153,6 +194,8 @@ struct Prop<'a> {
     target: ParamTarget,
     param: &'a str,
     default: Value,
+    /// Only in steps of this much (the slider snaps to them and marks each).
+    step: Option<f64>,
 }
 
 /// Which part of the clip the inspector is showing.
@@ -292,7 +335,8 @@ impl App {
         }
         ui.add_space(crate::style::GAP_S);
         let titled: Vec<(Tab, &str, crate::icons::Icon)> = tabs.iter().map(|t| (*t, t.title(), t.icon())).collect();
-        crate::widgets::tabs(ui, &mut self.inspector_tab, &titled);
+        // Dragging an effect: holding it over a tab opens it (Effects ↔ Transitions).
+        crate::widgets::tabs(ui, &mut self.inspector_tab, &titled, self.effect_drag.is_some());
         ui.add_space(crate::style::GAP);
 
         match self.inspector_tab {
@@ -479,12 +523,14 @@ impl App {
         self.transition_end(ui, item, true, t);
         section(ui, tr("End"), tr("How the clip leaves: its own outro (effects over its last seconds, several combine) — or, when a clip starts right where it ends, a transition into that clip."));
         self.transition_end(ui, item, false, t);
+        // Keys over it are the picked intros' and outros' (see `App::effect_keys`).
+        self.effect_list_rect = Some(ui.min_rect());
     }
 
     /// Level and sound effects. The speed control is only here for sound on its own —
     /// on a video clip it lives with the picture, and the sound follows it.
     fn sound_tab(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
-        self.slider(ui, item, Prop { label: "volume (dB)", target: ParamTarget::Item, param: schema::AUDIO_GAIN, default: Value::Float(0.0) }, -60.0..=12.0, t);
+        self.slider(ui, item, Prop { label: "volume (dB)", target: ParamTarget::Item, param: schema::AUDIO_GAIN, default: Value::Float(0.0), step: None }, -60.0..=12.0, t);
         ui.label(
             egui::RichText::new(tr("◇ keyframes the volume — or drag its line on the clip in the timeline to fade by hand."))
                 .small()
@@ -516,7 +562,7 @@ impl App {
         ui.label(egui::RichText::new(what).small().weak());
         if kind == oa_doc::TrackKind::Video {
             section(ui, tr("Mix"), tr("How much of the result shows over the untouched picture. Intros and outros like Fade fade it in and out; a Blend effect sets how it combines with it."));
-            self.slider(ui, item, Prop { label: "opacity", target: ParamTarget::Item, param: schema::OPACITY, default: Value::Float(1.0) }, 0.0..=1.0, t);
+            self.slider(ui, item, Prop { label: "opacity", target: ParamTarget::Item, param: schema::OPACITY, default: Value::Float(1.0), step: None }, 0.0..=1.0, t);
         }
         section(ui, if list == List::Sound { "Sound effects" } else { "Effects" }, tr("Applied top to bottom."));
         self.effect_list(ui, item, list, t);
@@ -681,7 +727,9 @@ impl App {
                             write = Some((oa_params::Gradient { angle: g.angle, stops: vec![oa_params::GradientStop { pos: 0.0, ..first }] }, true));
                             ui.close();
                         }
-                        self.spoken_entry(ui, item, target, id, &schema.default, t);
+                        // Then what every property's menu has: copy, paste, reset, keys, waves…
+                        ui.separator();
+                        self.property_menu_items(ui, item, target, id, &schema.default, schema.range, t);
                     });
                 });
                 if was_advanced && advanced {
@@ -705,7 +753,7 @@ impl App {
             }
             Value::Float(_) => {
                 let (lo, hi) = schema.range.unwrap_or((-360.0, 360.0));
-                let prop = Prop { label: &label, target: target.clone(), param: id, default: schema.default.clone() };
+                let prop = Prop { label: &label, target: target.clone(), param: id, default: schema.default.clone(), step: schema.step };
                 self.slider(ui, item, prop, lo..=hi, t);
             }
             Value::Bool(_) => {
@@ -965,6 +1013,8 @@ impl App {
 
     fn effects_section(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
         self.effect_list(ui, item, List::Effects, t);
+        // Presets dropped here go on the selected clips.
+        self.effect_list_rect = Some(ui.min_rect());
     }
 
     /// One card per effect in chain order — the clip's passive picture effects, its sound
@@ -982,25 +1032,32 @@ impl App {
         let sound = list == List::Sound;
         let in_out = matches!(list, List::Intro | List::Outro);
         let reversing = list == List::Outro && it.outro_reverses_intro;
+        // A Duplicate's own effects are listed under it, in a list of their own.
+        let copy_of = if let List::Copy(d) = list { Some(d) } else { None };
         let registry = &self.registry;
         let in_list = |e: &oa_doc::EffectInstance| {
             let heard = registry.is_sound(&e.type_id);
-            // A Duplicate's own effects are listed under it.
-            if e.on_duplicate.is_some() {
+            if e.on_duplicate != copy_of {
                 return false;
             }
             match list {
-                List::Effects => e.role == EffectRole::Passive && !heard,
+                List::Effects | List::Copy(_) => e.role == EffectRole::Passive && !heard,
                 List::Sound => heard,
                 List::Intro => matches!(e.role, EffectRole::In { .. }) && !heard,
                 List::Outro => matches!(e.role, EffectRole::Out { .. }) && !heard,
             }
         };
+        if list == List::Effects {
+            // The copies' lists, drawn inside this one, say when a drag is theirs.
+            self.copy_drop = false;
+        }
         let effects: Vec<(usize, oa_doc::EffectInstance)> = it.effects.iter().cloned().enumerate().filter(|(_, e)| in_list(e)).filter(|_| !reversing).collect();
+        let groups: Vec<oa_doc::EffectGroup> = it.effect_groups.clone();
         // With several clips selected, the cards are every effect any of them has — this
         // clip's first, then the others' it doesn't — each saying how many have it, and
         // anything done to one is done to all of them (`Editor::fanned`).
-        let peers: Vec<ItemId> = self.editor.linked.iter().copied().filter(|l| *l != item).collect();
+        // A copy's effects are this clip's alone.
+        let peers: Vec<ItemId> = if copy_of.is_some() { Vec::new() } else { self.editor.linked.iter().copied().filter(|l| *l != item).collect() };
         let mut cards: Vec<(ItemId, oa_doc::EffectInstance)> = effects.iter().map(|(_, e)| (item, e.clone())).collect();
         if !reversing {
             for &other in &peers {
@@ -1016,7 +1073,7 @@ impl App {
         let total = peers.len() + 1;
         let seq = self.editor.seq;
         // The other selected clips (the background is never part of a selection).
-        let others: Vec<ItemId> = if item == oa_doc::BACKGROUND { Vec::new() } else { self.selected_clips().into_iter().filter(|i| *i != item).collect() };
+        let others: Vec<ItemId> = if item == oa_doc::BACKGROUND || copy_of.is_some() { Vec::new() } else { self.selected_clips().into_iter().filter(|i| *i != item).collect() };
         let mut ops: Option<(&str, Vec<Op>)> = None;
         let mut apply_all: Option<oa_doc::EffectInstance> = None;
         if list == List::Outro {
@@ -1037,26 +1094,127 @@ impl App {
                 List::Sound => tr("No sound effects yet."),
                 List::Intro => tr("No intro yet."),
                 List::Outro => tr("No outro yet."),
+                List::Copy(_) => tr("Nothing yet: effects added or dragged here change the copy, not the clip."),
             };
             ui.label(egui::RichText::new(none).weak());
         } else if !cards.is_empty() {
             let order = if in_out { tr("They play together. Drag ⋮⋮ to reorder, or onto another clip to copy.") } else { tr("Applied top to bottom. Drag ⋮⋮ to reorder, or onto another clip to copy.") };
-            let hint = if cards.len() > 1 { order } else { tr("Drag ⋮⋮ onto another clip to copy it there.") };
+            let hint = if copy_of.is_some() {
+                tr("Drag ⋮⋮ to reorder, or out into the clip's own effects to move it there.")
+            } else if cards.len() > 1 {
+                order
+            } else {
+                tr("Drag ⋮⋮ onto another clip to copy it there.")
+            };
             ui.label(egui::RichText::new(hint).small().weak());
         }
-        // Dragging: the effect being dragged, and where each card sits.
+        // Dragging: the effect (or group) being dragged, and where each card sits — as
+        // units of the list: a card, or a whole collapsed group.
         let drag_key = egui::Id::new(("effect-drag", item.0, list));
-        let dragging: Option<u64> = ui.data(|d| d.get_temp(drag_key));
-        let mut rects: Vec<egui::Rect> = Vec::new();
+        let group_drag_key = egui::Id::new(("group-drag", item.0, list));
+        let mut dragging: Option<u64> = ui.data(|d| d.get_temp(drag_key));
+        let mut group_dragging: Option<u64> = ui.data(|d| d.get_temp(group_drag_key));
+        // A drag that ended somewhere else (taken by another list or tab) leaves nothing to
+        // land here.
+        if (dragging.is_some() || group_dragging.is_some()) && self.effect_drag.is_none() {
+            ui.data_mut(|d| {
+                d.remove::<u64>(drag_key);
+                d.remove::<u64>(group_drag_key);
+            });
+            (dragging, group_dragging) = (None, None);
+        }
+        // Where the list starts (its whole height takes effects dragged from another tab).
+        let list_top = ui.cursor().top();
+        // Its empty space (as last drawn, down to the bottom of the panel): a click there
+        // lets go of the picked effects. Taken first, so the cards and buttons drawn over
+        // it get their own clicks.
+        let list_bg = egui::Id::new(("effect-list-background", item.0, list));
+        if let Some(last) = ui.data(|d| d.get_temp::<egui::Rect>(list_bg)) {
+            let bg = ui.interact(last, list_bg, egui::Sense::click());
+            if bg.clicked() && !ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+                self.effect_picks = None;
+            }
+        }
+        let mut units: Vec<Unit> = Vec::new();
+        let mut heads: Vec<(egui::Rect, u64)> = Vec::new();
+        let mut run: Option<u64> = None;
         let primary = item;
+        // Picked effects (click, Ctrl+click, Shift+click), and what can be done to them.
+        let shown_ids: Vec<oa_doc::EffectId> = effects.iter().map(|(_, e)| e.id).collect();
+        let picked = self.picks(primary);
+        // Showing only the picked ones (while some are).
+        let only_picked = self.only_picked && !picked.is_empty();
+        // The panel drawn around a group's head and effects: a slot for its shape (filled
+        // in once its last effect is drawn), where it starts, and whether it's on.
+        let mut panel: Option<(egui::layers::ShapeIdx, egui::Rect, bool)> = None;
+        let close_panel = |ui: &mut egui::Ui, panel: &mut Option<(egui::layers::ShapeIdx, egui::Rect, bool)>| {
+            if let Some((slot, start, on)) = panel.take() {
+                ui.add_space(4.0);
+                let rect = egui::Rect::from_min_max(start.min, egui::pos2(start.right(), ui.cursor().top()));
+                let accent = if on { crate::style::ACCENT } else { ui.visuals().weak_text_color() };
+                let shape = egui::epaint::RectShape::new(rect, 6.0, accent.gamma_multiply(0.07), egui::Stroke::new(1.0, accent.gamma_multiply(0.55)), egui::StrokeKind::Inside);
+                ui.painter().set(slot, shape);
+                ui.add_space(6.0);
+            }
+        };
         for (owner, fx) in cards.iter() {
             // A card is its owner's effect (this clip's, or another selected clip's).
             let item = *owner;
+            if only_picked && !(item == primary && picked.contains(&fx.id)) {
+                continue;
+            }
+            // This clip's effects in a group: under its head (drawn before the first),
+            // indented — or, while it's collapsed, only its ticked properties.
+            let in_group = if item == primary { fx.group.and_then(|g| groups.iter().find(|x| x.id == g)).cloned() } else { None };
+            let pos = effects.iter().position(|(_, e)| e.id == fx.id);
+            if in_group.as_ref().map(|g| g.id) != run {
+                run = in_group.as_ref().map(|g| g.id);
+                close_panel(ui, &mut panel);
+                if let Some(g) = &in_group {
+                    let start = ui.available_rect_before_wrap();
+                    panel = Some((ui.painter().add(egui::Shape::Noop), start, g.enabled));
+                    let head = self.group_head(ui, primary, g, group_dragging == Some(g.id), t);
+                    if head.drag_started {
+                        ui.data_mut(|d| d.insert_temp(group_drag_key, g.id));
+                        self.effect_drag = Some(EffectDrag { from: primary, effect: fx.clone(), group: Some(g.clone()), more: Vec::new() });
+                    }
+                    heads.push((head.rect, g.id));
+                    if (g.collapsed || g.locked)
+                        && let Some(first) = pos
+                    {
+                        let last = effects.iter().rposition(|(_, e)| e.group == Some(g.id)).unwrap_or(first).max(first);
+                        units.push(Unit { rect: head.rect, first, last, group: Some(g.id), member: false });
+                    }
+                    if group_dragging == Some(g.id) {
+                        ui.painter().rect_filled(head.rect, 4.0, ui.visuals().panel_fill.gamma_multiply(0.6));
+                    }
+                }
+            }
+            if in_group.as_ref().is_some_and(|g| g.collapsed || g.locked) {
+                continue;
+            }
             let have = 1 + self.editor.effect_peers(item, fx.id).len();
             let d = self.registry.effect(&fx.type_id).cloned();
             let sound_info = if sound { oa_audio::fx::info(&fx.type_id) } else { None };
             let fits: Vec<ItemId> = others.iter().copied().filter(|o| self.effect_fits(*o, &fx.type_id)).collect();
-            let resp = ui.push_id(("effect", fx.id.0), |ui| {
+            let indent = in_group.is_some();
+            let margin = if indent { egui::Margin { left: 14, right: 6, top: 0, bottom: 0 } } else { egui::Margin::ZERO };
+            // A click anywhere on the card's background picks it (Ctrl+click for more,
+            // Shift+click for a run); right-click there for its menu. Its box as last drawn
+            // takes the click, under everything drawn on it.
+            let card_key = egui::Id::new(("effect-card", fx.id.0));
+            if item == primary
+                && let Some(last) = ui.data(|d| d.get_temp::<egui::Rect>(card_key))
+            {
+                let bg = ui.interact(last, card_key.with("background"), egui::Sense::click());
+                if bg.clicked() {
+                    let mods = ui.input(|i| i.modifiers);
+                    self.pick_effect(item, &shown_ids, fx.id, mods);
+                }
+                crate::widgets::context_menu(&bg, |ui| self.effect_menu(ui, item, fx));
+            }
+            let folded = self.folded_effects.contains(&fx.id);
+            let framed = egui::Frame::new().inner_margin(margin).show(ui, |ui| ui.push_id(("effect", fx.id.0), |ui| {
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
                         // The grip: two columns of dots.
@@ -1067,10 +1225,29 @@ impl App {
                                 ui.painter().circle_filled(grip.center() + egui::vec2(dx, y), 1.4, dot);
                             }
                         }
-                        let gr = gr.on_hover_text(tr("Drag to reorder, or onto another clip to copy it there")).on_hover_cursor(egui::CursorIcon::Grab);
+                        let gr = gr.on_hover_text(tr("Drag to reorder, onto another clip to copy it there, or onto the Transitions tab to make it an intro or outro")).on_hover_cursor(egui::CursorIcon::Grab);
+                        // Fold the card to this line, or open it.
+                        let (fold_icon, fold_tip) = if folded { (crate::icons::STEP_ON, tr("Show its settings")) } else { (crate::icons::EXPAND, tr("Fold to this line")) };
+                        let (fold_rect, fold) = ui.allocate_exact_size(egui::vec2(16.0, 18.0), egui::Sense::click());
+                        let fold_color = if fold.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+                        crate::icons::paint(ui.painter(), fold_rect.shrink2(egui::vec2(0.0, 1.0)), fold_icon, fold_color);
+                        if fold.on_hover_text(fold_tip).clicked() {
+                            if folded {
+                                self.folded_effects.remove(&fx.id);
+                            } else {
+                                self.folded_effects.insert(fx.id);
+                            }
+                        }
                         if gr.drag_started() {
                             ui.data_mut(|d| d.insert_temp(drag_key, fx.id.0));
-                            self.effect_drag = Some(EffectDrag { from: item, effect: fx.clone() });
+                            // Picked with others: they all go.
+                            let picked = self.picks(item);
+                            let more: Vec<oa_doc::EffectInstance> = if picked.len() > 1 && picked.contains(&fx.id) {
+                                self.editor.item(item).map(|it| it.effects.iter().filter(|e| e.id != fx.id && picked.contains(&e.id)).cloned().collect()).unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            self.effect_drag = Some(EffectDrag { from: item, effect: fx.clone(), group: None, more });
                         }
                         let mut on = fx.enabled;
                         if ui.checkbox(&mut on, tr("")).on_hover_text(if on { "Turn off" } else { "Turn on" }).changed() {
@@ -1079,8 +1256,20 @@ impl App {
                         let name = d.as_ref().map_or(fx.type_id.as_str(), |d| d.name.as_str());
                         let color = if fx.enabled { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
                         let r = ui.add(egui::Label::new(egui::RichText::new(name).strong().color(color)).sense(egui::Sense::click()));
+                        // Click to pick it (Ctrl+click for more, Shift+click for a run).
+                        if r.clicked() && item == primary {
+                            let mods = ui.input(|i| i.modifiers);
+                            self.pick_effect(item, &shown_ids, fx.id, mods);
+                        }
                         if have < total {
                             ui.label(egui::RichText::new(trf("on {have} of {total}", &[("have", &have.to_string()), ("total", &total.to_string())])).small().weak()).on_hover_text(tr("Only some of the selected clips have it; changes go to those"));
+                        }
+                        // A Duplicate whose copy's effects are out of sight: how many it has.
+                        if fx.type_id == oa_graph::registry::DUPLICATE && (folded || self.closed_copies.contains(&fx.id)) {
+                            let n = self.editor.item(item).map_or(0, |it| it.effects.iter().filter(|e| e.on_duplicate == Some(fx.id)).count());
+                            if n > 0 {
+                                copy_badge(ui, n);
+                            }
                         }
                         let about = sound_info.as_ref().map(|i| i.description.clone()).or_else(|| d.as_ref().map(|d| d.description.clone())).unwrap_or_default();
                         let tip = if about.is_empty() { String::new() } else { format!("{about}\n") };
@@ -1122,6 +1311,10 @@ impl App {
                             }
                         });
                     });
+                    // Folded: just that line.
+                    if folded {
+                        return;
+                    }
                     if sound {
                         // When it plays: over the whole clip, or as its intro or outro —
                         // the same roles picture effects have.
@@ -1189,7 +1382,19 @@ impl App {
                         Some(d) => {
                             let target = ParamTarget::Effect(fx.id);
                             for schema in &d.params {
-                                self.param_widget(ui, item, &target, schema, t, &fx.id.0.to_string());
+                                // A Duplicate's order for its own effects sits with them.
+                                if fx.type_id == oa_graph::registry::DUPLICATE && schema.id.as_str() == schema::DUPLICATE_OWN {
+                                    continue;
+                                }
+                                if indent {
+                                    // In a group: the circle that shows it on the collapsed group.
+                                    ui.horizontal_top(|ui| {
+                                        self.shown_circle(ui, item, fx, schema.id.as_str());
+                                        ui.vertical(|ui| self.param_widget(ui, item, &target, schema, t, &fx.id.0.to_string()));
+                                    });
+                                } else {
+                                    self.param_widget(ui, item, &target, schema, t, &fx.id.0.to_string());
+                                }
                             }
                             if sound {
                                 self.sound_meter(ui, fx);
@@ -1205,58 +1410,185 @@ impl App {
                             ui.label(egui::RichText::new(tr("This effect's plugin is off or isn't installed; its settings are kept.")).small().weak());
                         }
                     }
+                    // Used with a blend: its mode and mix (right-click its name to stop).
+                    if fx.params.get(schema::EFFECT_BLEND_MODE).is_some() {
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new(tr("Blended with the picture that went into it")).small().weak())
+                            .on_hover_text(tr("Right-click the effect to remove the blend"));
+                        let target = ParamTarget::Effect(fx.id);
+                        for schema in schema::effect_blend() {
+                            self.param_widget(ui, item, &target, schema, t, &format!("blend-{}", fx.id.0));
+                        }
+                    }
                 });
-            });
-            // Only this clip's own cards are reordered here.
+            }));
+            let resp = framed.inner;
             if item == primary {
-                rects.push(resp.response.rect);
+                ui.data_mut(|d| d.insert_temp(card_key, resp.response.rect));
             }
-            // The card being dragged is dimmed where it was.
-            if dragging == Some(fx.id.0) {
+            // Picked: outlined.
+            if item == primary && picked.contains(&fx.id) {
+                let r = resp.response.rect;
+                ui.painter().rect_stroke(egui::Rect::from_min_max(r.min, egui::pos2(r.right(), r.bottom() - 3.0)), 4.0, egui::Stroke::new(2.0, crate::style::ACCENT), egui::StrokeKind::Inside);
+            }
+            // Only this clip's own cards are reordered here.
+            if item == primary
+                && let Some(pos) = pos
+            {
+                units.push(Unit { rect: resp.response.rect, first: pos, last: pos, group: in_group.as_ref().map(|g| g.id), member: true });
+            }
+            // The cards being dragged are dimmed where they were.
+            let carried = self.effect_drag.as_ref().is_some_and(|d| dragging.is_some() && d.more.iter().any(|m| m.id == fx.id));
+            if dragging == Some(fx.id.0) || carried {
                 ui.painter().rect_filled(resp.response.rect, 4.0, ui.visuals().panel_fill.gamma_multiply(0.6));
             }
         }
+        close_panel(ui, &mut panel);
         // While dragging: inside the list, a line where it would land (let go: it moves
-        // there); outside it, a label that follows the pointer (let go over a clip: it's
-        // copied there — the timeline and viewer take the drop).
-        if let Some(moving) = dragging {
-            let from = effects.iter().position(|(_, e)| e.id.0 == moving);
-            let pointer = ui.input(|i| i.pointer.latest_pos());
-            let area = rects.iter().copied().reduce(|a, b| a.union(b)).map(|r| r.expand2(egui::vec2(40.0, 24.0)));
-            let inside = matches!((area, pointer), (Some(a), Some(p)) if a.contains(p));
-            // The slot: how many cards' middles are above the pointer.
-            let slot = pointer.map_or(0, |p| rects.iter().filter(|r| r.center().y < p.y).count());
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            if inside
-                && let (Some(from), Some(first), Some(last)) = (from, rects.first(), rects.last())
-                && slot != from
-                && slot != from + 1
-            {
-                let y = if slot == 0 { first.top() - 2.0 } else if slot >= rects.len() { last.bottom() + 2.0 } else { (rects[slot - 1].bottom() + rects[slot].top()) / 2.0 };
-                let (x0, x1) = (first.left(), first.right());
-                ui.painter().line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], egui::Stroke::new(3.0, crate::style::ACCENT));
-                ui.painter().circle_filled(egui::pos2(x0, y), 4.0, crate::style::ACCENT);
+        // there; between two of a group's effects, or on its head, it joins the group);
+        // outside it, a label that follows the pointer (let go over a clip: it's copied
+        // there — the timeline and viewer take the drop; over the media bin: it's kept
+        // in the asset library).
+        let moving: Option<Moving> = match (dragging, group_dragging) {
+            (Some(id), _) => {
+                // The dragged effect, and the others picked with it, in list order.
+                let carried: Vec<oa_doc::EffectId> = self.effect_drag.as_ref().map(|d| d.more.iter().map(|m| m.id).collect()).unwrap_or_default();
+                let at: Vec<usize> = effects.iter().enumerate().filter(|(_, (_, e))| e.id.0 == id || carried.contains(&e.id)).map(|(i, _)| i).collect();
+                (!at.is_empty()).then_some(Moving::Effects(at))
             }
-            if !inside
-                && let (Some(p), Some(from)) = (pointer, from)
+            (None, Some(g)) => Some(Moving::Group(g)),
+            _ => None,
+        };
+        if let Some(moving) = moving {
+            let pointer = ui.input(|i| i.pointer.latest_pos());
+            let area = units.iter().map(|u| u.rect).chain(heads.iter().map(|h| h.0)).reduce(|a, b| a.union(b)).map(|r| r.expand2(egui::vec2(40.0, 24.0)));
+            let mut inside = matches!((area, pointer), (Some(a), Some(p)) if a.contains(p));
+            if copy_of.is_some() && inside {
+                self.copy_drop = true;
+            }
+            // Over a copy's list (drawn inside this one), the drag is that list's.
+            if list == List::Effects && self.copy_drop {
+                inside = false;
+            }
+            // A copy's effects let go over the clip's own list move there (it takes them).
+            let to_parent = copy_of.is_some() && !inside && pointer.is_some_and(|p| ui.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("effect-list-background", item.0, List::Effects)))).is_some_and(|r| r.contains(p)));
+            let away = !inside && !to_parent && !(list == List::Effects && self.copy_drop);
+            let released = !ui.input(|i| i.pointer.primary_down());
+            // The units it can land between (a group isn't dropped into itself).
+            let open: Vec<&Unit> = units.iter().filter(|u| !matches!(moving, Moving::Group(g) if u.group == Some(g))).collect();
+            // The slot: how many units' middles are above the pointer.
+            let slot = pointer.map_or(0, |p| open.iter().filter(|u| u.rect.center().y < p.y).count());
+            // Let go on a group's head (an unlocked one): they join, after its effects.
+            let on_head = match moving {
+                Moving::Effects(_) => pointer.and_then(|p| heads.iter().find(|h| h.0.contains(p))).map(|h| h.1).filter(|g| groups.iter().any(|x| x.id == *g && !x.locked)),
+                Moving::Group(_) => None,
+            };
+            // Where they go, and in which group; or only a group change, in place.
+            let mut regroup: Vec<(oa_doc::EffectId, Option<u64>)> = Vec::new();
+            let plan: Option<(Vec<oa_doc::EffectInstance>, crate::effect_groups::Anchor)> = {
+                use crate::effect_groups::Anchor;
+                let last_shown = |skip: &dyn Fn(&oa_doc::EffectInstance) -> bool| effects.iter().rev().find(|(_, e)| !skip(e)).map(|(_, e)| e.id);
+                match &moving {
+                    Moving::Effects(at) => {
+                        let fxs: Vec<&oa_doc::EffectInstance> = at.iter().map(|&i| &effects[i].1).collect();
+                        let is_moved = |e: &oa_doc::EffectInstance| fxs.iter().any(|f| f.id == e.id);
+                        // The group they share, if they all are in the same one.
+                        let own = fxs[0].group.filter(|g| groups.iter().any(|x| x.id == *g) && fxs.iter().all(|f| f.group == Some(*g)));
+                        // Where they sit now: dropping there (they being one run) moves nothing.
+                        let their: Vec<usize> = open.iter().enumerate().filter(|(_, u)| at.iter().any(|&p| u.first <= p && p <= u.last)).map(|(i, _)| i).collect();
+                        let run = their.windows(2).all(|w| w[1] == w[0] + 1);
+                        let still = run && their.first().is_some_and(|f| slot >= *f) && their.last().is_some_and(|l| slot <= l + 1);
+                        let member = |u: Option<&&Unit>| u.filter(|u| u.member).and_then(|u| u.group);
+                        let (above, below) = (slot.checked_sub(1).and_then(|s| open.get(s)), open.get(slot));
+                        let joined = match on_head {
+                            Some(g) => Some(g),
+                            None => match (member(above), member(below)) {
+                                (Some(a), Some(b)) if a == b => Some(a),
+                                (a, b) if own.is_some() && (a == own || b == own) => own,
+                                _ => None,
+                            },
+                        };
+                        let moved: Vec<oa_doc::EffectInstance> = fxs.iter().map(|f| oa_doc::EffectInstance { group: joined, ..(*f).clone() }).collect();
+                        let anchor = match on_head {
+                            Some(g) => effects.iter().rev().find(|(_, e)| e.group == Some(g) && !is_moved(e)).map(|(_, e)| Anchor::After(e.id)),
+                            None if still => None,
+                            // Before the first unit at the slot that isn't one being moved.
+                            None => Some(match open.iter().skip(slot).find(|u| !is_moved(&effects[u.first].1)) {
+                                Some(u) => Anchor::Before(effects[u.first].1.id),
+                                None => last_shown(&is_moved).map_or(Anchor::End, Anchor::After),
+                            }),
+                        };
+                        if anchor.is_none() {
+                            regroup = fxs.iter().filter(|f| f.group != joined).map(|f| (f.id, joined)).collect();
+                        }
+                        anchor.map(|a| (moved, a))
+                    }
+                    &Moving::Group(g) => {
+                        let members: Vec<oa_doc::EffectInstance> = effects.iter().filter(|(_, e)| e.group == Some(g)).map(|(_, e)| e.clone()).collect();
+                        // Where its units were among the others: dropping there moves nothing.
+                        let at_unit = units.iter().take_while(|u| u.group != Some(g)).count();
+                        (slot != at_unit && !members.is_empty()).then(|| {
+                            let anchor = match open.get(slot) {
+                                Some(u) => Anchor::Before(effects[u.first].1.id),
+                                None => last_shown(&|e| e.group == Some(g)).map_or(Anchor::End, Anchor::After),
+                            };
+                            (members, anchor)
+                        })
+                    }
+                }
+            };
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if inside {
+                if let Some(g) = on_head
+                    && let Some((r, _)) = heads.iter().find(|h| h.1 == g)
+                {
+                    ui.painter().rect_stroke(*r, 4.0, egui::Stroke::new(2.0, crate::style::ACCENT), egui::StrokeKind::Outside);
+                } else if (plan.is_some() || !regroup.is_empty())
+                    && let (Some(first), Some(last)) = (open.first(), open.last())
+                {
+                    let y = if slot == 0 { first.rect.top() - 2.0 } else if slot >= open.len() { last.rect.bottom() + 2.0 } else { (open[slot - 1].rect.bottom() + open[slot].rect.top()) / 2.0 };
+                    let (x0, x1) = (first.rect.left(), first.rect.right());
+                    ui.painter().line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], egui::Stroke::new(3.0, crate::style::ACCENT));
+                    ui.painter().circle_filled(egui::pos2(x0, y), 4.0, crate::style::ACCENT);
+                }
+            }
+            let pass = ui.ctx().cumulative_pass_nr();
+            let over_assets = |app: &App, p: egui::Pos2| app.assets_drop.is_some_and(|(r, at)| r.contains(p) && pass <= at + 2);
+            if away
+                && let Some(p) = pointer
             {
-                let name = self.effect_name(&effects[from].1.type_id);
+                let name = match &moving {
+                    Moving::Effects(at) if at.len() == 1 => self.effect_name(&effects[at[0]].1.type_id),
+                    Moving::Effects(at) => trf("{n} effects", &[("n", &at.len().to_string())]),
+                    Moving::Group(g) => groups.iter().find(|x| x.id == *g).map(|x| x.name.clone()).unwrap_or_default(),
+                };
+                let text = if over_assets(self, p) { trf("⧉ {name} — let go to keep it in assets", &[("name", &name)]) } else { trf("⧉ {name} — drop on a clip to copy", &[("name", &name)]) };
                 let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, drag_key));
-                let galley = painter.layout_no_wrap(trf("⧉ {name} — drop on a clip to copy", &[("name", &(name).to_string())]), egui::FontId::proportional(12.0), egui::Color32::WHITE);
+                let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.0), egui::Color32::WHITE);
                 let at = p + egui::vec2(14.0, 10.0);
                 let bg = egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(8.0, 4.0));
                 painter.rect_filled(bg, 4.0, crate::style::ACCENT.gamma_multiply(0.9));
                 painter.galley(at, galley, egui::Color32::WHITE);
             }
-            if !ui.input(|i| i.pointer.primary_down()) {
-                ui.data_mut(|d| d.remove::<u64>(drag_key));
-                // Let go outside the list: onto the clip under the pointer, if any.
-                if let Some(drag) = self.effect_drag.take()
-                    && !inside
+            if released {
+                ui.data_mut(|d| {
+                    d.remove::<u64>(drag_key);
+                    d.remove::<u64>(group_drag_key);
+                });
+                // Let go outside the list: onto the media bin (kept in assets), or the
+                // clip under the pointer, if any. (Over the clip's own list, a copy's
+                // effects are left for it to take.)
+                let drag = if to_parent { None } else { self.effect_drag.take() };
+                if let Some(drag) = drag
+                    && away
                     && let Some(p) = pointer
                 {
                     let lane = self.fx_lanes.iter().find(|l| l.0.contains(p)).copied();
                     match self.clip_on_screen(p) {
+                        _ if over_assets(self, p) => match &drag.group {
+                            Some(g) => self.save_preset_from(drag.from, Some(g.id), Vec::new()),
+                            None => self.save_preset_from(drag.from, None, std::iter::once(drag.effect.id).chain(drag.more.iter().map(|m| m.id)).collect()),
+                        },
                         Some(onto) => self.drop_effect(&drag, onto),
                         // On an empty stretch of an effect track: a container starts there,
                         // holding the effect.
@@ -1266,24 +1598,175 @@ impl App {
                             self.drop_effect_on_track(&drag, track, at);
                         }
                         None if !ui.max_rect().contains(p) => {
-                            let name = self.effect_name(&drag.effect.type_id);
-                            self.notify(trf("Drop {name} on a clip in the timeline or the viewer to copy it there.", &[("name", &name.to_string())]));
+                            let name = drag.group.as_ref().map_or_else(|| self.effect_name(&drag.effect.type_id), |g| g.name.clone());
+                            self.notify(trf("Drop {name} on a clip in the timeline or the viewer to copy it there, or on the media bin to keep it in assets.", &[("name", &name.to_string())]));
                         }
                         None => {}
                     }
                 }
-                if inside
-                    && let Some(from) = from
-                    && slot != from
-                    && slot != from + 1
-                {
-                    // Where it goes among all the clip's effects (the other lists sit in
-                    // the same one): before the card at `slot`, or just after the last one
-                    // — counted after taking it out.
-                    let positions: Vec<usize> = effects.iter().map(|(i, _)| *i).collect();
-                    if let Some(at) = move_target(&positions, from, slot) {
-                        let fx = effects[from].1.clone();
-                        ops = Some(("Reorder effects", vec![Op::RemoveEffect { seq, item, effect: fx.id }, Op::InsertEffect { seq, item, index: at, effect: fx }]));
+                if inside {
+                    if let Some((moved, anchor)) = plan {
+                        let label = if matches!(moving, Moving::Group(_)) { "Move group" } else { "Reorder effects" };
+                        ops = Some((label, self.place_ops(item, &moved, anchor)));
+                    } else if !regroup.is_empty() {
+                        ops = Some(("Effect group", regroup.into_iter().map(|(effect, group)| Op::SetEffectGroup { seq, item, effect, group }).collect()));
+                    }
+                }
+            }
+        }
+
+        // An effect dragged in from the other tab — from Effects onto the Transitions tab's
+        // intro or outro, or back: let go anywhere over this list and a copy goes in it,
+        // as an intro or outro here or for the whole clip there — if it can be one.
+        let list_rect = egui::Rect::from_min_max(egui::pos2(ui.min_rect().left(), list_top), egui::pos2(ui.max_rect().right(), ui.cursor().top().max(list_top + 24.0)));
+        // (A copy's list, inside a card, is only as tall as it is.)
+        let bg_rect = if copy_of.is_some() { list_rect } else { list_rect.with_max_y(list_rect.bottom().max(ui.clip_rect().bottom())) };
+        ui.data_mut(|d| d.insert_temp(list_bg, bg_rect));
+        let own_drag = dragging.is_some() || group_dragging.is_some();
+        let pointer = ui.input(|i| i.pointer.latest_pos());
+        // This clip's effects moved between its own list and a Duplicate's copy (or from
+        // one copy to another): let go over the list, and they move to where the line is.
+        let between = |app: &App, drag: &EffectDrag| {
+            drag.from == primary
+                && !sound
+                && !app.registry.is_sound(&drag.effect.type_id)
+                && drag.effect.role == EffectRole::Passive
+                && match copy_of {
+                    Some(d) => drag.effect.on_duplicate != Some(d) && drag.effect.id != d,
+                    None => list == List::Effects && drag.effect.on_duplicate.is_some() && !app.copy_drop,
+                }
+        };
+        let mut moving_between = false;
+        if !own_drag
+            && let Some(drag) = self.effect_drag.clone()
+            && between(self, &drag)
+            && let Some(p) = pointer.filter(|p| bg_rect.contains(*p))
+        {
+            moving_between = true;
+            if copy_of.is_some() {
+                self.copy_drop = true;
+            }
+            let dragged: Vec<oa_doc::EffectInstance> = match &drag.group {
+                Some(g) => self.group_members(drag.from, g.id),
+                None => std::iter::once(drag.effect.clone()).chain(drag.more.iter().cloned()).collect(),
+            };
+            let is_moved = |e: &oa_doc::EffectInstance| dragged.iter().any(|m| m.id == e.id);
+            // Where they'd go: before the first card under the pointer, else after the last.
+            let below = units.iter().find(|u| u.rect.center().y > p.y && !is_moved(&effects[u.first].1));
+            let y = match (below, units.last()) {
+                (Some(u), _) => u.rect.top() - 2.0,
+                (None, Some(u)) => u.rect.bottom() + 2.0,
+                (None, None) => list_rect.top() + 2.0,
+            };
+            ui.painter().rect_stroke(list_rect.expand(2.0), 6.0, egui::Stroke::new(1.0, crate::style::ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Outside);
+            ui.painter().line_segment([egui::pos2(list_rect.left(), y), egui::pos2(list_rect.right(), y)], egui::Stroke::new(3.0, crate::style::ACCENT));
+            ui.painter().circle_filled(egui::pos2(list_rect.left(), y), 4.0, crate::style::ACCENT);
+            let name = drag.group.as_ref().map_or_else(|| if dragged.len() > 1 { trf("{n} effects", &[("n", &dragged.len().to_string())]) } else { self.effect_name(&drag.effect.type_id) }, |g| g.name.clone());
+            let text = if copy_of.is_some() { trf("⧉ {name} — let go to move it onto the copy", &[("name", &name)]) } else { trf("⧉ {name} — let go to move it off the copy", &[("name", &name)]) };
+            drag_label(ui, drag_key.with("between"), p, text);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.effect_drag = None;
+                forget_drags(ui, primary, drag.effect.on_duplicate);
+                // A whole group moves as a group; effects taken from one leave it. A copy
+                // can't hold a Duplicate.
+                let whole = drag.group.is_some();
+                let moved: Vec<oa_doc::EffectInstance> = dragged
+                    .iter()
+                    .filter(|e| copy_of.is_none() || e.type_id != oa_graph::registry::DUPLICATE)
+                    .map(|e| oa_doc::EffectInstance {
+                        on_duplicate: copy_of,
+                        group: if whole { e.group } else { None },
+                        shown: if whole { e.shown.clone() } else { Vec::new() },
+                        ..e.clone()
+                    })
+                    .collect();
+                if moved.len() < dragged.len() {
+                    self.notify(tr("A Duplicate can't go on another Duplicate's copy; it was left where it was."));
+                }
+                if !moved.is_empty() {
+                    let anchor = {
+                        use crate::effect_groups::Anchor;
+                        match below {
+                            Some(u) => Anchor::Before(effects[u.first].1.id),
+                            None => match effects.iter().rev().find(|(_, e)| !is_moved(e)) {
+                                Some((_, e)) => Anchor::After(e.id),
+                                // An empty copy: its effects sit after the Duplicate.
+                                None => copy_of.map_or(Anchor::End, Anchor::After),
+                            },
+                        }
+                    };
+                    let label = if copy_of.is_some() { "Move effects onto the copy" } else { "Move effects off the copy" };
+                    ops = Some((label, self.place_ops(primary, &moved, anchor)));
+                }
+            }
+        }
+        if !own_drag
+            && !moving_between
+            && copy_of.is_none()
+            && !(list == List::Effects && self.copy_drop)
+            && !sound
+            && let Some(drag) = self.effect_drag.clone()
+            && (drag.effect.role == EffectRole::Passive) == in_out
+            && !self.registry.is_sound(&drag.effect.type_id)
+            && let Some(p) = pointer.filter(|p| list_rect.contains(*p))
+        {
+            ui.painter().rect_stroke(list_rect.expand(2.0), 6.0, egui::Stroke::new(2.0, crate::style::ACCENT), egui::StrokeKind::Outside);
+            let name = drag.group.as_ref().map_or_else(|| self.effect_name(&drag.effect.type_id), |g| g.name.clone());
+            let text = match list {
+                List::Intro => trf("⧉ {name} — let go to add it as the intro", &[("name", &name)]),
+                List::Outro => trf("⧉ {name} — let go to add it as the outro", &[("name", &name)]),
+                _ => trf("⧉ {name} — let go to add it for the whole clip", &[("name", &name)]),
+            };
+            drag_label(ui, drag_key.with("foreign"), p, text);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.effect_drag = None;
+                forget_drags(ui, primary, drag.effect.on_duplicate);
+                forget_drags(ui, drag.from, drag.effect.on_duplicate);
+                let dragged: Vec<oa_doc::EffectInstance> = match &drag.group {
+                    Some(g) => self.group_members(drag.from, g.id),
+                    None => std::iter::once(drag.effect.clone()).chain(drag.more.iter().cloned()).collect(),
+                };
+                // As an intro or outro: one made for it, or one with an off state to ease from.
+                // For the whole clip: any but one made only for intros and outros.
+                let can = |app: &App, e: &oa_doc::EffectInstance| {
+                    app.effect_fits(primary, &e.type_id)
+                        && app.registry.effect(&e.type_id).is_some_and(|d| if in_out { d.usage == oa_graph::registry::EffectUsage::InOut || d.in_out() } else { d.usage == oa_graph::registry::EffectUsage::Passive })
+                };
+                let duration = effects.last().and_then(|(_, c)| match c.role {
+                    EffectRole::In { duration } | EffectRole::Out { duration } => Some(duration),
+                    _ => None,
+                });
+                let duration = duration.unwrap_or(Time::from_seconds_f64(0.5)).min(length);
+                let role = match list {
+                    List::Intro => EffectRole::In { duration },
+                    List::Outro => EffectRole::Out { duration },
+                    _ => EffectRole::Passive,
+                };
+                let copies: Vec<oa_doc::EffectInstance> = dragged.iter().filter(|e| can(self, e)).map(|e| oa_doc::EffectInstance { role, group: None, shown: Vec::new(), on_duplicate: None, ..e.clone() }).collect();
+                if copies.is_empty() {
+                    let name = drag.group.as_ref().map_or_else(|| self.effect_name(&drag.effect.type_id), |g| g.name.clone());
+                    self.notify(if in_out {
+                        trf("{name} can't be an intro or outro: it has no off state to come in from.", &[("name", &name)])
+                    } else {
+                        trf("{name} only works as an intro or outro.", &[("name", &name)])
+                    });
+                } else {
+                    let index = match role {
+                        EffectRole::Passive => self.editor.item(primary).map_or(0, |i| i.effects.len()),
+                        _ => self.editor.item(primary).map_or(0, |i| i.effects.iter().take_while(|e| e.role != EffectRole::Passive).count()),
+                    };
+                    let skipped = dragged.len() - copies.len();
+                    let changes = self.insert_effects_ops(primary, &copies, &[], index);
+                    let label = match list {
+                        List::Intro => tr("Add as intro"),
+                        List::Outro => tr("Add as outro"),
+                        _ => tr("Add effect"),
+                    };
+                    ops = Some((label, changes));
+                    if skipped > 0 {
+                        self.notify(trf("{n} of them can't go there and were left out.", &[("n", &skipped.to_string())]));
                     }
                 }
             }
@@ -1322,6 +1805,7 @@ impl App {
                 let (label, kind, usage) = match list {
                     List::Intro => (plural("intro"), ThumbKind::Intro, oa_graph::registry::EffectUsage::InOut),
                     List::Outro => (plural("outro"), ThumbKind::Outro, oa_graph::registry::EffectUsage::InOut),
+                    List::Copy(_) => (tr("+ Add effect to the copy").to_string(), ThumbKind::Passive, oa_graph::registry::EffectUsage::Passive),
                     _ => (plural("effect"), ThumbKind::Passive, oa_graph::registry::EffectUsage::Passive),
                 };
                 ui.add_enabled_ui(!reversing, |ui| {
@@ -1334,6 +1818,10 @@ impl App {
                     })
                 });
             }
+        }
+        if copy_of.is_some() && add.as_deref() == Some(oa_graph::registry::DUPLICATE) {
+            self.notify(tr("A Duplicate can't go on another Duplicate's copy."));
+            add = None;
         }
         if let Some(type_id) = add {
             // How long a new intro/outro plays: as long as the last one, else half a
@@ -1355,6 +1843,7 @@ impl App {
                     List::Sound if sound_in_out => EffectRole::In { duration: Time::from_seconds_f64(1.0).min(it.range.duration) },
                     _ => EffectRole::Passive,
                 };
+                effect.on_duplicate = copy_of;
                 // Intros/outros go after the clip's others, before its passive effects (so
                 // those see the clip as it arrives); everything else at the end.
                 let index = if effect.role == EffectRole::Passive { it.effects.len() } else { it.effects.iter().take_while(|e| e.role != EffectRole::Passive).count() };
@@ -1371,8 +1860,10 @@ impl App {
             let n = self.apply_effect_to(&fx, &others, tr("Apply to all selected"));
             self.notify(if n == 0 { trf("The selected clips already have {name} like this.", &[("name", &(name).to_string())]) } else { trf("Applied {name} to {n} more clip{0}.", &[("name", &(name).to_string()), ("n", &(n).to_string()), ("0", (if n == 1 { "" } else { "s" }))]) });
         }
+        // (A copy's effects aren't the selection's: nothing to fan out to.)
+        let ops = ops.map(|(label, ops)| (label, if copy_of.is_some() { ops } else { self.editor.fanned(ops) }));
         if let Some((label, ops)) = ops
-            && let Err(e) = self.editor.apply(label, self.editor.fanned(ops))
+            && let Err(e) = self.editor.apply(label, ops)
         {
             self.error = Some(e.to_string());
         }
@@ -1569,68 +2060,68 @@ impl App {
         }
     }
 
-    /// The clip's sound effects, in the same cards as its picture effects.
-    /// Under a Duplicate's card: the effects on the copy alone (each with its settings),
-    /// and a button to add more. They run after the effects the copy takes from the clip.
+    /// Under a Duplicate's card: the effects on the copy alone, in cards like the clip's
+    /// own (drag them in from the clip's list or out to it), behind a rail; a fold for the
+    /// lot, whether they run before or after the effects the copy takes from the clip, and
+    /// a switch showing the copy alone in the viewer while it's adjusted.
     fn duplicate_effects(&mut self, ui: &mut egui::Ui, item: ItemId, dup: &oa_doc::EffectInstance, t: Time) {
-        use oa_doc::Op;
         let Some(it) = self.editor.item(item) else { return };
-        let is_text = it.kind == ItemKind::Text;
-        let own: Vec<oa_doc::EffectInstance> = it.effects.iter().filter(|e| e.on_duplicate == Some(dup.id)).cloned().collect();
-        let count = it.effects.len();
-        let seq = self.editor.seq;
-        let mut ops: Option<(&str, Vec<Op>)> = None;
+        let n = it.effects.iter().filter(|e| e.on_duplicate == Some(dup.id)).count();
+        let order = self.registry.effect(oa_graph::registry::DUPLICATE).and_then(|d| d.params.iter().find(|p| p.id.as_str() == schema::DUPLICATE_OWN).cloned());
+        let open = !self.closed_copies.contains(&dup.id);
         ui.add_space(crate::style::GAP_S);
-        ui.label(egui::RichText::new(tr("On the duplicate only")).small().strong());
-        ui.indent(("duplicate-own", dup.id.0), |ui| {
-            if own.is_empty() {
-                ui.label(egui::RichText::new(tr("Nothing yet: effects added here change the copy, not the clip.")).small().weak());
+        ui.horizontal(|ui| {
+            let (icon, tip) = if open { (crate::icons::EXPAND, tr("Hide the copy's effects")) } else { (crate::icons::STEP_ON, tr("Show the copy's effects")) };
+            let (rect, fold) = ui.allocate_exact_size(egui::vec2(16.0, 18.0), egui::Sense::click());
+            let color = if fold.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+            crate::icons::paint(ui.painter(), rect.shrink2(egui::vec2(0.0, 1.0)), icon, color);
+            let title = ui.add(egui::Label::new(egui::RichText::new(tr("On the duplicate only")).small().strong()).sense(egui::Sense::click()));
+            if fold.on_hover_text(tip).clicked() || title.clicked() {
+                if open {
+                    self.closed_copies.insert(dup.id);
+                } else {
+                    self.closed_copies.remove(&dup.id);
+                }
             }
-            for fx in &own {
-                let d = self.registry.effect(&fx.type_id).cloned();
-                ui.push_id(("duplicate-effect", fx.id.0), |ui| {
-                    ui.horizontal(|ui| {
-                        let mut on = fx.enabled;
-                        if ui.checkbox(&mut on, "").on_hover_text(if on { tr("Turn off") } else { tr("Turn on") }).changed() {
-                            ops = Some(("Toggle effect", vec![Op::SetEffectEnabled { seq, item, effect: fx.id, enabled: on }]));
-                        }
-                        let name = d.as_ref().map_or(fx.type_id.as_str(), |d| d.name.as_str());
-                        let color = if fx.enabled { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
-                        ui.label(egui::RichText::new(name).strong().color(color));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button(tr("✕")).on_hover_text(tr("Remove this effect")).clicked() {
-                                ops = Some(("Remove effect", vec![Op::RemoveEffect { seq, item, effect: fx.id }]));
-                            }
-                        });
-                    });
-                    if let Some(d) = &d {
-                        let target = ParamTarget::Effect(fx.id);
-                        for schema in &d.params {
-                            self.param_widget(ui, item, &target, schema, t, &fx.id.0.to_string());
-                        }
-                    }
-                });
+            if n > 0 {
+                copy_badge(ui, n);
             }
-            crate::widgets::sticky_menu(ui, tr("+ Add effect to the duplicate"), |ui| {
-                let taken: Vec<String> = own.iter().map(|e| e.type_id.clone()).collect();
-                let used = |id: &str| taken.iter().any(|t| t == id);
-                if let Some(type_id) = self.effect_picker(ui, item, ThumbKind::Passive, oa_graph::registry::EffectUsage::Passive, is_text, &used) {
-                    let mut effect = oa_doc::EffectInstance::new(oa_doc::EffectId(self.editor.doc.alloc_id()), &type_id);
-                    effect.on_duplicate = Some(dup.id);
-                    ops = Some(("Add effect", vec![Op::InsertEffect { seq, item, index: count, effect }]));
-                    ui.close();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Solo: the viewer shows the copy alone (until switched off, or another
+                // clip is selected).
+                let solo = self.solo_copy == Some(dup.id);
+                let (rect, r) = ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::click());
+                if solo {
+                    ui.painter().rect_filled(rect, 4.0, crate::style::ACCENT.gamma_multiply(0.25));
+                }
+                let color = if solo { crate::style::ACCENT } else if r.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+                crate::icons::paint(ui.painter(), rect.shrink2(egui::vec2(2.0, 1.0)), crate::icons::VISIBLE, color);
+                let tip = if solo { tr("Show the clip again") } else { tr("Show the copy alone in the viewer while you adjust it") };
+                if r.on_hover_text(tip).clicked() {
+                    self.solo_copy = if solo { None } else { Some(dup.id) };
                 }
             });
         });
-        if let Some((label, ops)) = ops
-            && let Err(e) = self.editor.apply(label, ops)
-        {
-            self.error = Some(e.to_string());
+        if !open {
+            return;
         }
+        // Behind a rail, so it's clear which card they belong to.
+        let top = ui.cursor().top();
+        let inner = ui.indent(("duplicate-own", dup.id.0), |ui| {
+            if let Some(order) = &order {
+                self.param_widget(ui, item, &ParamTarget::Effect(dup.id), order, t, &format!("own-{}", dup.id.0));
+            }
+            self.effect_list(ui, item, List::Copy(dup.id), t);
+        });
+        let r = inner.response.rect;
+        let x = r.left() - 7.0;
+        ui.painter().line_segment([egui::pos2(x, top + 2.0), egui::pos2(x, r.bottom() - 2.0)], egui::Stroke::new(2.0, crate::style::ACCENT.gamma_multiply(0.45)));
     }
 
+    /// The clip's sound effects, in the same cards as its picture effects.
     fn sound_effects_section(&mut self, ui: &mut egui::Ui, item: ItemId, t: Time) {
         self.effect_list(ui, item, List::Sound, t);
+        self.effect_list_rect = Some(ui.min_rect());
     }
 
     pub(crate) fn canvas_aspect(&self) -> f32 {
@@ -1953,8 +2444,17 @@ impl App {
         ui.horizontal(|ui| {
             self.key_toggle_for(ui, item, prop.target.clone(), prop.param, prop.default.clone(), t);
             let mut value = self.editor.param_value(item, &prop.target, prop.param, t).and_then(|v| v.as_float()).unwrap_or(default);
-            // Dragging stays in the comfortable range; typing a value goes past it.
-            let r = ui.add(egui::Slider::new(&mut value, range).text(crate::i18n::t(prop.label)).clamping(egui::SliderClamping::Edits));
+            // Dragging stays in the comfortable range; typing a value goes past it. In
+            // steps: snapped to them (from the low end), with a dot at each.
+            let mut slider = egui::Slider::new(&mut value, range).text(crate::i18n::t(prop.label)).clamping(egui::SliderClamping::Edits);
+            if let Some(step) = prop.step.filter(|s| *s > 0.0) {
+                slider = slider.step_by(step);
+            }
+            let r = ui.add(slider);
+            if let Some(step) = prop.step.filter(|s| *s > 0.0) {
+                value = lo + ((value - lo) / step).round() * step;
+                slider_ticks(ui, r.rect, lo, hi, step, value);
+            }
             if r.changed() {
                 self.editor.set_value_at(item, prop.target.clone(), prop.param, Value::Float(value), t, prop.param);
             }

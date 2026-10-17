@@ -1,0 +1,6 @@
+// The first three run on a grid coarser for wider blooms (cells of 1 to 8 pixels a
+// side; the shader works the cell out the same way, by doubling); the last, which
+// draws, at full size.
+let r = max(radius, 0);
+let cell = select(r >= 32, clamp(2 ^ floor(log2(r / 16)), 1, 8), 1);
+out = select(pass + 1 == passes, 1, cell);

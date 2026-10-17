@@ -55,6 +55,7 @@ pub fn probe(path: &Path) -> Result<MediaProbe, MediaError> {
         transfer_tag: None,
         primaries_tag: None,
         has_alpha: true,
+        packed_alpha: false,
         still: true,
         index: FrameIndex { time_base, pts: vec![0], keyframes: vec![0] },
     };

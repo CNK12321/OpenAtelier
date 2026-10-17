@@ -15,6 +15,8 @@ pub enum ParamTarget {
     VariantOverride(VariantId),
     /// The transition on one end of the item.
     Transition(ClipEnd),
+    /// One of the item's effect groups (its mix).
+    Group(u64),
 }
 
 /// Every change to a project. Ops reference stable ids only, never positions of
@@ -67,6 +69,12 @@ pub enum Op {
     RemoveEffect { seq: SeqId, item: ItemId, effect: EffectId },
     SetEffectEnabled { seq: SeqId, item: ItemId, effect: EffectId, enabled: bool },
     SetEffectRole { seq: SeqId, item: ItemId, effect: EffectId, role: EffectRole },
+    /// Replaces a clip's effect groups (names, switches, collapsed, locked, mixes).
+    SetEffectGroups { seq: SeqId, item: ItemId, groups: Vec<EffectGroup> },
+    /// Puts an effect in one of the clip's groups or, with `None`, takes it out.
+    SetEffectGroup { seq: SeqId, item: ItemId, effect: EffectId, group: Option<u64> },
+    /// Which of an effect's parameters show on its collapsed group.
+    SetEffectShown { seq: SeqId, item: ItemId, effect: EffectId, shown: Vec<String> },
     /// Adds, replaces or (with `None`) removes the transition on one end of a clip.
     SetTransition { seq: SeqId, item: ItemId, end: ClipEnd, transition: Option<Transition> },
     /// Replaces a clip's masks (what was drawn; their animated values are params).
@@ -344,6 +352,11 @@ impl Op {
                         let tr = it.transition_mut(*end).as_mut().ok_or(EditError::NotFound("transition", item.0))?;
                         swap(&mut tr.params, &param, source)
                     }
+                    ParamTarget::Group(g) => {
+                        let it = item_mut(p, seq, item)?;
+                        let group = it.effect_groups.iter_mut().find(|x| x.id == *g).ok_or(EditError::NotFound("effect group", *g))?;
+                        swap(&mut group.params, &param, source)
+                    }
                     ParamTarget::VariantOverride(v) => {
                         let s = seq_mut(p, seq)?;
                         if s.find_item(item).is_none() {
@@ -384,6 +397,31 @@ impl Op {
                 let fx = it.effects.iter_mut().find(|x| x.id == effect).ok_or(EditError::NotFound("effect", effect.0))?;
                 let old = std::mem::replace(&mut fx.role, role);
                 vec![Op::SetEffectRole { seq, item, effect, role: old }]
+            }
+            Op::SetEffectGroups { seq, item, groups } => {
+                if groups.iter().enumerate().any(|(i, g)| groups[..i].iter().any(|o| o.id == g.id)) || !groups.iter().all(|g| params_valid(&g.params)) {
+                    return Err(EditError::InvalidValue);
+                }
+                let it = item_mut(p, seq, item)?;
+                let old = std::mem::replace(&mut it.effect_groups, groups);
+                vec![Op::SetEffectGroups { seq, item, groups: old }]
+            }
+            Op::SetEffectGroup { seq, item, effect, group } => {
+                let it = item_mut(p, seq, item)?;
+                if let Some(g) = group
+                    && it.effect_group(g).is_none()
+                {
+                    return Err(EditError::NotFound("effect group", g));
+                }
+                let fx = it.effects.iter_mut().find(|x| x.id == effect).ok_or(EditError::NotFound("effect", effect.0))?;
+                let old = std::mem::replace(&mut fx.group, group);
+                vec![Op::SetEffectGroup { seq, item, effect, group: old }]
+            }
+            Op::SetEffectShown { seq, item, effect, shown } => {
+                let it = item_mut(p, seq, item)?;
+                let fx = it.effects.iter_mut().find(|x| x.id == effect).ok_or(EditError::NotFound("effect", effect.0))?;
+                let old = std::mem::replace(&mut fx.shown, shown);
+                vec![Op::SetEffectShown { seq, item, effect, shown: old }]
             }
             Op::SetTransition { seq, item, end, transition } => {
                 if transition.as_ref().is_some_and(|t| t.duration <= oa_time::Time::ZERO) {

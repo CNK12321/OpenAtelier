@@ -110,7 +110,7 @@ pub fn break_apart(p: &Project, seq: SeqId, item: ItemId, mut alloc: impl FnMut(
                         new_tracks += 1;
                         let index = above + 1 + inserted;
                         inserted += 1;
-                        ops.push(Op::InsertTrack { seq, index, track: Arc::new(Track::new(id, &name, TrackKind::Video)) });
+                        ops.push(Op::InsertTrack { seq, index, track: Arc::new(Track { temp: true, ..Track::new(id, &name, TrackKind::Video) }) });
                         id
                     }
                 }
@@ -120,7 +120,7 @@ pub fn break_apart(p: &Project, seq: SeqId, item: ItemId, mut alloc: impl FnMut(
                 None => {
                     let id = TrackId(alloc());
                     new_tracks += 1;
-                    ops.push(Op::InsertTrack { seq, index: s.tracks.len() + new_tracks - 1, track: Arc::new(Track::new(id, &name, TrackKind::Audio)) });
+                    ops.push(Op::InsertTrack { seq, index: s.tracks.len() + new_tracks - 1, track: Arc::new(Track { temp: true, ..Track::new(id, &name, TrackKind::Audio) }) });
                     id
                 }
             },

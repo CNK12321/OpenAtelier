@@ -176,11 +176,14 @@ pub struct AudioEffect {
     pub params: ParamSet,
     /// When it runs, as for picture effects: the whole clip, or its intro/outro window.
     pub role: EffectRole,
+    /// The effect group it's in, if any: the group's effects run as one, their result
+    /// mixed with the sound that went into them (dry/wet) by its mix.
+    pub group: Option<oa_doc::EffectGroup>,
 }
 
 impl AudioEffect {
     pub fn new(id: u64, type_id: &str, params: ParamSet) -> Self {
-        AudioEffect { id, type_id: type_id.into(), params, role: EffectRole::Passive }
+        AudioEffect { id, type_id: type_id.into(), params, role: EffectRole::Passive, group: None }
     }
 }
 

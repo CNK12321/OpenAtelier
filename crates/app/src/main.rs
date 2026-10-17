@@ -32,6 +32,7 @@ mod tracks;
 mod update;
 mod deps;
 mod drop_in;
+mod effect_groups;
 mod eyedropper;
 mod winfocus;
 mod curves;
@@ -50,6 +51,7 @@ mod guard;
 mod home;
 mod library;
 mod project_page;
+mod keybinds;
 mod icons;
 mod i18n;
 mod inspector;
@@ -64,6 +66,7 @@ mod plan_ahead;
 mod plugin_previews;
 mod plugin_scripts;
 mod preview_worker;
+mod presets;
 mod proxies;
 mod roto;
 mod previews;
@@ -319,6 +322,8 @@ struct FrameKey {
     /// The idle, refined render (see [`App::refine_when_idle`]).
     refined: bool,
     see_through: bool,
+    /// The Duplicate whose copy is shown alone.
+    solo: Option<u64>,
 }
 
 struct App {
@@ -371,6 +376,31 @@ struct App {
     /// With "Copy all effects": whether that clip's outro plays its intro backwards
     /// (pasted along with the effects). `None` for a single copied effect.
     effect_clipboard_reverse: Option<bool>,
+    /// The groups the copied effects are in (pasted along with them).
+    effect_clipboard_groups: Vec<oa_doc::EffectGroup>,
+    /// A preset being saved to the asset library (its window), and a preset card being
+    /// dragged out of the Assets tab.
+    preset_save: Option<presets::PresetSave>,
+    preset_drag: Option<presets::PresetDrag>,
+    /// The inspector's effect list as last drawn (presets dropped there go on the
+    /// selected clips), and the media bin while an effect is dragged over it (let go
+    /// there, it's saved to assets), with the pass it was drawn in.
+    effect_list_rect: Option<egui::Rect>,
+    /// The viewer, as last drawn (Alt+arrows nudge the picture while the pointer's over it).
+    viewer_rect: Option<egui::Rect>,
+    /// Effects picked in the inspector (click, Ctrl+click, Shift+click), on the clip given.
+    effect_picks: Option<(ItemId, Vec<oa_doc::EffectId>)>,
+    /// Effect cards folded down to their header (this session only), and whether the
+    /// effect list shows only the picked effects.
+    folded_effects: std::collections::HashSet<oa_doc::EffectId>,
+    only_picked: bool,
+    /// Duplicates whose copy's effects are folded away (this session only); whether a
+    /// copy's list, drawn inside the clip's, has the drag under the pointer this frame;
+    /// and the Duplicate whose copy the viewer shows alone.
+    closed_copies: std::collections::HashSet<oa_doc::EffectId>,
+    copy_drop: bool,
+    solo_copy: Option<oa_doc::EffectId>,
+    assets_drop: Option<(egui::Rect, u64)>,
     value_clipboard: Option<oa_params::Value>,
     transform_clipboard: Option<clips::TransformCopy>,
     /// The media bin's sort order and search.
@@ -456,6 +486,11 @@ struct App {
     project_thumbs: std::collections::HashMap<String, Arc<std::sync::OnceLock<Option<home::ProjectPicture>>>>,
     /// The start page's Projects page: what it's showing, its search, sort, layout.
     projects_page: project_page::ProjectsPage,
+    /// The open project's picture was last written (for the start page): which, and when.
+    thumb_written: Option<(PathBuf, Instant)>,
+    /// A search for the missing files under way (`find_missing`): what it found, and how
+    /// many it looked for.
+    finding: Option<std::sync::mpsc::Receiver<bin::Found>>,
     /// Put the keyboard in the inspector's text box next frame (a title was just added).
     focus_text: bool,
     /// A title being typed into right on the canvas (double-click it in the viewer).
@@ -650,6 +685,8 @@ impl App {
             last_saved: Instant::now(),
             project_thumbs: Default::default(),
             projects_page: Default::default(),
+            thumb_written: None,
+            finding: None,
             selection: None,
             selected: Default::default(),
             clipboard: Vec::new(),
@@ -658,6 +695,18 @@ impl App {
             bands: Default::default(),
             effect_clipboard: Vec::new(),
             effect_clipboard_reverse: None,
+            effect_clipboard_groups: Vec::new(),
+            preset_save: None,
+            preset_drag: None,
+            effect_list_rect: None,
+            viewer_rect: None,
+            effect_picks: None,
+            folded_effects: Default::default(),
+            closed_copies: Default::default(),
+            copy_drop: false,
+            solo_copy: None,
+            only_picked: false,
+            assets_drop: None,
             value_clipboard: None,
             transform_clipboard: None,
             bin: Default::default(),
@@ -784,6 +833,8 @@ impl App {
     /// "Unsaved work", and a fresh autosave begins for what comes next.
     fn set_aside_project(&mut self) {
         self.finish_background_save();
+        // Its picture on the start page, as it's left.
+        self.refresh_thumbnail(true);
         if !self.editor.dirty() {
             self.autosave.clear();
             return;
@@ -826,6 +877,16 @@ impl App {
         self.clipboard_note = None;
         self.effect_clipboard.clear();
         self.effect_clipboard_reverse = None;
+        self.effect_clipboard_groups.clear();
+        self.preset_drag = None;
+        self.preset_save = None;
+        self.effect_list_rect = None;
+        self.effect_picks = None;
+        self.folded_effects.clear();
+        self.closed_copies.clear();
+        self.solo_copy = None;
+        self.only_picked = false;
+        self.assets_drop = None;
         self.value_clipboard = None;
         self.transform_clipboard = None;
         self.renaming = None;
@@ -1052,10 +1113,12 @@ impl App {
         self.imports.push_back(PendingImport { path: PathBuf::from(&url), name: drop_in::safe_name(&name), rx, to_timeline: false, folder, place });
     }
 
-    /// Imports media files; with `to_timeline` they're also added to the end of the
-    /// timeline, otherwise they only go into the bin's `folder`.
+    /// Imports media files; with `to_timeline` they're also put on the timeline at the
+    /// playhead, one after another, each on the first track with room there (as one
+    /// dropped there would be); otherwise they only go into the bin's `folder`.
     pub(crate) fn import_paths(&mut self, paths: &[PathBuf], to_timeline: bool, folder: &str) {
-        self.import_files(paths, to_timeline, folder, None);
+        let place = to_timeline.then(|| Placing { at: std::rc::Rc::new(std::cell::Cell::new(self.playhead)), track: None });
+        self.import_files(paths, to_timeline, folder, place);
     }
 
     fn import_files(&mut self, paths: &[PathBuf], to_timeline: bool, folder: &str, place: Option<Placing>) {
@@ -1166,13 +1229,14 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let (bridge, file) = (self.bridge(), path.to_path_buf());
         let progress = std::sync::Arc::new([std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)]);
+        let smart = self.settings.smart_relink;
         self.opening_progress = progress.clone();
         std::thread::spawn(move || {
             let tell = |done: usize, total: usize| {
                 progress[0].store(done, std::sync::atomic::Ordering::Relaxed);
                 progress[1].store(total, std::sync::atomic::Ordering::Relaxed);
             };
-            let _ = tx.send(Editor::open(&file, |p| Self::import_with(bridge.clone(), p), &tell));
+            let _ = tx.send(Editor::open(&file, |p| Self::import_with(bridge.clone(), p), &tell, smart));
         });
         self.set_playing(false);
         self.opening = Some((path.to_path_buf(), rx));
@@ -1214,6 +1278,10 @@ impl App {
                 self.reset_workspace();
                 self.messages.extend(warnings);
                 self.rebuild_sources();
+                // A project that never had a picture gets one now.
+                if self.editor.path.as_ref().is_some_and(|p| !thumbnail::path_for(p).exists()) {
+                    self.refresh_thumbnail(true);
+                }
             }
             Err(e) => self.error = Some(e),
         }
@@ -1360,6 +1428,30 @@ impl App {
     /// The properties: the inspector, then performance and messages, scrolling.
     fn inspector_panel(&mut self, ui: &mut egui::Ui) {
         let compact = self.settings.compact_properties;
+        // On the Effects, Sound and Transitions tabs, the effect tools stand down the left,
+        // outside the scrolling, so they stay put however long the list is.
+        let strip = self.selection.filter(|i| self.editor.item(*i).is_some() && self.container_kind(*i).is_none()).zip(self.tab_list());
+        if let Some((item, list)) = strip {
+            let full = ui.available_rect_before_wrap();
+            let column = egui::Rect::from_min_size(full.min + egui::vec2(0.0, 4.0), egui::vec2(34.0, full.height() - 4.0));
+            self.effect_strip(ui, column, item, list);
+            let rest = egui::Rect::from_min_max(egui::pos2(column.right() + 6.0, full.top()), full.max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rest).layout(egui::Layout::top_down(egui::Align::Min)), |ui| self.inspector_scroll(ui, compact));
+            return;
+        }
+        // An effect being dragged over the tabs opens them as it passes: its column's room
+        // stays kept on the tabs without it, so the tabs don't shift under the pointer.
+        if self.effect_drag.is_some() {
+            let full = ui.available_rect_before_wrap();
+            let rest = egui::Rect::from_min_max(egui::pos2(full.left() + 40.0, full.top()), full.max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rest).layout(egui::Layout::top_down(egui::Align::Min)), |ui| self.inspector_scroll(ui, compact));
+            return;
+        }
+        self.inspector_scroll(ui, compact);
+    }
+
+    /// The inspector's scrolling contents (see [`App::inspector_panel`]).
+    fn inspector_scroll(&mut self, ui: &mut egui::Ui, compact: bool) {
         egui::ScrollArea::vertical().show(ui, |ui| {
                 inspector::set_compact(ui, compact);
                 if !compact {
@@ -1600,11 +1692,13 @@ impl App {
         self.set_playhead(rate.frame_start(index.max(0)));
     }
 
-    /// The playhead to the first frame (`start`) or the last frame of the selected clip —
-    /// or, with none selected, the topmost clip under the playhead. Already there: on to
-    /// the clip before or after it on its track (which becomes the selection, if a clip
-    /// was selected).
-    pub(crate) fn go_to_clip_edge(&mut self, start: bool) {
+    /// The playhead to the next (`forward`) or the previous stop of the selected clip — or,
+    /// with none selected, the topmost clip under the playhead: its first frame, each of
+    /// its keyframes (with `keys`; without, they're passed over), its last frame. Past its last stop, on to the clip after it on its
+    /// track (before it: the clip before, at its last frame), which becomes the selection
+    /// if a clip was selected. Counted in whole frames, so a clip or a key that doesn't
+    /// sit on a frame boundary is never a frame off.
+    pub(crate) fn step_to_stop(&mut self, forward: bool, keys: bool) {
         let s = self.editor.sequence();
         let rate = s.rate;
         let t = self.playhead;
@@ -1615,19 +1709,48 @@ impl App {
         };
         let Some((ti, ii)) = self.selection.and_then(|id| s.find_item(id)).or_else(under) else { return };
         let items = &s.tracks[ti].items;
-        let edge = |i: &oa_doc::Item| if start { i.range.start } else { rate.frame_start((rate.frame_at(i.range.end()) - 1).max(rate.frame_at(i.range.start))) };
-        let mut at = (ii, edge(&items[ii]));
-        if at.1 == t {
-            let next = if start { ii.checked_sub(1) } else { Some(ii + 1).filter(|n| *n < items.len()) };
-            if let Some(n) = next {
-                at = (n, edge(&items[n]));
+        let stops = |i: &oa_doc::Item| editor::Editor::clip_stops(i, &if keys { editor::Editor::clip_key_times(s, i, self.variant_id()) } else { Vec::new() }, rate);
+        let now = rate.frame_at(t);
+        let here = stops(&items[ii]);
+        let found = if forward { here.iter().copied().find(|f| *f > now) } else { here.iter().rev().copied().find(|f| *f < now) };
+        let (landed, frame) = match found {
+            Some(f) => (ii, f),
+            None => {
+                let next = if forward { Some(ii + 1).filter(|n| *n < items.len()) } else { ii.checked_sub(1) };
+                let Some(n) = next else { return };
+                let theirs = stops(&items[n]);
+                let Some(f) = (if forward { theirs.first() } else { theirs.last() }).copied() else { return };
+                (n, f)
             }
+        };
+        let landed_id = items[landed].id;
+        if self.selection.is_some_and(|s| s != landed_id) {
+            self.select_clip(landed_id, false);
         }
-        let landed = items[at.0].id;
-        if self.selection.is_some_and(|s| s != landed) {
-            self.select_clip(landed, false);
+        self.set_playhead(rate.frame_start(frame));
+    }
+
+    /// Alt+← / Alt+→: to the start of the previous or next clip on the track — the
+    /// selected clip's, or else the top one under the playhead's (else the top track with
+    /// clips on it). Back from inside a clip: its own start first. The clip landed on
+    /// becomes the selection if a clip was selected.
+    pub(crate) fn step_to_clip(&mut self, forward: bool) {
+        let s = self.editor.sequence();
+        let rate = s.rate;
+        let now = rate.frame_at(self.playhead);
+        // Picture tracks top down, then sound.
+        let order: Vec<usize> = s.tracks.iter().enumerate().rev().filter(|(_, tr)| tr.kind == oa_doc::TrackKind::Video).chain(s.tracks.iter().enumerate().filter(|(_, tr)| tr.kind == oa_doc::TrackKind::Audio)).filter(|(_, tr)| tr.enabled).map(|(i, _)| i).collect();
+        let under = order.iter().find_map(|&ti| s.tracks[ti].items.iter().position(|i| i.range.contains(self.playhead)).map(|ii| (ti, Some(ii))));
+        let Some((ti, at)) = self.selection.and_then(|id| s.find_item(id)).map(|(ti, ii)| (ti, Some(ii))).or(under).or_else(|| order.iter().copied().find(|ti| !s.tracks[*ti].items.is_empty()).map(|ti| (ti, None))) else { return };
+        let items = &s.tracks[ti].items;
+        // Each one's first whole frame (a clip that starts between frames: the one after).
+        let starts: Vec<i64> = items.iter().map(|i| editor::Editor::clip_stops(i, &[], rate)[0]).collect();
+        let Some(landed) = editor::Editor::next_clip(&starts, at, now, forward) else { return };
+        let (id, frame) = (items[landed].id, starts[landed]);
+        if self.selection.is_some_and(|s| s != id) {
+            self.select_clip(id, false);
         }
-        self.set_playhead(at.1);
+        self.set_playhead(rate.frame_start(frame));
     }
 
     /// While playing, the **audio clock** decides where we are — video follows it. With
@@ -1728,12 +1851,30 @@ impl App {
         }
     }
 
+    /// Writes the open project's picture for the start page — `now`, or else only if it
+    /// has none or the last is a minute old. (Only saving with Ctrl+S used to: projects
+    /// that save themselves never got one.)
+    fn refresh_thumbnail(&mut self, now: bool) {
+        let Some(path) = self.editor.path.clone() else { return };
+        let thumb = thumbnail::path_for(&path);
+        let fresh = self.thumb_written.as_ref().is_some_and(|(p, at)| *p == path && at.elapsed() < std::time::Duration::from_secs(60));
+        if !now && fresh && thumb.exists() {
+            return;
+        }
+        if self.write_thumbnail(&path).is_some() {
+            self.thumb_written = Some((path, Instant::now()));
+            // The start page loads it again next time it's shown.
+            self.project_thumbs.remove(&thumb.to_string_lossy().to_string());
+        }
+    }
+
     /// Waits for a background save (if one is running) and takes in how it went.
     pub(crate) fn finish_background_save(&mut self) {
         let Some((path, snapshot, handle)) = self.saving.take() else { return };
         match handle.join().unwrap_or_else(|_| Err("saving stopped unexpectedly".into())) {
             Ok(()) => {
                 self.editor.mark_saved(&path, snapshot);
+                self.refresh_thumbnail(false);
                 // Written up to that snapshot: the recovery copy is only needed for edits
                 // made since (the next autosave covers them).
                 if !self.editor.dirty() {
@@ -1876,6 +2017,7 @@ impl App {
             follow: self.follower_key.1,
             refined: refine,
             see_through: !self.compound_trail.is_empty(),
+            solo: self.solo_copy.map(|e| e.0),
         }
     }
 
@@ -1908,6 +2050,12 @@ impl App {
     /// the project as it is, the moment, the options — it plans and renders there, and
     /// the picture comes back through `receive_frames`.
     fn request_frame(&mut self) {
+        // Solo ends when the clip selected no longer has that Duplicate.
+        if let Some(s) = self.solo_copy
+            && !self.selection.and_then(|i| self.editor.item(i)).is_some_and(|it| it.effects.iter().any(|e| e.id == s))
+        {
+            self.solo_copy = None;
+        }
         let key = self.frame_key();
         if self.asked.as_ref().is_some_and(|(_, k)| *k == key) {
             return; // on its way
@@ -1919,6 +2067,8 @@ impl App {
             see_through: !self.compound_trail.is_empty(),
             // The refined idle frame draws titles as an export does.
             text_supersample: if self.refine { 2 } else { 1 },
+            // Adjusting a Duplicate's copy: it alone, if asked.
+            solo: self.solo_copy,
             ..Default::default()
         };
         let t = self.render_time();
@@ -2087,6 +2237,22 @@ impl App {
         if self.bin.quick_cut.is_some() {
             return;
         }
+        // Over the effect list, its keys are the picked effects' (Ctrl+A, Del, Ctrl+G,
+        // Alt+↑/↓, Esc), and Ctrl+C / Ctrl+V copy and paste effects rather than clips.
+        if let Some((item, list)) = self.effects_under_pointer(ctx) {
+            if self.effect_keys(ctx, item, list) {
+                return;
+            }
+            let (copy, paste) = ctx.input(|i| (i.events.iter().any(|e| matches!(e, egui::Event::Copy)), i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))));
+            if copy && !self.picks(item).is_empty() {
+                self.copy_picks(item);
+                return;
+            }
+            if paste && !self.effect_clipboard.is_empty() {
+                self.paste_effects(&[item]);
+                return;
+            }
+        }
         let pressed = |m: M, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         // F: fullscreen playback, in and out. While it's on, only playing and stepping —
         // no edits made by a key pressed while watching.
@@ -2115,18 +2281,35 @@ impl App {
                 self.undo();
             }
         }
-        // Ctrl+← / Ctrl+→: to the start / end of the clip.
-        if pressed(M::COMMAND, Key::ArrowLeft) {
-            self.go_to_clip_edge(true);
+        // Ctrl+← / Ctrl+→: to the clip's previous / next keyframe, start or last frame;
+        // with Shift, its start or last frame only (Shift first: Ctrl+← would take it too).
+        if pressed(M::COMMAND | M::SHIFT, Key::ArrowLeft) {
+            self.step_to_stop(false, false);
+        } else if pressed(M::COMMAND, Key::ArrowLeft) {
+            self.step_to_stop(false, true);
         }
-        if pressed(M::COMMAND, Key::ArrowRight) {
-            self.go_to_clip_edge(false);
+        if pressed(M::COMMAND | M::SHIFT, Key::ArrowRight) {
+            self.step_to_stop(true, false);
+        } else if pressed(M::COMMAND, Key::ArrowRight) {
+            self.step_to_stop(true, true);
         }
-        // Nudge the selected layer: Alt+arrows (Shift for 10 px). With tracks picked,
-        // Alt+↑/↓ moves them instead (below).
+        // Alt+← / Alt+→: the previous or next clip on the track — except over the viewer,
+        // where they nudge the picture (below).
+        let over_viewer = self.viewer_rect.zip(ctx.input(|i| i.pointer.latest_pos())).is_some_and(|(r, p)| r.contains(p));
+        if !over_viewer {
+            if pressed(M::ALT, Key::ArrowLeft) {
+                self.step_to_clip(false);
+            }
+            if pressed(M::ALT, Key::ArrowRight) {
+                self.step_to_clip(true);
+            }
+        }
+        // Nudge the selected layer: Alt+arrows (Shift for 10 px); left and right only
+        // with the pointer over the viewer. With tracks picked, Alt+↑/↓ moves them instead
+        // (below).
         let arrows = [(Key::ArrowLeft, [-1.0, 0.0]), (Key::ArrowRight, [1.0, 0.0]), (Key::ArrowUp, [0.0, -1.0]), (Key::ArrowDown, [0.0, 1.0])];
         for (key, d) in arrows {
-            if d[0] == 0.0 && !self.selected_tracks.is_empty() {
+            if (d[0] == 0.0 && !self.selected_tracks.is_empty()) || (d[1] == 0.0 && !over_viewer) {
                 continue;
             }
             for (mods, step) in [(M::ALT | M::SHIFT, 10.0), (M::ALT, 1.0)] {
@@ -2213,6 +2396,15 @@ impl App {
         }
         if pressed(M::COMMAND, Key::Comma) {
             self.settings_open = !self.settings_open;
+        }
+        // Saving and importing (the menus showed these keys; nothing took them).
+        if pressed(M::COMMAND | M::SHIFT, Key::S) {
+            self.run_command("project.save_as");
+        } else if pressed(M::COMMAND, Key::S) {
+            self.run_command("project.save");
+        }
+        if pressed(M::COMMAND, Key::I) {
+            self.run_command("project.import");
         }
         if !self.bin.hovered && pressed(M::COMMAND, Key::A) {
             self.select_all();
@@ -2587,9 +2779,13 @@ impl App {
         self.font_samples.frame_start();
         self.poll_imports();
         self.poll_relinks();
+        self.poll_finding();
         self.poll_eyedropper();
-        self.ambient_tick(ctx);
-        if !self.imports.is_empty() || !self.relinks.is_empty() || self.opening.is_some() {
+        // The viewer's glow samples the picture; nothing to sample for with UI effects off.
+        if self.settings.ui_effects {
+            self.ambient_tick(ctx);
+        }
+        if !self.imports.is_empty() || !self.relinks.is_empty() || self.opening.is_some() || self.finding.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.proxy_tick();
@@ -2606,6 +2802,8 @@ impl App {
         self.settings_window(ctx);
         self.new_project_window(ctx);
         self.quick_cut_window(ctx);
+        self.preset_save_window(ctx);
+        self.drop_preset(ctx);
         self.script_consent_window(ctx);
         if self.screen == home::Screen::Home {
             self.update_banner(root);
@@ -2613,6 +2811,7 @@ impl App {
             egui::CentralPanel::default().show(root, |ui| self.home(ui));
             return;
         }
+        self.keep_window_fullscreen(ctx);
         if self.fullscreen.on {
             self.fullscreen_view(root, frame);
             return;

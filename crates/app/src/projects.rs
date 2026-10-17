@@ -44,6 +44,51 @@ fn documents_dir() -> Option<PathBuf> {
     }
 }
 
+/// Where to look for a project's moved media, nearest first: around where each file was
+/// (the nearest of its folders still there, and the one above that), the project's
+/// folder and the one above, the usual places for media in the home folder, the home
+/// folder, then (on Windows) each drive.
+pub fn relink_roots(project_dir: Option<&Path>, missing: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut add = |p: PathBuf| {
+        if p.is_dir() && !roots.contains(&p) {
+            roots.push(p);
+        }
+    };
+    for file in missing {
+        if let Some(near) = file.ancestors().skip(1).find(|d| d.is_dir()) {
+            add(near.to_path_buf());
+            if let Some(up) = near.parent().filter(|u| u.parent().is_some()) {
+                add(up.to_path_buf());
+            }
+        }
+    }
+    if let Some(dir) = project_dir {
+        add(dir.to_path_buf());
+        if let Some(up) = dir.parent() {
+            add(up.to_path_buf());
+        }
+    }
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    if let Some(home) = &home {
+        for place in ["Videos", "Movies", "Desktop", "Downloads", "Documents", "Pictures", "Music", "OneDrive"] {
+            add(home.join(place));
+        }
+    }
+    if let Some(docs) = documents_dir() {
+        add(docs);
+    }
+    if let Some(home) = home {
+        add(home);
+    }
+    if cfg!(windows) {
+        for drive in b'C'..=b'Z' {
+            add(PathBuf::from(format!("{}:\\", drive as char)));
+        }
+    }
+    roots
+}
+
 /// The projects folder unless Settings name another (`OA_PROJECTS_DIR` overrides both,
 /// for tests and portable installs).
 pub fn default_projects_dir() -> PathBuf {

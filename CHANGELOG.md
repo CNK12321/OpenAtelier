@@ -4,6 +4,173 @@ Each release's section becomes its description on GitHub, and the app's update d
 lists its points. Name a section after the version as it's tagged (`0.1-beta.6`, the
 tag without its `v`) before tagging; until then it's **Unreleased**.
 
+## 0.1-beta.9 — Beta 9
+
+### New
+- **Effect groups:** right-click an effect → **Group**, then drag more effects between
+  its effects or onto its head (or right-click → Add to…). A group has:
+  - **a mix slider**, keyframable: the group's result faded over the picture that went
+    in (a true blend, so it works with any effect), or dry/wet for sound groups;
+  - **an off switch** apart from the mix, so turning it back on returns to the same mix;
+  - **a collapsed view**: tick the circle beside any of its effects' properties, and the
+    collapsed group shows just those, with its mix;
+  - **a lock** (right-click its head): it stays collapsed and its effects can't be
+    changed, only its mix, switch and ticked properties.
+
+  Drag a group's grip to move it in the list, or onto another clip to copy it there.
+  Copy all effects / Paste effects bring groups along. A group is one panel around its
+  header and effects, with a ⋮ menu; collapsed, it lists what's in it.
+- **Themes** (Settings → Interface): Automatic (follows your system), Dark, Light or
+  Black (dark with true-black panels, for OLED screens and dim rooms).
+  Beside it, **UI effects** can be turned off: no glow around the viewer, and project
+  cards stay flat instead of lifting and tilting.
+- **Shortcuts list** (Settings → Shortcuts): every key and mouse shortcut, drawn as
+  keycaps (arrows and mouse buttons as pictures), by panel — General, Playback,
+  Timeline, Viewer, Media bin, Effects, Curve editor, Quick cut, Captions — with a
+  search box.
+- **Echo** (Effects → Motion): ghost copies of the clip from moments before, after or
+  both — the frame-blended "slow shutter" look of vlog edits. Set how many copies, how
+  many frames apart, how fast they fade, and whether they go over the clip (ghosts on
+  full-frame footage), under it (trails behind a cut-out or title), average out like a
+  slow shutter, or add up into a glow. It echoes the footage's own motion as well as
+  keyframed moves; speeding the clip up spreads the copies further apart.
+- **Bloom** (Effects → Light): light spilling out of the bright parts of the picture —
+  what's over the threshold, blurred and added back, with a bright core round each
+  highlight and a wide spread around it. It goes by how bright things really are, so an
+  overexposed light blooms more than a white wall. Threshold (0.1–1), softness (how
+  gently it cuts in), radius, intensity and tint, all keyframable; wide blooms are
+  worked out on a coarser grid, so they stay fast.
+- **Stepped sliders:** properties that only make sense in whole steps — Liquify's
+  detail, Kaleidoscope's segments, Echo's copies, Motion Blur's samples — snap to them,
+  with a dot on the slider at each step, and keyframed they move from step to step.
+  Plugins get the same with `"step"` on a parameter.
+- **Pick several effects:** click anywhere on an effect's card, Ctrl+click for more,
+  Shift+click for a run (click a group's head to pick the whole group). A click on the
+  list's empty space picks none (so does one on the media bin's, for its files). Tools
+  stand down the side of the Effects, Sound and Transitions tabs, staying put as the
+  list scrolls: group, ungroup,
+  turn on/off, move up/down, copy, paste, put on the other selected clips, save to
+  assets, fold every card, show only the picked ones, remove. Keys over the list:
+  Ctrl+A, Del, Ctrl+C/V, Ctrl+G, Alt+↑/↓, Esc. Right-click a picked card for all of
+  them. Dragging one drags them all: to reorder, onto a clip to copy, onto the media
+  bin to keep them as one preset.
+- **Effect cards fold** to their header (the arrow beside the grip).
+- **Use with blend…** (an effect's right-click menu): its result mixes with the picture
+  that went into it by a blend mode — add, screen, multiply, overlay and the rest, as
+  the Blend effect has — and a mix, instead of replacing it. Keyframable mix.
+- **Effects ↔ transitions:** drag an effect over the Transitions tab (it opens) and onto
+  the intro or outro to add a copy there — if it can come in from an off state — or
+  drag an intro or outro onto the Effects tab to have it for the whole clip.
+- **Effect presets in Assets:** drag an effect or a group onto the media bin (it turns
+  to Assets) or use **Save to assets…** in its right-click menu. Choose whether to keep
+  its keyframes (they stretch to the clip it goes on) and its masks. Presets show as
+  cards previewed on a sample picture; drag one onto a clip or the effect list, or
+  double-click it, to put it on the selected clips. An effect whose plugin isn't
+  installed comes along with its settings kept and is named, not silently dropped.
+- **Smart relink** (Settings → Media, on by default): when a project opens, files that
+  have moved are looked for on this computer — around where they were, by the project,
+  in your Videos, Desktop, Downloads and other folders, then the drives. A file counts
+  as found with the same name and the same content, or (renamed) the same content alone,
+  told by a quick fingerprint of each file taken when it was imported; a different file
+  that only shares the name is passed over. Projects older than fingerprints get theirs
+  as they open. The bin's **Find missing files on this computer** does the same any
+  time, and **Find missing files in a folder** now matches by content too, in the
+  background.
+- **A Duplicate's own effects are full effect cards:** under the Duplicate, the effects
+  on its copy alone now fold, reorder by drag, get picked, grouped, masked, blended and
+  saved as presets like the clip's own. Drag a card from the clip's list onto the copy's
+  to move it there, or back out; a count shows on the Duplicate while its copy's list is
+  folded away, and a rail marks which card the list belongs to. **own effects** says
+  whether they run after the effects the copy takes from the clip or before them, and the
+  eye button shows the copy alone in the viewer while you adjust it.
+
+### Faster
+- **Sped-up clips scrub and step back smoothly:** going backwards through a clip at
+  2× or 4× decoded far more than it needed (stepping back at 4× ran at 32 fps; now 80).
+- **Transparent video plays, scrubs and speeds up smoothly:** transparent footage bigger
+  than 720p (ProRes 4444, VP9 with alpha…) now gets a proxy of its own, made in the
+  background: small H.264 with the picture on top and its transparency below, which the
+  hardware decoder plays and the viewer puts back together, soft edges and all. A 4×
+  ProRes 4444 clip went from 20 fps to 260, a jump while scrubbing from 130 ms to 15.
+  Exports still use the original. Until the proxy is ready, sped-up every-frame-a-keyframe
+  footage only hands over the frames shown, and stepping back no longer restarts ffmpeg
+  on every frame.
+- **Footage with keyframes far apart** (game and screen recordings, 60 fps phone video)
+  gets a proxy, made in the background: scrubbing a 4× clip of it jumps in 9 ms instead
+  of 79. Exports still use the original.
+
+### Changed
+- **Liquify's amount slider runs 50–400**, where it's most useful (typing a value still
+  goes past either end).
+- **Mirror, Kaleidoscope, Tile, Scroll and Surface** are listed under Compositing instead
+  of Warp: they arrange the picture rather than bend it.
+- **The example plugin no longer ships:** releases carry only the plugin guide
+  (`plugins/README.md`) and never load the `plugins` folder beside the program;
+  `example-looks` stays in the repository for anyone writing a plugin, and a debug build
+  run from a checkout still loads it.
+
+### Fixed
+- **Files and browser pictures can be dropped on a track's header:** they go on that
+  track, right against the header (at the left edge of what the timeline shows), with
+  the drop line showing where; before, a drop there went only into the media bin.
+- **Pictures in the media bin keep their shape and scale mode:** assets that aren't
+  16:9 were squashed into a 16:9 preview; every preview (bin cards, folders, assets,
+  the timeline's clips, Quick cut) now keeps its picture's own shape, read from the file
+  when it isn't known, and is never stretched to fit. Pixel art (or anything set to
+  **Pixel scale**) previews pixel-sharp instead of blurred; changing a file's scale mode
+  remakes its preview.
+- **Dragging an effect across the inspector's tabs no longer flickers** between two of
+  them: the tools column keeps its room on every tab while an effect is dragged, a tab
+  opens once the pointer rests on it a moment, and none opens again until the pointer
+  moves on.
+- **Effect groups can be picked:** a click anywhere on a group's head picks the whole
+  group (Ctrl or Shift: with what's picked), and a picked group is outlined, collapsed or
+  not. Locked groups can be picked too, and removed — from their menu, the side strip or
+  Delete; locking stops changes, not removal.
+- **Projects get their pictures again:** a project's picture for the start page was only
+  written on Ctrl+S, so projects that save themselves showed just their initial. Now
+  it's written as you work (at most once a minute), when a project without one opens,
+  and as you leave a project.
+- **Mirror turns to any angle, with a handle in the viewer:** its line, like Slice's cut,
+  through a point you drag and turned by its handle (it replaces the vertical/horizontal
+  choice; older projects are converted).
+- **Effects work on cropped clips:** a cropped clip's effects take what the crop keeps as
+  the whole picture. Kaleidoscope folds round the middle of what you see, Mirror, Tile,
+  Fisheye, Swirl and the rest work on the kept picture instead of reaching into the cut
+  away (transparent) part, and their points in the viewer — a center, a mirror line —
+  are on the kept picture too (a tracked point as well). Surface's points rest on the
+  corners of what the crop leaves.
+- **Alt+← / Alt+→ go clip to clip:** to the start of the previous or next clip on the
+  track (the selected clip's, or the top one under the playhead), selecting it if a clip
+  was selected; back from inside a clip goes to its own start first. Over the viewer,
+  Alt+← / Alt+→ still nudge the picture.
+- **Ctrl+← / Ctrl+→ step through keyframes:** the selected clip's start, each of its
+  keyframes and its last frame, then on to the next clip; with Shift, its start and
+  last frame only. Counted in whole frames, so it no longer lands a frame off on clips
+  that don't end on a frame boundary.
+- **The arrange buttons work on real footage:** Close gaps, Space evenly and Move to
+  playhead refused with "item would overlap another item" whenever a clip's length
+  wasn't a whole number of frames (most footage), or when moving clips later.
+- **Adding a clip from the bin (＋ or double-click) or an asset puts it at the playhead**,
+  on the first track with room there, instead of at the end of the bottom track.
+- **Renaming a project from the top bar renames it everywhere:** its file and picture
+  (what the start page and recent list show) and its folder, unless its media live in
+  there. It used to change only the name stored inside the project.
+- **Ctrl+S, Ctrl+Shift+S and Ctrl+I work:** the menus showed them, but nothing took
+  the keys.
+- **Clips that find no room go on a temp layer** everywhere, as pastes already did:
+  dropping from the bin, Add Title, nesting, Extract audio, breaking a compound clip
+  apart and appending to a timeline with no track of the kind made real tracks. A temp
+  layer goes away once it's empty (keep it with its +), and Add Title over other clips
+  is now one undo step, not two.
+- **Fullscreen playback takes on the first press:** a request Windows dropped (it can,
+  while the window is maximized or settling) is sent again, and a window taken out of
+  fullscreen another way no longer needs a press to "leave" first. Leaving puts a
+  maximized window back maximized.
+- **The vertical layout opens with roomier proportions:** the viewer's column a little
+  under half the width, the bin a quarter, the timeline over a third of the height, as
+  shares of the window (sizes you've dragged are kept).
+
 ## 0.1-beta.8 — Beta 8
 
 ### New

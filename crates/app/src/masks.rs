@@ -1038,7 +1038,7 @@ impl App {
     /// Why an effect can't run inside a mask, if it can't: `Err(None)` when masks don't
     /// apply to it at all (sound, a whole-clip move), `Err(Some(reason))` when they could
     /// but don't (bounded or per-letter text effects).
-    fn effect_maskable(&self, item: ItemId, fx: &oa_doc::EffectInstance) -> Result<(), Option<&'static str>> {
+    pub(crate) fn effect_maskable(&self, item: ItemId, fx: &oa_doc::EffectInstance) -> Result<(), Option<&'static str>> {
         if !self.settings.masking || !self.maskable(item) {
             return Err(None);
         }

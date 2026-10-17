@@ -227,6 +227,8 @@ fn project_file_round_trips() {
         params: Default::default(),
         role: Default::default(),
         on_duplicate: None,
+        group: None,
+        shown: Vec::new(),
     });
     item.params.set("future.param", ParamSource::Static(Value::Text("kept".into())));
     insert(&mut doc, item).unwrap();

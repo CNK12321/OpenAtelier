@@ -324,8 +324,24 @@ impl Chain {
         let end = t + Time::from_seconds_f64(frames as f64 / format.sample_rate as f64);
         let (local, local_end) = (t - owner.clock_start, end - owner.clock_start);
         let mut before = Vec::new();
+        // The effect group being run (its effects sit together): its id, the sound that
+        // went into it (dry) and its mix — the result (wet) is mixed with it after its
+        // last effect. At a mix of 0 its effects are skipped.
+        let mut dry: Option<(u64, Vec<f32>, f64)> = None;
         for (id, type_id, p) in &mut self.fx {
             let Some(e) = owner.effects.iter().find(|e| e.id == *id) else { continue };
+            let group = e.group.as_ref();
+            if dry.as_ref().is_some_and(|d| Some(d.0) != group.map(|g| g.id)) {
+                mix_dry(dry.take(), buf);
+            }
+            if dry.is_none()
+                && let Some(g) = group
+            {
+                dry = Some((g.id, buf.to_vec(), g.mix(&owner.context)));
+            }
+            if dry.as_ref().is_some_and(|d| d.2 <= 0.0) {
+                continue;
+            }
             let Some(info) = fx::info(type_id) else { continue };
             let Some(start) = e.role.clock(local, owner.length) else { continue };
             // Where it ends up by the block's end (held at the window's edge).
@@ -344,6 +360,20 @@ impl Chain {
             p.process(buf, &values, &fx::ClockSpan { start, end: stop });
             crate::dynamics::publish(*id, &before, buf, ch, p.reduction_db());
         }
+        mix_dry(dry, buf);
+    }
+}
+
+/// The end of an effect group's run in [`Chain::process`]: `buf` (its wet sound) mixed
+/// with the dry sound that went in, by its mix.
+fn mix_dry(dry: Option<(u64, Vec<f32>, f64)>, buf: &mut [f32]) {
+    let Some((_, dry, mix)) = dry else { return };
+    if mix >= 1.0 {
+        return;
+    }
+    let k = mix.max(0.0) as f32;
+    for (wet, d) in buf.iter_mut().zip(dry) {
+        *wet = d + (*wet - d) * k;
     }
 }
 
@@ -1303,6 +1333,26 @@ mod tests {
         assert!(quarter(&b, 0) < quarter(&b, 1) && quarter(&b, 1) < quarter(&b, 2) && quarter(&b, 2) < quarter(&b, 3), "rises");
         let after = a[50_000..140_000].iter().zip(&b[50_000..140_000]).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         assert!(after < 1e-6, "untouched after the intro: {after}");
+    }
+
+    /// A group's effects are mixed with the sound that went into them (dry/wet) by its
+    /// mix: a gate that silences the tone, at a 50% mix, leaves half the tone; at 0%,
+    /// all of it.
+    #[test]
+    fn effect_groups_mix_dry_and_wet() {
+        let grouped = |mix: f64| {
+            let mut gate = effect(8, "oa.audio.gate", &[("threshold", -3.0), ("release", 0.01)]);
+            let mut group = oa_doc::EffectGroup::new(1, "Room");
+            group.params.set(oa_doc::schema::GROUP_MIX, ParamSource::Static(Value::Float(mix)));
+            gate.group = Some(group);
+            gate
+        };
+        let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt();
+        let dry = rms(&drain(&mut tone_mixer(vec![]))[48_000..96_000]);
+        let half = rms(&drain(&mut tone_mixer(vec![grouped(50.0)]))[48_000..96_000]);
+        let none = rms(&drain(&mut tone_mixer(vec![grouped(0.0)]))[48_000..96_000]);
+        assert!((half - dry * 0.5).abs() < dry * 0.02, "{half} vs {dry}");
+        assert!((none - dry).abs() < 1e-4, "{none} vs {dry}");
     }
 
     #[test]

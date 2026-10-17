@@ -251,21 +251,35 @@ fn set_name_inside(file: &Path, name: &str) -> std::io::Result<()> {
 /// Renames a project: the name it has for itself, its file and picture and (laid out
 /// the library's way) its folder. Returns its file's new path.
 pub fn rename_project(file: &Path, name: &str) -> std::io::Result<PathBuf> {
+    rename_project_with(file, name, true)
+}
+
+/// [`rename_project`], leaving its folder's name alone unless `folder` (the open project
+/// whose media live in its folder: moving it would pull them out from under it).
+pub fn rename_project_with(file: &Path, name: &str, folder: bool) -> std::io::Result<PathBuf> {
     let base = crate::projects::folder_name(name);
     set_name_inside(file, name.trim())?;
     let thumb = crate::thumbnail::path_for(file);
     let dir = file.parent().ok_or_else(|| std::io::Error::other("a project file with no folder"))?.to_path_buf();
-    let folder = if owns_folder(file) && base != name_of(file) {
+    let folder = if folder && owns_folder(file) && base != name_of(file) {
         let parent = dir.parent().ok_or_else(|| std::io::Error::other("a folder with no parent"))?;
         let free = free_name(parent, &base);
         std::fs::rename(&dir, parent.join(&free))?;
         parent.join(free)
     } else {
-        dir
+        dir.clone()
     };
-    let stem = if owns_folder(file) { folder.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(base) } else { base };
+    // Named after its folder when that was renamed with it; else after the name, never
+    // over another project's file.
+    let moved_folder = folder != dir;
+    let stem = if moved_folder { folder.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(base) } else { base };
     let old = folder.join(file.file_name().expect("a file"));
-    let new = folder.join(format!("{stem}{EXTENSION}"));
+    let mut new = folder.join(format!("{stem}{EXTENSION}"));
+    let mut n = 2;
+    while new != old && new.exists() {
+        new = folder.join(format!("{stem} {n}{EXTENSION}"));
+        n += 1;
+    }
     if new != old {
         std::fs::rename(&old, &new)?;
         let old_thumb = folder.join(thumb.file_name().expect("a file"));
@@ -391,6 +405,15 @@ mod tests {
         assert!(crate::thumbnail::path_for(&renamed).exists(), "the picture follows");
         let (inside, _) = oa_doc::ProjectFile::load(&std::fs::read_to_string(&renamed).unwrap()).unwrap();
         assert_eq!(inside.name, "Summer trip");
+
+        // Renamed while open with media in its folder: the folder stays, the file and its
+        // picture take the name (and the start page finds it by it).
+        let open = rename_project_with(&renamed, "Beach day", false).unwrap();
+        assert_eq!(name_of(&open), "Beach day");
+        assert_eq!(open.parent(), renamed.parent(), "the folder stays");
+        assert!(crate::thumbnail::path_for(&open).exists());
+        assert!(scan(&root).projects.iter().any(|e| e.name == "Beach day"));
+        let renamed = rename_project_with(&open, "Summer trip", false).unwrap();
 
         // Copied beside it.
         let copy = duplicate_project(&renamed).unwrap();

@@ -21,6 +21,10 @@ pub struct Surface {
     pub effect: EffectId,
     pub n: usize,
     pub points: Vec<[f64; 2]>,
+    /// The picture's box the points rest on (the clip's crop): its top left and bottom
+    /// right, fractions of the layer.
+    pub lo: [f64; 2],
+    pub hi: [f64; 2],
 }
 
 impl Surface {
@@ -78,9 +82,20 @@ impl App {
         let is_surface = |type_id: &str| self.registry.effect(type_id).is_some_and(|d| d.editor.as_deref() == Some(EDITOR_SURFACE));
         let fx = it.effects.iter().find(|e| e.enabled && e.role == EffectRole::Passive && is_surface(&e.type_id))?;
         let d = self.registry.effect(&fx.type_id)?;
-        let values = fx.params.eval(&d.params, None, &it.eval_context(t));
+        let mut values = fx.params.eval(&d.params, None, &it.eval_context(t));
+        // At rest on what's shown: the clip's crop, as the renderer does.
+        let crop = oa_doc::schema::CROPS.map(|c| self.editor.param_value(item, &ParamTarget::Item, c, t).and_then(|v| v.as_float()).unwrap_or(0.0).clamp(0.0, 1.0));
+        let lo = [crop[0], crop[2]];
+        let hi = [(1.0 - crop[1]).max(lo[0]), (1.0 - crop[3]).max(lo[1])];
+        for (id, value) in values.0.iter_mut() {
+            match id.as_str() {
+                "crop_lo" => *value = Value::Vec2(lo),
+                "crop_hi" => *value = Value::Vec2(hi),
+                _ => {}
+            }
+        }
         let (n, points) = surface_points(&values);
-        Some(Surface { effect: fx.id, n, points })
+        Some(Surface { effect: fx.id, n, points, lo, hi })
     }
 
     /// A press on point `i` of `s` at `canvas` (px).
@@ -88,7 +103,7 @@ impl App {
         let Some(start) = p.to_layer_fraction(canvas) else { return };
         let (r, c) = (i / s.n, i % s.n);
         let side = (s.n - 1) as f64;
-        let rest = [c as f64 / side, r as f64 / side];
+        let rest = [s.lo[0] + c as f64 / side * (s.hi[0] - s.lo[0]), s.lo[1] + r as f64 / side * (s.hi[1] - s.lo[1])];
         let offset0 = [s.points[i][0] - rest[0], s.points[i][1] - rest[1]];
         self.surface_drag = Some(SurfaceDrag { item: p.item, effect: s.effect, point: (r, c), start, offset0 });
         self.set_playing(false);
@@ -133,12 +148,12 @@ mod tests {
     /// layer it no longer covers aren't.
     #[test]
     fn a_warped_surface_is_hit_where_the_picture_is() {
-        let s = Surface { effect: EffectId(1), n: 2, points: vec![[0.5, 0.0], [1.0, 0.5], [0.0, 0.5], [0.5, 1.0]] };
+        let s = Surface { effect: EffectId(1), n: 2, points: vec![[0.5, 0.0], [1.0, 0.5], [0.0, 0.5], [0.5, 1.0]], lo: [0.0; 2], hi: [1.0; 2] };
         assert!(s.covers([0.5, 0.5]));
         assert!(s.covers([0.6, 0.3]));
         assert!(!s.covers([0.05, 0.05]), "the layer's corner, outside the diamond");
         assert!(!s.covers([0.95, 0.95]));
-        let rest = Surface { effect: EffectId(1), n: 3, points: (0..9).map(|i| [(i % 3) as f64 / 2.0, (i / 3) as f64 / 2.0]).collect() };
+        let rest = Surface { effect: EffectId(1), n: 3, points: (0..9).map(|i| [(i % 3) as f64 / 2.0, (i / 3) as f64 / 2.0]).collect(), lo: [0.0; 2], hi: [1.0; 2] };
         assert!(rest.covers([0.01, 0.99]) && !rest.covers([1.2, 0.5]));
     }
 }

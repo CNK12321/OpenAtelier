@@ -190,14 +190,21 @@ fn run(gpu: Arc<GpuContext>, decoders: oa_media::DecoderChoice, vram_budget: u64
     let mut registry: Option<Arc<Registry>> = None;
     // The project's files, and those kept whatever the project (`Msg::Keep`).
     let (mut project_media, mut kept): (Vec<MediaEntry>, Vec<MediaEntry>) = (Vec::new(), Vec::new());
+    // A new file list that came after a render was asked for waits for the next round:
+    // the render is of the project as it was (a project's picture written as it's left).
+    let mut held: Option<Msg> = None;
     // Blocks when there's nothing to do; ends when the UI drops its handle.
-    while let Ok(first) = jobs.recv() {
+    while let Some(first) = held.take().or_else(|| jobs.recv().ok()) {
         let mut media = None;
         let mut renders: Vec<Box<Request>> = Vec::new();
         let mut strips: Vec<Box<StripRequest>> = Vec::new();
         let mut readback: Option<(Box<Request>, Sender<Option<FramePixels>>)> = None;
         for msg in std::iter::once(first).chain(std::iter::from_fn(|| jobs.try_recv().ok())) {
             match msg {
+                Msg::Media(list) if !renders.is_empty() || readback.is_some() => {
+                    held = Some(Msg::Media(list));
+                    break;
+                }
                 Msg::Media(list) => media = Some(list),
                 Msg::Keep(entry) => {
                     kept.retain(|k| k.id != entry.id);

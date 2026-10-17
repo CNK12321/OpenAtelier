@@ -439,6 +439,86 @@ fn fast_clips_upload_only_the_frames_they_show() {
     assert!(stats.skipped_uploads >= 30, "only {} of the frames in between went un-uploaded", stats.skipped_uploads);
 }
 
+/// A file whose every frame is a keyframe (ProRes, DNxHD…), at 4×: ffmpeg hands over
+/// only the frames shown — the ones between are dropped before they're converted and
+/// piped — and each is still exact, through a jump and back to every frame.
+#[test]
+fn every_keyframe_files_at_speed_hand_over_only_what_is_shown() {
+    const INTRA: Clip = Clip { name: "prores_30_intra.mov", rate: "30", args: &["-c:v", "prores_ks", "-profile:v", "0"] };
+    let Some(mut h) = harness(&INTRA) else { return };
+    let index = h.video().index.clone();
+    assert_eq!(index.keyframes.len(), index.len(), "every frame a keyframe");
+    let size = [h.video().width, h.video().height];
+    let check = |h: &mut Harness, frames: &[usize]| {
+        for &i in frames {
+            assert_eq!(h.shown_frame(index.time_of(i), size).unwrap(), i as u32, "frame {i}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    // 4×, then a jump at the same speed, then every frame again.
+    check(&mut h, &(0..index.len()).step_by(4).take(15).collect::<Vec<_>>());
+    let decoded_at_speed = h.source.stats().decoded;
+    check(&mut h, &(index.len() / 2..index.len()).step_by(4).take(8).collect::<Vec<_>>());
+    check(&mut h, &(10..20).collect::<Vec<_>>());
+    let stats = h.source.stats();
+    eprintln!("{stats:?}");
+    assert_eq!(stats.inexact, 0);
+    // Frames 0, 4, 8… 56: about 15 handed over (plus the first ones, before the rhythm
+    // shows), not the 57 a decoder handing over every frame reads.
+    assert!(decoded_at_speed < 30, "{decoded_at_speed} frames handed over for 15 shown");
+}
+
+/// A packed proxy (H.264 twice as tall: the picture, then its transparency as brightness)
+/// comes out as the top half with that transparency: red over black where the bottom is
+/// white, half red where it's mid-gray, black where it's black.
+#[test]
+fn packed_proxies_unpack_their_transparency() {
+    if !tool_available("ffmpeg") || !tool_available("ffprobe") {
+        return;
+    }
+    let Ok(ctx) = GpuContext::new_headless().map(Arc::new) else { return };
+    let dir = std::env::temp_dir().join("oa-media-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("packed-{}.mkv", std::process::id()));
+    let graph = "color=c=red:s=96x32:d=1:r=10[top];color=c=white:s=32x32:d=1:r=10[a];color=c=0x808080:s=32x32:d=1:r=10[b];color=c=black:s=32x32:d=1:r=10[c];[a][b][c]hstack=3[bottom];[top][bottom]vstack,format=yuv420p[v]";
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-filter_complex", graph, "-map", "[v]", "-c:v", "libx264", "-qp", "0", "-color_range", "tv", "-colorspace", "bt709"])
+        .arg(&path)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !made {
+        return;
+    }
+    let mut video = probe(&path).expect("probe").video.expect("video");
+    video.packed_alpha = true;
+    let mut source = ffmpeg_source(&ctx);
+    source.add(1, &path, video);
+    let mut renderer = Renderer::new(ctx.clone(), RenderOptions { fusion: FusionMode::Blocking, cache_budget: 0, ..Default::default() });
+    let size = [96u32, 32];
+    let mut b = GraphBuilder::new(KeyContext::default());
+    let src = b.add(
+        NodeOp::Source { media: 1, fingerprint: None, source_time: Time::from_seconds_f64(0.5), rep: Representation::Original, decode_scale: 1.0, size, yuv: [0, 0] },
+        vec![],
+        Rect::from_size(96.0, 32.0),
+        false,
+    );
+    let out = b.add(
+        NodeOp::Composite { size, background: [0.0, 0.0, 0.0, 1.0], layers: vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false }] },
+        vec![src],
+        Rect::from_size(96.0, 32.0),
+        true,
+    );
+    let img = renderer.render(&b.finish(out), &Registry::with_builtins(), &mut source).expect("render");
+    let rgba = read_srgb8(&ctx, renderer.pipelines(), &img).expect("read back");
+    let red_at = |x: u32| rgba[((16 * 96 + x) * 4) as usize];
+    let (full, half, none) = (red_at(16), red_at(48), red_at(80));
+    let _ = std::fs::remove_file(&path);
+    assert!(full > 240, "opaque: red, got {full}");
+    // Half covering red over black: 0.5 in linear light, about 188 in sRGB.
+    assert!((170..=205).contains(&half), "half transparent: half red, got {half}");
+    assert!(none < 10, "transparent: the black under it, got {none}");
+}
+
 /// Shown small, ffmpeg decodes small (a quarter of the size here, a sixteenth of the
 /// bytes) and every frame is still the right one; asked for full size again, it goes
 /// back to full size, still exact.

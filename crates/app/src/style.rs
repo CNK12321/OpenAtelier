@@ -33,7 +33,8 @@ pub const ERROR: egui::Color32 = egui::Color32::from_rgb(225, 110, 110);
 /// Applies the look to a context. Called once at startup (and again if the user
 /// changes the theme).
 pub fn install(ctx: &egui::Context) {
-    ctx.global_style_mut(|style| {
+    // What both themes share: spacing, text sizes, rounding, the accent.
+    ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(GAP, GAP_S + 2.0);
         style.spacing.button_padding = egui::vec2(GAP, GAP_S + 1.0);
         style.spacing.menu_margin = egui::Margin::same(GAP_S as i8);
@@ -60,11 +61,53 @@ pub fn install(ctx: &egui::Context) {
         for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open, &mut v.widgets.noninteractive] {
             w.corner_radius = egui::CornerRadius::same(ROUNDING as u8);
         }
-        // A quieter window: panels a shade darker than the content they hold.
-        v.panel_fill = egui::Color32::from_gray(24);
-        v.window_fill = egui::Color32::from_gray(30);
-        v.extreme_bg_color = egui::Color32::from_gray(16);
-        v.faint_bg_color = egui::Color32::from_gray(34);
-
     });
+    dark(ctx, false);
+    // Light: soft gray panels around white fields, so the picture and the clips stand
+    // out rather than the chrome; the accent darker, to read on white.
+    ctx.style_mut_of(egui::Theme::Light, |style| {
+        let v = &mut style.visuals;
+        v.panel_fill = egui::Color32::from_gray(238);
+        v.window_fill = egui::Color32::from_gray(248);
+        v.extreme_bg_color = egui::Color32::from_gray(255);
+        v.faint_bg_color = egui::Color32::from_gray(228);
+        v.selection.bg_fill = ACCENT.gamma_multiply(0.35);
+        v.hyperlink_color = egui::Color32::from_rgb(30, 110, 200);
+    });
+}
+
+/// The dark theme's panels: a quieter window, panels a shade darker than the content
+/// they hold — or, `black`, true black with controls a step above it.
+pub fn dark(ctx: &egui::Context, black: bool) {
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        let v = &mut style.visuals;
+        let gray = egui::Color32::from_gray;
+        // egui's own dark controls to start from (so Black can be switched back off).
+        let base = egui::Visuals::dark().widgets;
+        for (w, b) in [
+            (&mut v.widgets.noninteractive, base.noninteractive),
+            (&mut v.widgets.inactive, base.inactive),
+            (&mut v.widgets.hovered, base.hovered),
+            (&mut v.widgets.active, base.active),
+            (&mut v.widgets.open, base.open),
+        ] {
+            (w.bg_fill, w.weak_bg_fill, w.bg_stroke) = (b.bg_fill, b.weak_bg_fill, b.bg_stroke);
+        }
+        if black {
+            (v.panel_fill, v.window_fill, v.extreme_bg_color, v.faint_bg_color) = (gray(0), gray(8), gray(0), gray(14));
+            v.widgets.noninteractive.bg_fill = gray(0);
+            v.widgets.noninteractive.weak_bg_fill = gray(0);
+            v.widgets.noninteractive.bg_stroke.color = gray(40);
+            for (w, fill) in [(&mut v.widgets.inactive, 26), (&mut v.widgets.open, 30), (&mut v.widgets.hovered, 38), (&mut v.widgets.active, 48)] {
+                (w.bg_fill, w.weak_bg_fill) = (gray(fill), gray(fill));
+            }
+        } else {
+            (v.panel_fill, v.window_fill, v.extreme_bg_color, v.faint_bg_color) = (gray(24), gray(30), gray(16), gray(34));
+        }
+    });
+}
+
+/// Whether the dark theme's panels are the black ones now.
+pub fn is_black(ctx: &egui::Context) -> bool {
+    ctx.style_of(egui::Theme::Dark).visuals.panel_fill == egui::Color32::from_gray(0)
 }

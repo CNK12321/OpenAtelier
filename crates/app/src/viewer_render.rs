@@ -222,6 +222,7 @@ fn render(
         scale: (r.opts.render_scale as f32).to_bits(),
         variant: r.opts.variant.map_or(0, |v| v.0),
         see_through: r.opts.see_through,
+        solo: r.opts.solo.map(|e| e.0),
         reference: r.reference,
         follow: r.follow,
         text_supersample: r.opts.text_supersample,

@@ -288,9 +288,19 @@ impl App {
                 let size = self.canvas_size();
                 Some([now[0] + (c[0] - p.pivot[0]) / size[0], now[1] + (c[1] - p.pivot[1]) / size[1]])
             }
-            Space::OnClip => p.to_layer_fraction(c),
+            // A fraction of what the crop keeps (see `App::effect_frame`).
+            Space::OnClip => {
+                let f = self.point_frame(ed, t);
+                p.to_layer_fraction(c).map(|[u, v]| [(u - f[0]) / f[2], (v - f[1]) / f[3]])
+            }
             Space::MaskCenter => p.to_layer_fraction(c).map(|f| [f[0] - 0.5, f[1] - 0.5]),
         }
+    }
+
+    /// The box an on-clip point's fractions are of: an effect's, what the clip's crop
+    /// keeps; anything else's, the whole clip.
+    fn point_frame(&self, ed: &TrackEditor, t: Time) -> [f64; 4] {
+        if matches!(ed.target, ParamTarget::Effect(_)) { self.effect_frame(ed.item, t) } else { [0.0, 0.0, 1.0, 1.0] }
     }
 
     /// Where the property puts its point on the canvas at `t`.
@@ -300,7 +310,7 @@ impl App {
             Space::Position => Some(p.pivot),
             Space::OnClip | Space::MaskCenter => {
                 let v = self.editor.param_value(ed.item, &ed.target, &ed.param, t).and_then(|v| v.as_vec2())?;
-                let v = if ed.space == Space::MaskCenter { [v[0] + 0.5, v[1] + 0.5] } else { v };
+                let v = if ed.space == Space::MaskCenter { [v[0] + 0.5, v[1] + 0.5] } else { crate::points::on_clip(self.point_frame(ed, t), v) };
                 Some(p.to_canvas.apply([v[0] * p.native[0], v[1] * p.native[1]]))
             }
         }

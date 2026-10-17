@@ -246,7 +246,7 @@ impl App {
             } else if r.lost_focus() {
                 let new = text.trim().to_string();
                 if !new.is_empty() && new != name {
-                    let _ = self.editor.apply(tr("Rename project"), vec![oa_doc::Op::SetProjectName(new)]);
+                    self.rename_open_project(&new);
                 }
                 ui.data_mut(|d| d.remove::<String>(key));
             } else {
@@ -266,6 +266,34 @@ impl App {
         let response = response.on_hover_cursor(egui::CursorIcon::Text).on_hover_text(tr("Click to rename the project"));
         if response.clicked() {
             ui.data_mut(|d| d.insert_temp(key, name));
+        }
+    }
+
+    /// Renames the open project: the name it has for itself (one undo step) and, once it's
+    /// been saved, its file and picture — what the start page and the recent list call it
+    /// — and its folder, unless some of its media are in there (moving them would pull
+    /// them out from under the open project). A project never saved takes the name when
+    /// it's first saved.
+    pub(crate) fn rename_open_project(&mut self, name: &str) {
+        if let Err(e) = self.editor.apply(tr("Rename project"), vec![oa_doc::Op::SetProjectName(name.to_string())]) {
+            self.report_error(e.to_string());
+            return;
+        }
+        let Some(old) = self.editor.path.clone() else { return };
+        // Never two writers on one file.
+        self.finish_background_save();
+        let folder = old.parent().map(|d| d.to_path_buf());
+        let media_inside = folder.as_ref().is_some_and(|dir| self.editor.doc.project().media.values().any(|m| std::path::Path::new(&m.path).starts_with(dir)));
+        let key = crate::layout::key(&old);
+        match crate::library::rename_project_with(&old, name, !media_inside) {
+            Ok(new) => {
+                self.project_thumbs.remove(&crate::thumbnail::path_for(&old).to_string_lossy().to_string());
+                self.editor.path = Some(new.clone());
+                self.settings.moved_project(&old, &key, &new);
+                self.view_key = None;
+                self.thumb_written = None;
+            }
+            Err(e) => self.report_error(trf("Renamed inside the project, but couldn't rename its file: {e}", &[("e", &e.to_string())])),
         }
     }
 

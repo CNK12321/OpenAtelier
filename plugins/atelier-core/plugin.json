@@ -259,10 +259,11 @@
       "shader": {"entry": "oa_warp_swirl", "file": "warp/swirl.wgsl"}
     },
     {
-      "id": "oa.warp.mirror", "name": "Mirror", "kind": "uv_warp", "category": "Warp",
+      "id": "oa.warp.mirror", "name": "Mirror", "kind": "uv_warp", "category": "Compositing", "editor": "line",
+      "description": "Everything past a line is the reflection of what's before it. Drag the line's point in the viewer and turn it by its handle: pointing down it mirrors left onto right, pointing left the top onto the bottom, anything between at a slant. Flip mirrors the other side instead.",
       "params": [
-        {"id": "axis", "type": "enum", "options": ["vertical", "horizontal"], "static_only": true},
-        {"id": "position", "type": "float", "default": 0.5, "min": 0, "max": 1},
+        {"id": "point", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"},
+        {"id": "angle", "type": "float", "default": 90, "min": 0, "max": 360, "unit": "direction"},
         {"id": "flip", "type": "bool", "default": false, "static_only": true}
       ],
       "shader": {"entry": "oa_warp_mirror", "file": "warp/mirror.wgsl"}
@@ -281,6 +282,21 @@
         {"id": "solid_color", "type": "bool", "default": false}
       ],
       "shader": {"entry": "oa_light_glow", "file": "light/glow.wgsl"}
+    },
+    {
+      "id": "oa.light.bloom", "name": "Bloom", "off": {"intensity": 0}, "kind": "spatial", "category": "Light", "expand": "radius",
+      "description": "Light spilling out of the bright parts of the picture: what's brighter than the threshold, blurred and added back over it. Works on how bright things really are, so a light that's overexposed blooms more than a white wall.",
+      "second_input": "original",
+      "pass_count": {"file": "light/bloom.passes"},
+      "pass_divisor": {"file": "light/bloom.divisor"},
+      "params": [
+        {"id": "threshold", "type": "float", "default": 0.8, "min": 0.1, "max": 1},
+        {"id": "softness", "type": "float", "default": 0.5, "min": 0, "max": 1},
+        {"id": "radius", "type": "float", "default": 40, "min": 0, "max": 400, "unit": "layer_pixels"},
+        {"id": "intensity", "type": "float", "default": 1, "min": 0, "max": 4},
+        {"id": "tint", "type": "color", "default": [1, 1, 1, 1]}
+      ],
+      "shader": {"entry": "oa_light_bloom", "file": "light/bloom.wgsl"}
     },
     {
       "id": "oa.light.shadow", "name": "Drop Shadow", "off": {"opacity": 0}, "kind": "spatial", "category": "Light",
@@ -312,9 +328,9 @@
       "shader": {"entry": "oa_stylize_glitch", "file": "stylize/glitch.wgsl"}
     },
     {
-      "id": "oa.warp.kaleidoscope", "name": "Kaleidoscope", "kind": "uv_warp", "category": "Warp",
+      "id": "oa.warp.kaleidoscope", "name": "Kaleidoscope", "kind": "uv_warp", "category": "Compositing",
       "params": [
-        {"id": "segments", "type": "float", "default": 6, "min": 2, "max": 24},
+        {"id": "segments", "type": "float", "default": 6, "min": 2, "max": 24, "step": 1},
         {"id": "rotation", "type": "float", "default": 0, "min": -180, "max": 180, "unit": "degrees"},
         {"id": "center", "type": "vec2", "default": [0.5, 0.5], "unit": "source_fraction"}
       ],
@@ -340,7 +356,7 @@
       "shader": {"entry": "oa_color_temperature", "file": "color/temperature.wgsl"}
     },
     {
-      "id": "oa.warp.tile", "name": "Tile", "kind": "uv_warp", "category": "Warp",
+      "id": "oa.warp.tile", "name": "Tile", "kind": "uv_warp", "category": "Compositing",
       "params": [
         {"id": "columns", "type": "float", "default": 3, "min": 1, "max": 20},
         {"id": "rows", "type": "float", "default": 3, "min": 1, "max": 20},
@@ -350,7 +366,7 @@
       "shader": {"entry": "oa_warp_tile", "file": "warp/tile.wgsl"}
     },
     {
-      "id": "oa.warp.scroll", "name": "Scroll", "kind": "spatial", "category": "Warp", "time_varying": true,
+      "id": "oa.warp.scroll", "name": "Scroll", "kind": "spatial", "category": "Compositing", "time_varying": true,
       "params": [
         {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
         {"id": "speed", "type": "float", "default": 120, "min": -2000, "max": 2000, "unit": "layer_pixels"},
@@ -463,9 +479,21 @@
       "description": "Smears the clip along its own movement, as a camera's shutter would: its position, scale, rotation and keyframed effects are drawn at moments across the shutter and averaged. 180° is film's usual look; more samples are smoother and slower.",
       "params": [
         {"id": "shutter_angle", "type": "float", "default": 180, "min": 0, "max": 720, "unit": "degrees"},
-        {"id": "samples", "type": "float", "default": 8, "min": 2, "max": 32}
+        {"id": "samples", "type": "float", "default": 8, "min": 2, "max": 32, "step": 1}
       ],
       "shader": {"entry": "oa_motion_blur", "file": "motion/motion-blur.wgsl"}
+    },
+    {
+      "id": "oa.motion.echo", "name": "Echo", "kind": "point", "category": "Motion", "preserves_opacity": false,
+      "description": "Ghost copies of the clip from a moment before (behind), after (ahead) or both: what moves — the footage, its position, its keyframed effects — leaves see-through doubles. Copies: how many on each side. Spacing: frames between them. Decay: how much of the one before each copy keeps (lower fades faster). Over lays them on top of the clip (ghosts on full-frame footage), Under puts them behind it (trails behind a cut-out or a title), Average blends them evenly (like a slow shutter), Add makes them glow. Speeding the clip up spreads them further apart.",
+      "params": [
+        {"id": "copies", "type": "float", "default": 4, "min": 1, "max": 16, "step": 1},
+        {"id": "spacing", "type": "float", "default": 2, "min": 0.25, "max": 30},
+        {"id": "direction", "type": "enum", "options": ["behind", "ahead", "both"], "default": "behind"},
+        {"id": "decay", "type": "float", "default": 0.6, "min": 0, "max": 1},
+        {"id": "mix", "type": "enum", "options": ["over", "under", "average", "add"], "default": "over"}
+      ],
+      "shader": {"entry": "oa_motion_echo", "file": "motion/echo.wgsl"}
     },
     {
       "id": "oa.composite.blend", "name": "Blend", "kind": "point", "category": "Compositing", "preserves_opacity": true,
@@ -477,9 +505,10 @@
     },
     {
       "id": "oa.composite.duplicate", "name": "Duplicate", "kind": "point", "category": "Compositing", "preserves_opacity": true,
-      "description": "A second copy of the clip, drawn with it: in front or behind, moved, scaled, turned and faded on its own. Its effects: the clip's (inherit), only those listed above this one (copy previous), or none — plus any added to the duplicate alone.",
+      "description": "A second copy of the clip, drawn with it: in front or behind, moved, scaled, turned and faded on its own. Its effects: the clip's (inherit), only those listed above this one (copy previous), or none — plus any added to the duplicate alone, run after those or before them.",
       "params": [
         {"id": "effects", "type": "enum", "options": ["inherit effects", "copy previous effects", "no effects"], "default": "inherit effects"},
+        {"id": "own_effects", "type": "enum", "options": ["run last", "run first"], "default": "run last"},
         {"id": "in_front", "type": "bool", "default": true},
         {"id": "offset", "type": "vec2", "default": [0.05, 0.05], "unit": "canvas_fraction"},
         {"id": "scale", "type": "float", "default": 1, "min": 0, "max": 10},
@@ -505,9 +534,9 @@
       "id": "oa.warp.liquify", "name": "Liquify", "off": {"amount": 0}, "kind": "uv_warp", "category": "Warp", "time_varying": true,
       "description": "Melts the picture into swirling, marbled ribbons, like paint stirred in liquid. Amount is how far it flows; size how big the swirls are; detail how many smaller swirls ride on them; swirl how twisted they are; flow how fast they move.",
       "params": [
-        {"id": "amount", "type": "float", "default": 280, "min": 0, "max": 3000, "unit": "layer_pixels"},
+        {"id": "amount", "type": "float", "default": 280, "min": 50, "max": 400, "unit": "layer_pixels"},
         {"id": "size", "type": "float", "default": 800, "min": 10, "max": 5000, "unit": "layer_pixels"},
-        {"id": "detail", "type": "float", "default": 3, "min": 1, "max": 6},
+        {"id": "detail", "type": "float", "default": 3, "min": 1, "max": 6, "step": 1},
         {"id": "swirl", "type": "float", "default": 1.2, "min": 0, "max": 3},
         {"id": "flow", "type": "float", "default": 0.15, "min": 0, "max": 4},
         {"id": "seed", "type": "float", "default": 1, "min": 0, "max": 1000},
@@ -701,7 +730,7 @@
       "shader": {"entry": "oa_depth_slab", "file": "depth/slab.wgsl"}
     },
     {
-      "id": "oa.warp.surface", "name": "Surface", "kind": "spatial", "category": "Warp",
+      "id": "oa.warp.surface", "name": "Surface", "kind": "spatial", "category": "Compositing",
       "editor": "surface",
       "bounds": {"file": "warp/surface.bounds"},
       "params": [
@@ -721,7 +750,9 @@
         {"id": "p30", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
         {"id": "p31", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
         {"id": "p32", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
-        {"id": "p33", "type": "vec2", "default": [0, 0], "unit": "source_fraction"}
+        {"id": "p33", "type": "vec2", "default": [0, 0], "unit": "source_fraction"},
+        {"id": "crop_lo", "type": "vec2", "default": [0, 0], "static_only": true},
+        {"id": "crop_hi", "type": "vec2", "default": [1, 1], "static_only": true}
       ],
       "shader": {"entry": "oa_warp_surface", "file": "warp/surface.wgsl"}
     },

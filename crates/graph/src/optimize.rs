@@ -107,7 +107,9 @@ impl Rewriter<'_> {
                     m = inner.then(&m);
                     src = self.old.node(src).inputs[0];
                 }
-                if m.is_identity() {
+                // One that moves nothing goes — unless it cuts its picture down (a cropped
+                // clip's layer, before its effects, which take the box it leaves).
+                if m.is_identity() && node.bounds == self.old.node(src).bounds {
                     return self.visit(src);
                 }
                 let input = self.visit(src);

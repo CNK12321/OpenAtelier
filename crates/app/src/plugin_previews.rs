@@ -92,33 +92,6 @@ fn slot(type_id: &str) -> u64 {
 /// still preview, else seconds into the hover animation. `sky`: the sample picture's
 /// size, when it's available (else a plain backdrop stands in).
 pub fn sample_scene(d: &EffectDescriptor, phase: Option<f64>, sky: Option<[u32; 2]>) -> (Project, Time) {
-    let mut p = Project::new("sample");
-    let variant = FormatVariant { id: VARIANT, name: "3:4".into(), size: CanvasSize::new(CANVAS[0], CANVAS[1]), overrides: Default::default() };
-    // Inside: the picture (or a warm-to-cool backdrop) and a big two-tone "Aa".
-    let mut inner = Sequence::new(INNER, "Sample", FrameRate::FPS_30, variant.clone());
-    let stop = |pos: f64, color: [f64; 4]| GradientStop { pos, color };
-    inner.params.set(
-        oa_doc::schema::BG_COLOR,
-        ParamSource::Static(Value::Gradient(Gradient { angle: 60.0, stops: vec![stop(0.0, [0.08, 0.2, 0.5, 1.0]), stop(0.55, [0.85, 0.3, 0.35, 1.0]), stop(1.0, [0.98, 0.8, 0.3, 1.0])] })),
-    );
-    if let Some([width, height]) = sky {
-        let info = MediaInfo { width, height, duration: Time::ZERO, rate: None, has_video: true, has_audio: false, still: true, ..Default::default() };
-        p.media.insert(
-            MediaId(SKY),
-            Arc::new(MediaRef { id: MediaId(SKY), path: String::new(), fingerprint: Some("oa-preview-sky-1".into()), info: Some(info), scaling: Default::default(), folder: String::new(), color: Default::default() }),
-        );
-        let mut v0 = Track::new(TrackId(14), "Picture", TrackKind::Video);
-        v0.items.push(Item::new(PHOTO, "sky", ItemKind::Media { media: MediaId(SKY) }, TimeRange::new(Time::ZERO, LENGTH)));
-        inner.tracks.push(Arc::new(v0));
-    }
-    let mut title = Item::new(TITLE, "Aa", ItemKind::Text, TimeRange::new(Time::ZERO, LENGTH));
-    title.params.set(oa_doc::schema::TEXT_CONTENT, ParamSource::Static(Value::Text("Aa".into())));
-    title.params.set(oa_doc::schema::TEXT_SIZE, ParamSource::Static(Value::Float(130.0)));
-    title.params.set(oa_doc::schema::TEXT_BOLD, ParamSource::Static(Value::Bool(true)));
-    title.params.set(
-        oa_doc::schema::TEXT_COLOR,
-        ParamSource::Static(Value::Gradient(Gradient { angle: 90.0, stops: vec![stop(0.0, [1.0, 1.0, 1.0, 1.0]), stop(1.0, [1.0, 0.85, 0.55, 1.0])] })),
-    );
     let mut fx = EffectInstance::new(EffectId(99), &d.type_id);
     for (param, value) in &d.preview {
         fx.params.set(param.as_str(), ParamSource::Static(value.clone()));
@@ -147,25 +120,65 @@ pub fn sample_scene(d: &EffectDescriptor, phase: Option<f64>, sky: Option<[u32; 
             Time::from_seconds_f64(1.5)
         }
     };
-    let text_effect = d.kind.text_only();
-    if text_effect {
-        title.effects.push(fx.clone());
+    let (title, scene) = if d.kind.text_only() { (vec![fx], Vec::new()) } else { (Vec::new(), vec![fx]) };
+    (sample_project(sky, title, scene, Vec::new()), t)
+}
+
+/// The sample scene with `effects` (an effects preset's, in `groups`) on it — text
+/// effects on the letters, the rest on the whole scene — and the moment to show.
+pub fn preset_scene(effects: &[EffectInstance], groups: &[oa_doc::EffectGroup], sky: Option<[u32; 2]>, registry: &oa_graph::registry::Registry) -> (Project, Time) {
+    let text = |e: &EffectInstance| registry.effect(&e.type_id).is_some_and(|d| d.kind.text_only());
+    let title = effects.iter().filter(|e| text(e)).cloned().collect();
+    let scene = effects.iter().filter(|e| !text(e)).cloned().collect();
+    (sample_project(sky, title, scene, groups.to_vec()), Time::from_seconds_f64(1.5))
+}
+
+/// The sample scene: the picture (or a warm-to-cool backdrop) and a big two-tone "Aa"
+/// carrying `title_effects`, as one clip carrying `scene_effects` (in `groups`).
+fn sample_project(sky: Option<[u32; 2]>, title_effects: Vec<EffectInstance>, scene_effects: Vec<EffectInstance>, groups: Vec<oa_doc::EffectGroup>) -> Project {
+    let mut p = Project::new("sample");
+    let variant = FormatVariant { id: VARIANT, name: "3:4".into(), size: CanvasSize::new(CANVAS[0], CANVAS[1]), overrides: Default::default() };
+    // Inside: the picture (or a warm-to-cool backdrop) and a big two-tone "Aa".
+    let mut inner = Sequence::new(INNER, "Sample", FrameRate::FPS_30, variant.clone());
+    let stop = |pos: f64, color: [f64; 4]| GradientStop { pos, color };
+    inner.params.set(
+        oa_doc::schema::BG_COLOR,
+        ParamSource::Static(Value::Gradient(Gradient { angle: 60.0, stops: vec![stop(0.0, [0.08, 0.2, 0.5, 1.0]), stop(0.55, [0.85, 0.3, 0.35, 1.0]), stop(1.0, [0.98, 0.8, 0.3, 1.0])] })),
+    );
+    if let Some([width, height]) = sky {
+        let info = MediaInfo { width, height, duration: Time::ZERO, rate: None, has_video: true, has_audio: false, still: true, ..Default::default() };
+        p.media.insert(
+            MediaId(SKY),
+            Arc::new(MediaRef { id: MediaId(SKY), path: String::new(), fingerprint: Some("oa-preview-sky-1".into()), info: Some(info), scaling: Default::default(), folder: String::new(), color: Default::default() }),
+        );
+        let mut v0 = Track::new(TrackId(14), "Picture", TrackKind::Video);
+        v0.items.push(Item::new(PHOTO, "sky", ItemKind::Media { media: MediaId(SKY) }, TimeRange::new(Time::ZERO, LENGTH)));
+        inner.tracks.push(Arc::new(v0));
     }
+    let mut title = Item::new(TITLE, "Aa", ItemKind::Text, TimeRange::new(Time::ZERO, LENGTH));
+    title.params.set(oa_doc::schema::TEXT_CONTENT, ParamSource::Static(Value::Text("Aa".into())));
+    title.params.set(oa_doc::schema::TEXT_SIZE, ParamSource::Static(Value::Float(130.0)));
+    title.params.set(oa_doc::schema::TEXT_BOLD, ParamSource::Static(Value::Bool(true)));
+    title.params.set(
+        oa_doc::schema::TEXT_COLOR,
+        ParamSource::Static(Value::Gradient(Gradient { angle: 90.0, stops: vec![stop(0.0, [1.0, 1.0, 1.0, 1.0]), stop(1.0, [1.0, 0.85, 0.55, 1.0])] })),
+    );
+    title.effect_groups = groups.iter().filter(|g| title_effects.iter().any(|e| e.group == Some(g.id))).cloned().collect();
+    title.effects = title_effects;
     let mut v1 = Track::new(TrackId(11), "Title", TrackKind::Video);
     v1.items.push(title);
     inner.tracks.push(Arc::new(v1));
     p.sequences.insert(INNER, Arc::new(inner));
-    // Outside: the scene as one clip, carrying a picture effect.
+    // Outside: the scene as one clip, carrying the picture effects.
     let mut outer = Sequence::new(OUTER, "Preview", FrameRate::FPS_30, variant);
     let mut scene = Item::new(SCENE, "scene", ItemKind::Nested { sequence: INNER }, TimeRange::new(Time::ZERO, LENGTH));
-    if !text_effect {
-        scene.effects.push(fx);
-    }
+    scene.effect_groups = groups.into_iter().filter(|g| scene_effects.iter().any(|e| e.group == Some(g.id))).collect();
+    scene.effects = scene_effects;
     let mut v = Track::new(TrackId(2), "V1", TrackKind::Video);
     v.items.push(scene);
     outer.tracks.push(Arc::new(v));
     p.sequences.insert(OUTER, Arc::new(outer));
-    (p, t)
+    p
 }
 
 impl App {
@@ -389,6 +402,33 @@ impl App {
         if self.plugin_previews.requested.insert(key) {
             let sky = self.preview_sky();
             let (project, at) = sample_scene(d, None, sky);
+            self.request_sample(slot, tag, project, at);
+        }
+        None
+    }
+
+    /// The preview of an effects preset in the asset library, on the sample picture:
+    /// asked for once per version of its file, picked up when done.
+    pub(crate) fn preset_still(&mut self, preset: &crate::assets::PresetAsset) -> Option<egui::TextureId> {
+        let key = format!("preset:{}:{}", preset.path.display(), preset.modified);
+        if let Some((id, _)) = self.plugin_previews.images.get(&key) {
+            return Some(*id);
+        }
+        let slot = slot(&key);
+        let tag = self.plugin_previews.registry as u64;
+        if let Some(done) = self.preview_worker.take(slot).filter(|r| r.tag == tag)
+            && let Some(rs) = self.render_state.as_ref()
+        {
+            let view = oa_gpu::readback::display_view(&done.texture);
+            let id = rs.renderer.write().register_native_texture(&self.gpu.device, &view, wgpu::FilterMode::Linear);
+            self.plugin_previews.images.insert(key, (id, done.texture));
+            return Some(id);
+        }
+        if self.plugin_previews.requested.insert(key) {
+            let Ok(p) = crate::presets::Preset::read(&preset.path) else { return None };
+            let sky = self.preview_sky();
+            let (effects, groups) = p.fitted(LENGTH);
+            let (project, at) = preset_scene(&effects, &groups, sky, &self.registry);
             self.request_sample(slot, tag, project, at);
         }
         None

@@ -1,0 +1,3 @@
+// Bloom's passes: the bright parts picked out, blurred across, blurred down, then
+// added over the picture.
+out = 4;

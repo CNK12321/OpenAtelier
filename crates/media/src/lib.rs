@@ -15,6 +15,7 @@
 
 mod any;
 pub mod ffmpeg;
+pub mod find;
 mod fingerprint;
 pub mod import;
 mod probe;

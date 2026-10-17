@@ -149,6 +149,9 @@ pub(crate) enum Entry {
     Compound(SeqId),
 }
 
+/// What a search for missing files found (where each is now), and how many it looked for.
+pub(crate) type Found = (Vec<(MediaId, std::path::PathBuf)>, usize);
+
 /// What a card being dragged carries.
 #[derive(Clone)]
 pub struct BinDrop {
@@ -537,7 +540,8 @@ impl App {
         painter.rect_filled(thumb, 4.0, visuals.faint_bg_color);
         let pictures = self.folder_pictures(path, 12);
         let draw = |app: &mut Self, cell: egui::Rect, p: &(MediaId, PathBuf, [u32; 2], f64, f64)| -> bool {
-            let Some(strip) = app.clip_previews.strip(&ctx, p.0, &p.1, p.2, p.3) else { return false };
+            let scaling = app.media_scaling(p.0);
+            let Some(strip) = app.clip_previews.strip(&ctx, p.0, &p.1, p.2, p.3, scaling) else { return false };
             // Filled (cropped to the cell), like a cover.
             let (cw, ch) = (cell.width(), cell.height());
             let uv = strip.uv(p.4);
@@ -680,6 +684,13 @@ impl App {
         ui.set_max_width(ui.available_width());
         // The tabs run down the left edge, so nothing on the top row can run into them.
         let full = ui.available_rect_before_wrap();
+        // An effect or group dragged over the bin: it turns to Assets, and letting go
+        // there keeps it as a preset (the inspector takes the drop).
+        if self.effect_drag.is_some() && ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| full.contains(p)) {
+            self.bin.tab = BinTab::Assets;
+            self.assets_drop = Some((full, ui.ctx().cumulative_pass_nr()));
+            ui.painter().rect_stroke(full, 4.0, egui::Stroke::new(2.0, crate::style::ACCENT), egui::StrokeKind::Inside);
+        }
         let strip = egui::Rect::from_min_max(full.min, egui::pos2(full.left() + TAB_STRIP, full.bottom()));
         let body = egui::Rect::from_min_max(egui::pos2(strip.right() + crate::style::GAP_S, full.top()), full.max);
         ui.scope_builder(egui::UiBuilder::new().max_rect(strip).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
@@ -853,6 +864,7 @@ impl App {
         // As a list: folders, then a row per file.
         if self.bin.list && self.bin.tab != BinTab::Assets {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                self.bin_background(ui);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 for text in &loading {
                     ui.label(egui::RichText::new(text).weak());
@@ -873,6 +885,7 @@ impl App {
         }
         // The bin fills its panel, top to bottom.
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            self.bin_background(ui);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                 for text in &loading {
@@ -896,6 +909,22 @@ impl App {
                 }
             });
         });
+    }
+
+    /// The bin's empty space: a click there lets go of the picked files. Taken first, so
+    /// the cards and folders drawn over it get their own clicks.
+    fn bin_background(&mut self, ui: &mut egui::Ui) {
+        // The cards' own area only: the clip rect reaches over the tabs beside it.
+        let area = ui.max_rect().intersect(ui.clip_rect());
+        let bg = ui.interact(area, ui.id().with("bin-background"), egui::Sense::click());
+        if bg.clicked() && !ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+            self.bin.picked.clear();
+        }
+    }
+
+    /// How a file's pixels are scaled (its Scale mode in the bin's right-click menu).
+    pub(crate) fn media_scaling(&self, media: MediaId) -> oa_doc::MediaScaling {
+        self.editor.doc.project().media(media).map_or(oa_doc::MediaScaling::Auto, |m| m.scaling)
     }
 
     /// A card's picture in `thumb`: a compound clip's frames, a file's (skimmed with the
@@ -931,7 +960,8 @@ impl App {
         }
         if let Some((media, path, size, duration, rest)) = card.picture.as_ref().filter(|_| !drawn) {
             let at = skim(*duration, *rest);
-            if let Some(strip) = self.clip_previews.strip(&ctx, *media, path, *size, *duration) {
+            let scaling = self.media_scaling(*media);
+            if let Some(strip) = self.clip_previews.strip(&ctx, *media, path, *size, *duration, scaling) {
                 let h = thumb.height().min(thumb.width() / strip.aspect.max(0.01));
                 let dest = egui::Rect::from_center_size(thumb.center(), egui::vec2(h * strip.aspect, h));
                 painter.image(strip.texture.id(), dest, strip.uv(at), egui::Color32::WHITE);
@@ -1342,11 +1372,17 @@ impl App {
         }
     }
 
+    /// A card's ＋ (or a double-click): onto the timeline at the playhead, on the first
+    /// track of its kind with room there — or a temp layer when none has.
     fn add_bin_entry(&mut self, entry: Entry, length: Time) {
-        let added = match entry {
-            Entry::Media(id) => self.editor.append_clip(id, length),
-            Entry::Compound(seq) => self.editor.append_compound(seq),
+        let (name, kind, length) = match entry {
+            Entry::Media(id) => (self.editor.pool_item(id).map(|p| p.name.clone()).unwrap_or_default(), ItemKind::Media { media: id }, length),
+            Entry::Compound(sequence) => {
+                let s = self.editor.doc.project().sequence(sequence);
+                (s.map(|s| s.name.clone()).unwrap_or_default(), ItemKind::Nested { sequence }, s.map_or(length, |s| s.duration()))
+            }
         };
+        let added = self.editor.place_clip(&name, kind, length, self.playhead, None);
         match added {
             Ok(item) => self.selection = Some(item),
             Err(e) => self.error = Some(e.to_string()),
@@ -1506,52 +1542,57 @@ impl App {
         }
     }
 
-    /// Relinks every missing file found by name in `dir` (and the folders in it).
-    pub(crate) fn relink_from_folder(&mut self, dir: &std::path::Path) {
-        let missing: Vec<(MediaId, String)> = self
+    /// Looks for every missing file — in `dir` (and the folders in it), or with `None`
+    /// all around this computer — on a thread of its own: the same name and content, or
+    /// the same content renamed (`oa_media::find`). What's found is relinked as it comes
+    /// back (`poll_finding`).
+    pub(crate) fn find_missing(&mut self, dir: Option<&std::path::Path>) {
+        let project = self.editor.doc.project();
+        let missing: Vec<(MediaId, oa_media::find::Missing)> = self
             .editor
             .pool
             .iter()
             .filter(|m| m.missing)
             .filter_map(|m| {
-                let path = self.editor.doc.project().media(m.id)?.path.clone();
-                let name = std::path::Path::new(&path).file_name()?.to_string_lossy().to_lowercase();
-                Some((m.id, name))
+                let r = project.media(m.id)?;
+                Some((m.id, oa_media::find::Missing { path: std::path::PathBuf::from(&r.path), fingerprint: r.fingerprint.clone() }))
             })
             .collect();
-        let mut found = std::collections::HashMap::new();
-        let mut stack = vec![(dir.to_path_buf(), 0usize)];
-        let mut seen = 0usize;
-        while let Some((d, depth)) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&d) else { continue };
-            for e in entries.flatten() {
-                seen += 1;
-                if seen > 50_000 {
-                    break;
-                }
-                let p = e.path();
-                if p.is_dir() {
-                    if depth < 8 {
-                        stack.push((p, depth + 1));
-                    }
-                } else if let Some(n) = p.file_name().map(|n| n.to_string_lossy().to_lowercase()) {
-                    found.entry(n).or_insert(p);
-                }
-            }
+        if missing.is_empty() {
+            return;
         }
-        let mut relinked = 0;
-        for (id, name) in missing.iter() {
-            if let Some(path) = found.get(name).cloned() {
-                self.relink(*id, &path);
-                relinked += 1;
+        let roots = match dir {
+            Some(d) => vec![d.to_path_buf()],
+            None => {
+                let paths: Vec<std::path::PathBuf> = missing.iter().map(|(_, m)| m.path.clone()).collect();
+                crate::projects::relink_roots(self.editor.path.as_deref().and_then(|p| p.parent()), &paths)
             }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let wanted: Vec<oa_media::find::Missing> = missing.iter().map(|(_, m)| m.clone()).collect();
+            let hits = oa_media::find::find_moved(&wanted, &roots, std::time::Duration::from_secs(30));
+            let found: Vec<(MediaId, std::path::PathBuf)> = missing.iter().zip(hits).filter_map(|((id, _), hit)| hit.map(|p| (*id, p))).collect();
+            let _ = tx.send((found, missing.len()));
+        });
+        self.finding = Some(rx);
+        self.notify(tr("Looking for the missing files…"));
+    }
+
+    /// Takes in what `find_missing` found: each file relinked (probed in the background;
+    /// the cards update as each comes in).
+    pub(crate) fn poll_finding(&mut self) {
+        let Some(rx) = &self.finding else { return };
+        let Ok((found, looked_for)) = rx.try_recv() else { return };
+        self.finding = None;
+        for (id, path) in &found {
+            self.relink(*id, path);
         }
-        let left = missing.len() - relinked;
-        // They're probed in the background; the cards update as each comes in.
+        let left = looked_for - found.len();
         if left == 0 {
-            self.notify(trf("Relinking {n} files…", &[("n", &relinked.to_string())]));
+            self.notify(trf("Relinking {n} files…", &[("n", &found.len().to_string())]));
         } else {
-            self.notify(trf("Relinking {n} files… {left} weren't found there.", &[("n", &relinked.to_string()), ("left", &left.to_string())]));
+            self.notify(trf("Relinking {n} files… {left} weren't found there.", &[("n", &found.len().to_string()), ("left", &left.to_string())]));
         }
     }
 
@@ -1615,8 +1656,17 @@ impl App {
                 {
                     ui.close();
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.relink_from_folder(&dir);
+                        self.find_missing(Some(&dir));
                     }
+                }
+                if self.editor.pool.iter().any(|m| m.missing)
+                    && self.finding.is_none()
+                    && crate::icons::menu_item(ui, Some(crate::icons::SEARCH), tr("Find missing files on this computer"), "", true)
+                        .on_hover_text(tr("Around where they were, by the project, in your usual folders and on your drives: by name and content, or by content if renamed"))
+                        .clicked()
+                {
+                    ui.close();
+                    self.find_missing(None);
                 }
                 let (uses, _) = self.editor.media_uses();
                 let clips: usize = media.iter().map(|m| uses.get(m).copied().unwrap_or(0)).sum();
@@ -1669,7 +1719,7 @@ impl App {
                 }
             });
         }
-        if self.assets.items.is_empty() && self.assets.folders.is_empty() {
+        if self.assets.items.is_empty() && self.assets.presets.is_empty() && self.assets.folders.is_empty() {
             ui.label(
                 egui::RichText::new(
                     tr("Nothing here yet. Right-click a clip in Media → Save to assets, or add files with the arrow above — they stay available in every project."),
@@ -1685,7 +1735,12 @@ impl App {
         } else {
             (Vec::new(), self.assets.items.iter().filter(|a| matches(&needle, &[&a.name, &a.folder])).cloned().collect())
         };
-        if !needle.is_empty() && items.is_empty() {
+        let presets: Vec<crate::assets::PresetAsset> = if needle.is_empty() {
+            self.assets.presets_in(&here).cloned().collect()
+        } else {
+            self.assets.presets.iter().filter(|a| matches(&needle, &[&a.name, &a.folder])).cloned().collect()
+        };
+        if !needle.is_empty() && items.is_empty() && presets.is_empty() {
             ui.label(egui::RichText::new(tr("Nothing matches.")).weak());
         }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -1699,6 +1754,9 @@ impl App {
                 }
                 for asset in items {
                     self.asset_card(ui, &asset);
+                }
+                for preset in presets {
+                    self.preset_card(ui, &preset);
                 }
             });
         });
@@ -1766,7 +1824,7 @@ impl App {
                 }
                 drawn = true;
             }
-        } else if let Some(strip) = self.clip_previews.strip(&ctx, id, &asset.path, [640, 360], 0.0) {
+        } else if let Some(strip) = self.clip_previews.strip(&ctx, id, &asset.path, [0, 0], 0.0, oa_doc::MediaScaling::Auto) {
             let h = thumb.height().min(thumb.width() / strip.aspect.max(0.01));
             let dest = egui::Rect::from_center_size(thumb.center(), egui::vec2(h * strip.aspect, h));
             painter.image(strip.texture.id(), dest, strip.uv(0.0), egui::Color32::WHITE);
@@ -1844,6 +1902,93 @@ impl App {
                 .clicked()
             {
                 if let Err(e) = self.assets.remove(&asset.path) {
+                    self.report_error(e);
+                }
+                ui.close();
+            }
+        });
+    }
+
+    /// An effects preset (`presets.rs`): its effects previewed on the sample picture (a
+    /// sound preset shows its icon). Drag it onto a clip or the effect list, or
+    /// double-click or ＋ it, to put it on the selected clips.
+    fn preset_card(&mut self, ui: &mut egui::Ui, preset: &crate::assets::PresetAsset) {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(CARD_W, THUMB_H + 30.0), egui::Sense::click_and_drag());
+        if response.drag_started() {
+            self.preset_drag = Some(crate::presets::PresetDrag { path: preset.path.clone(), name: preset.name.clone() });
+        }
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let thumb = egui::Rect::from_min_size(rect.min, egui::vec2(CARD_W, THUMB_H));
+        let visuals = ui.visuals().clone();
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(thumb, 4.0, visuals.faint_bg_color);
+        let picture = if preset.sound { None } else { self.preset_still(preset) };
+        match picture {
+            Some(id) => {
+                // The sample is 3:4: its middle, filling the card.
+                let aspect = thumb.width() / thumb.height() * 0.75;
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.5 - 0.5 * aspect), egui::pos2(1.0, 0.5 + 0.5 * aspect));
+                painter.image(id, thumb, uv, egui::Color32::WHITE);
+            }
+            None => {
+                let icon = if preset.sound { crate::icons::SOUND } else { crate::icons::EFFECTS };
+                crate::icons::paint(&painter, thumb.shrink(THUMB_H * 0.3), icon, visuals.weak_text_color());
+            }
+        }
+        // A badge: it's effects, not a file to import.
+        let badge = egui::Rect::from_min_size(thumb.left_top() + egui::vec2(3.0, 3.0), egui::vec2(19.0, 19.0));
+        painter.rect_filled(badge, 4.0, egui::Color32::from_black_alpha(160));
+        crate::icons::paint(&painter, badge.shrink(3.0), crate::icons::EFFECTS, egui::Color32::WHITE);
+        let border = if response.hovered() { egui::Stroke::new(1.5, crate::style::ACCENT) } else { egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color) };
+        painter.rect_stroke(thumb, 4.0, border, egui::StrokeKind::Inside);
+        let plus = egui::Rect::from_min_size(thumb.right_top() + egui::vec2(-22.0, 3.0), egui::vec2(19.0, 19.0));
+        let over_plus = response.hover_pos().is_some_and(|p| plus.contains(p));
+        if response.hovered() {
+            painter.rect_filled(plus, 4.0, if over_plus { visuals.selection.bg_fill } else { egui::Color32::from_black_alpha(160) });
+            crate::icons::paint(&painter, plus.shrink(3.0), crate::icons::ADD, egui::Color32::WHITE);
+        }
+        let mut job = egui::text::LayoutJob::simple_singleline(preset.name.clone(), egui::FontId::proportional(12.0), visuals.text_color());
+        job.wrap = egui::text::TextWrapping::truncate_at_width(CARD_W - 4.0);
+        painter.galley(egui::pos2(rect.left() + 2.0, thumb.bottom() + 2.0), painter.layout_job(job), visuals.text_color());
+        let n = preset.effects;
+        let what = if preset.sound {
+            trf("{n} sound effect{0}", &[("n", &n.to_string()), ("0", if n == 1 { "" } else { "s" })])
+        } else {
+            trf("{n} effect{0}", &[("n", &n.to_string()), ("0", if n == 1 { "" } else { "s" })])
+        };
+        painter.text(egui::pos2(rect.left() + 2.0, thumb.bottom() + 17.0), egui::Align2::LEFT_TOP, what, egui::FontId::proportional(10.0), visuals.weak_text_color());
+
+        let response = response.on_hover_text(tr("An effects preset: drag it onto a clip, or double-click or ＋ to put it on the selected clips"));
+        let apply = |app: &mut App, path: &std::path::Path| {
+            let targets = app.selected_clips();
+            if targets.is_empty() {
+                app.notify(tr("Select a clip first, or drag the preset onto one."));
+            } else {
+                app.apply_preset(path, &targets);
+            }
+        };
+        if (response.clicked() && over_plus) || response.double_clicked() {
+            apply(self, &preset.path);
+        }
+        let preset = preset.clone();
+        crate::widgets::context_menu(&response, |ui| {
+            if ui.button(tr("Put on the selected clips")).clicked() {
+                apply(self, &preset.path);
+                ui.close();
+            }
+            if ui.button(tr("Show in folder")).clicked() {
+                let dir = preset.path.parent().unwrap_or(&preset.path).to_path_buf();
+                #[cfg(windows)]
+                let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                #[cfg(not(windows))]
+                let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                ui.close();
+            }
+            ui.separator();
+            if ui.button(tr("Remove from assets")).clicked() {
+                if let Err(e) = self.assets.remove(&preset.path) {
                     self.report_error(e);
                 }
                 ui.close();

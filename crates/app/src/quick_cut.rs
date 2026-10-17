@@ -337,7 +337,8 @@ impl App {
         // The file across: frames tiled along it, or its waveform.
         match size {
             Some(size) => {
-                if let Some(strip) = self.clip_previews.strip(ui.ctx(), media, &path, size, duration) {
+                let scaling = self.media_scaling(media);
+                if let Some(strip) = self.clip_previews.strip(ui.ctx(), media, &path, size, duration, scaling) {
                     let tile_w = rect.height() * strip.aspect;
                     let tiles = (rect.width() / tile_w.max(8.0)).ceil().max(1.0) as usize;
                     let w = rect.width() / tiles as f32;

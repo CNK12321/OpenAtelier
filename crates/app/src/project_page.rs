@@ -555,7 +555,9 @@ impl App {
         let menu_id = id.with("menu");
         let menu_open = egui::Popup::is_id_open(ui.ctx(), menu_id);
         let lit = response.hovered() || menu_open || response.dragged();
-        let h = ui.ctx().animate_bool_with_time(id.with("lift"), lit, 0.16);
+        // With UI effects off it stays flat on the page: no lift, tilt or glow.
+        let effects = self.settings.ui_effects;
+        let h = if effects { ui.ctx().animate_bool_with_time(id.with("lift"), lit, 0.16) } else { 0.0 };
         // Toward the pointer while it's over the card; eased back from where it was.
         let tilt_key = id.with("tilt");
         let mut tilt: egui::Vec2 = ui.data(|d| d.get_temp(tilt_key)).unwrap_or_default();
@@ -617,6 +619,9 @@ impl App {
                 painter.add(egui::Shape::closed_line(outline, egui::Stroke::new(1.5, color)));
             }
             None if h > 0.01 => glow_edge(painter, &outline, map(0.5, 0.5), map(light.x, light.y), lifted.width(), h),
+            None if lit && !effects => {
+                painter.add(egui::Shape::closed_line(outline, egui::Stroke::new(1.5, crate::style::ACCENT)));
+            }
             None => {
                 painter.add(egui::Shape::closed_line(outline, egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color)));
             }

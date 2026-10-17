@@ -33,17 +33,28 @@ pub struct EffectPoint {
     /// turns it (`param` is then the angle, `at` still the line's point).
     pub line: Option<f64>,
     pub turn: bool,
+    /// The box `at` is a fraction of, in fractions of the clip (left, top, width,
+    /// height): what the clip's crop keeps — its effects take that as the picture.
+    pub frame: [f64; 4],
+}
+
+/// A point given in fractions of `frame` (left, top, width, height: fractions of the
+/// clip), in fractions of the whole clip.
+pub(crate) fn on_clip(frame: [f64; 4], at: [f64; 2]) -> [f64; 2] {
+    [frame[0] + at[0] * frame[2], frame[1] + at[1] * frame[3]]
 }
 
 impl EffectPoint {
     fn on_canvas(&self, p: &Placement) -> [f64; 2] {
-        p.to_canvas.apply([self.at[0] * p.native[0], self.at[1] * p.native[1]])
+        let [u, v] = on_clip(self.frame, self.at);
+        p.to_canvas.apply([u * p.native[0], v * p.native[1]])
     }
 
     /// The line's direction on screen (a unit vector), for a point on a line.
     fn direction(&self, p: &Placement, to_screen: &dyn Fn([f64; 2]) -> egui::Pos2) -> Option<egui::Vec2> {
         let a = self.line?.to_radians();
-        let c = [self.at[0] * p.native[0], self.at[1] * p.native[1]];
+        let [u, v] = on_clip(self.frame, self.at);
+        let c = [u * p.native[0], v * p.native[1]];
         let ahead = p.to_canvas.apply([c[0] + a.cos(), c[1] + a.sin()]);
         let d = to_screen(ahead) - to_screen(p.to_canvas.apply(c));
         (d.length() > 1e-6).then(|| d.normalized())
@@ -80,14 +91,25 @@ pub struct PointDrag {
     at0: [f64; 2],
     /// Turning a line about `at0`.
     turn: bool,
+    /// The box the point's fractions are of (see [`EffectPoint::frame`]).
+    frame: [f64; 4],
 }
 
 impl App {
+    /// The box a clip's effects take as the picture at `t`, in fractions of the clip
+    /// (left, top, width, height): what its crop keeps, as the renderer cuts the layer
+    /// down to it. A point on the clip (`source_fraction`) is a fraction of this.
+    pub(crate) fn effect_frame(&self, item: ItemId, t: Time) -> [f64; 4] {
+        let crop = oa_doc::schema::CROPS.map(|c| self.editor.param_value(item, &ParamTarget::Item, c, t).and_then(|v| v.as_float()).unwrap_or(0.0).clamp(0.0, 1.0));
+        [crop[0], crop[2], (1.0 - crop[0] - crop[1]).max(1e-6), (1.0 - crop[2] - crop[3]).max(1e-6)]
+    }
+
     /// The points of the clip's switched-on effects at `t` (not a Surface's: it has its
     /// own editor), and each cut line's point and turning handle.
     pub(crate) fn effect_points(&self, item: ItemId, t: Time) -> Vec<EffectPoint> {
         let Some(it) = self.editor.item(item) else { return Vec::new() };
         let ctx = it.eval_context(t);
+        let frame = self.effect_frame(item, t);
         let mut out = Vec::new();
         for fx in it.effects.iter().filter(|e| e.enabled) {
             let Some(d) = self.registry.effect(&fx.type_id) else { continue };
@@ -99,9 +121,9 @@ impl App {
             let angle = line.then(|| values.float("angle"));
             for s in d.params.iter().filter(|s| s.unit == Unit::SourceFraction && matches!(s.default, Value::Vec2(_))) {
                 let at = values.vec2(s.id.as_str());
-                out.push(EffectPoint { effect: fx.id, param: s.id.as_str().to_string(), at, name: d.name.clone(), line: angle, turn: false });
+                out.push(EffectPoint { effect: fx.id, param: s.id.as_str().to_string(), at, name: d.name.clone(), line: angle, turn: false, frame });
                 if line {
-                    out.push(EffectPoint { effect: fx.id, param: "angle".into(), at, name: d.name.clone(), line: angle, turn: true });
+                    out.push(EffectPoint { effect: fx.id, param: "angle".into(), at, name: d.name.clone(), line: angle, turn: true, frame });
                 }
             }
         }
@@ -110,7 +132,7 @@ impl App {
 
     pub(crate) fn begin_point_drag(&mut self, p: &Placement, point: &EffectPoint, canvas: [f64; 2]) {
         let Some(start) = p.to_layer_fraction(canvas) else { return };
-        self.point_drag = Some(PointDrag { item: p.item, effect: point.effect, param: point.param.clone(), start, at0: point.at, turn: point.turn });
+        self.point_drag = Some(PointDrag { item: p.item, effect: point.effect, param: point.param.clone(), start, at0: point.at, turn: point.turn, frame: point.frame });
         self.set_playing(false);
     }
 
@@ -118,8 +140,10 @@ impl App {
     /// line to point at it (Shift: in 15° steps).
     pub(crate) fn drag_point(&mut self, drag: &PointDrag, p: &Placement, canvas: [f64; 2], shift: bool) {
         let Some([u, v]) = p.to_layer_fraction(canvas) else { return };
+        let f = drag.frame;
         if drag.turn {
-            let (dx, dy) = ((u - drag.at0[0]) * p.native[0], (v - drag.at0[1]) * p.native[1]);
+            let [cx, cy] = on_clip(f, drag.at0);
+            let (dx, dy) = ((u - cx) * p.native[0], (v - cy) * p.native[1]);
             if dx.hypot(dy) < 1e-6 {
                 return;
             }
@@ -130,7 +154,8 @@ impl App {
             self.editor.set_value_at(drag.item, ParamTarget::Effect(drag.effect), &drag.param, Value::Float(degrees), self.playhead, "viewer-point");
             return;
         }
-        let at = [drag.at0[0] + u - drag.start[0], drag.at0[1] + v - drag.start[1]];
+        // The pointer's move across the clip, as a share of the box the point is in.
+        let at = [drag.at0[0] + (u - drag.start[0]) / f[2], drag.at0[1] + (v - drag.start[1]) / f[3]];
         self.editor.set_value_at(drag.item, ParamTarget::Effect(drag.effect), &drag.param, Value::Vec2(at), self.playhead, "viewer-point");
     }
 

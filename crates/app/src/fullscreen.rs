@@ -18,7 +18,18 @@ pub struct Fullscreen {
     /// UI time the pointer last moved (controls show until `CONTROLS_FOR` after).
     moved_at: f64,
     last_pointer: Option<egui::Pos2>,
+    /// UI times fullscreen was asked for (or left) and last sent, while the window may
+    /// not have followed yet (see `keep_window_fullscreen`).
+    asked_at: Option<(f64, f64)>,
+    /// The window was maximized before going fullscreen (put back after).
+    was_maximized: bool,
 }
+
+/// Seconds the window has to follow a fullscreen request before it's asked again.
+const ASK_AGAIN_AFTER: f64 = 0.3;
+/// Seconds after a request the window is still kept to it; past that, the window's own
+/// state wins (it was taken out of fullscreen some other way).
+const KEEP_ASKING_FOR: f64 = 1.5;
 
 impl App {
     /// In or out of fullscreen playback.
@@ -26,10 +37,48 @@ impl App {
         if self.fullscreen.on == on {
             return;
         }
+        let (now, maximized) = ctx.input(|i| (i.time, i.viewport().maximized.unwrap_or(false)));
+        if on {
+            self.fullscreen.was_maximized = maximized;
+        }
         self.fullscreen.on = on;
-        self.fullscreen.moved_at = ctx.input(|i| i.time);
+        self.fullscreen.moved_at = now;
+        self.fullscreen.asked_at = Some((now, now));
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        if !on && self.fullscreen.was_maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
         self.rendered = None;
+    }
+
+    /// Every frame: the window follows fullscreen playback. A request the system dropped
+    /// (Windows can ignore one while the window is maximized or still settling — it took
+    /// a second press) is sent again; a window taken out of fullscreen some other way
+    /// ends fullscreen playback, so the next press goes in instead of doing nothing.
+    pub(crate) fn keep_window_fullscreen(&mut self, ctx: &egui::Context) {
+        let (now, actual) = ctx.input(|i| (i.time, i.viewport().fullscreen));
+        let Some(actual) = actual else { return };
+        let want = self.fullscreen.on;
+        if actual == want {
+            self.fullscreen.asked_at = None;
+            return;
+        }
+        match self.fullscreen.asked_at {
+            Some((first, sent)) if now - first < KEEP_ASKING_FOR && now - sent < ASK_AGAIN_AFTER => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+            Some((first, _)) if now - first < KEEP_ASKING_FOR => {
+                self.fullscreen.asked_at = Some((first, now));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(want));
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            // The window went its own way: playback follows it.
+            _ => {
+                self.fullscreen.asked_at = None;
+                if want {
+                    self.fullscreen.on = false;
+                    self.rendered = None;
+                }
+            }
+        }
     }
 
     /// The whole window, while fullscreen: just the picture and its controls.

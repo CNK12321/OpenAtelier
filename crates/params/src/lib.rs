@@ -82,6 +82,10 @@ pub struct ParamSchema {
     pub animatable: bool,
     /// Soft UI range (values outside are allowed).
     pub range: Option<(f64, f64)>,
+    /// A number that only goes in steps of this much (counted from the range's low end):
+    /// the slider snaps to them and marks each.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<f64>,
     /// Choices for `Enum` params, in order. The index is what shaders receive.
     #[serde(default)]
     pub options: Vec<String>,
@@ -103,9 +107,23 @@ impl ParamSchema {
             unit,
             animatable: true,
             range: None,
+            step: None,
             options: Vec::new(),
             multiple: false,
             default_anchor: KeyframeAnchor::ClipStart,
+        }
+    }
+
+    /// `v` on this parameter's steps, if it goes in steps (the nearest, counted from the
+    /// range's low end); anything else as it is. A keyframed number with steps moves
+    /// from one to the next rather than gliding.
+    pub fn stepped(&self, v: Value) -> Value {
+        match (v, self.step) {
+            (Value::Float(x), Some(step)) if step > 0.0 => {
+                let lo = self.range.map_or(0.0, |r| r.0);
+                Value::Float(lo + ((x - lo) / step).round() * step)
+            }
+            (v, _) => v,
         }
     }
 
@@ -1147,7 +1165,7 @@ impl ParamSet {
                 let src = overrides
                     .and_then(|o| o.0.get(&s.id))
                     .or_else(|| self.0.get(&s.id));
-                let v = src.and_then(|src| src.eval(ctx).coerce(s.ty));
+                let v = src.and_then(|src| src.eval(ctx).coerce(s.ty)).map(|v| s.stepped(v));
                 (s.id.clone(), v.unwrap_or_else(|| s.default.clone()))
             })
             .collect();

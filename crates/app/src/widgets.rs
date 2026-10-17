@@ -116,11 +116,16 @@ pub fn stack_rows(widths: &[f32], full: f32, gap: f32, current: usize) -> Vec<Ve
     rows
 }
 
+/// How long something dragged rests on a spring-loaded tab before it opens (seconds).
+const SPRING_DELAY: f64 = 0.25;
+
 /// Folder tabs over a baseline: the open tab is raised (rounded top, an accent strip,
 /// joined to the page below with no line under it); the others sit flat and dimmer.
 /// Each has an icon before its title. Too many for one row, they stack in rows, the
 /// open tab's row nearest the page. Returns true when the open tab changed.
-pub fn tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T, &str, crate::icons::Icon)]) -> bool {
+/// With `spring`, a tab the pointer rests on opens (something is being dragged that
+/// may land on it).
+pub fn tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T, &str, crate::icons::Icon)], spring: bool) -> bool {
     let font = egui::FontId::proportional(crate::style::TEXT);
     // Shorter when the controls are (the compact properties panel).
     let height = if ui.spacing().interact_size.y < 18.0 { 22.0 } else { 28.0 };
@@ -139,6 +144,17 @@ pub fn tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T,
     let mut changed = false;
     let mut gap = None;
     let last = rows.len().saturating_sub(1);
+    // Spring-loaded (something dragged over them): a tab opens once the pointer has rested
+    // on it a moment, and none opens again until the pointer has moved on — so if opening
+    // one shifts the tabs, the one that lands under the pointer doesn't open straight back.
+    let (hover_id, lock_id) = (ui.id().with("spring-hover"), ui.id().with("spring-lock"));
+    let pointer = ui.input(|i| i.pointer.latest_pos());
+    let now = ui.input(|i| i.time);
+    let locked = ui.data(|d| d.get_temp::<egui::Pos2>(lock_id)).zip(pointer).is_some_and(|(at, p)| at.distance(p) < 16.0);
+    if !locked {
+        ui.data_mut(|d| d.remove::<egui::Pos2>(lock_id));
+    }
+    let mut resting = None;
     for (row_i, row) in rows.iter().enumerate() {
         let top_y = area.top() + row_i as f32 * height;
         let base = top_y + height - 0.5;
@@ -156,6 +172,23 @@ pub fn tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T,
             if r.clicked() && !on {
                 *current = *tab;
                 changed = true;
+            }
+            if spring && !on && !locked && r.contains_pointer() {
+                resting = Some(i);
+                let since = ui.data(|d| d.get_temp::<(usize, f64)>(hover_id)).filter(|(t, _)| *t == i).map_or(now, |(_, s)| s);
+                ui.data_mut(|d| d.insert_temp(hover_id, (i, since)));
+                if now - since >= SPRING_DELAY {
+                    *current = *tab;
+                    changed = true;
+                    ui.data_mut(|d| {
+                        d.remove::<(usize, f64)>(hover_id);
+                        if let Some(p) = pointer {
+                            d.insert_temp(lock_id, p);
+                        }
+                    });
+                } else {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(SPRING_DELAY - (now - since)));
+                }
             }
             let corners = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
             let color = if on {
@@ -182,6 +215,9 @@ pub fn tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T,
         if row_i < last {
             painter.line_segment([egui::pos2(area.left(), base), egui::pos2(area.right(), base)], egui::Stroke::new(1.0, stroke.color.gamma_multiply(0.5)));
         }
+    }
+    if resting.is_none() {
+        ui.data_mut(|d| d.remove::<(usize, f64)>(hover_id));
     }
     let base = area.bottom() - 0.5;
     match gap {

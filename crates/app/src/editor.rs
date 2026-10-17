@@ -216,15 +216,15 @@ impl Editor {
         let pool = self.pool_item(media).ok_or(EditError::NotFound("media", media.0))?;
         let (preferred, name) = (if pool.kind == MediaKind::Audio { self.audio_track } else { self.video_track }, pool.name.clone());
         let kind = if pool.kind == MediaKind::Audio { TrackKind::Audio } else { TrackKind::Video };
-        // The default track may have been deleted: any track of the kind, or a new one.
-        let track = match self.sequence().track(preferred).map(|t| t.id).or_else(|| self.sequence().tracks.iter().find(|t| t.kind == kind && !t.effects).map(|t| t.id)) {
-            Some(t) => t,
-            None => self.add_track(kind)?,
-        };
+        // The default track may have been deleted: any track of the kind, or a temp layer.
+        let found = self.sequence().track(preferred).map(|t| t.id).or_else(|| self.sequence().tracks.iter().find(|t| t.kind == kind && !t.effects).map(|t| t.id));
+        let mut ops = Vec::new();
+        let track = self.track_or_temp(found, kind, &mut ops);
         let start = self.sequence().track(track).map(|t| t.items.last().map_or(Time::ZERO, |i| i.range.end())).unwrap_or(Time::ZERO);
         let id = ItemId(self.doc.alloc_id());
         let item = Item::new(id, &name, ItemKind::Media { media }, TimeRange::new(start, duration.max(Time::from_seconds(1))));
-        self.doc.edit("Add clip", vec![Op::InsertItem { seq: self.seq, track, item }])?;
+        ops.push(Op::InsertItem { seq: self.seq, track, item });
+        self.doc.edit("Add clip", ops)?;
         Ok(id)
     }
 
@@ -235,13 +235,11 @@ impl Editor {
         let pool = self.pool_item(media).ok_or(EditError::NotFound("media", media.0))?;
         let (preferred, name) = (if pool.kind == MediaKind::Audio { self.audio_track } else { self.video_track }, pool.name.clone());
         let kind = if pool.kind == MediaKind::Audio { TrackKind::Audio } else { TrackKind::Video };
-        let track = match self.sequence().track(preferred).map(|t| t.id).or_else(|| self.sequence().tracks.iter().find(|t| t.kind == kind && !t.effects).map(|t| t.id)) {
-            Some(t) => t,
-            None => self.add_track(kind)?,
-        };
+        let found = self.sequence().track(preferred).map(|t| t.id).or_else(|| self.sequence().tracks.iter().find(|t| t.kind == kind && !t.effects).map(|t| t.id));
+        let (mut ops, mut ids) = (Vec::new(), Vec::new());
+        let track = self.track_or_temp(found, kind, &mut ops);
         let rate = self.sequence().rate;
         let mut at = self.sequence().track(track).map_or(Time::ZERO, |t| t.items.last().map_or(Time::ZERO, |i| i.range.end()));
-        let (mut ops, mut ids) = (Vec::new(), Vec::new());
         for &(from, length) in parts.iter().filter(|(_, l)| *l > Time::ZERO) {
             // Each on whole frames of the timeline, at least one long.
             let length = rate.frame_start(rate.frame_at(length).max(1));
@@ -252,7 +250,7 @@ impl Editor {
             ids.push(id);
             at += length;
         }
-        if !ops.is_empty() {
+        if !ids.is_empty() {
             self.doc.edit("Add parts", ops)?;
         }
         Ok(ids)
@@ -291,20 +289,23 @@ impl Editor {
     }
 
     /// Adds a text clip at `at` on top of everything: on the topmost video track if it's
-    /// free there and something lies beneath, otherwise on a new track above.
+    /// free there and something lies beneath, otherwise on a temp layer above.
     pub fn add_text(&mut self, at: Time, content: &str, length: Time) -> Result<ItemId, EditError> {
         let range = TimeRange::new(at, length.max(Time::from_seconds_f64(0.1)));
         let videos: Vec<&Track> = self.sequence().tracks.iter().filter(|t| t.kind == TrackKind::Video && !t.effects).map(|t| &**t).collect();
         let top = videos.last().filter(|t| videos.len() > 1 && !t.items.iter().any(|i| i.range.overlaps(range))).map(|t| t.id);
-        let track = match top {
-            Some(t) => t,
-            None if videos.iter().all(|t| t.items.is_empty()) && !videos.is_empty() => videos[0].id,
-            None => self.add_track(TrackKind::Video)?,
+        let found = match top {
+            Some(t) => Some(t),
+            None if videos.iter().all(|t| t.items.is_empty()) && !videos.is_empty() => Some(videos[0].id),
+            None => None,
         };
+        let mut ops = Vec::new();
+        let track = self.track_or_temp(found, TrackKind::Video, &mut ops);
         let id = ItemId(self.doc.alloc_id());
         let mut item = Item::new(id, "Text", ItemKind::Text, range);
         item.params.set(oa_doc::schema::TEXT_CONTENT, ParamSource::Static(Value::Text(content.into())));
-        self.doc.edit("Add text", vec![Op::InsertItem { seq: self.seq, track, item }])?;
+        ops.push(Op::InsertItem { seq: self.seq, track, item });
+        self.doc.edit("Add text", ops)?;
         Ok(id)
     }
 
@@ -319,6 +320,28 @@ impl Editor {
         let track = Arc::new(Track::new(id, &name, kind));
         self.doc.edit("Add track", vec![Op::InsertTrack { seq: self.seq, index, track }])?;
         Ok(id)
+    }
+
+    /// A temp layer of `kind`, where `add_track` would put a track, for a clip that found
+    /// no room: outlined on the timeline, gone again once it's empty, kept with its +. The
+    /// op goes in the same edit as the clip (an empty temp layer is pruned at once).
+    pub fn temp_track(&mut self, kind: TrackKind) -> (TrackId, Op) {
+        let s = self.sequence();
+        let count = s.tracks.iter().filter(|t| t.kind == kind && !t.effects).count();
+        let index = s.tracks.iter().rposition(|t| t.kind == kind).map_or(s.tracks.len(), |i| i + 1);
+        let name = format!("{}{}", if kind == TrackKind::Video { "V" } else { "A" }, count + 1);
+        let id = TrackId(self.doc.alloc_id());
+        let track = Arc::new(Track { temp: true, ..Track::new(id, &name, kind) });
+        (id, Op::InsertTrack { seq: self.seq, index, track })
+    }
+
+    /// The track to put a clip on: `found`, or a new temp layer (its op added to `ops`).
+    fn track_or_temp(&mut self, found: Option<TrackId>, kind: TrackKind, ops: &mut Vec<Op>) -> TrackId {
+        found.unwrap_or_else(|| {
+            let (id, op) = self.temp_track(kind);
+            ops.push(op);
+            id
+        })
     }
 
     /// Adds an effect track of `kind` just above `track` as the timeline shows it — for
@@ -403,7 +426,7 @@ impl Editor {
             let range = TimeRange::new(start, end - start);
             ops.extend(chosen.iter().map(|(_, i)| Op::RemoveItem { seq: self.seq, item: i.id }));
             // On the first of their tracks (video first) that's free once they're gone,
-            // or a new video track on top.
+            // or a temp video layer on top.
             let free = |t: &Track| !t.items.iter().any(|i| !items.contains(&i.id) && i.range.overlaps(range));
             let mut tracks: Vec<usize> = chosen.iter().map(|(t, _)| *t).collect();
             tracks.dedup();
@@ -414,7 +437,8 @@ impl Editor {
                     let tid = TrackId(self.doc.alloc_id());
                     let count = s.tracks.iter().filter(|t| t.kind == TrackKind::Video && !t.effects).count();
                     let index = s.tracks.iter().rposition(|t| t.kind == TrackKind::Video).map_or(0, |i| i + 1);
-                    ops.push(Op::InsertTrack { seq: self.seq, index, track: Arc::new(Track::new(tid, &format!("V{}", count + 1), TrackKind::Video)) });
+                    let layer = Track { temp: true, ..Track::new(tid, &format!("V{}", count + 1), TrackKind::Video) };
+                    ops.push(Op::InsertTrack { seq: self.seq, index, track: Arc::new(layer) });
                     tid
                 }
             };
@@ -450,28 +474,9 @@ impl Editor {
         }
     }
 
-    /// Adds a clip playing compound `seq` at the end of the video track (the sound track,
-    /// for a compound of sound alone).
-    pub fn append_compound(&mut self, seq: SeqId) -> Result<ItemId, EditError> {
-        let inner = self.doc.project().sequence(seq).ok_or(EditError::NotFound("sequence", seq.0))?;
-        let (name, duration) = (inner.name.clone(), inner.duration());
-        let kind = self.track_kind_for(&ItemKind::Nested { sequence: seq });
-        let preferred = if kind == TrackKind::Video { self.video_track } else { self.audio_track };
-        let found = self.sequence().track(preferred).filter(|t| t.kind == kind).map(|t| t.id).or_else(|| self.sequence().tracks.iter().find(|t| t.kind == kind && !t.effects).map(|t| t.id));
-        let track = match found {
-            Some(t) => t,
-            None => self.add_track(kind)?,
-        };
-        let start = self.sequence().track(track).map_or(Time::ZERO, |t| t.items.last().map_or(Time::ZERO, |i| i.range.end()));
-        let id = ItemId(self.doc.alloc_id());
-        let item = Item::new(id, &name, ItemKind::Nested { sequence: seq }, TimeRange::new(start, duration.max(Time::from_seconds(1))));
-        self.doc.edit("Add clip", vec![Op::InsertItem { seq: self.seq, track, item }])?;
-        Ok(id)
-    }
-
     /// Puts a clip of `kind` at `at` (on a frame boundary): on `preferred` if it's the
     /// right kind of track and free there, else the first free track of the kind, else a
-    /// new track. One undo step.
+    /// temp layer. One undo step.
     pub fn place_clip(&mut self, name: &str, kind: ItemKind, duration: Time, at: Time, preferred: Option<TrackId>) -> Result<ItemId, EditError> {
         let track_kind = self.track_kind_for(&kind);
         let rate = self.sequence().rate;
@@ -481,18 +486,7 @@ impl Editor {
         let free = |t: &Track| t.kind == track_kind && !t.effects && !t.items.iter().any(|i| i.range.overlaps(range));
         let found = preferred.and_then(|p| s.track(p)).filter(|t| free(t)).or_else(|| s.tracks.iter().map(|t| &**t).find(|t| free(t))).map(|t| t.id);
         let mut ops = Vec::new();
-        let track = match found {
-            Some(t) => t,
-            None => {
-                let id = TrackId(self.doc.alloc_id());
-                let s = self.sequence();
-                let count = s.tracks.iter().filter(|t| t.kind == track_kind && !t.effects).count();
-                let index = s.tracks.iter().rposition(|t| t.kind == track_kind).map_or(s.tracks.len(), |i| i + 1);
-                let name = format!("{}{}", if track_kind == TrackKind::Video { "V" } else { "A" }, count + 1);
-                ops.push(Op::InsertTrack { seq: self.seq, index, track: Arc::new(Track::new(id, &name, track_kind)) });
-                id
-            }
-        };
+        let track = self.track_or_temp(found, track_kind, &mut ops);
         let id = ItemId(self.doc.alloc_id());
         ops.push(Op::InsertItem { seq: self.seq, track, item: Item::new(id, name, kind, range) });
         self.apply("Add clip", ops)?;
@@ -586,6 +580,35 @@ impl Editor {
         keys.sort();
         keys.dedup();
         keys
+    }
+
+    /// Where Ctrl+←/→ stops on a clip, as frames of the timeline at `rate`, in order: its
+    /// first frame (the first that shows it), each keyframe's frame (`keys`: timeline
+    /// times) and its last frame (the one its end falls in, or just before).
+    /// Which clip of a track Alt+← / Alt+→ goes to (`starts`: each clip's first frame, in
+    /// order; `at`: the clip it goes from, if any; `now`: the playhead's frame): the next
+    /// one, or the one before — back from inside a clip, that clip's own start first. On
+    /// no clip: the first starting after the playhead, or the last before it.
+    pub fn next_clip(starts: &[i64], at: Option<usize>, now: i64, forward: bool) -> Option<usize> {
+        match (at, forward) {
+            (Some(i), true) => Some(i + 1).filter(|n| *n < starts.len()),
+            (Some(i), false) if starts[i] < now => Some(i),
+            (Some(i), false) => i.checked_sub(1),
+            (None, true) => starts.iter().position(|s| *s > now),
+            (None, false) => starts.iter().rposition(|s| *s < now),
+        }
+    }
+
+    pub fn clip_stops(it: &Item, keys: &[Time], rate: oa_time::FrameRate) -> Vec<i64> {
+        let first = {
+            let f = rate.frame_at(it.range.start);
+            if rate.frame_start(f) < it.range.start { f + 1 } else { f }
+        };
+        let last = rate.frame_at(it.range.end() - Time(1)).max(first);
+        let mut stops: Vec<i64> = std::iter::once(first).chain(keys.iter().map(|k| rate.frame_at(*k).clamp(first, last))).chain(std::iter::once(last)).collect();
+        stops.sort();
+        stops.dedup();
+        stops
     }
 
     /// Where a clip or effect parameter's keyframes are, in clip-local seconds.
@@ -826,6 +849,7 @@ impl Editor {
             ParamTarget::Item => Some(&it.params),
             ParamTarget::Effect(id) => it.effects.iter().find(|e| e.id == *id).map(|e| &e.params),
             ParamTarget::Transition(end) => it.transition(*end).map(|t| &t.params),
+            ParamTarget::Group(g) => it.effect_group(*g).map(|g| &g.params),
             ParamTarget::VariantOverride(_) => None,
         }
     }
@@ -1080,7 +1104,7 @@ impl Editor {
 
     /// Loads a project and re-establishes its media: relinking files that moved and
     /// re-importing each one (so conformed copies and frame indexes come back).
-    pub fn open(path: &Path, import: impl Fn(&Path) -> Result<Imported, String> + Sync, progress: &(dyn Fn(usize, usize) + Sync)) -> Result<(Self, Vec<String>), String> {
+    pub fn open(path: &Path, import: impl Fn(&Path) -> Result<Imported, String> + Sync, progress: &(dyn Fn(usize, usize) + Sync), smart: bool) -> Result<(Self, Vec<String>), String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let (mut project, report) = ProjectFile::load(&text).map_err(|e| e.to_string())?;
         let seq = *project.sequences.keys().next().ok_or("project has no sequences")?;
@@ -1115,10 +1139,35 @@ impl Editor {
                 relinked
             });
         }
+        // …anything still missing, looked for around this computer (Settings: smart
+        // relink): the same name and content, or the same content renamed.
+        if smart {
+            let medias: Vec<&Arc<MediaRef>> = project.media.values().collect();
+            let lost: Vec<usize> = (0..medias.len()).filter(|&i| found[i].is_none()).collect();
+            if !lost.is_empty() {
+                let wanted: Vec<oa_media::find::Missing> = lost.iter().map(|&i| oa_media::find::Missing { path: PathBuf::from(&medias[i].path), fingerprint: medias[i].fingerprint.clone() }).collect();
+                let paths: Vec<PathBuf> = wanted.iter().map(|m| m.path.clone()).collect();
+                let roots = crate::projects::relink_roots(path.parent(), &paths);
+                let hits = oa_media::find::find_moved(&wanted, &roots, SMART_RELINK_BUDGET);
+                for (&i, hit) in lost.iter().zip(hits) {
+                    if let Some(p) = hit {
+                        warnings.push(format!("relinked {} → {}", medias[i].path, p.display()));
+                        relinks.push((medias[i].id, p.clone()));
+                        found[i] = Some(p);
+                    }
+                }
+            }
+        }
         // …then all of them taken in, several at once: one at a time, a project with a
         // few hundred files took that many probes end to end.
         let results = import_all(&found, &import, progress);
+        // Media imported before fingerprints were kept get one now, so a later search can
+        // tell them by their content. (Not an edit: it's what the file is.)
+        let mut prints = Vec::new();
         for (media, result) in project.media.values().zip(results) {
+            if let (None, Some(Ok(imported))) = (&media.fingerprint, &result) {
+                prints.push((media.id, imported.fingerprint.clone()));
+            }
             match result {
                 Some(Ok(imported)) => pool.push(PoolItem {
                     id: media.id,
@@ -1140,6 +1189,11 @@ impl Editor {
             }
         }
 
+        for (id, fp) in prints {
+            if let Some(m) = project.media.get_mut(&id) {
+                Arc::make_mut(m).fingerprint = Some(fp);
+            }
+        }
         // Projects saved before color tags were kept: take them from the fresh probe, so
         // an HDR file's automatic input transform finds it's HDR. (Not an edit — it's
         // what the file always said.)
@@ -1170,6 +1224,9 @@ impl Editor {
         Ok((Editor { doc, seq, video_track, audio_track, pool, path: Some(path.to_path_buf()), saved, linked: Vec::new(), index: Default::default() }, warnings))
     }
 }
+
+/// How long a smart relink may look for a project's moved media when it opens.
+const SMART_RELINK_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Takes in each file found (`None`: not found, skipped), a few at a time on worker
 /// threads — as many as there are cores, two to eight — telling `progress` (done, of how
@@ -1387,6 +1444,69 @@ mod tests {
         assert!(e.item(b).is_none(), "and gone again after redo");
     }
 
+    /// Ctrl+←/→ stops on a clip's first frame, its keyframes and its last frame — whole
+    /// frames, even when its end (or a key) falls between two.
+    #[test]
+    fn clips_stop_at_their_edges_and_keys() {
+        let rate = oa_time::FrameRate::FPS_30;
+        let frame = |n: i64| rate.frame_start(n);
+        // From frame 30 to just past frame 89 (a length no whole number of frames long).
+        let it = Item::new(ItemId(1), "c", ItemKind::Solid, TimeRange::new(frame(30), frame(90) - frame(30) + Time(7)));
+        let keys = [frame(45), frame(60) + Time(3), frame(200)];
+        assert_eq!(Editor::clip_stops(&it, &keys, rate), [30, 45, 60, 90], "its end falls in frame 90: that's its last");
+        let even = Item::new(ItemId(2), "d", ItemKind::Solid, TimeRange::new(frame(30), frame(60) - frame(30)));
+        assert_eq!(Editor::clip_stops(&even, &[], rate), [30, 59], "ending on a boundary: the frame before it");
+    }
+
+    /// Alt+←/→ goes clip to clip along a track.
+    #[test]
+    fn alt_arrows_go_clip_to_clip() {
+        let starts = [0, 30, 90];
+        let go = |at, now, forward| Editor::next_clip(&starts, at, now, forward);
+        assert_eq!(go(Some(0), 10, true), Some(1));
+        assert_eq!(go(Some(2), 95, true), None, "past the last: nowhere");
+        assert_eq!(go(Some(1), 50, false), Some(1), "back from inside a clip: its own start");
+        assert_eq!(go(Some(1), 30, false), Some(0), "back from its start: the one before");
+        assert_eq!(go(Some(0), 0, false), None);
+        // In a gap (on no clip): the next to start, or the last that started.
+        assert_eq!(go(None, 60, true), Some(2));
+        assert_eq!(go(None, 60, false), Some(1));
+        assert_eq!(go(None, 100, true), None);
+    }
+
+    /// Added to the timeline from the bin, a clip goes at the playhead on the first track
+    /// with room there — over the clip there, not at the end of the bottom track.
+    #[test]
+    fn added_clips_go_at_the_playhead_where_there_is_room() {
+        let mut e = Editor::new();
+        let a = e.add_text(Time::ZERO, "A", Time::from_seconds(10)).unwrap();
+        let (track_a, _) = e.sequence().find_item(a).unwrap();
+        let b = e.place_clip("B", ItemKind::Solid, Time::from_seconds(2), Time::from_seconds(3), None).unwrap();
+        let (track_b, _) = e.sequence().find_item(b).unwrap();
+        assert_eq!(e.item(b).unwrap().range.start, Time::from_seconds(3), "at the playhead");
+        assert_ne!(track_a, track_b, "on a layer with room, not over A");
+        let c = e.place_clip("C", ItemKind::Solid, Time::from_seconds(2), Time::from_seconds(12), None).unwrap();
+        assert_eq!(e.sequence().find_item(c).unwrap().0, track_a, "after A ends, A's track has room again");
+    }
+
+    /// A clip that finds no room goes on a temp layer, made in the same undo step as the
+    /// clip and gone again with it.
+    #[test]
+    fn clips_without_room_go_on_temp_layers() {
+        let mut e = Editor::new();
+        e.add_text(Time::ZERO, "A", Time::from_seconds(4)).unwrap();
+        let tracks = e.sequence().tracks.len();
+        let b = e.add_text(Time::from_seconds(1), "B", Time::from_seconds(2)).unwrap();
+        let (t, _) = e.sequence().find_item(b).unwrap();
+        assert!(e.sequence().tracks[t].temp, "the title's new layer is a temp one");
+        let c = e.place_clip("C", ItemKind::Text, Time::from_seconds(2), Time::from_seconds(1), None).unwrap();
+        let (t, _) = e.sequence().find_item(c).unwrap();
+        assert!(e.sequence().tracks[t].temp, "so is a dropped clip's");
+        e.doc.undo().unwrap();
+        e.doc.undo().unwrap();
+        assert_eq!(e.sequence().tracks.len(), tracks, "each undone with its clip, in one step");
+    }
+
     /// With several clips selected, what's done to one clip's effect happens to the same
     /// effect on the others (matched by type and order), and "Reverse" reaches each; a
     /// split cuts every selected clip under the playhead.
@@ -1468,7 +1588,7 @@ mod tests {
         assert!(!editor.dirty(), "saving marks the project clean");
 
         // Reopen: the pool and the timeline come back.
-        let (reopened, warnings) = Editor::open(&project_path, importer, &|_, _| {}).expect("open");
+        let (reopened, warnings) = Editor::open(&project_path, importer, &|_, _| {}, false).expect("open");
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(reopened.pool.len(), 1);
         assert_eq!(reopened.pool[0].kind, MediaKind::Still);
@@ -1479,14 +1599,26 @@ mod tests {
 
         // Move the file somewhere the project searches: it should be found by content.
         std::fs::rename(&media_path, root.join("samples").join("E.png")).unwrap();
-        let (relinked, warnings) = Editor::open(&project_path, importer, &|_, _| {}).expect("open after move");
+        let (relinked, warnings) = Editor::open(&project_path, importer, &|_, _| {}, false).expect("open after move");
         assert!(warnings.iter().any(|w| w.starts_with("relinked")), "{warnings:?}");
         assert!(!relinked.pool[0].missing, "relinked media is usable again");
         assert!(relinked.item(clip).is_some());
 
+        // Moved deeper and renamed: past the quick look beside the project — found by its
+        // content only with smart relink on.
+        let deep = root.join("deep").join("er");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::rename(root.join("samples").join("E.png"), deep.join("renamed.png")).unwrap();
+        let (lost, _) = Editor::open(&project_path, importer, &|_, _| {}, false).expect("open, not looking");
+        assert!(lost.pool[0].missing, "the quick look doesn't go that far");
+        let (smart, warnings) = Editor::open(&project_path, importer, &|_, _| {}, true).expect("open, looking");
+        assert!(!smart.pool[0].missing, "found by content: {warnings:?}");
+        assert_eq!(smart.pool[0].decode_path.file_name().unwrap(), "renamed.png");
+        std::fs::rename(deep.join("renamed.png"), root.join("samples").join("E.png")).unwrap();
+
         // Delete it: the project still opens, with the media flagged as missing.
         std::fs::remove_file(root.join("samples").join("E.png")).unwrap();
-        let (broken, warnings) = Editor::open(&project_path, importer, &|_, _| {}).expect("open with missing media");
+        let (broken, warnings) = Editor::open(&project_path, importer, &|_, _| {}, false).expect("open with missing media");
         assert!(warnings.iter().any(|w| w.starts_with("missing:")), "{warnings:?}");
         assert!(broken.pool[0].missing);
         assert!(broken.item(clip).is_some(), "the clip stays; only its media is missing");

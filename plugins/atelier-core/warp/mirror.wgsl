@@ -1,16 +1,17 @@
+// Mirror: everything past a line is the reflection of what's before it. The line runs
+// through `point` (a fraction of the layer) at `angle` (degrees, 0 = across to the
+// right, 90 = down: a line straight down mirrors left onto right). `flip` mirrors the
+// other side onto this one instead.
 fn oa_warp_mirror(pos: vec2f, base: u32) -> vec2f {
-    // Everything past the line is the reflection of what's before it.
     let size = max(in_size(), vec2f(1.0));
-    let vertical = u(base) < 0.5;
-    let at = in_origin() + size * clamp(u(base + 1u), 0.0, 1.0);
-    let flip = u(base + 2u) > 0.5;
-    var p = pos;
-    if (vertical) {
-        let past = select(pos.x > at.x, pos.x < at.x, flip);
-        if (past) { p.x = 2.0 * at.x - pos.x; }
-    } else {
-        let past = select(pos.y > at.y, pos.y < at.y, flip);
-        if (past) { p.y = 2.0 * at.y - pos.y; }
+    let center = in_origin() + size * vec2f(u(base), u(base + 1u));
+    let a = radians(u(base + 2u));
+    let normal = vec2f(-sin(a), cos(a));
+    let flip = u(base + 3u) > 0.5;
+    let d = dot(pos - center, normal);
+    let past = select((d < 0.0), (d > 0.0), flip);
+    if (past) {
+        return pos - 2.0 * d * normal;
     }
-    return p;
+    return pos;
 }

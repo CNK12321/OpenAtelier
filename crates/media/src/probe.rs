@@ -39,6 +39,10 @@ pub struct VideoTrack {
     pub primaries_tag: Option<String>,
     /// The pixel format carries alpha (PNG, ProRes 4444, …).
     pub has_alpha: bool,
+    /// A packed-transparency proxy: H.264 twice as tall as the picture, the picture on top
+    /// and its transparency below as brightness (no codec the hardware plays keeps alpha).
+    /// Set by whoever made it; the picture is the top half.
+    pub packed_alpha: bool,
     /// A single-frame image: it has no inherent duration, so a clip using it can be any
     /// length.
     pub still: bool,
@@ -345,6 +349,7 @@ fn video_track(path: &Path, s: Stream) -> Result<VideoTrack, MediaError> {
     Ok(VideoTrack {
         codec,
         has_alpha: pixel_format.contains('a') && !pixel_format.starts_with("ya") || pixel_format.contains("rgba") || pixel_format.contains("bgra") || s.tags.get("alpha_mode").or(s.tags.get("ALPHA_MODE")).is_some_and(|v| v == "1"),
+        packed_alpha: false,
         pixel_format,
         width,
         height,

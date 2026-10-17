@@ -228,7 +228,7 @@ mod bench {
             force_ffmpeg: std::env::var("OA_DECODER").is_ok_and(|v| v == "ffmpeg"),
         };
         let choice = decoders.clone();
-        let (editor, _) = crate::editor::Editor::open(std::path::Path::new(&path), |p| crate::App::import_with(choice.clone(), p), &|_, _| {}).unwrap();
+        let (editor, _) = crate::editor::Editor::open(std::path::Path::new(&path), |p| crate::App::import_with(choice.clone(), p), &|_, _| {}, false).unwrap();
         let seq = editor.seq;
         let (audio, buses, _) = oa_export::audio_mix(editor.doc.project(), seq, |media| {
             let pool = editor.pool_item(media)?;

@@ -39,11 +39,14 @@ pub struct PlanOptions {
     /// Leave out the sequence's background: see-through where it has nothing, as it is
     /// where it's used as a compound clip (the preview while editing inside one).
     pub see_through: bool,
+    /// Show only this Duplicate's copy of its clip, not the clip (the viewer, while the
+    /// copy's effects are adjusted).
+    pub solo: Option<oa_doc::EffectId>,
 }
 
 impl Default for PlanOptions {
     fn default() -> Self {
-        PlanOptions { variant: None, render_scale: 1.0, use_proxies: false, key_context: KeyContext::default(), text_supersample: 1, see_through: false }
+        PlanOptions { variant: None, render_scale: 1.0, use_proxies: false, key_context: KeyContext::default(), text_supersample: 1, see_through: false, solo: None }
     }
 }
 
@@ -110,6 +113,7 @@ pub fn plan_frame(
         b: GraphBuilder::new(opts.key_context),
         report: PlanReport::default(),
         frame: 1.0 / sequence.rate.as_f64().max(1.0),
+        layer_crop: [0.0; 4],
     };
     let out = p.sequence(seq, Some(variant), t, opts.render_scale, 0);
     let out = p.output_transform(sequence, seq, t, out);
@@ -166,6 +170,39 @@ fn effect_values(d: &oa_graph::registry::EffectDescriptor, fx: &oa_doc::EffectIn
     let mut values = fx.params.eval(&d.params, None, ctx);
     if fx.role != oa_doc::EffectRole::Passive && d.usage == oa_graph::registry::EffectUsage::Passive {
         d.eased(&mut values, 1.0 - visibility);
+    }
+    values
+}
+
+/// Where a layer is cut down to its crop (`crop`: left, right, top, bottom, fractions of
+/// the picture, `raster` px, at the layer's origin): the kept box rounded out to whole
+/// pixels, within `bounds` — and what the crop still takes off inside that box, as
+/// fractions of it. `None` when nothing is kept.
+fn crop_cut(crop: [f64; 4], raster: [f64; 2], bounds: Rect) -> Option<(Rect, [f64; 4])> {
+    let [left, right, top, bottom] = crop.map(|c| c.clamp(0.0, 1.0));
+    let [w, h] = raster;
+    let kept = Rect::new(left * w, top * h, (1.0 - right) * w, (1.0 - bottom) * h);
+    let cut = Rect::new(kept.x0.floor().max(bounds.x0), kept.y0.floor().max(bounds.y0), kept.x1.ceil().min(bounds.x1), kept.y1.ceil().min(bounds.y1));
+    let (cw, ch) = (cut.x1 - cut.x0, cut.y1 - cut.y0);
+    if cw < 1.0 || ch < 1.0 || kept.x1 <= kept.x0 || kept.y1 <= kept.y0 {
+        return None;
+    }
+    let rest = [(kept.x0 - cut.x0) / cw, (cut.x1 - kept.x1) / cw, (kept.y0 - cut.y0) / ch, (cut.y1 - kept.y1) / ch];
+    Some((cut, rest.map(|r| r.max(0.0))))
+}
+
+/// Surface's values with the picture's box (`crop_lo`, `crop_hi`: fractions of the
+/// layer) set from the clip's crop (left, right, top, bottom).
+fn with_crop(mut values: oa_params::Evaluated, crop: [f64; 4]) -> oa_params::Evaluated {
+    let [left, right, top, bottom] = crop.map(|c| c.clamp(0.0, 1.0));
+    let lo = [left, top];
+    let hi = [(1.0 - right).max(left), (1.0 - bottom).max(top)];
+    for (id, value) in values.0.iter_mut() {
+        match id.as_str() {
+            "crop_lo" => *value = Value::Vec2(lo),
+            "crop_hi" => *value = Value::Vec2(hi),
+            _ => {}
+        }
     }
     values
 }
@@ -243,6 +280,9 @@ struct Planner<'a> {
     /// How long a frame of the timeline being planned lasts (seconds): what a motion
     /// blur's shutter is a share of.
     frame: f64,
+    /// The crop of the clip whose effects are being planned (left, right, top, bottom;
+    /// fractions of the layer): Surface rests its grid on what's left.
+    layer_crop: [f64; 4],
 }
 
 impl Planner<'_> {
@@ -285,7 +325,7 @@ impl Planner<'_> {
             // flattened into one picture (the background too), then carried on up as the
             // bottom layer of what's above.
             if track.effects {
-                let Some(item) = track.item_at(t).filter(|i| i.enabled && i.effects.iter().any(|e| e.enabled && !self.registry.is_sound(&e.type_id))) else { continue };
+                let Some(item) = track.item_at(t).filter(|i| i.enabled && i.effects.iter().any(|e| i.effect_on(e) && !self.registry.is_sound(&e.type_id))) else { continue };
                 let ctx = item.eval_context(t);
                 // How much of the result shows: its opacity, times its fades (a Fade intro
                 // fades the effect in over the untouched picture).
@@ -423,14 +463,14 @@ impl Planner<'_> {
     /// Intros, outros, motion and text effects stay with the clip.
     fn blend_split(&self, item: &Item) -> Option<(Item, Item)> {
         let passive = |e: &oa_doc::EffectInstance| e.role == oa_doc::EffectRole::Passive;
-        let at = item.effects.iter().rposition(|e| e.enabled && e.on_duplicate.is_none() && passive(e) && e.type_id == oa_graph::registry::BLEND)?;
+        let at = item.effects.iter().rposition(|e| item.effect_on(e) && e.on_duplicate.is_none() && passive(e) && e.type_id == oa_graph::registry::BLEND)?;
         let later = |i: usize, e: &oa_doc::EffectInstance| {
             i > at && e.on_duplicate.is_none()
                 && passive(e)
                 && !self.registry.is_sound(&e.type_id)
                 && self.registry.effect(&e.type_id).is_some_and(|d| d.kind != oa_graph::EffectKind::Motion && !d.kind.text_only())
         };
-        if !item.effects.iter().enumerate().any(|(i, e)| e.enabled && later(i, e)) {
+        if !item.effects.iter().enumerate().any(|(i, e)| item.effect_on(e) && later(i, e)) {
             return None;
         }
         let (mut before, mut after) = (item.clone(), item.clone());
@@ -442,7 +482,7 @@ impl Planner<'_> {
 
     /// Whether the sequence's background has picture effects to run.
     fn has_background_effects(&self, s: &oa_doc::Sequence) -> bool {
-        s.background.effects.iter().any(|e| e.enabled && !self.registry.is_sound(&e.type_id))
+        s.background.effects.iter().any(|e| s.background.effect_on(e) && !self.registry.is_sound(&e.type_id))
     }
 
     /// The background's effects (`Sequence::background`, a clip as long as time) on
@@ -624,7 +664,7 @@ impl Planner<'_> {
     fn motion(&mut self, item: &Item, variant: &oa_doc::FormatVariant, ctx: &oa_params::EvalContext) -> Motion {
         let canvas = [variant.size.width as f64, variant.size.height as f64];
         let mut total = Motion::NONE;
-        for fx in item.active_effects().iter().filter(|e| e.enabled && e.on_duplicate.is_none()) {
+        for fx in item.active_effects().iter().filter(|e| item.effect_on(e) && item.group_of(e).is_none_or(|g| g.mix(ctx) > 0.0) && e.on_duplicate.is_none()) {
             let Some(d) = self.registry.effect(&fx.type_id) else { continue };
             let Some(script) = d.motion.as_ref().filter(|_| d.kind == oa_graph::EffectKind::Motion) else { continue };
             let Some(clock) = fx.role.clock(ctx.clip_time, item.range.duration) else { continue };
@@ -651,7 +691,23 @@ impl Planner<'_> {
         depth: usize,
         text: Option<(std::sync::Arc<oa_text::TextSpec>, f64)>,
     ) -> (NodeId, Rect) {
-        for fx in item.active_effects().iter().filter(|e| e.enabled && e.on_duplicate.is_none()) {
+        // The effect group being run (its effects sit together): its id, the picture
+        // that went into it and its mix — its result is mixed with that picture once its
+        // last effect has run. At a mix of 0 its effects are skipped.
+        let mut open: Option<(u64, NodeId, Rect, f64)> = None;
+        for fx in item.active_effects().iter().filter(|e| item.effect_on(e) && e.on_duplicate.is_none()) {
+            let group = item.group_of(fx).map(|g| (g.id, g.mix(ctx)));
+            if open.is_some_and(|o| Some(o.0) != group.map(|g| g.0)) {
+                (node, bounds) = self.close_group(open.take(), node, bounds);
+            }
+            if open.is_none()
+                && let Some((id, mix)) = group
+            {
+                open = Some((id, node, bounds, mix));
+            }
+            if open.is_some_and(|o| o.3 <= 0.0) {
+                continue;
+            }
             // On a title, an effect can be bounded to some of its letters.
             let (before, before_bounds) = (node, bounds);
             if self.registry.is_sound(&fx.type_id) {
@@ -664,12 +720,14 @@ impl Planner<'_> {
             if d.kind == oa_graph::EffectKind::Motion || d.kind.text_only() {
                 continue; // folded into the layer's transform above / run in the text pass
             }
-            if [oa_graph::registry::MOTION_BLUR, oa_graph::registry::BLEND, oa_graph::registry::DUPLICATE].contains(&fx.type_id.as_str()) {
+            if [oa_graph::registry::MOTION_BLUR, oa_graph::registry::ECHO, oa_graph::registry::BLEND, oa_graph::registry::DUPLICATE].contains(&fx.type_id.as_str()) {
                 continue; // the whole layer sampled across its shutter / drawn twice (`Planner::layer`), or how the compositor lays it down (`blend_of`)
             }
             // In/out effects only run inside their windows.
             let Some(clock) = fx.role.clock(ctx.clip_time, item.range.duration) else { continue };
             let values = effect_values(&d, fx, ctx, clock.visibility);
+            // Surface rests its grid on the picture's box: the clip's crop.
+            let values = if fx.type_id == oa_graph::registry::SURFACE { with_crop(values, self.layer_crop) } else { values };
             let clock = if fx.role == oa_doc::EffectRole::Passive && !d.time_varying {
                 oa_graph::registry::STILL_CLOCK
             } else {
@@ -723,6 +781,23 @@ impl Planner<'_> {
             if display {
                 node = self.internal_keeping(oa_graph::registry::TO_LINEAR, vec![], node, bounds, opaque).unwrap_or(node);
             }
+            // Used with a blend: its result laid over the picture that went in by the
+            // blend mode, then faded to that picture by the blend's mix.
+            if fx.params.get(schema::EFFECT_BLEND_MODE).is_some() {
+                let v = fx.params.eval(schema::effect_blend(), None, ctx);
+                let mode = schema::blend_index(v.get(schema::EFFECT_BLEND_MODE).and_then(|m| m.as_enum()).unwrap_or("normal"));
+                let mix = (v.float(schema::EFFECT_BLEND_MIX) / 100.0).clamp(0.0, 1.0);
+                let area = bounds.union(&before_bounds);
+                if let Some(blended) = self.two_input(oa_graph::registry::BACKDROP_BLEND, vec![mode as f32, 0.0], before, node, area) {
+                    node = blended;
+                    bounds = area;
+                }
+                if mix < 1.0
+                    && let Some(mixed) = self.two_input(oa_graph::registry::MIX, vec![mix as f32], node, before, area)
+                {
+                    node = mixed;
+                }
+            }
             // Bounded: the effect's result where the letters' mask says, the picture as
             // it was elsewhere.
             if let Some((spec, scale)) = &text
@@ -761,7 +836,23 @@ impl Planner<'_> {
                 }
             }
         }
-        (node, bounds)
+        self.close_group(open, node, bounds)
+    }
+
+    /// The end of an effect group's run in [`Planner::effect_chain`]: its result
+    /// (`node`) mixed with the picture that went into it, by its mix.
+    fn close_group(&mut self, open: Option<(u64, NodeId, Rect, f64)>, node: NodeId, bounds: Rect) -> (NodeId, Rect) {
+        match open {
+            Some((_, before, before_bounds, mix)) if mix <= 0.0 => (before, before_bounds),
+            Some((_, before, before_bounds, mix)) if mix < 1.0 && before != node => {
+                let area = bounds.union(&before_bounds);
+                match self.two_input(oa_graph::registry::MIX, vec![mix as f32], node, before, area) {
+                    Some(mixed) => (mixed, area),
+                    None => (node, bounds),
+                }
+            }
+            _ => (node, bounds),
+        }
     }
 
     /// One of the host's two-input effects (`b` is its second input) over `area`.
@@ -911,7 +1002,7 @@ impl Planner<'_> {
     /// drawn whole.
     fn text_reach(&self, item: &Item, ctx: &oa_params::EvalContext, raster: f64) -> Option<f64> {
         let mut reach = 0.0;
-        for fx in item.active_effects().iter().filter(|e| e.enabled && e.on_duplicate.is_none() && !self.registry.is_sound(&e.type_id)) {
+        for fx in item.active_effects().iter().filter(|e| item.effect_on(e) && item.group_of(e).is_none_or(|g| g.mix(ctx) > 0.0) && e.on_duplicate.is_none() && !self.registry.is_sound(&e.type_id)) {
             if fx.role.clock(ctx.clip_time, item.range.duration).is_none() {
                 continue;
             }
@@ -922,9 +1013,9 @@ impl Planner<'_> {
             match &d.kind {
                 oa_graph::EffectKind::PointOp | oa_graph::EffectKind::Motion | oa_graph::EffectKind::Glyph { .. } | oa_graph::EffectKind::GlyphPixel | oa_graph::EffectKind::TextBox => {}
                 // A neighborhood effect that says how far it reaches (blur, shadow, glow) —
-                // not a warp or a sheet in depth, whose bounds say where they draw, not
+                // not a warp, a repeat or a sheet in depth, whose bounds say where they draw, not
                 // where they read from.
-                oa_graph::EffectKind::Spatial { expand } if !matches!(d.category.as_deref(), Some("Warp" | "Depth")) && (expand.is_some() || d.bounds.is_some()) => {
+                oa_graph::EffectKind::Spatial { expand } if !matches!(d.category.as_deref(), Some("Warp" | "Compositing" | "Depth")) && (expand.is_some() || d.bounds.is_some()) => {
                     let values = fx.params.eval(&d.params, None, ctx);
                     let input = Rect::new(0.0, 0.0, 1e5, 1e5);
                     let g = d.grown_bounds(&values, raster, input);
@@ -982,7 +1073,7 @@ impl Planner<'_> {
         let mut reach_em = 0.3;
         let mut any_spoken = spoken_values.is_some();
         let mut chain = Vec::new();
-        for fx in item.active_effects().iter().filter(|e| e.enabled && e.on_duplicate.is_none()) {
+        for fx in item.active_effects().iter().filter(|e| item.effect_on(e) && item.group_of(e).is_none_or(|g| g.mix(ctx) > 0.0) && e.on_duplicate.is_none()) {
             let Some(d) = self.registry.effect(&fx.type_id).cloned() else { continue };
             if !d.kind.text_only() {
                 continue;
@@ -1052,21 +1143,23 @@ impl Planner<'_> {
         let duplicates: Vec<oa_doc::EffectInstance> = item
             .effects
             .iter()
-            .filter(|e| e.enabled && e.on_duplicate.is_none() && e.role == oa_doc::EffectRole::Passive && e.type_id == oa_graph::registry::DUPLICATE)
+            .filter(|e| item.effect_on(e) && e.on_duplicate.is_none() && e.role == oa_doc::EffectRole::Passive && e.type_id == oa_graph::registry::DUPLICATE)
             .cloned()
             .collect();
         if duplicates.is_empty() {
             return self.layer_once(item, variant, t, out_scale, depth);
         }
         let ctx = item.eval_context(t);
+        // Solo (the viewer, adjusting one copy): that copy alone.
+        let solo = self.opts.solo.filter(|s| duplicates.iter().any(|d| d.id == *s));
         let (mut behind, mut front) = (Vec::new(), Vec::new());
-        for fx in &duplicates {
+        for fx in duplicates.iter().filter(|d| solo.is_none_or(|s| s == d.id)) {
             let Some((copy, in_front)) = self.duplicate(item, fx, variant, &ctx) else { continue };
             if let Some(l) = self.layer_once(&copy, variant, t, out_scale, depth) {
                 if in_front { front.push(l) } else { behind.push(l) }
             }
         }
-        let main = self.layer_once(item, variant, t, out_scale, depth);
+        let main = if solo.is_some() { None } else { self.layer_once(item, variant, t, out_scale, depth) };
         let blend = main.map_or(BlendMode::Normal, |m| m.1.blend);
         let all: Vec<(NodeId, LayerInfo)> = behind.into_iter().chain(main).chain(front).collect();
         if all.len() <= 1 {
@@ -1103,8 +1196,10 @@ impl Planner<'_> {
                     _ => false,
                 }
         });
-        let own = item.effects.iter().filter(|e| e.on_duplicate == Some(fx.id)).map(|e| oa_doc::EffectInstance { on_duplicate: None, ..e.clone() });
-        copy.effects = inherited.map(|(_, e)| e.clone()).chain(own).collect();
+        let own: Vec<oa_doc::EffectInstance> = item.effects.iter().filter(|e| e.on_duplicate == Some(fx.id)).map(|e| oa_doc::EffectInstance { on_duplicate: None, ..e.clone() }).collect();
+        let inherited: Vec<oa_doc::EffectInstance> = inherited.map(|(_, e)| e.clone()).collect();
+        // Its own effects after the ones it takes from the clip, or before them.
+        copy.effects = if v.get(schema::DUPLICATE_OWN).and_then(Value::as_enum) == Some(schema::DUPLICATE_OWN_FIRST) { [own, inherited].concat() } else { [inherited, own].concat() };
         // The clip's values now, as this format shows them, then the duplicate's on top.
         let overrides = variant.overrides.get(&item.id);
         let mut vis = item.params.eval(schema::visual(), overrides, ctx);
@@ -1130,17 +1225,109 @@ impl Planner<'_> {
 
     /// One drawing of a clip's layer — with Motion Blur on it, built at moments across
     /// its shutter and averaged (see [`Planner::motion_blurred`]).
+    /// With Echo on it, also drawn at moments before and/or after (see [`Planner::echoed`]).
     fn layer_once(&mut self, item: &Item, variant: &oa_doc::FormatVariant, t: Time, out_scale: f64, depth: usize) -> Option<(NodeId, LayerInfo)> {
+        match self.echo(item, t) {
+            Some(echo) => self.echoed(item, variant, t, out_scale, depth, &echo),
+            None => self.blurred_layer(item, variant, t, out_scale, depth),
+        }
+    }
+
+    /// The clip's layer at `t`, motion blurred if it has Motion Blur on.
+    fn blurred_layer(&mut self, item: &Item, variant: &oa_doc::FormatVariant, t: Time, out_scale: f64, depth: usize) -> Option<(NodeId, LayerInfo)> {
         match self.motion_blur(item, t) {
             Some((samples, shutter)) => self.motion_blurred(item, variant, t, out_scale, depth, samples, shutter),
             None => self.layer_at(item, variant, t, out_scale, depth),
         }
     }
 
+    /// Echo's settings on `item` at `t`, if it has it on.
+    fn echo(&self, item: &Item, t: Time) -> Option<Echo> {
+        let fx = item.effects.iter().find(|e| item.effect_on(e) && e.on_duplicate.is_none() && e.type_id == oa_graph::registry::ECHO)?;
+        let d = self.registry.effect(&fx.type_id)?;
+        let ctx = item.eval_context(t);
+        if item.group_of(fx).is_some_and(|g| g.mix(&ctx) <= 0.0) {
+            return None;
+        }
+        let values = fx.params.eval(&d.params, None, &ctx);
+        let pick = |id: &str| values.get(id).and_then(|v| v.as_enum()).unwrap_or_default().to_string();
+        let copies = values.float("copies").round().clamp(0.0, 16.0) as usize;
+        let decay = values.float("decay").clamp(0.0, 1.0);
+        (copies > 0 && decay > 0.0).then(|| Echo {
+            copies,
+            spacing: values.float("spacing").clamp(0.25, 30.0),
+            behind: pick("direction") != "ahead",
+            ahead: matches!(pick("direction").as_str(), "ahead" | "both"),
+            decay,
+            mix: match pick("mix").as_str() {
+                "under" => EchoMix::Under,
+                "average" => EchoMix::Average,
+                "add" => EchoMix::Add,
+                _ => EchoMix::Over,
+            },
+        })
+    }
+
+    /// The clip drawn at `t` and again, `echo.copies` times on each side it reaches,
+    /// `echo.spacing` frames apart — the `k`-th copy at `decay^k` of its opacity — and laid
+    /// together on a clear canvas: copies on top of the clip (Over: ghosts on full-frame
+    /// footage), behind it (Under: trails behind a cut-out), all averaged by weight
+    /// (Average), or added onto it (Add). Moments outside the clip are left out.
+    fn echoed(&mut self, item: &Item, variant: &oa_doc::FormatVariant, t: Time, out_scale: f64, depth: usize, echo: &Echo) -> Option<(NodeId, LayerInfo)> {
+        // (offset in frames, weight), farthest first, the clip itself last.
+        let mut moments: Vec<(f64, f64)> = Vec::new();
+        for k in (1..=echo.copies).rev() {
+            let w = echo.decay.powi(k as i32);
+            if echo.behind {
+                moments.push((-(k as f64) * echo.spacing, w));
+            }
+            if echo.ahead {
+                moments.push((k as f64 * echo.spacing, w));
+            }
+        }
+        moments.push((0.0, 1.0));
+        let mut drawn: Vec<(NodeId, LayerInfo, f64)> = Vec::new();
+        for (offset, w) in moments {
+            let at = t + Time::from_seconds_f64(offset * self.frame);
+            if offset != 0.0 && (at < item.range.start || at >= item.range.end()) {
+                continue;
+            }
+            let Some((node, info)) = self.blurred_layer(item, variant, at, out_scale, depth) else { continue };
+            drawn.push((node, info, w));
+        }
+        let blend = drawn.last().map(|d| d.1.blend)?;
+        if drawn.len() == 1 {
+            return drawn.pop().map(|(n, i, _)| (n, i));
+        }
+        let total: f64 = drawn.iter().map(|d| d.2).sum();
+        if matches!(echo.mix, EchoMix::Over | EchoMix::Add) {
+            // The clip first, the copies on it (the nearest last, on top).
+            drawn.rotate_right(1);
+        }
+        let (inputs, layers): (Vec<NodeId>, Vec<LayerInfo>) = drawn
+            .into_iter()
+            .enumerate()
+            .map(|(i, (node, info, w))| {
+                let (opacity, mode) = match echo.mix {
+                    EchoMix::Over if i == 0 => (1.0, BlendMode::Normal),
+                    EchoMix::Over | EchoMix::Under => (w, BlendMode::Normal),
+                    EchoMix::Average => (w / total, BlendMode::Add),
+                    EchoMix::Add if i == 0 => (1.0, BlendMode::Normal),
+                    EchoMix::Add => (w, BlendMode::Add),
+                };
+                (node, LayerInfo { opacity: info.opacity * opacity as f32, blend: mode, pixelated: info.pixelated })
+            })
+            .unzip();
+        let size = [((variant.size.width as f64 * out_scale).round() as u32).max(1), ((variant.size.height as f64 * out_scale).round() as u32).max(1)];
+        let canvas = Rect::from_size(size[0] as f64, size[1] as f64);
+        let node = self.b.add(NodeOp::Composite { size, background: [0.0; 4], layers }, inputs, canvas, false);
+        Some((node, LayerInfo { opacity: 1.0, blend, pixelated: false }))
+    }
+
     /// Motion Blur's settings on `item` at `t`, if it has it on: (samples, shutter as a
     /// share of a frame).
     fn motion_blur(&self, item: &Item, t: Time) -> Option<(usize, f64)> {
-        let fx = item.effects.iter().find(|e| e.enabled && e.on_duplicate.is_none() && e.type_id == oa_graph::registry::MOTION_BLUR)?;
+        let fx = item.effects.iter().find(|e| item.effect_on(e) && e.on_duplicate.is_none() && e.type_id == oa_graph::registry::MOTION_BLUR)?;
         let d = self.registry.effect(&fx.type_id)?;
         let ctx = item.eval_context(t);
         let values = fx.params.eval(&d.params, None, &ctx);
@@ -1353,7 +1540,24 @@ impl Planner<'_> {
             node = self.b.add(op, vec![node], bounds, false);
         }
 
+        // Then, with effects to come, the layer is cut down to the crop's box (whole pixels
+        // round it): they take what's left as the whole picture — a Kaleidoscope's middle,
+        // a Mirror's line, a Tile's tiles, any point on the clip are of what shows. What
+        // the crop still takes off inside the box is left for those that need it (Surface).
+        let mut inner_crop = crop.map(f64::from);
+        let has_effects = item.active_effects().iter().any(|e| item.effect_on(e) && e.on_duplicate.is_none() && !self.registry.is_sound(&e.type_id));
+        if has_effects
+            && crop.iter().any(|c| *c > 0.0)
+            && let Some((cut, rest)) = crop_cut(inner_crop, raster_size, bounds)
+        {
+            node = self.b.add(NodeOp::Transform { matrix: Affine2::IDENTITY }, vec![node], cut, false);
+            bounds = cut;
+            inner_crop = rest;
+        }
+        // (Kept around the chain: a clip inside a media setting has a crop of its own.)
+        let outer_crop = std::mem::replace(&mut self.layer_crop, inner_crop);
         let (node, bounds) = self.effect_chain(item, &ctx, node, bounds, raster, raster_size, pixelated, depth, text_layout);
+        self.layer_crop = outer_crop;
 
         // Other values inside the mask: its opacity there (one pass over the picture) —
         // and, when it also moves, scales or turns there, the part inside is placed on
@@ -1407,6 +1611,32 @@ struct Drawn {
 /// made of the frame, which has nothing past its edges: where the picture surely is.
 /// Centered on the middle of where the clip is on the canvas. `None` if there's too
 /// little of it.
+/// Echo's settings at one moment (see [`Planner::echoed`]).
+struct Echo {
+    /// On each side it reaches.
+    copies: usize,
+    /// Frames between copies.
+    spacing: f64,
+    behind: bool,
+    ahead: bool,
+    /// Each copy's share of the opacity of the one before it.
+    decay: f64,
+    mix: EchoMix,
+}
+
+/// How Echo lays its copies together.
+#[derive(Copy, Clone, PartialEq)]
+enum EchoMix {
+    /// On top of the clip, each fainter (ghosts over full-frame footage).
+    Over,
+    /// Behind the clip, each fainter (trails behind a cut-out or a title).
+    Under,
+    /// Averaged by weight, like a slow shutter.
+    Average,
+    /// Their light added onto the clip.
+    Add,
+}
+
 fn filled_rect(quad: [[f64; 2]; 4], size: [u32; 2]) -> Option<Rect> {
     let (w, h) = (size[0] as f64, size[1] as f64);
     // The clip's part of the canvas: the quad clipped to it, edge by edge.

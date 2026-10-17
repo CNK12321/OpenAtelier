@@ -182,7 +182,7 @@ fn pattern_project(configure: impl FnOnce(&mut Item)) -> (Project, SeqId) {
 fn add_effect(clip: &mut Item, id: u64, type_id: &str, param: &str, value: ParamSource) {
     let mut params = ParamSet::default();
     params.set(param, value);
-    clip.effects.push(EffectInstance { id: EffectId(id), type_id: type_id.into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None });
+    clip.effects.push(EffectInstance { id: EffectId(id), type_id: type_id.into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None, group: None, shown: Vec::new() });
 }
 
 fn color_chain(clip: &mut Item) {
@@ -489,6 +489,30 @@ fn keyframed_blur_changes_the_rendered_frame() {
     };
     let (s0, s2, s4) = (sharpness(&mut r, 0), sharpness(&mut r, 2), sharpness(&mut r, 4));
     assert!(s0 > s2 && s2 > s4, "{s0} {s2} {s4}");
+}
+
+/// A cropped clip's effects take what the crop keeps as the whole picture: a Kaleidoscope
+/// folds the kept half round its own middle, so it shows picture all over that half,
+/// not the transparent part cut away.
+#[test]
+fn effects_on_a_cropped_clip_work_on_what_it_keeps() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let (p, seq) = pattern_project(|clip| {
+        clip.params.set(oa_doc::schema::CROP_LEFT, ParamSource::Static(Value::Float(0.5)));
+        clip.effects.push(EffectInstance::new(EffectId(30), "oa.warp.kaleidoscope"));
+    });
+    // See-through: where nothing is drawn stays transparent.
+    let opts = PlanOptions { see_through: true, ..Default::default() };
+    let g = plan_frame(&p, seq, Time::from_seconds(1), &opts, &registry).unwrap().graph;
+    let g = optimize(&g, OptLevel::Full, KeyContext::default());
+    let px = render_one(&mut r, &g);
+    // 640 × 360: the kept half is x 320–640.
+    let kept: Vec<f32> = (0..360).flat_map(|y| (324..636).map(move |x| (x, y))).map(|(x, y)| px[y * 640 + x][3]).collect();
+    let empty = kept.iter().filter(|a| **a < 0.5).count() as f32 / kept.len() as f32;
+    assert!(empty < 0.01, "{:.0}% of the kept half is empty", empty * 100.0);
+    assert!(px[180 * 640 + 100][3] < 0.01, "and the cut half stays cut");
 }
 
 #[test]
@@ -1490,17 +1514,21 @@ fn surface_moves_the_picture_with_its_points() {
     let Some(ctx) = gpu() else { return };
     let registry = Registry::with_builtins();
     let mut r = renderer(&ctx, FusionMode::Blocking);
-    let run = |r: &mut Renderer, corner: [f32; 2], room: f64| {
+    let run_in = |r: &mut Renderer, corner: [f32; 2], room: f64, hi: [f32; 2]| {
         let mut b = GraphBuilder::new(KeyContext::default());
         let s = solid(&mut b, [1.0, 1.0, 1.0, 1.0], 64.0);
-        // Corners grid; the bottom-right point (row 1, column 1) moved.
-        let mut uniforms = vec![0.0; 33];
+        // Corners grid; the bottom-right point (row 1, column 1) moved. Then the
+        // picture's box (the crop): from the top left to `hi`.
+        let mut uniforms = vec![0.0; 37];
         uniforms[1 + 2 * 5] = corner[0];
         uniforms[2 + 2 * 5] = corner[1];
+        uniforms[35] = hi[0];
+        uniforms[36] = hi[1];
         let e = effect(&mut b, &registry, s, oa_graph::registry::SURFACE, uniforms, room);
         let out = composite(&mut b, 128, [0.0; 4], &[(e, BlendMode::Normal)]);
         render_one(r, &b.finish(out))
     };
+    let run = |r: &mut Renderer, corner: [f32; 2], room: f64| run_in(r, corner, room, [1.0, 1.0]);
     let at = |px: &[[f32; 4]], x: usize, y: usize| px[y * 128 + x][3];
     let rest = run(&mut r, [0.0, 0.0], 0.0);
     assert!(at(&rest, 60, 60) > 0.99 && at(&rest, 70, 70) < 0.01, "at rest: the layer as it was");
@@ -1514,6 +1542,14 @@ fn surface_moves_the_picture_with_its_points() {
     let pulled_out = run(&mut r, [0.25, 0.25], 32.0);
     assert!(at(&pulled_out, 70, 70) > 0.99, "past the layer's old corner");
     assert!(at(&pulled_out, 90, 90) < 0.01, "but not past the point");
+
+    // Cropped to its left half: the points rest on that half, so the cut-away right
+    // stays empty — and pulling the bottom-right point out stretches what's left.
+    let cropped = run_in(&mut r, [0.0, 0.0], 0.0, [0.5, 1.0]);
+    assert!(at(&cropped, 20, 30) > 0.99 && at(&cropped, 44, 30) < 0.01, "at rest: the left half, as cropped");
+    let stretched = run_in(&mut r, [0.5, 0.0], 32.0, [0.5, 1.0]);
+    assert!(at(&stretched, 60, 60) > 0.99, "the bottom right of what's left, pulled to the layer's corner");
+    assert!(at(&stretched, 44, 4) < 0.01, "its top right stayed at the crop");
 }
 
 /// An effect node with its clock at `seconds` (a passive effect's live clock).
@@ -1613,6 +1649,49 @@ fn glow_takes_the_nearest_edge_color_and_fades_out() {
     // same distance.
     let (straight, diagonal) = (at(71, 56)[0], at(68, 25)[2]);
     assert!((straight - diagonal).abs() < 0.06, "a radial falloff (the blue corner, 7.9 px away, vs red 7.5 px out): {straight} vs {diagonal}");
+}
+
+/// Bloom: only what's brighter than the threshold spills light around it, fading with
+/// the distance; dim parts stay exactly as they were — on the fine grid and the coarse.
+#[test]
+fn bloom_spills_light_from_the_bright_parts_only() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let d = registry.effect("oa.light.bloom").unwrap();
+    // 32 × 32 of dim gray with a 4 × 4 overexposed square in the middle (`bright` 0: none).
+    let mut run = |bright: f32, radius: f32| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let gray = solid(&mut b, [0.3, 0.3, 0.3, 1.0], 32.0);
+        let spot = solid(&mut b, [bright, bright, bright, 1.0], 4.0);
+        let m = Affine2::translate(14.0, 14.0);
+        let spot = b.add(NodeOp::Transform { matrix: m }, vec![spot], m.map_rect(b.node(spot).bounds), true);
+        let layers = if bright > 0.0 { vec![gray, spot] } else { vec![gray] };
+        let infos = vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false }; layers.len()];
+        let picture = b.add(NodeOp::Composite { size: [32, 32], background: [0.0; 4], layers: infos }, layers, Rect::from_size(32.0, 32.0), true);
+        // Threshold 0.8, softness 0.5, the radius, intensity 1, white.
+        let mut uniforms = vec![0.8, 0.5, radius, 1.0, 1.0, 1.0, 1.0, 1.0];
+        uniforms.extend(oa_graph::registry::STILL_CLOCK);
+        let op = NodeOp::Effect { type_id: d.type_id.clone(), version: d.version, kind: d.kind.clone(), space: d.space, fusible: d.fusible, stateful: false, uniforms, nearest: false };
+        let bloom = b.add(op, vec![picture, picture], b.node(picture).bounds.expand(radius as f64), false);
+        let m = Affine2::translate(32.0, 32.0);
+        let placed = b.add(NodeOp::Transform { matrix: m }, vec![bloom], m.map_rect(b.node(bloom).bounds), false);
+        let out = composite(&mut b, 96, [0.0, 0.0, 0.0, 1.0], &[(placed, BlendMode::Normal)]);
+        render_one(&mut r, &b.finish(out))
+    };
+    let at = |px: &[[f32; 4]], x: usize, y: usize| px[y * 96 + x];
+    let dim = run(0.0, 12.0);
+    assert!(close(at(&dim, 48, 48), [0.3, 0.3, 0.3, 1.0], 1e-3), "nothing over the threshold: untouched {:?}", at(&dim, 48, 48));
+    assert!(at(&dim, 20, 48)[0] < 1e-3, "and no light around it");
+    for radius in [12.0, 80.0] {
+        let px = run(3.0, radius);
+        assert!(at(&px, 48, 48)[0] >= 3.0 - 1e-2, "the bright square keeps its light (radius {radius}): {:?}", at(&px, 48, 48));
+        // Beside it, the gray gets brighter, less so further out.
+        let near: Vec<f32> = [52, 56, 60].iter().map(|&x| at(&px, x, 48)[0]).collect();
+        assert!(near[0] > 0.35 && near.windows(2).all(|w| w[0] > w[1]), "fading out from the square (radius {radius}): {near:?}");
+    }
+    let px = run(3.0, 12.0);
+    assert!((at(&px, 33, 33)[0] - 0.3).abs() < 0.02, "the far corner, past the radius, as it was: {:?}", at(&px, 33, 33));
 }
 
 /// A wide glow finds its edges on a coarse grid (4 × 4 pixels a cell at 64 px) and still
@@ -2530,4 +2609,30 @@ fn a_glance_reads_a_picture_back_small() {
     let px = |x: u32| &bytes[(x * 4) as usize..(x * 4 + 4) as usize];
     assert!(px(0)[0] > 200 && px(0)[2] < 50, "left red: {:?}", px(0));
     assert!(px(7)[2] > 200 && px(7)[0] < 50, "right blue: {:?}", px(7));
+}
+
+/// Mirror reflects across a line through its point at its angle: pointing down, the left
+/// half shows on the right; pointing left, the top shows at the bottom; flipped, the
+/// other way round.
+#[test]
+fn mirror_turns_to_any_angle() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    // 64 × 64: white in the top-left quarter, black elsewhere.
+    let run = |r: &mut Renderer, angle: f32, flip: f32| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let white = solid(&mut b, [1.0, 1.0, 1.0, 1.0], 32.0);
+        let picture = composite(&mut b, 64, [0.0, 0.0, 0.0, 1.0], &[(white, BlendMode::Normal)]);
+        let m = effect(&mut b, &registry, picture, "oa.warp.mirror", vec![0.5, 0.5, angle, flip], 0.0);
+        let out = composite(&mut b, 64, [0.0; 4], &[(m, BlendMode::Normal)]);
+        render_one(r, &b.finish(out))
+    };
+    let lum = |px: &[[f32; 4]], x: usize, y: usize| px[y * 64 + x][0];
+    let down = run(&mut r, 90.0, 0.0);
+    assert!(lum(&down, 48, 16) > 0.9 && lum(&down, 16, 48) < 0.1, "left onto right");
+    let left = run(&mut r, 180.0, 0.0);
+    assert!(lum(&left, 16, 48) > 0.9 && lum(&left, 48, 16) < 0.1, "top onto bottom");
+    let flipped = run(&mut r, 90.0, 1.0);
+    assert!(lum(&flipped, 16, 16) < 0.1, "right (black) onto left");
 }

@@ -1124,8 +1124,12 @@ impl App {
             }
         }
         // Files (or a picture from a browser) dragged in from outside: a line where they'd
-        // land, on the track under the pointer; dropped here, they go there.
-        if let Some(pos) = self.file_hover.filter(|p| lane.contains(*p) && !in_ruler(*p)) {
+        // land, on the track under the pointer; dropped here, they go there. Over a
+        // track's header they go on that track, right against it: at the left edge of
+        // what's showing.
+        let on_head = |p: egui::Pos2| p.x >= full.left() && p.x < lane.left() && !in_ruler(p) && row_at(p.y).is_some();
+        let landing = |p: egui::Pos2| if on_head(p) { egui::pos2(lane.left(), p.y) } else { p };
+        if let Some(pos) = self.file_hover.filter(|p| (lane.contains(*p) && !in_ruler(*p)) || on_head(*p)).map(landing) {
             let x = x_of(time_at(pos.x));
             let (y0, y1) = match row_at(pos.y) {
                 Some(r) => (row_top(r), row_top(r) + row_h(r)),
@@ -1139,9 +1143,10 @@ impl App {
             clip_painter.galley(bg.min + egui::vec2(4.0, 2.0), label, egui::Color32::WHITE);
             ui.ctx().request_repaint();
         }
-        if self.file_drop.as_ref().is_some_and(|(_, p)| lane.contains(*p) && !in_ruler(*p))
+        if self.file_drop.as_ref().is_some_and(|(_, p)| (lane.contains(*p) && !in_ruler(*p)) || on_head(*p))
             && let Some((items, pos)) = self.file_drop.take()
         {
+            let pos = landing(pos);
             let track = row_at(pos.y).map(|r| rows[r].0);
             let at = time_at(pos.x);
             self.take_dropped(items, Some((at, track)));
@@ -1569,8 +1574,9 @@ impl App {
         let r = b.rect;
         let visible = painter.clip_rect();
         let wave_h = if video.is_some() { r.height() * 0.4 } else { r.height() };
+        let scaling = self.media_scaling(media);
         if let Some(v) = &video
-            && let Some(strip) = self.clip_previews.strip(ctx, media, &path, [v.width, v.height], if still { 0.0 } else { duration })
+            && let Some(strip) = self.clip_previews.strip(ctx, media, &path, [v.width, v.height], if still { 0.0 } else { duration }, scaling)
         {
             let pic = egui::Rect::from_min_max(r.min, egui::pos2(r.right(), if audible { r.bottom() - wave_h } else { r.bottom() }));
             let tile = (pic.height() * strip.aspect).max(8.0);

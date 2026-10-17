@@ -492,7 +492,7 @@ impl App {
                     let id = TrackId(self.editor.doc.alloc_id());
                     let count = s.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count() + new_tracks + 1;
                     new_tracks += 1;
-                    let track = std::sync::Arc::new(oa_doc::Track::new(id, &format!("A{count}"), TrackKind::Audio));
+                    let track = std::sync::Arc::new(oa_doc::Track { temp: true, ..oa_doc::Track::new(id, &format!("A{count}"), TrackKind::Audio) });
                     ops.push(Op::InsertTrack { seq, index: s.tracks.len() + new_tracks, track });
                     id
                 }
@@ -534,8 +534,12 @@ impl App {
         let Some(it) = self.editor.item(item) else { return };
         self.effect_clipboard = it.effects.iter().filter(|e| only.is_none_or(|id| e.id == id)).cloned().collect();
         // All of them: the "Reverse" outro comes too (it decides what the intros do at
-        // the end of the clip).
+        // the end of the clip), and their groups. One alone leaves its group behind.
         self.effect_clipboard_reverse = only.is_none().then_some(it.outro_reverses_intro);
+        self.effect_clipboard_groups = if only.is_none() { it.effect_groups.clone() } else { Vec::new() };
+        if only.is_some() {
+            self.effect_clipboard.iter_mut().for_each(|e| e.group = None);
+        }
     }
 
     /// Adds copies of the copied effects (fresh ids, same settings and roles) to every
@@ -558,10 +562,8 @@ impl App {
             // Only the ones that belong on this clip (sound on sound, text effects on
             // titles…): one that doesn't mustn't stop the rest.
             let fitting: Vec<oa_doc::EffectInstance> = self.effect_clipboard.clone().into_iter().filter(|fx| self.effect_fits(item, &fx.type_id)).collect();
-            for (k, fx) in fitting.into_iter().enumerate() {
-                let effect = oa_doc::EffectInstance { id: oa_doc::EffectId(self.editor.doc.alloc_id()), on_duplicate: None, ..fx };
-                ops.push(Op::InsertEffect { seq, item, index: n + k, effect });
-            }
+            let groups = self.effect_clipboard_groups.clone();
+            ops.extend(self.insert_effects_ops(item, &fitting, &groups, n));
         }
         if ops.is_empty() {
             self.report_error(tr("none of the copied effects fit the selected clips"));
@@ -652,7 +654,8 @@ impl App {
                         EffectRole::Passive => it.effects.len(),
                         _ => it.effects.iter().take_while(|e| e.role != EffectRole::Passive).count(),
                     };
-                    let copy = oa_doc::EffectInstance { id: oa_doc::EffectId(self.editor.doc.alloc_id()), on_duplicate: None, ..effect.clone() };
+                    // On its own: its group stays behind.
+                    let copy = oa_doc::EffectInstance { id: oa_doc::EffectId(self.editor.doc.alloc_id()), on_duplicate: None, group: None, shown: Vec::new(), ..effect.clone() };
                     ops.push(Op::InsertEffect { seq, item, index, effect: copy });
                 }
             }
@@ -687,6 +690,32 @@ impl App {
                 return;
             }
         };
+        if !drag.more.is_empty() {
+            // Several picked: copies of them (for the whole container), on their own.
+            let all: Vec<oa_doc::EffectInstance> = std::iter::once(drag.effect.clone())
+                .chain(drag.more.iter().cloned())
+                .filter(|e| self.registry.is_sound(&e.type_id) == (kind == TrackKind::Audio))
+                .map(|e| oa_doc::EffectInstance { role: oa_doc::EffectRole::Passive, group: None, ..e })
+                .collect();
+            let ops = self.insert_effects_ops(container, &all, &[], 0);
+            if let Err(e) = self.editor.apply(tr("Add effect container"), ops) {
+                self.error = Some(e.to_string());
+            }
+            self.selection = Some(container);
+            self.sync_selection();
+            return;
+        }
+        if let Some(group) = &drag.group {
+            // A whole group: copies of its effects (for the whole container) in it.
+            let members: Vec<oa_doc::EffectInstance> = self.group_members(drag.from, group.id).into_iter().map(|e| oa_doc::EffectInstance { role: oa_doc::EffectRole::Passive, ..e }).collect();
+            let ops = self.insert_effects_ops(container, &members, std::slice::from_ref(group), 0);
+            if let Err(e) = self.editor.apply(tr("Add effect container"), ops) {
+                self.error = Some(e.to_string());
+            }
+            self.selection = Some(container);
+            self.sync_selection();
+            return;
+        }
         let mut effect = drag.effect.clone();
         effect.role = oa_doc::EffectRole::Passive;
         if self.apply_effect_to(&effect, &[container], tr("Add effect container")) == 0 && self.editor.doc.undo_depth() > before {
@@ -703,8 +732,42 @@ impl App {
         if onto == drag.from {
             return;
         }
-        let name = self.effect_name(&drag.effect.type_id);
         let target = self.editor.item(onto).map(|i| i.name.clone()).unwrap_or_default();
+        if let Some(group) = &drag.group {
+            // A whole group: copies of the effects of it that fit, in a group of their own.
+            let members: Vec<oa_doc::EffectInstance> = self.group_members(drag.from, group.id).into_iter().filter(|e| self.effect_fits(onto, &e.type_id)).collect();
+            if members.is_empty() {
+                self.report_error(trf("{name} can't go on {target}: none of its effects fit it", &[("name", &group.name), ("target", &target)]));
+                return;
+            }
+            let at = self.editor.item(onto).map_or(0, |i| i.effects.len());
+            let ops = self.insert_effects_ops(onto, &members, std::slice::from_ref(group), at);
+            if let Err(e) = self.editor.apply(tr("Copy group"), ops) {
+                self.error = Some(e.to_string());
+            } else {
+                self.notify(trf("Copied {name} onto {target}.", &[("name", &group.name), ("target", &target)]));
+            }
+            return;
+        }
+        if !drag.more.is_empty() {
+            // Several picked: copies of the ones that fit, on their own (their groups stay).
+            let mut all: Vec<oa_doc::EffectInstance> = std::iter::once(drag.effect.clone()).chain(drag.more.iter().cloned()).filter(|e| self.effect_fits(onto, &e.type_id)).collect();
+            all.iter_mut().for_each(|e| e.group = None);
+            if all.is_empty() {
+                self.report_error(trf("None of those effects fit {target}", &[("target", &target)]));
+                return;
+            }
+            let n = all.len();
+            let at = self.editor.item(onto).map_or(0, |i| i.effects.len());
+            let ops = self.insert_effects_ops(onto, &all, &[], at);
+            if let Err(e) = self.editor.apply(tr("Copy effects"), ops) {
+                self.error = Some(e.to_string());
+            } else {
+                self.notify(trf("Copied {n} effects onto {target}.", &[("n", &n.to_string()), ("target", &target)]));
+            }
+            return;
+        }
+        let name = self.effect_name(&drag.effect.type_id);
         if !self.effect_fits(onto, &drag.effect.type_id) {
             let why = if self.registry.is_sound(&drag.effect.type_id) { "it has no sound" } else { "it doesn't take that kind of effect" };
             self.report_error(trf("{name} can't go on {target}: {why}", &[("name", &name.to_string()), ("target", &target.to_string()), ("why", why)]));
@@ -749,6 +812,12 @@ impl App {
     }
 
     pub(crate) fn effect_menu(&mut self, ui: &mut eframe::egui::Ui, item: ItemId, effect: &oa_doc::EffectInstance) {
+        // One of several picked: the menu is for all of them.
+        let picks = self.picks(item);
+        if picks.len() > 1 && picks.contains(&effect.id) {
+            self.picks_menu(ui, item);
+            return;
+        }
         if ui.button(tr("Copy effect")).clicked() {
             self.copy_effects(item, Some(effect.id));
             ui.close();
@@ -773,6 +842,7 @@ impl App {
             }
         }
         self.effect_mask_menu(ui, item, effect);
+        self.effect_blend_menu(ui, item, effect);
         ui.separator();
         if ui.button(tr("Copy all effects")).clicked() {
             self.copy_effects(item, None);
@@ -780,6 +850,34 @@ impl App {
         }
         if ui.add_enabled(!self.effect_clipboard.is_empty(), eframe::egui::Button::new(tr("Paste effects"))).clicked() {
             self.paste_effects(&[item]);
+            ui.close();
+        }
+        self.effect_group_menu(ui, item, effect);
+    }
+
+    /// The blend entry of an effect's right-click menu, beside its mask one: Use with
+    /// blend… (how its result mixes with the picture that went into it), or Remove blend.
+    fn effect_blend_menu(&mut self, ui: &mut eframe::egui::Ui, item: ItemId, effect: &oa_doc::EffectInstance) {
+        if self.registry.is_sound(&effect.type_id) {
+            return;
+        }
+        // Right under Use with mask (which starts its own section), or a section of its own.
+        if matches!(self.effect_maskable(item, effect), Err(None)) {
+            ui.separator();
+        }
+        let seq = self.editor.seq;
+        let target = ParamTarget::Effect(effect.id);
+        let set = |param: &str, source: Option<ParamSource>| Op::SetParam { seq, item, target: target.clone(), param: oa_params::ParamId::new(param), source };
+        if effect.params.get(schema::EFFECT_BLEND_MODE).is_none() {
+            let tip = tr("Its result mixes with the picture that went into it by a blend mode (add, screen, multiply…), as much as you like, rather than replacing it");
+            if ui.button(tr("Use with blend…")).on_hover_text(tip).clicked() {
+                let ops = vec![set(schema::EFFECT_BLEND_MODE, Some(ParamSource::Static(oa_params::Value::Enum("screen".into())))), set(schema::EFFECT_BLEND_MIX, Some(ParamSource::Static(oa_params::Value::Float(100.0))))];
+                self.apply_or_report(tr("Use with blend"), ops);
+                ui.close();
+            }
+        } else if ui.button(tr("Remove blend")).on_hover_text(tr("Its result replaces the picture again")).clicked() {
+            let ops = vec![set(schema::EFFECT_BLEND_MODE, None), set(schema::EFFECT_BLEND_MIX, None)];
+            self.apply_or_report(tr("Remove blend"), ops);
             ui.close();
         }
     }

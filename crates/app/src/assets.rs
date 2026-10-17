@@ -49,11 +49,26 @@ fn kind_of(path: &Path) -> Option<MediaKind> {
     })
 }
 
+/// An effects preset in the library (`presets.rs`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresetAsset {
+    pub path: PathBuf,
+    /// Its own name (not the file's).
+    pub name: String,
+    pub folder: String,
+    /// How many effects it holds.
+    pub effects: usize,
+    pub sound: bool,
+    /// When the file was last written (previews follow it).
+    pub modified: u64,
+}
+
 /// The library as it is on disk.
 #[derive(Default)]
 pub struct Assets {
     pub dir: PathBuf,
     pub items: Vec<Asset>,
+    pub presets: Vec<PresetAsset>,
     /// Folders inside the library, as paths.
     pub folders: Vec<String>,
     pub error: Option<String>,
@@ -69,11 +84,13 @@ impl Assets {
     /// Reads the folder again (after adding, removing, or the user editing it outside).
     pub fn rescan(&mut self) {
         self.items.clear();
+        self.presets.clear();
         self.folders.clear();
         self.error = None;
         let dir = self.dir.clone();
         self.walk(&dir, "");
         self.items.sort_by_key(|a| (a.folder.to_lowercase(), a.name.to_lowercase()));
+        self.presets.sort_by_key(|a| (a.folder.to_lowercase(), a.name.to_lowercase()));
         self.folders.sort();
     }
 
@@ -92,6 +109,11 @@ impl Assets {
                 self.walk(&path, &inside);
             } else if let Some(kind) = kind_of(&path) {
                 self.items.push(Asset { path, name, kind, folder: folder.to_string() });
+            } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(crate::presets::EXTENSION))
+                && let Ok(p) = crate::presets::Preset::read(&path)
+            {
+                let modified = entry.metadata().ok().and_then(|m| m.modified().ok()).and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+                self.presets.push(PresetAsset { path, name: p.name, folder: folder.to_string(), effects: p.effects.len(), sound: p.sound, modified });
             }
         }
     }
@@ -111,7 +133,8 @@ impl Assets {
             })
             .map(|f| {
                 let inside = format!("{f}/");
-                let n = self.items.iter().filter(|a| a.folder == *f || a.folder.starts_with(&inside)).count();
+                let inside_folder = |a: &str| a == f.as_str() || a.starts_with(&inside);
+                let n = self.items.iter().filter(|a| inside_folder(&a.folder)).count() + self.presets.iter().filter(|a| inside_folder(&a.folder)).count();
                 (f.clone(), n)
             })
             .collect()
@@ -142,6 +165,30 @@ impl Assets {
         std::fs::copy(source, &target).map_err(|e| format!("{}: {e}", target.display()))?;
         self.rescan();
         Ok(target)
+    }
+
+    /// Writes `preset` into the library (into `folder`), named after it ("Dream.oafx",
+    /// then "Dream 2.oafx"…). Returns where it landed.
+    pub fn add_preset(&mut self, preset: &crate::presets::Preset, folder: &str) -> Result<PathBuf, String> {
+        let dir = if folder.is_empty() { self.dir.clone() } else { self.dir.join(folder) };
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        // A file name from the preset's: no characters a file system refuses.
+        let stem: String = preset.name.chars().map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
+        let stem = stem.trim().trim_end_matches('.').to_string();
+        let stem = if stem.is_empty() { "Preset".to_string() } else { stem };
+        let ext = crate::presets::EXTENSION;
+        let target = (1..1000)
+            .map(|n| if n == 1 { dir.join(format!("{stem}.{ext}")) } else { dir.join(format!("{stem} {n}.{ext}")) })
+            .find(|p| !p.exists())
+            .ok_or_else(|| tr("too many presets with that name").to_string())?;
+        preset.write(&target)?;
+        self.rescan();
+        Ok(target)
+    }
+
+    /// The presets directly inside `folder`.
+    pub fn presets_in<'a>(&'a self, folder: &'a str) -> impl Iterator<Item = &'a PresetAsset> {
+        self.presets.iter().filter(move |a| a.folder == folder)
     }
 
     /// Deletes a file from the library. It's a copy, so this doesn't touch the original

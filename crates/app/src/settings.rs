@@ -42,6 +42,9 @@ pub struct Settings {
     /// Clip lengths shown and typed in frames rather than seconds (the Length section).
     #[serde(default)]
     pub length_in_frames: bool,
+    /// Opening a project, media that has moved is looked for around this computer: the
+    /// same name and content, or the same content renamed (`oa_media::find`).
+    pub smart_relink: bool,
     /// The language to show the app in ("en", "fr"/"fr-CA"…). None: the system's.
     #[serde(default)]
     pub language: Option<String>,
@@ -101,6 +104,11 @@ pub struct Settings {
     /// before Auto was the default, and would have pinned everyone to it.
     #[serde(rename = "panels")]
     pub layout: Layout,
+    /// Dark or light, or following the system (Automatic, the default).
+    pub theme: Theme,
+    /// The interface's flourishes: the viewer's glow in the picture's colors, project
+    /// cards that lift and tilt toward the pointer. Off: plain frames and outlines.
+    pub ui_effects: bool,
     /// Each saved project's panel sizes, format and layout, by file path: reopening a
     /// project puts them back.
     pub project_views: std::collections::BTreeMap<String, ProjectView>,
@@ -147,6 +155,29 @@ pub struct Settings {
     pub new_project: NewProjectPrefs,
     #[serde(skip)]
     path: Option<PathBuf>,
+}
+
+/// The interface's colors.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    /// Dark or light as the system is.
+    #[default]
+    Auto,
+    Dark,
+    Light,
+    /// Dark with true-black panels (OLED screens, dim rooms).
+    Black,
+}
+
+impl Theme {
+    pub fn preference(self) -> eframe::egui::ThemePreference {
+        match self {
+            Theme::Auto => eframe::egui::ThemePreference::System,
+            Theme::Dark | Theme::Black => eframe::egui::ThemePreference::Dark,
+            Theme::Light => eframe::egui::ThemePreference::Light,
+        }
+    }
 }
 
 /// How the editor's panels are arranged.
@@ -362,6 +393,7 @@ impl Default for Settings {
             favorite_fonts: Vec::new(),
             recent_fonts: Vec::new(),
             length_in_frames: false,
+            smart_relink: true,
             language: None,
             vram_budget_mb: None,
             preview_limit: full_hd(),
@@ -380,6 +412,8 @@ impl Default for Settings {
             still_seconds: 5.0,
             export: ExportPrefs::default(),
             layout: Layout::Auto,
+            theme: Theme::Auto,
+            ui_effects: true,
             project_views: Default::default(),
             window: None,
             gpu_backend: auto(),

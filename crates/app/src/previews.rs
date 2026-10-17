@@ -31,6 +31,8 @@ pub struct Strip {
     pub duration: f64,
     /// Frame width / height.
     pub aspect: f32,
+    /// The scaling it was made with (made again when the file's changes).
+    pub scaling: oa_doc::MediaScaling,
 }
 
 impl Strip {
@@ -52,6 +54,8 @@ struct StripPixels {
     frames: usize,
     duration: f64,
     aspect: f32,
+    /// Drawn pixel by pixel (nearest neighbor), not smoothed.
+    pixel: bool,
 }
 
 #[derive(Default)]
@@ -82,7 +86,7 @@ impl ClipPreviews {
                     if let Some(f) = made {
                         let image = egui::ColorImage::from_rgba_unmultiplied(f.size, &f.pixels);
                         let texture = ctx.load_texture(format!("compound-strip-{}", seq.0), image, egui::TextureOptions::LINEAR);
-                        self.compounds.insert(seq, (f.version, Strip { texture, frames: f.frames, duration: f.duration, aspect: f.aspect }));
+                        self.compounds.insert(seq, (f.version, Strip { texture, frames: f.frames, duration: f.duration, aspect: f.aspect, scaling: oa_doc::MediaScaling::Smooth }));
                     }
                 }
                 Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
@@ -112,13 +116,19 @@ impl ClipPreviews {
         self.strip_jobs.contains_key(&media)
     }
 
-    pub fn strip(&mut self, ctx: &egui::Context, media: MediaId, path: &Path, size: [u32; 2], duration: f64) -> Option<&Strip> {
+    /// `size` [0, 0]: read from the file. `scaling`: how the file's pixels are scaled
+    /// (`MediaRef::scaling`), so pixel art stays crisp in its preview too.
+    pub fn strip(&mut self, ctx: &egui::Context, media: MediaId, path: &Path, size: [u32; 2], duration: f64, scaling: oa_doc::MediaScaling) -> Option<&Strip> {
+        // Its scaling changed since it was made: made again.
+        if matches!(self.strips.get(&media), Some(Slot::Ready(s)) if s.scaling != scaling) && !self.strip_jobs.contains_key(&media) {
+            self.strips.remove(&media);
+        }
         if !self.strips.contains_key(&media) && !self.strip_jobs.contains_key(&media) {
             let (tx, rx) = channel();
             let path = path.to_path_buf();
             // Two at a time: a bin full of new cards would start dozens of readers.
             let ticket = crate::gate::previews().ticket();
-            std::thread::spawn(move || make_strip(&path, size, duration, &tx, ticket));
+            std::thread::spawn(move || make_strip(&path, size, duration, scaling, &tx, ticket));
             self.strip_jobs.insert(media, rx);
         }
         // The strip arrives in stages (the first frame at once, the rest as they're
@@ -138,12 +148,13 @@ impl ClipPreviews {
             }
         }
         if let Some(px) = latest {
+            let options = if px.pixel { egui::TextureOptions::NEAREST } else { egui::TextureOptions::LINEAR };
             if let Some(Slot::Ready(s)) = self.strips.get_mut(&media) {
-                s.texture.set(px.image, egui::TextureOptions::LINEAR);
-                (s.frames, s.duration, s.aspect) = (px.frames, px.duration, px.aspect);
+                s.texture.set(px.image, options);
+                (s.frames, s.duration, s.aspect, s.scaling) = (px.frames, px.duration, px.aspect, scaling);
             } else {
-                let texture = ctx.load_texture(format!("strip-{}", media.0), px.image, egui::TextureOptions::LINEAR);
-                self.strips.insert(media, Slot::Ready(Strip { texture, frames: px.frames, duration: px.duration, aspect: px.aspect }));
+                let texture = ctx.load_texture(format!("strip-{}", media.0), px.image, options);
+                self.strips.insert(media, Slot::Ready(Strip { texture, frames: px.frames, duration: px.duration, aspect: px.aspect, scaling }));
             }
         }
         if !self.strip_jobs.contains_key(&media) && !matches!(self.strips.get(&media), Some(Slot::Ready(_))) {
@@ -383,22 +394,31 @@ pub fn coarse_to_fine(frames: usize) -> Vec<Vec<usize>> {
 /// other files' first frames (`ticket`); the rest wait again behind every first frame
 /// asked for meanwhile, so each card gets a picture before any fills in. Sends `None` if
 /// not even the first frame could be read.
-fn make_strip(path: &Path, size: [u32; 2], duration: f64, tx: &std::sync::mpsc::Sender<Option<StripPixels>>, ticket: crate::gate::Ticket<'static>) {
+fn make_strip(path: &Path, size: [u32; 2], duration: f64, scaling: oa_doc::MediaScaling, tx: &std::sync::mpsc::Sender<Option<StripPixels>>, ticket: crate::gate::Ticket<'static>) {
+    // Its size as shown (after any rotation), read from the file when not given.
+    let size = if size[0] == 0 || size[1] == 0 { oa_media::probe(path).ok().and_then(|p| p.video).map_or([16, 9], |v| [v.width, v.height]) } else { size };
+    // Pixel art stays crisp: scaled by nearest neighbor, and drawn that way.
+    let pixel = match scaling {
+        oa_doc::MediaScaling::Pixel => true,
+        oa_doc::MediaScaling::Smooth => false,
+        oa_doc::MediaScaling::Auto => size[0] <= oa_doc::MediaScaling::PIXEL_ART_MAX && size[1] <= oa_doc::MediaScaling::PIXEL_ART_MAX,
+    };
     let aspect = size[0].max(1) as f32 / size[1].max(1) as f32;
     let (w, h) = (FRAME_W as usize, ((FRAME_W as f32 / aspect / 2.0).round() as usize * 2).max(2));
     let frames = if duration <= 0.0 { 1 } else { (duration.ceil() as usize).clamp(1, 60) };
     let rows = frames.div_ceil(COLS);
     let (iw, ih) = (w * COLS, h * rows);
     let path = path.to_path_buf();
-    let send = |canvas: &[u8]| tx.send(Some(StripPixels { image: egui::ColorImage::from_rgba_unmultiplied([iw, ih], canvas), frames, duration: duration.max(1e-3), aspect }));
-    // Made before: straight from the cache, without waiting in line.
-    let key = cache_key(&path, &format!("strip {w}x{h} {frames} {duration:.3}"));
+    let send = |canvas: &[u8]| tx.send(Some(StripPixels { image: egui::ColorImage::from_rgba_unmultiplied([iw, ih], canvas), frames, duration: duration.max(1e-3), aspect, pixel }));
+    // Made before: straight from the cache, without waiting in line. ("fit": frames fitted
+    // inside their cell, never stretched to it — older strips were.)
+    let key = cache_key(&path, &format!("strip fit {w}x{h} {frames} {duration:.3}{}", if pixel { " pixel" } else { "" }));
     if let Some(cached) = key.as_deref().and_then(|k| read_strip(k, [iw, ih])) {
         let _ = send(&cached);
         return;
     }
     let pass = ticket.wait();
-    let scale = format!("scale={w}:{h}");
+    let scale = fit_filter(w, h, pixel);
     // One frame at `seconds` (in the middle of its share of the file), as RGBA.
     let frame_at = |i: usize| -> Option<Vec<u8>> {
         // A drawing: drawn at the cell's size (ffmpeg may not read SVG).
@@ -464,7 +484,7 @@ fn make_strip(path: &Path, size: [u32; 2], duration: f64, tx: &std::sync::mpsc::
         let mut before: Option<(f64, Vec<u8>)> = None;
         let (mut count, mut gone) = (0usize, false);
         let mut sent = std::time::Instant::now();
-        let finished = keyframes(&path, w, h, |t, px| {
+        let finished = keyframes(&path, w, h, pixel, |t, px| {
             count += 1;
             while next < frames && middle(next) < t {
                 let pick = match &before {
@@ -527,15 +547,23 @@ fn make_strip(path: &Path, size: [u32; 2], duration: f64, tx: &std::sync::mpsc::
     }
 }
 
-/// Reads every keyframe of `path`'s picture, scaled to `w`×`h`, in one pass that decodes
+/// ffmpeg's filter putting a frame in a `w`×`h` cell: fitted inside it keeping its own
+/// shape (frames not the size the file said are never stretched), the rest of the cell
+/// transparent; by nearest neighbor for pixel art, smoothly otherwise.
+fn fit_filter(w: usize, h: usize, pixel: bool) -> String {
+    let flags = if pixel { "neighbor" } else { "bicubic" };
+    format!("scale={w}:{h}:force_original_aspect_ratio=decrease:flags={flags},format=rgba,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0")
+}
+
+/// Reads every keyframe of `path`'s picture, fitted in `w`×`h` (see [`fit_filter`]), in one pass that decodes
 /// nothing else, handing each (its time in seconds, RGBA) to `each` as it comes; `each`
 /// returns whether to go on. Whether it read to the end.
-fn keyframes(path: &Path, w: usize, h: usize, mut each: impl FnMut(f64, &[u8]) -> bool) -> bool {
+fn keyframes(path: &Path, w: usize, h: usize, pixel: bool, mut each: impl FnMut(f64, &[u8]) -> bool) -> bool {
     use std::io::{BufRead, Read};
     let Ok(mut child) = oa_media::background_tool("ffmpeg")
         .args(["-hide_banner", "-nostdin", "-v", "info", "-threads", "2", "-skip_frame", "nokey", "-i"])
         .arg(path)
-        .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-fps_mode", "passthrough", "-vf", &format!("scale={w}:{h},showinfo"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-fps_mode", "passthrough", "-vf", &format!("{},showinfo", fit_filter(w, h, pixel)), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -650,7 +678,7 @@ mod tests {
                 return;
             }
             let (tx, rx) = channel();
-            make_strip(&clip, [160, 90], 5.0, &tx, crate::gate::previews().ticket());
+            make_strip(&clip, [160, 90], 5.0, oa_doc::MediaScaling::Auto, &tx, crate::gate::previews().ticket());
             drop(tx);
             let stages: Vec<StripPixels> = rx.iter().map(|s| s.expect("frames")).collect();
             assert!(stages.len() >= 2, "{name}: the first frame, then the rest");
@@ -664,7 +692,7 @@ mod tests {
             assert!((1..5).all(|i| brightness(last, i) > brightness(last, i - 1)), "{name}: in the end, each second its own frame");
             // Again: from the cache, all at once.
             let (tx, rx) = channel();
-            make_strip(&clip, [160, 90], 5.0, &tx, crate::gate::previews().ticket());
+            make_strip(&clip, [160, 90], 5.0, oa_doc::MediaScaling::Auto, &tx, crate::gate::previews().ticket());
             drop(tx);
             let again: Vec<StripPixels> = rx.iter().map(|s| s.expect("frames")).collect();
             assert_eq!(again.len(), 1, "{name}: one stage, the finished strip");
@@ -672,8 +700,52 @@ mod tests {
         }
 
         let (tx, rx) = channel();
-        make_strip(&dir.join("missing.mp4"), [160, 90], 5.0, &tx, crate::gate::previews().ticket());
+        make_strip(&dir.join("missing.mp4"), [160, 90], 5.0, oa_doc::MediaScaling::Auto, &tx, crate::gate::previews().ticket());
         assert!(rx.recv().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A frame keeps its own shape in its cell: told the wrong size, a wide picture sits
+    /// in a square cell with see-through bars above and below, never squashed into it;
+    /// not told, the size is read from the file. Tiny pictures (pixel art) are scaled by
+    /// nearest neighbor, so their pixels stay hard-edged squares.
+    #[test]
+    fn strip_frames_keep_their_shape_and_scale_mode() {
+        if !oa_media::tool("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success()) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oa-strip-shape-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, args: &[&str]| {
+            let file = dir.join(name);
+            oa_media::tool("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi"]).args(args).arg(&file).status().is_ok_and(|s| s.success()).then_some(file)
+        };
+        let strip = |file: &Path, size: [u32; 2], scaling: oa_doc::MediaScaling| {
+            let (tx, rx) = channel();
+            make_strip(file, size, 0.0, scaling, &tx, crate::gate::previews().ticket());
+            drop(tx);
+            rx.iter().last().flatten().expect("a frame")
+        };
+        // White, 160 × 90.
+        let Some(wide) = make("wide.png", &["-i", "color=c=white:s=160x90", "-frames:v", "1"]) else { return };
+        let s = strip(&wide, [1, 1], oa_doc::MediaScaling::Auto);
+        let [w, h] = s.image.size;
+        assert_eq!(w, FRAME_W as usize * COLS);
+        let at = |x: usize, y: usize| s.image.pixels[y * w + x];
+        assert_eq!(at(FRAME_W as usize / 2, 2).a(), 0, "a bar above, see-through");
+        assert_eq!(at(FRAME_W as usize / 2, h - 3).a(), 0, "and below");
+        assert!(at(FRAME_W as usize / 2, h / 2).r() > 240, "the picture in the middle");
+        let s = strip(&wide, [0, 0], oa_doc::MediaScaling::Auto);
+        assert!((s.aspect - 16.0 / 9.0).abs() < 0.01, "its size read from the file: {}", s.aspect);
+        assert!(!s.pixel);
+        // 4 × 4 checks (pixel art): nearest neighbor, so every pixel is black or white.
+        let Some(tiny) = make("tiny.png", &["-i", "nullsrc=s=4x4", "-vf", "geq=lum='255*mod(X+Y,2)':cb=128:cr=128", "-frames:v", "1"]) else { return };
+        let s = strip(&tiny, [4, 4], oa_doc::MediaScaling::Auto);
+        assert!(s.pixel, "drawn pixel by pixel");
+        let cell: Vec<u8> = (0..FRAME_W as usize).flat_map(|y| (0..FRAME_W as usize).map(move |x| (x, y))).map(|(x, y)| s.image.pixels[y * s.image.size[0] + x].r()).collect();
+        assert!(cell.iter().all(|v| *v < 20 || *v > 235), "no gray in between");
+        let s = strip(&tiny, [4, 4], oa_doc::MediaScaling::Smooth);
+        assert!(!s.pixel, "unless it's set to smooth");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -695,7 +767,7 @@ mod tests {
             return;
         }
         let mut times = Vec::new();
-        assert!(keyframes(&clip, 32, 18, |t, px| {
+        assert!(keyframes(&clip, 32, 18, false, |t, px| {
             assert_eq!(px.len(), 32 * 18 * 4);
             times.push(t);
             true
@@ -703,7 +775,7 @@ mod tests {
         assert_eq!(times.len(), 4, "{times:?}");
         assert!(times.iter().enumerate().all(|(i, t)| (t - i as f64).abs() < 0.05), "{times:?}");
         // Stopped early: says so.
-        assert!(!keyframes(&clip, 32, 18, |_, _| false));
+        assert!(!keyframes(&clip, 32, 18, false, |_, _| false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

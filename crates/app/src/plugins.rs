@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 pub struct Plugins {
-    /// Where the user's plugins live (also scanned: `./plugins` beside the app, so a
-    /// checkout's examples work without installing anything).
+    /// Where the user's plugins live (in a debug build, `./plugins` is scanned too, so a
+    /// checkout's example works without installing anything; a release never loads it).
     pub dir: PathBuf,
     /// Other folders that were scanned (the checkout's `./plugins`).
     pub extra_dirs: Vec<PathBuf>,
@@ -30,7 +30,7 @@ impl Plugins {
         let (mut found, mut errors) = plugin::load_dir(&dir);
         let mut extra_dirs = Vec::new();
         let local = PathBuf::from("plugins");
-        if local.is_dir() && local != dir {
+        if cfg!(debug_assertions) && local.is_dir() && local != dir {
             extra_dirs.push(std::fs::canonicalize(&local).unwrap_or(local.clone()));
             let (more, e) = plugin::load_dir(&local);
             for p in more {

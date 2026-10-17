@@ -125,40 +125,54 @@ impl Proxies {
     }
 }
 
-/// Whether a file is heavy enough to want a proxy by default: bigger than 1440p, or
-/// deeper than 8 bits. Stills and video with transparency are left alone (a proxy would
-/// drop it).
+/// Whether a file is heavy enough to want a proxy by default: bigger than 1440p, deeper
+/// than 8 bits, or with its keyframes far apart (more than [`SPARSE_KEYFRAMES`] frames:
+/// game and screen recordings, 60 fps phone video) — scrubbing, stepping back and
+/// playing it sped up decode from the keyframe before each frame, and a proxy has one
+/// every 12. Video with transparency bigger than 720p is too: no decoder the hardware has
+/// keeps alpha, so it's decoded by ffmpeg and copied over a frame at a time (a 1080p
+/// ProRes 4444 frame is 16 MB) — its proxy packs the transparency below the picture
+/// ([`VideoTrack::packed_alpha`]). Stills are left alone.
 pub fn heavy(track: &VideoTrack) -> bool {
-    !track.still && !track.has_alpha && (track.width as u64 * track.height as u64 > 2560 * 1440 || track.bit_depth() > 8)
+    let pixels = track.width as u64 * track.height as u64;
+    let big = pixels > 2560 * 1440 || track.bit_depth() > 8;
+    let transparent = track.has_alpha && pixels > 1280 * 720;
+    !track.still && (big || transparent || track.index.max_gop() > SPARSE_KEYFRAMES)
 }
 
-/// The proxy's name for `file`: its content fingerprint.
-fn proxy_path(dir: &Path, file: &Path) -> Result<PathBuf, String> {
+/// Keyframes further apart than this many frames make a file worth a proxy.
+pub const SPARSE_KEYFRAMES: usize = 45;
+
+/// The proxy's name for `file`: its content fingerprint (`.packed` for one holding its
+/// transparency below the picture).
+fn proxy_path(dir: &Path, file: &Path, packed: bool) -> Result<PathBuf, String> {
     let fp = oa_media::fingerprint(file).map_err(|e| e.to_string())?;
-    Ok(dir.join(format!("{fp}.mkv")))
+    Ok(dir.join(if packed { format!("{fp}.packed.mkv") } else { format!("{fp}.mkv") }))
 }
 
 fn work(dir: &Path, jobs: Receiver<Request>, tell: Sender<(PathBuf, State)>, running: Arc<Mutex<Option<Child>>>) {
     let _ = std::fs::create_dir_all(dir);
     for job in jobs {
         let Request::Find { file, make } = job;
-        let path = match proxy_path(dir, &file) {
+        // Transparent video: a packed proxy (its alpha below the picture).
+        let packed = oa_media::probe(&file).ok().and_then(|p| p.video).is_some_and(|v| v.has_alpha);
+        let path = match proxy_path(dir, &file, packed) {
             Ok(p) => p,
             Err(e) => {
                 let _ = tell.send((file, State::Failed(e)));
                 continue;
             }
         };
-        let found = path.exists().then(|| probe_proxy(&path)).and_then(Result::ok);
+        let found = path.exists().then(|| probe_proxy(&path, packed)).and_then(Result::ok);
         let state = match found {
             Some(track) => State::Ready { path, track: Box::new(track) },
             None if !make => State::Missing,
             None => {
                 let _ = tell.send((file.clone(), State::Making(0.0)));
-                match make_proxy(&file, &path, &running, |p| {
+                match make_proxy(&file, &path, packed, &running, |p| {
                     let _ = tell.send((file.clone(), State::Making(p)));
                 })
-                .and_then(|()| probe_proxy(&path))
+                .and_then(|()| probe_proxy(&path, packed))
                 {
                     Ok(track) => State::Ready { path, track: Box::new(track) },
                     Err(e) => State::Failed(e),
@@ -169,24 +183,39 @@ fn work(dir: &Path, jobs: Receiver<Request>, tell: Sender<(PathBuf, State)>, run
     }
 }
 
-fn probe_proxy(path: &Path) -> Result<VideoTrack, String> {
-    oa_media::probe(path).map_err(|e| e.to_string())?.video.ok_or_else(|| "the proxy has no picture".into())
+fn probe_proxy(path: &Path, packed: bool) -> Result<VideoTrack, String> {
+    let mut track = oa_media::probe(path).map_err(|e| e.to_string())?.video.ok_or("the proxy has no picture")?;
+    track.packed_alpha = packed;
+    Ok(track)
 }
 
 /// Encodes `file`'s proxy into `to` (written aside, then moved into place), reporting
 /// progress (0–1) as it goes.
-pub fn make_proxy(file: &Path, to: &Path, running: &Mutex<Option<Child>>, progress: impl Fn(f32)) -> Result<(), String> {
+/// `packed`: the file has transparency, kept below the picture as brightness (the frame
+/// twice as tall) — H.264 has no alpha, and this way the hardware decoder still plays it.
+pub fn make_proxy(file: &Path, to: &Path, packed: bool, running: &Mutex<Option<Child>>, progress: impl Fn(f32)) -> Result<(), String> {
     let duration = oa_media::probe(file).map_err(|e| e.to_string())?.duration.as_seconds_f64().max(1e-3);
     let part = to.with_extension("part.mkv");
     // Below normal priority and on half the cores at most: it runs while you edit.
     let threads = (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2).max(1).to_string();
     let mut c = oa_media::background_tool("ffmpeg");
     c.args(["-hide_banner", "-nostdin", "-v", "error", "-y", "-copyts", "-threads", &threads, "-i"]).arg(file);
-    c.args(["-map", "0:v:0", "-an", "-sn", "-dn"]);
     // The short side down to SHORT_SIDE (never up), even sizes; one frame for each of the
     // original's, at the original's times.
     let short = SHORT_SIDE;
-    c.args(["-vf", &format!("scale='if(gt(iw,ih),-2,min({short},iw))':'if(gt(iw,ih),min({short},ih),-2)':flags=bicubic,format=yuv420p")]);
+    let scale = format!("scale='if(gt(iw,ih),-2,min({short},iw))':'if(gt(iw,ih),min({short},ih),-2)':flags=bicubic");
+    if packed {
+        // The picture (BT.709, video range — what the shader reads) on top, its alpha
+        // below as brightness.
+        let graph = format!(
+            "[0:v:0]{scale}:out_color_matrix=bt709:out_range=tv,format=yuva420p,split[c][a];[a]alphaextract,format=yuv420p[alpha];[c]format=yuv420p[picture];[picture][alpha]vstack,format=yuv420p[v]"
+        );
+        c.args(["-filter_complex", &graph, "-map", "[v]", "-an", "-sn", "-dn"]);
+        c.args(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]);
+    } else {
+        c.args(["-map", "0:v:0", "-an", "-sn", "-dn"]);
+        c.args(["-vf", &format!("{scale},format=yuv420p")]);
+    }
     c.args(["-fps_mode", "passthrough"]);
     c.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g", "12", "-bf", "0", "-tune", "fastdecode", "-threads", &threads]);
     c.args(["-progress", "pipe:1", "-nostats"]).arg(&part);
@@ -236,6 +265,50 @@ mod tests {
         oa_media::tool("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success())
     }
 
+    /// Transparent footage (here ProRes 4444) gets a packed proxy: H.264 twice as tall,
+    /// marked so the viewer reads its transparency from the bottom half; and transparent
+    /// video bigger than 720p counts as heavy.
+    #[test]
+    fn transparent_footage_gets_a_packed_proxy() {
+        if !ffmpeg() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("oa-proxies-packed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("alpha.mov");
+        let made = oa_media::tool("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=25:d=1,format=yuva444p10le"])
+            .args(["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"])
+            .arg(&file)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let original = oa_media::probe(&file).unwrap().video.unwrap();
+        assert!(original.has_alpha);
+        let mut big = original.clone();
+        (big.width, big.height) = (1920, 1080);
+        assert!(heavy(&big), "1080p with transparency counts as heavy");
+        let mut proxies = Proxies::new(root.join("proxies"));
+        proxies.find(&file, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !matches!(proxies.state(&file), Some(State::Ready { .. } | State::Failed(_))) {
+            assert!(std::time::Instant::now() < deadline, "made in time: {:?}", proxies.state(&file));
+            proxies.poll();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (path, track) = proxies.ready(&file).map(|(p, t)| (p.to_path_buf(), t.clone())).unwrap_or_else(|| panic!("{:?}", proxies.state(&file)));
+        assert!(path.to_string_lossy().ends_with(".packed.mkv"), "{}", path.display());
+        assert!(track.packed_alpha, "marked as packed");
+        assert_eq!([track.width, track.height], [320, 480], "the picture on top of its transparency");
+        assert_eq!(track.codec, "h264");
+        assert_eq!(track.index.len(), original.index.len(), "a frame for each of the original's");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A proxy is small, has a frame for each of the original's at the same times, and is
     /// found again (by content) instead of made twice.
     #[test]
@@ -275,6 +348,10 @@ mod tests {
         assert!(saw_progress);
         assert_eq!([track.width, track.height], [540, 960], "the short side down to 540, the shape kept");
         assert_eq!(track.bit_depth(), 8);
+        assert!(!heavy(&track), "the proxy itself: small, 8-bit, a keyframe every 12 frames");
+        let mut sparse = track.clone();
+        (sparse.index.pts, sparse.index.keyframes) = ((0..120).collect(), vec![0, 60]);
+        assert!(heavy(&sparse), "keyframes 60 frames apart: scrubbing would decode up to that many each time");
         // The same frames at the same times (Matroska keeps milliseconds).
         assert_eq!(track.index.pts.len(), original.index.pts.len());
         let secs = |t: &VideoTrack, i: usize| t.index.pts[i] as f64 * t.index.time_base.num() as f64 / t.index.time_base.den() as f64;

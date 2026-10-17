@@ -327,6 +327,9 @@ struct ParamDef {
     min: Option<f64>,
     #[serde(default)]
     max: Option<f64>,
+    /// Only in steps of this much from `min` (the slider snaps, and marks each step).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step: Option<f64>,
     /// none (default) · layer_pixels · canvas_fraction · source_fraction · degrees ·
     /// direction · seconds · decibels
     #[serde(default)]
@@ -408,6 +411,12 @@ impl ParamDef {
         let mut schema = ParamSchema::new(&self.id, default, unit_of(self.unit.as_deref()).map_err(|e| format!("parameter \"{}\": {e}", self.id))?);
         if let (Some(lo), Some(hi)) = (self.min, self.max) {
             schema.range = Some((lo, hi));
+        }
+        if let Some(step) = self.step {
+            if !(step > 0.0 && step.is_finite()) {
+                return Err(format!("parameter \"{}\": step must be more than 0", self.id));
+            }
+            schema.step = Some(step);
         }
         schema.options = self.options;
         schema.multiple = self.multiple;
@@ -495,13 +504,13 @@ impl EffectDef {
         let mut preview = Vec::new();
         for (id, v) in self.preview {
             let Some(p) = params.iter().find(|p| p.id.as_str() == id) else { return Err(format!("{where_}: \"preview\" sets \"{id}\", which isn't one of its parameters")) };
-            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
+            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, step: None, unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
             preview.push((ParamId::new(&id), def.into_schema().map_err(|e| format!("{where_}: preview: {e}"))?.default));
         }
         let mut off = Vec::new();
         for (id, v) in self.off {
             let Some(p) = params.iter().find(|p| p.id.as_str() == id) else { return Err(format!("{where_}: \"off\" sets \"{id}\", which isn't one of its parameters")) };
-            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
+            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, step: None, unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
             off.push((ParamId::new(&id), def.into_schema().map_err(|e| format!("{where_}: off: {e}"))?.default));
         }
         if let Some(e) = &self.editor
@@ -735,7 +744,8 @@ mod tests {
                     "id": "com.example.vignette", "name": "Vignette", "kind": "point",
                     "params": [
                         {"id": "amount", "type": "float", "default": 0.5, "min": 0, "max": 1},
-                        {"id": "edges", "type": "enum", "options": ["soft", "hard"], "static_only": true}
+                        {"id": "edges", "type": "enum", "options": ["soft", "hard"], "static_only": true},
+                        {"id": "rings", "type": "float", "default": 3, "min": 1, "max": 6, "step": 1}
                     ],
                     "shader": {"entry": "vignette", "file": "vignette.wgsl"}
                 }]
@@ -751,6 +761,11 @@ mod tests {
         assert_eq!(d.params[0].range, Some((0.0, 1.0)));
         assert_eq!(d.params[1].default, Value::Enum("soft".into()));
         assert!(!d.params[1].animatable);
+        // In steps: a keyframed or typed 3.4 is 3; 4.6 is 5.
+        assert_eq!(d.params[2].step, Some(1.0));
+        assert_eq!(d.params[2].stepped(Value::Float(3.4)), Value::Float(3.0));
+        assert_eq!(d.params[2].stepped(Value::Float(4.6)), Value::Float(5.0));
+        assert_eq!(d.params[0].stepped(Value::Float(0.37)), Value::Float(0.37), "no step: as it is");
         assert!(d.shader.as_ref().is_some_and(|s| s.source.contains("fn vignette")));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -151,7 +151,7 @@ fn layer_pixel_params_and_bounds_follow_raster_scale() {
     let p = project(|clip| {
         let mut params = oa_params::ParamSet::default();
         params.set("radius", ParamSource::Static(Value::Float(20.0)));
-        clip.effects.push(EffectInstance { id: EffectId(9), type_id: "oa.blur.gaussian".into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None });
+        clip.effects.push(EffectInstance { id: EffectId(9), type_id: "oa.blur.gaussian".into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None, group: None, shown: Vec::new() });
     });
     let full = plan(&p, secs(1), PlanOptions::default());
     let blur = |g: &oa_graph::Graph| match &find(g, |op| matches!(op, NodeOp::Effect { .. }))[0].op {
@@ -179,7 +179,7 @@ fn effect_params_are_keyframed_and_modulated_per_frame() {
                 vec![Keyframe::linear(secs(0), Value::Float(0.0)), Keyframe::linear(secs(4), Value::Float(40.0))],
             )),
         );
-        clip.effects.push(EffectInstance { id: EffectId(9), type_id: "oa.blur.gaussian".into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None });
+        clip.effects.push(EffectInstance { id: EffectId(9), type_id: "oa.blur.gaussian".into(), type_version: 1, enabled: true, params, role: Default::default(), on_duplicate: None, group: None, shown: Vec::new() });
         // ...while the layer shakes.
         clip.params.set(schema::POSITION, ParamSource::Static(Value::Vec2([0.0, 0.0])).wiggle(0.01, 10.0, 1));
     });
@@ -281,7 +281,7 @@ fn with_stateful_effect() -> Registry {
 fn missing_and_stateful_effects() {
     let p = project(|clip| {
         for (i, id) in ["com.someone.missing", "test.trail"].iter().enumerate() {
-            clip.effects.push(EffectInstance { id: EffectId(30 + i as u64), type_id: (*id).into(), type_version: 1, enabled: true, params: Default::default(), role: Default::default(), on_duplicate: None });
+            clip.effects.push(EffectInstance { id: EffectId(30 + i as u64), type_id: (*id).into(), type_version: 1, enabled: true, params: Default::default(), role: Default::default(), on_duplicate: None, group: None, shown: Vec::new() });
         }
     });
     let plan = plan_frame(&p, SEQ, secs(3), &PlanOptions::default(), &with_stateful_effect()).unwrap();
@@ -376,8 +376,18 @@ fn crop_cuts_the_edges_before_effects() {
         _ => unreachable!(),
     }
     assert!(matches!(g.node(crop.inputs[0]).op, NodeOp::Source { .. }));
+    // Then cut down to what's kept, so the effects take that as the whole picture.
     let exposure = find(&g, |op| matches!(op, NodeOp::Effect { type_id, .. } if &**type_id == "oa.color.exposure"))[0];
-    assert!(std::ptr::eq(g.node(exposure.inputs[0]), crop));
+    let cut = g.node(exposure.inputs[0]);
+    assert!(matches!(cut.op, NodeOp::Transform { matrix } if matrix.is_identity()));
+    assert_eq!(cut.bounds, oa_graph::Rect::new(480.0, 0.0, 1920.0, 1080.0));
+    assert!(std::ptr::eq(g.node(cut.inputs[0]), crop));
+    // Without effects, nothing to cut for.
+    let bare = plan(&project(|clip| {
+        clip.params.set(schema::CROP_LEFT, ParamSource::Static(Value::Float(0.25)));
+    }), secs(1), PlanOptions::default()).graph;
+    let crop = find(&bare, |op| matches!(op, NodeOp::Effect { type_id, .. } if &**type_id == oa_graph::registry::CROP))[0];
+    assert!(!find(&bare, |op| matches!(op, NodeOp::Transform { .. })).iter().any(|t| std::ptr::eq(bare.node(t.inputs[0]), crop) && t.bounds != crop.bounds));
 
     let g = plan(&project(|_| {}), secs(1), PlanOptions::default()).graph;
     assert!(find(&g, |op| matches!(op, NodeOp::Effect { .. })).is_empty(), "no crop: no node");
@@ -1009,4 +1019,182 @@ fn duplicates_take_the_effects_they_are_given() {
     assert_eq!(count(schema::DUPLICATE_INHERIT), (2, 2, 1));
     assert_eq!(count(schema::DUPLICATE_PREVIOUS), (2, 1, 1));
     assert_eq!(count("no effects"), (1, 1, 1));
+}
+
+/// A Duplicate's own effects run after the ones its copy takes from the clip, or before
+/// them; solo (the viewer, adjusting the copy) draws the copy without the clip.
+#[test]
+fn duplicates_order_their_own_effects_and_can_be_shown_alone() {
+    let chain = |own: &str, solo: Option<EffectId>| {
+        let p = project(|clip| {
+            clip.effects.push(EffectInstance::new(EffectId(20), "oa.color.tint"));
+            let mut dup = EffectInstance::new(EffectId(21), oa_graph::registry::DUPLICATE);
+            dup.params.set(schema::DUPLICATE_OWN, ParamSource::Static(Value::Enum(own.into())));
+            clip.effects.push(dup);
+            let mut mine = EffectInstance::new(EffectId(22), "oa.color.invert");
+            mine.on_duplicate = Some(EffectId(21));
+            clip.effects.push(mine);
+        });
+        let g = plan(&p, secs(1), PlanOptions { solo, ..Default::default() }).graph;
+        find(&g, |op| matches!(op, NodeOp::Effect { .. }))
+            .iter()
+            .filter_map(|n| match &n.op {
+                NodeOp::Effect { type_id, .. } => Some(type_id.trim_start_matches("oa.color.").to_string()),
+                _ => None,
+            })
+            .collect::<Vec<String>>()
+            .join(" ")
+    };
+    // The clip: tint; its copy: tint and invert, in the order asked for.
+    let last = chain(schema::DUPLICATE_OWN_LAST, None);
+    assert!(last.contains("tint invert") && last.matches("tint").count() == 2, "{last}");
+    let first = chain(schema::DUPLICATE_OWN_FIRST, None);
+    assert!(first.contains("invert tint") && first.matches("tint").count() == 2, "{first}");
+    assert_eq!(chain(schema::DUPLICATE_OWN_LAST, Some(EffectId(21))), "tint invert", "solo: the copy alone");
+    assert_eq!(chain(schema::DUPLICATE_OWN_LAST, Some(EffectId(99))).matches("tint").count(), 2, "solo on a Duplicate it doesn't have: as it is");
+}
+
+/// An effect group's result is mixed with the picture that went into it by its mix
+/// (keyframable); at 100% nothing extra runs, and at 0% or switched off its effects
+/// are skipped.
+#[test]
+fn effect_groups_mix_with_what_went_in() {
+    let at = |mix: ParamSource, on: bool| {
+        let p = project(|clip| {
+            let mut group = EffectGroup::new(1, "Look");
+            group.enabled = on;
+            group.params.set(schema::GROUP_MIX, mix.clone());
+            clip.effect_groups.push(group);
+            for (n, type_id) in ["oa.blur.gaussian", "oa.color.invert"].into_iter().enumerate() {
+                let mut fx = EffectInstance::new(EffectId(20 + n as u64), type_id);
+                fx.group = Some(1);
+                clip.effects.push(fx);
+            }
+        });
+        let g = plan(&p, secs(1), PlanOptions::default()).graph;
+        let effects: Vec<String> = find(&g, |op| matches!(op, NodeOp::Effect { .. }))
+            .iter()
+            .filter_map(|n| match &n.op {
+                NodeOp::Effect { type_id, uniforms, .. } if &**type_id == oa_graph::registry::MIX => Some(format!("mix {}", uniforms[0])),
+                NodeOp::Effect { type_id, .. } => Some(type_id.to_string()),
+                _ => None,
+            })
+            .collect();
+        effects
+    };
+    let still = |v: f64| ParamSource::Static(Value::Float(v));
+    assert_eq!(at(still(100.0), true), ["oa.blur.gaussian", "oa.color.invert"]);
+    assert_eq!(at(still(40.0), true), ["oa.blur.gaussian", "oa.color.invert", "mix 0.4"], "one mix, after the group's last effect");
+    assert!(at(still(0.0), true).is_empty(), "0% skips the group");
+    assert!(at(still(40.0), false).is_empty(), "so does its switch");
+    let ramp = ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, vec![Keyframe::linear(secs(0), Value::Float(0.0)), Keyframe::linear(secs(2), Value::Float(100.0))]));
+    assert_eq!(at(ramp, true).last().map(String::as_str), Some("mix 0.5"), "keyframed: halfway at 1 s");
+}
+
+/// Echo draws the clip again at moments before (behind), after (ahead) or both,
+/// `spacing` frames apart, each copy fainter by `decay` — laid on the clip (Over), under
+/// it (Under), averaged (Average) or added on (Add) — and leaves out moments outside the clip.
+#[test]
+fn echo_draws_ghost_copies_of_the_clip() {
+    let echo = |direction: &str, mix: &str, at: Time| {
+        let p = project(|clip| {
+            let mut fx = EffectInstance::new(EffectId(40), oa_graph::registry::ECHO);
+            fx.params.set("copies", ParamSource::Static(Value::Float(3.0)));
+            fx.params.set("spacing", ParamSource::Static(Value::Float(2.0)));
+            fx.params.set("decay", ParamSource::Static(Value::Float(0.5)));
+            fx.params.set("direction", ParamSource::Static(Value::Enum(direction.into())));
+            fx.params.set("mix", ParamSource::Static(Value::Enum(mix.into())));
+            clip.effects.push(fx);
+        });
+        let g = plan(&p, at, PlanOptions::default()).graph;
+        // The echo's own canvas: the one whose inputs are all the clip's moments.
+        let sources = find(&g, |op| matches!(op, NodeOp::Source { .. })).len();
+        let layers = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                NodeOp::Composite { layers, .. } if n.inputs.len() > 1 && n.inputs.len() == sources => Some(layers.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        (sources, layers.iter().map(|l| (l.opacity, l.blend)).collect::<Vec<_>>())
+    };
+    use oa_graph::BlendMode;
+    let (n, layers) = echo("behind", "over", secs(5));
+    assert_eq!(n, 4, "three copies and the clip");
+    assert_eq!(layers, [(1.0, BlendMode::Normal), (0.125, BlendMode::Normal), (0.25, BlendMode::Normal), (0.5, BlendMode::Normal)], "the clip, then the copies on it, the nearest on top");
+    let (_, under) = echo("behind", "under", secs(5));
+    assert_eq!(under, [(0.125, BlendMode::Normal), (0.25, BlendMode::Normal), (0.5, BlendMode::Normal), (1.0, BlendMode::Normal)], "under: farthest first, the clip on top");
+    assert_eq!(echo("both", "over", secs(5)).0, 7);
+    // At the clip's start, nothing before it to echo.
+    assert_eq!(echo("behind", "over", secs(0)).0, 1);
+    assert_eq!(echo("ahead", "over", secs(0)).0, 4);
+    let (_, avg) = echo("behind", "average", secs(5));
+    let total: f32 = avg.iter().map(|l| l.0).sum();
+    assert!((total - 1.0).abs() < 1e-5 && avg.iter().all(|l| l.1 == BlendMode::Add), "averaged: {avg:?}");
+    let (_, add) = echo("behind", "add", secs(5));
+    assert_eq!(add[0], (1.0, BlendMode::Normal), "the clip first, copies added on: {add:?}");
+    assert!(add[1..].iter().all(|l| l.1 == BlendMode::Add));
+}
+
+/// A cropped clip's Surface rests its grid on what the crop leaves: the planner hands
+/// it the crop's box (after its grid and 16 points), the whole layer when uncropped.
+#[test]
+fn surface_rests_on_the_cropped_picture() {
+    let boxed = |crop: Option<(f64, f64)>| {
+        let p = project(|clip| {
+            if let Some((left, bottom)) = crop {
+                clip.params.set(schema::CROP_LEFT, ParamSource::Static(Value::Float(left)));
+                clip.params.set(schema::CROP_BOTTOM, ParamSource::Static(Value::Float(bottom)));
+            }
+            clip.effects.push(EffectInstance::new(EffectId(50), oa_graph::registry::SURFACE));
+        });
+        let g = plan(&p, secs(1), PlanOptions::default()).graph;
+        let n = find(&g, |op| matches!(op, NodeOp::Effect { type_id, .. } if &**type_id == oa_graph::registry::SURFACE))[0];
+        let input = g.node(n.inputs[0]).bounds;
+        match &n.op {
+            NodeOp::Effect { uniforms, .. } => (uniforms[33..37].iter().map(|u| (u * 1e4).round() / 1e4).collect::<Vec<f32>>(), [input.x0, input.y0, input.x1, input.y1]),
+            _ => unreachable!(),
+        }
+    };
+    assert_eq!(boxed(None), (vec![0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1920.0, 1080.0]));
+    // Left a quarter in, the bottom half gone: the layer is cut to that box, so the
+    // points rest on all of what it gets.
+    assert_eq!(boxed(Some((0.25, 0.5))), (vec![0.0, 0.0, 1.0, 1.0], [480.0, 0.0, 1920.0, 540.0]));
+    // A crop off the pixel grid: cut to whole pixels round it, and the rest of the crop
+    // (half a pixel each side, 0.5 / 1441 of the width) is left for the points to rest
+    // inside.
+    let (b, input) = boxed(Some((0.25 + 0.5 / 1920.0, 0.0)));
+    assert_eq!(input, [480.0, 0.0, 1920.0, 1080.0]);
+    assert!((b[0] - (0.5 / 1440.0) as f32).abs() < 1e-4 && b[2] == 1.0, "{b:?}");
+}
+
+/// An effect used with a blend lays its result over the picture that went in by its
+/// mode, then fades to that picture by its mix; without one, nothing extra runs.
+#[test]
+fn effects_used_with_a_blend_mix_with_what_went_in() {
+    let passes = |blend: Option<(&str, f64)>| {
+        let p = project(|clip| {
+            let mut fx = EffectInstance::new(EffectId(60), "oa.color.invert");
+            if let Some((mode, mix)) = blend {
+                fx.params.set(schema::EFFECT_BLEND_MODE, ParamSource::Static(Value::Enum(mode.into())));
+                fx.params.set(schema::EFFECT_BLEND_MIX, ParamSource::Static(Value::Float(mix)));
+            }
+            clip.effects.push(fx);
+        });
+        let g = plan(&p, secs(1), PlanOptions::default()).graph;
+        find(&g, |op| matches!(op, NodeOp::Effect { .. }))
+            .iter()
+            .filter_map(|n| match &n.op {
+                NodeOp::Effect { type_id, uniforms, .. } if &**type_id == oa_graph::registry::BACKDROP_BLEND => Some(format!("blend {}", uniforms[0])),
+                NodeOp::Effect { type_id, uniforms, .. } if &**type_id == oa_graph::registry::MIX => Some(format!("mix {}", uniforms[0])),
+                NodeOp::Effect { type_id, .. } => Some(type_id.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(passes(None), ["oa.color.invert"]);
+    assert_eq!(passes(Some(("screen", 100.0))), ["oa.color.invert", "blend 3"], "screen is the fourth mode");
+    assert_eq!(passes(Some(("add", 40.0))), ["oa.color.invert", "blend 1", "mix 0.4"]);
+    assert_eq!(passes(Some(("difference", 100.0))).last().map(String::as_str), Some("blend 6"), "a mode that reads what's under it");
 }

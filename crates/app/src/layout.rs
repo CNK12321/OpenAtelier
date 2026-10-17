@@ -111,13 +111,30 @@ impl App {
 /// (right-hand column, media bin, timeline). Sizes remembered in a bigger window — or
 /// kept from a 4K monitor and opened on a laptop — would otherwise crowd the viewer out;
 /// the viewer keeps at least ~40% of the width and height.
+///
+/// In the vertical layout, sizes never dragged are shares of the window instead: the
+/// viewer's column a little under half the width, the bin a quarter, the timeline a bit
+/// over a third of the height — the media, the properties and the tall picture side by
+/// side.
 pub(crate) fn fit_panels(view: &crate::settings::ProjectView, vertical: bool, room: [f32; 2]) -> (f32, f32, f32) {
     let [w, h] = room;
-    let right = if vertical { view.viewer.min(w * 0.45) } else { view.inspector.min(w * 0.3) };
+    if vertical {
+        let usual = crate::settings::ProjectView::default();
+        let share = |kept: f32, usual: f32, share: f32| if kept == usual { share } else { kept };
+        let right = share(view.viewer, usual.viewer, w * VERTICAL_SHARES[0]).min(w * 0.45);
+        let media = share(view.media, usual.media, w * VERTICAL_SHARES[1]).min((w - right) * 0.6);
+        let timeline = share(view.timeline, usual.timeline, h * VERTICAL_SHARES[2]).min(h * 0.45);
+        return (right.max(1.0), media.max(1.0), timeline.max(1.0));
+    }
+    let right = view.inspector.min(w * 0.3);
     let media = view.media.min((w * 0.6 - right).max(w * 0.15));
     let timeline = view.timeline.min(h * 0.45);
     (right.max(1.0), media.max(1.0), timeline.max(1.0))
 }
+
+/// The vertical layout's untouched sizes, as shares of the window: the viewer's column
+/// and the bin of its width, the timeline of its height.
+const VERTICAL_SHARES: [f32; 3] = [0.43, 0.25, 0.38];
 
 impl App {
     /// The first frames: puts the window the way it should open. Maximized on the first
@@ -231,5 +248,10 @@ mod tests {
         assert!(right <= 576.0);
         let usual = ProjectView::default();
         assert_eq!(fit_panels(&usual, false, [2560.0, 1440.0]), (usual.inspector, usual.media, usual.timeline));
+        // Vertical, untouched: shares of the window; a dragged size stays as it was.
+        let (right, media, timeline) = fit_panels(&usual, true, [1920.0, 970.0]);
+        assert!((right - 825.6).abs() < 1.0 && (media - 480.0).abs() < 1.0 && (timeline - 368.6).abs() < 1.0, "{right} {media} {timeline}");
+        let dragged = ProjectView { viewer: 600.0, ..usual };
+        assert_eq!(fit_panels(&dragged, true, [1920.0, 970.0]).0, 600.0);
     }
 }

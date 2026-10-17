@@ -9,7 +9,8 @@ effect OpenAtelier ships with, picture and sound, written the way this page desc
 The program carries a copy of it inside and loads it through the same loader as yours;
 all it has that yours doesn't is its `oa.*` ids. Read it to see how anything is done.
 
-Folders here are loaded when you run the app from a checkout. Yours belong in the
+Folders here are loaded when you run a debug build from a checkout (releases don't
+ship them or load them). Yours belong in the
 plugins folder the app opens from **Home → Plugins → Open plugins folder**
 (`%LOCALAPPDATA%/OpenAtelier/plugins`). [`example-looks`](example-looks) is a small
 working example to copy.
@@ -82,6 +83,9 @@ manifest (`"bounds": {"file": "shape.bounds"}`).
   whole gradient as the editor saves one), `media` (a picture from the project — the
   effect's second input), `text`.
 * Every one is keyframable (and can wiggle) unless `"static_only": true`.
+* `"step": 1` makes a `float` go only in steps of that much, counted from `min` (a
+  count of copies, octaves, segments): the slider snaps and puts a dot at each step
+  when there are 40 or fewer, and a keyframed value moves from step to step.
 * **Units**: `none`, `layer_pixels` (scaled with the render resolution, so a radius
   looks the same in a ¼ preview), `canvas_fraction`, `source_fraction`, `degrees`,
   `direction` (edited with a dial: 0 = right, 90 = down), `seconds`, `decibels`.

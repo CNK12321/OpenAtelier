@@ -102,8 +102,9 @@ const DOT_GAP: f32 = 18.0;
 
 /// Behind the canvas: a faint grid of dots that moves with it (panning and zooming show
 /// where you are), and around it a soft glow in the colors along the picture's edges
-/// (`edges`: top, right, bottom, left; until a frame's been read, one color all round).
-fn backdrop(painter: &egui::Painter, area: egui::Rect, canvas: egui::Rect, visuals: &egui::Visuals, edges: [egui::Color32; 4]) {
+/// (`edges`: top, right, bottom, left; until a frame's been read, one color all round)
+/// — unless `glows` is off (UI effects off).
+fn backdrop(painter: &egui::Painter, area: egui::Rect, canvas: egui::Rect, visuals: &egui::Visuals, edges: [egui::Color32; 4], glows: bool) {
     let dot = if visuals.dark_mode { egui::Color32::from_white_alpha(16) } else { egui::Color32::from_black_alpha(22) };
     // Anchored to the canvas corner, so the dots travel with it.
     let first = |lo: f32, anchor: f32| anchor - ((anchor - lo) / DOT_GAP).floor() * DOT_GAP;
@@ -123,6 +124,9 @@ fn backdrop(painter: &egui::Painter, area: egui::Rect, canvas: egui::Rect, visua
         y += DOT_GAP;
     }
     painter.add(mesh);
+    if !glows {
+        return;
+    }
     // The glow: a band out from each side, its edge's color fading to nothing, mitred at
     // the corners so neighboring sides meet.
     const REACH: f32 = 46.0;
@@ -349,6 +353,7 @@ impl App {
         // The toolbar along the top and playback along the bottom float over the
         // viewer's backdrop (no bands of their own); the picture fits between them.
         let whole = ui.available_rect_before_wrap();
+        self.viewer_rect = Some(whole);
         let top_bar = egui::Rect::from_min_size(whole.min, egui::vec2(whole.width(), ui.spacing().interact_size.y + 6.0));
         let bottom_bar = egui::Rect::from_min_max(egui::pos2(whole.left(), whole.bottom() - crate::style::ICON - 12.0), whole.max);
         let available = egui::Rect::from_min_max(egui::pos2(whole.left(), top_bar.bottom()), egui::pos2(whole.right(), bottom_bar.top()));
@@ -381,8 +386,10 @@ impl App {
         let pan = if view.zoom.is_some() { view.pan } else { egui::Vec2::ZERO };
         let size = egui::vec2(canvas[0] as f32 * scale, canvas[1] as f32 * scale);
         let rect = egui::Rect::from_center_size(available.center() + pan, size);
-        let edges = self.ambient_colors().unwrap_or([frame_color(ui.visuals()); 4]);
-        backdrop(&ui.painter_at(whole), whole, rect, ui.visuals(), edges);
+        // With UI effects off: no glow, a plain frame.
+        let effects = self.settings.ui_effects;
+        let edges = if effects { self.ambient_colors().unwrap_or([frame_color(ui.visuals()); 4]) } else { [ui.visuals().widgets.noninteractive.bg_stroke.color; 4] };
+        backdrop(&ui.painter_at(whole), whole, rect, ui.visuals(), edges, effects);
         ui.scope_builder(egui::UiBuilder::new().max_rect(top_bar.shrink2(egui::vec2(2.0, 3.0))), |ui| self.viewer_toolbar(ui, canvas));
         ui.scope_builder(egui::UiBuilder::new().max_rect(bottom_bar), |ui| self.playback_bar(ui, bottom_bar));
         let clip = ui.painter_at(available);

@@ -418,6 +418,9 @@ pub struct Item {
     /// with it, staying with the footage. (A trim never moves them.)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_key_times: bool,
+    /// Its effect groups (see [`EffectGroup`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_groups: Vec<EffectGroup>,
 }
 
 impl Item {
@@ -433,6 +436,27 @@ impl Item {
         for fx in &mut self.effects {
             fx.on_duplicate = fx.on_duplicate.and_then(|d| renamed.get(&d).copied());
         }
+    }
+
+    /// The group `id` among its effect groups.
+    pub fn effect_group(&self, id: u64) -> Option<&EffectGroup> {
+        self.effect_groups.iter().find(|g| g.id == id)
+    }
+
+    /// Whether `fx` runs: it's on, and so is its group (a group's mix at 0 is decided
+    /// where it's evaluated, over time).
+    pub fn effect_on(&self, fx: &EffectInstance) -> bool {
+        fx.enabled && fx.group.is_none_or(|g| self.effect_group(g).is_none_or(|g| g.enabled))
+    }
+
+    /// `fx`'s group, when it's in one that exists.
+    pub fn group_of(&self, fx: &EffectInstance) -> Option<&EffectGroup> {
+        fx.group.and_then(|g| self.effect_group(g))
+    }
+
+    /// A group id not used by any of its groups.
+    pub fn free_group_id(&self) -> u64 {
+        self.effect_groups.iter().map(|g| g.id).max().map_or(1, |m| m + 1)
     }
 
     /// Stretches its clip-timed keys by `factor` about its start (its properties' and its
@@ -468,6 +492,7 @@ impl Item {
             word_times: Vec::new(),
             masks: Vec::new(),
             keep_key_times: false,
+            effect_groups: Vec::new(),
         }
     }
 
@@ -693,6 +718,14 @@ pub struct EffectInstance {
     /// Duplicate it belongs to. It's listed under that Duplicate, not run on the clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_duplicate: Option<EffectId>,
+    /// The effect group it's in ([`EffectGroup::id`], on the same clip). A group's
+    /// effects sit next to each other in the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u64>,
+    /// Its parameters (ids) ticked to show on its group's card while the group is
+    /// collapsed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shown: Vec<String>,
 }
 
 fn is_passive(r: &EffectRole) -> bool {
@@ -701,7 +734,47 @@ fn is_passive(r: &EffectRole) -> bool {
 
 impl EffectInstance {
     pub fn new(id: EffectId, type_id: &str) -> Self {
-        EffectInstance { id, type_id: type_id.into(), type_version: 1, enabled: true, params: ParamSet::default(), role: EffectRole::Passive, on_duplicate: None }
+        EffectInstance { id, type_id: type_id.into(), type_version: 1, enabled: true, params: ParamSet::default(), role: EffectRole::Passive, on_duplicate: None, group: None, shown: Vec::new() }
+    }
+}
+
+/// Effects of a clip run as one: a card they're listed under, which collapses to the
+/// parameters its effects have ticked, a mix of what they make with what went into
+/// them (keyframable), and an off switch apart from the mix, so turning it back on
+/// comes back at the same mix. Locked, it stays collapsed and its effects can't be
+/// changed — only its mix, its switch and the ticked parameters. Effects say which
+/// group they're in ([`EffectInstance::group`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EffectGroup {
+    /// Unique among the clip's groups.
+    pub id: u64,
+    pub name: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    /// Its mix ([`crate::schema::GROUP_MIX`]).
+    #[serde(default, skip_serializing_if = "ParamSet::is_empty")]
+    pub params: ParamSet,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl EffectGroup {
+    pub fn new(id: u64, name: &str) -> Self {
+        EffectGroup { id, name: name.into(), enabled: true, collapsed: false, locked: false, params: ParamSet::default() }
+    }
+
+    /// Its mix at `ctx`, 0 to 1 (0 when it's off).
+    pub fn mix(&self, ctx: &EvalContext) -> f64 {
+        if !self.enabled {
+            return 0.0;
+        }
+        (self.params.eval(crate::schema::group(), None, ctx).float(crate::schema::GROUP_MIX) / 100.0).clamp(0.0, 1.0)
     }
 }
 

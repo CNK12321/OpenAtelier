@@ -39,11 +39,19 @@ fn oa_surface_unmap(p: vec2f, a: vec2f, b: vec2f, c: vec2f, d: vec2f) -> vec2f {
 }
 
 // A point of the n × n grid, in fractions of the layer: where it rests
-// plus its offset (params are stored for a 4 × 4 grid).
+// (spread over the picture's box) plus its offset (params are stored for a
+// 4 × 4 grid).
 fn oa_surface_point(base: u32, n: u32, r: u32, c: u32) -> vec2f {
     let k = base + 1u + 2u * (r * 4u + c);
-    return vec2f(f32(c), f32(r)) / f32(n - 1u) + vec2f(u(k), u(k + 1u));
+    let lo = oa_surface_lo(base);
+    let rest = lo + vec2f(f32(c), f32(r)) / f32(n - 1u) * (oa_surface_hi(base) - lo);
+    return rest + vec2f(u(k), u(k + 1u));
 }
+
+// The picture's own box in the layer (fractions): the clip's crop, which the
+// planner fills in after the 16 points — the grid rests on what's shown.
+fn oa_surface_lo(base: u32) -> vec2f { return vec2f(u(base + 33u), u(base + 34u)); }
+fn oa_surface_hi(base: u32) -> vec2f { return vec2f(u(base + 35u), u(base + 36u)); }
 
 // The picture at `p` (fractions of the layer): found in whichever cell
 // of the grid covers it.
@@ -59,7 +67,8 @@ fn oa_surface_at(p: vec2f, base: u32, n: u32) -> vec4f {
                 oa_surface_point(base, n, r + 1u, c),
             );
             if (all(uv >= vec2f(-1e-4)) && all(uv <= vec2f(1.0 + 1e-4))) {
-                let src = (vec2f(f32(c), f32(r)) + clamp(uv, vec2f(0.0), vec2f(1.0))) / f32(n - 1u);
+                let lo = oa_surface_lo(base);
+                let src = lo + (vec2f(f32(c), f32(r)) + clamp(uv, vec2f(0.0), vec2f(1.0))) / f32(n - 1u) * (oa_surface_hi(base) - lo);
                 return sample_input(in_origin() + src * size);
             }
         }

@@ -67,6 +67,14 @@ impl VideoDecoder for AnyDecoder {
         }
     }
 
+    fn set_stride(&mut self, stride: usize) -> bool {
+        match self {
+            #[cfg(windows)]
+            AnyDecoder::Mf(d) => d.set_stride(stride),
+            AnyDecoder::Ffmpeg(d) => d.set_stride(stride),
+        }
+    }
+
     fn publish(&mut self, frame: &AnyFrame) -> Result<Surface, MediaError> {
         match (self, frame) {
             #[cfg(windows)]

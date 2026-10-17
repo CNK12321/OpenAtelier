@@ -38,10 +38,6 @@ pub trait VideoDecoder {
     /// shared with the render device. Called only for frames that will be shown.
     fn publish(&mut self, frame: &Self::Frame) -> Result<Surface, MediaError>;
 
-    /// Asks for frames `divisor` times smaller than the file's (1, 2, 4 or 8), when the
-    /// picture is only shown that small. True if the decoder changed and needs a
-    /// [`seek`](VideoDecoder::seek) before its next frame; decoders that can't (or
-    /// needn't: a hardware decoder already on the GPU) keep full size and say false.
     /// What a seek costs, in frames decoded: past a keyframe, decoding on from where the
     /// decoder is beats seeking unless it's more frames than the seek's own decode plus
     /// this. A decoder whose seek is a process restart (ffmpeg) says so here.
@@ -49,7 +45,22 @@ pub trait VideoDecoder {
         FORWARD_DECODE_LIMIT
     }
 
+    /// Asks for frames `divisor` times smaller than the file's (1, 2, 4 or 8), when the
+    /// picture is only shown that small. True if the decoder changed and needs a
+    /// [`seek`](VideoDecoder::seek) before its next frame; decoders that can't (or
+    /// needn't: a hardware decoder already on the GPU) keep full size and say false.
     fn set_scale_divisor(&mut self, _divisor: u32) -> bool {
+        false
+    }
+
+    /// Asks for only every `stride`-th frame from the next seek on (a clip played at 2×,
+    /// 4×…): the frames between are decoded but never handed over, so a decoder that has
+    /// to convert and copy each one (ffmpeg's raw pipe) skips that work. Only asked of
+    /// files whose every frame is a keyframe, where a seek lands exactly on the frame
+    /// wanted, so the frames kept are the ones the clip shows. True if the decoder
+    /// changed and needs a seek before its next frame; decoders that gain nothing by it
+    /// say false.
+    fn set_stride(&mut self, _stride: usize) -> bool {
         false
     }
 }
@@ -231,6 +242,13 @@ struct Decoding<D: VideoDecoder> {
     behind: VecDeque<(usize, Surface)>,
     /// The last requests went backwards, one or a few frames at a time.
     reverse: bool,
+    /// How many frames each step back went (a clip at 4× played or scrubbed backwards
+    /// asks for every 4th): the frames decoded ahead going back are that far apart, so
+    /// a stretch covers as many steps whatever the speed.
+    back_stride: usize,
+    /// Every how many frames the decoder hands one over (`VideoDecoder::set_stride`): 1,
+    /// or a sped-up clip's step in a file whose every frame is a keyframe.
+    stride_on: usize,
 }
 
 impl<D: VideoDecoder> Decoding<D> {
@@ -307,6 +325,8 @@ impl<D: VideoDecoder> Decoding<D> {
         self.offset = t0 - self.video.index.time_of(0);
         self.current = Some((0, first));
         self.decoder = Some(decoder);
+        // A new decoder hands over every frame.
+        self.stride_on = 1;
         Ok(())
     }
 
@@ -386,12 +406,16 @@ impl<D: VideoDecoder> Decoding<D> {
         // handed out last first — rather than a seek and a GOP of decoding every frame.
         let step_back = self.last.as_ref().is_some_and(|(i, _)| target < *i && *i - target <= 2 * REVERSE_CHUNK);
         if step_back {
+            // How far this step went: the stretch decoded is spaced to match (at 4×, every
+            // 4th frame, so it covers as many steps back as at 1×).
+            self.back_stride = self.last.as_ref().map_or(1, |(i, _)| i - target).max(1);
             while self.behind.back().is_some_and(|(i, _)| *i > target) {
                 self.behind.pop_back();
             }
             if self.behind.back().is_none_or(|(i, _)| *i != target) {
                 self.behind.clear();
-                let got = self.decode_range(target.saturating_sub(REVERSE_CHUNK - 1), target)?;
+                let stride = self.back_stride;
+                let got = self.decode_range(target.saturating_sub((REVERSE_CHUNK - 1) * stride), target, stride)?;
                 self.behind.extend(got);
             } else {
                 self.count(|s| s.lookahead_hits += 1);
@@ -412,6 +436,7 @@ impl<D: VideoDecoder> Decoding<D> {
         while self.ready.front().is_some_and(|(i, _)| *i < target) {
             self.ready.pop_front();
         }
+        self.follow_stride(target);
         let served = match self.ready.front() {
             Some((i, _)) if *i == target => {
                 self.count(|s| s.lookahead_hits += 1);
@@ -434,10 +459,50 @@ impl<D: VideoDecoder> Decoding<D> {
         Ok(served)
     }
 
+    /// A file whose every frame is a keyframe, asked for every k-th frame (a clip played
+    /// at k×): the decoder hands over only those (`VideoDecoder::set_stride`). It stays
+    /// that way while the frames asked for are among those — playback that skips one now
+    /// and then (8 instead of 4) still is — since each change restarts ffmpeg. Off them
+    /// (a jump, a step back), it starts over at the frame asked for (a seek lands right
+    /// on it) at the same rhythm if the requests still keep it, or at every frame.
+    fn follow_stride(&mut self, target: usize) {
+        let index = &self.video.index;
+        if index.len() < 2 || index.keyframes.len() != index.len() {
+            return;
+        }
+        // Among the frames the decoder hands out (decoded ahead, or still to come)?
+        let ready = self.ready.iter().any(|(i, _)| *i == target);
+        let ahead = self.current.as_ref().is_some_and(|(i, _)| target >= *i && (target - *i).is_multiple_of(self.stride_on));
+        if self.stride_on > 1 && (ready || ahead) {
+            return;
+        }
+        let s = self.strides[0];
+        let want = if s > 1 && self.strides.iter().all(|x| *x == s) { s } else { 1 };
+        if want != self.stride_on {
+            if let Some(d) = self.decoder.as_mut()
+                && d.set_stride(want)
+            {
+                self.stride_on = want;
+                self.current = None;
+                self.ready.clear();
+            }
+        } else if self.stride_on > 1 {
+            self.current = None;
+            self.ready.clear();
+        }
+    }
+
     /// Frames `from..=to` (no further back than `to`'s keyframe), decoded forward and
-    /// published, ascending. The last is `to` — or the nearest frame the file has there.
-    fn decode_range(&mut self, from: usize, to: usize) -> Result<Vec<(usize, Surface)>, MediaError> {
-        let from = from.max(self.video.index.keyframe_before(to));
+    /// published, ascending — every `stride`-th counting back from `to` (the others are
+    /// decoded, as they must be, but not uploaded). The last is `to` — or the nearest
+    /// frame the file has there.
+    fn decode_range(&mut self, from: usize, to: usize, stride: usize) -> Result<Vec<(usize, Surface)>, MediaError> {
+        let stride = stride.max(1);
+        // No further back than `to`'s keyframe, unless every frame is one: then the stretch
+        // starts where it's asked to (that keyframe would be `to` itself — a stretch of one
+        // frame, and a seek for every step back).
+        let index = &self.video.index;
+        let from = if index.keyframes.len() == index.len() { from } else { from.max(index.keyframe_before(to)) };
         // Past it (or nowhere yet): `decode_to` seeks back to the keyframe.
         if self.current.as_ref().is_some_and(|(i, _)| *i > from) {
             self.current = None;
@@ -447,7 +512,7 @@ impl<D: VideoDecoder> Decoding<D> {
         loop {
             let at = self.current.as_ref().map(|(i, _)| *i);
             match at {
-                Some(i) if i >= from && i <= to => out.push(self.publish_current()?),
+                Some(i) if i >= from && i <= to && (to - i).is_multiple_of(stride) => out.push(self.publish_current()?),
                 _ => {}
             }
             if at.is_none_or(|i| i >= to) {
@@ -468,8 +533,9 @@ impl<D: VideoDecoder> Decoding<D> {
             return false;
         }
         let lowest = self.behind.front().or(self.last.as_ref()).map(|(i, _)| *i);
-        let Some(below) = lowest.and_then(|i| i.checked_sub(1)) else { return false };
-        match self.decode_range(below.saturating_sub(REVERSE_CHUNK - 1), below) {
+        let stride = self.back_stride;
+        let Some(below) = lowest.and_then(|i| i.checked_sub(stride)) else { return false };
+        match self.decode_range(below.saturating_sub((REVERSE_CHUNK - 1) * stride), below, stride) {
             Ok(got) if !got.is_empty() => {
                 for frame in got.into_iter().rev() {
                     self.behind.push_front(frame);
@@ -555,6 +621,8 @@ fn spawn<D: VideoDecoder + 'static>(path: PathBuf, video: VideoTrack, open: Open
                 divisor: 1,
                 behind: VecDeque::new(),
                 reverse: false,
+                back_stride: 1,
+                stride_on: 1,
             };
             loop {
                 // Work ahead while nothing is asked of us; block when there's nothing to do.
@@ -912,12 +980,16 @@ impl<D: VideoDecoder + 'static> MediaFrameSource<D> {
     /// Converts a decoded surface to a working-format image of `size` and remembers it.
     fn convert(&mut self, gpu: &mut GpuServices<'_>, surface: Surface, key: FrameKey) -> Result<GpuImage, RenderError> {
         self.local.uploads += 1;
+        // A packed proxy: the picture is the top half (its transparency is below).
+        let packed = self.media.get(&key.0).is_some_and(|e| e.video.packed_alpha);
+        let visible_size = if packed { [surface.visible_size[0], surface.visible_size[1] / 2] } else { surface.visible_size };
         let frame = Nv12Frame {
             texture: &surface.texture,
             chroma: surface.chroma.as_deref(),
             alpha: surface.alpha.as_deref(),
+            packed_alpha: packed,
             coded_size: surface.coded_size,
-            visible_size: surface.visible_size,
+            visible_size,
             rotation_quarter_turns: surface.rotation_quarter_turns,
             color: with_yuv_override(surface.color, key.3),
         };
@@ -1095,6 +1167,7 @@ mod tests {
             transfer_tag: None,
             primaries_tag: None,
             has_alpha: false,
+            packed_alpha: false,
             still: false,
             index: crate::FrameIndex { time_base: Rational::new(1, 30), pts: (0..240).collect(), keyframes: vec![0, 120] },
         }
