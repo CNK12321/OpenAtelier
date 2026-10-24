@@ -927,6 +927,54 @@ fn text_layers_draw_their_glyphs_centered() {
     assert!((big_total / total - 4.0).abs() < 0.6, "{}", big_total / total);
 }
 
+/// Letters showing other characters (Characters, Counter) draw them in the letters'
+/// places: from blank, an intro starts with nothing and ends as the plain title; a
+/// rolling letter half-way shows halves of two characters, kept inside its slot; and a
+/// Counter draws its number instead of the words.
+#[test]
+fn letters_can_show_other_characters() {
+    let Some(ctx) = gpu() else { return };
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let (plain, _) = text_project(|_| {});
+    let at = Time::from_seconds(1);
+    let (_, plain_ink) = ink(&render_project(&mut r, &plain, at));
+    let characters = |from: &str, style: &str| {
+        text_project(|c| {
+            let mut fx = EffectInstance::new(EffectId(90), oa_graph::registry::CHARACTERS);
+            fx.params.set("from", ParamSource::Static(Value::Enum(from.into())));
+            fx.params.set("style", ParamSource::Static(Value::Enum(style.into())));
+            fx.params.set("stagger", ParamSource::Static(Value::Float(0.0)));
+            fx.params.set("scramble", ParamSource::Static(Value::Float(0.0)));
+            fx.role = EffectRole::In { duration: Time::from_seconds(2) };
+            c.effects.push(fx);
+        })
+        .0
+    };
+    let blank = characters("blank", "cut");
+    let (_, start) = ink(&render_project(&mut r, &blank, Time::from_seconds_f64(0.2)));
+    assert!(start < plain_ink * 0.01, "{start} vs {plain_ink}");
+    let (_, end) = ink(&render_project(&mut r, &blank, Time::from_seconds(3)));
+    assert!((end / plain_ink - 1.0).abs() < 0.01, "{end} vs {plain_ink}");
+
+    // Rolling in from blank, half-way: each letter's top half shows, risen into its
+    // slot from below (what's still below the slot is cut off).
+    let rolling = characters("blank", "roll");
+    let px = render_project(&mut r, &rolling, at);
+    let ([_, cy], half) = ink(&px);
+    assert!(half > plain_ink * 0.15 && half < plain_ink * 0.75, "{half} vs {plain_ink}");
+    let ([_, plain_cy], _) = ink(&render_project(&mut r, &plain, at));
+    assert!(cy > plain_cy + 5.0, "the letters are still rising: {cy} vs {plain_cy}");
+
+    // A Counter: "8" instead of HELLO.
+    let (count, _) = text_project(|c| {
+        let mut fx = EffectInstance::new(EffectId(90), oa_graph::registry::COUNTER);
+        fx.params.set("value", ParamSource::Static(Value::Float(8.0)));
+        c.effects.push(fx);
+    });
+    let (_, eight) = ink(&render_project(&mut r, &count, at));
+    assert!(eight > plain_ink * 0.1 && eight < plain_ink * 0.4, "{eight} vs {plain_ink}");
+}
+
 /// Export's anti-aliased text: drawn at twice the size and shrunk in a pass of its own
 /// (the optimizer keeps it apart from the layer's placement), the title lands in the
 /// same place with the same amount of ink — only its edges are smoother.
@@ -1692,6 +1740,144 @@ fn bloom_spills_light_from_the_bright_parts_only() {
     }
     let px = run(3.0, 12.0);
     assert!((at(&px, 33, 33)[0] - 0.3).abs() < 0.02, "the far corner, past the radius, as it was: {:?}", at(&px, 33, 33));
+}
+
+/// Bend Along Path lays the picture along its path as a band as wide as its points say:
+/// stretched, the picture's left end at the path's start; turned half round, the other
+/// way; only the part of the path between `start` and `end` drawn; nothing off the band.
+#[test]
+fn bend_lays_the_picture_along_its_path() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let d = registry.effect(oa_graph::registry::BEND).unwrap();
+    // fit (0 stretch, 1 repeat), alignment (degrees), end.
+    let mut run = |fit: f32, alignment: f32, end: f32| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        // 64 × 32: red on the left, blue on the right.
+        let red = solid(&mut b, [1.0, 0.0, 0.0, 1.0], 32.0);
+        let blue = solid(&mut b, [0.0, 0.0, 1.0, 1.0], 32.0);
+        let m = Affine2::translate(32.0, 0.0);
+        let blue = b.add(NodeOp::Transform { matrix: m }, vec![blue], m.map_rect(b.node(blue).bounds), true);
+        let infos = vec![LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false }; 2];
+        let picture = b.add(NodeOp::Composite { size: [64, 32], background: [0.0; 4], layers: infos }, vec![red, blue], Rect::from_size(64.0, 32.0), true);
+        // Straight across the middle, half the picture's height wide (16 px).
+        let path = oa_params::BezierPath::through(&[[0.0, 0.5], [1.0, 0.5]]);
+        let mut uniforms = path.pack(&[0.5, 0.0]);
+        uniforms.extend([fit, alignment, 0.0, 0.0, end, 1.0]);
+        uniforms.extend(oa_graph::registry::STILL_CLOCK);
+        let op = NodeOp::Effect { type_id: d.type_id.clone(), version: d.version, kind: d.kind.clone(), space: d.space, fusible: d.fusible, stateful: false, uniforms, nearest: false };
+        let bend = b.add(op, vec![picture], b.node(picture).bounds.expand(10.0), false);
+        let m = Affine2::translate(16.0, 32.0);
+        let placed = b.add(NodeOp::Transform { matrix: m }, vec![bend], m.map_rect(b.node(bend).bounds), false);
+        let out = composite(&mut b, 96, [0.0; 4], &[(placed, BlendMode::Normal)]);
+        render_one(&mut r, &b.finish(out))
+    };
+    // The picture's (0, 0) lands at (16, 32); the band runs along y = 48, from 40 to 56.
+    let at = |px: &[[f32; 4]], x: usize, y: usize| px[y * 96 + x];
+    let px = run(0.0, 0.0, 1.0);
+    assert!(close(at(&px, 26, 48), [1.0, 0.0, 0.0, 1.0], 0.02), "its left end at the start: {:?}", at(&px, 26, 48));
+    assert!(close(at(&px, 70, 48), [0.0, 0.0, 1.0, 1.0], 0.02), "its right end at the end: {:?}", at(&px, 70, 48));
+    assert!(at(&px, 48, 36)[3] < 0.01 && at(&px, 48, 60)[3] < 0.01, "nothing off the band");
+    assert!(at(&px, 48, 42)[3] > 0.99, "and all of it on the band");
+    let turned = run(0.0, 180.0, 1.0);
+    assert!(close(at(&turned, 26, 48), [0.0, 0.0, 1.0, 1.0], 0.02), "turned half round: the other way along: {:?}", at(&turned, 26, 48));
+    let half = run(0.0, 0.0, 0.5);
+    assert!(at(&half, 26, 48)[3] > 0.99 && at(&half, 70, 48)[3] < 0.01, "ending halfway: only the first half drawn");
+    // Repeated at its own shape: a 64 × 32 picture in a 16 px band is 32 px long, so the
+    // 64 px path holds it twice: red, blue, red, blue.
+    let tiled = run(1.0, 0.0, 1.0);
+    let colors: Vec<char> = [24, 40, 56, 72].iter().map(|&x| if at(&tiled, x, 48)[0] > 0.5 { 'r' } else { 'b' }).collect();
+    assert_eq!(colors, ['r', 'b', 'r', 'b'], "{colors:?}");
+}
+
+/// Dither: middle gray in two levels is a pattern of black and white, nothing in
+/// between — half each with the ordered grid, about half with noise.
+#[test]
+fn dither_makes_shades_from_a_pattern() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let mut white_share = |pattern: f32| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        // Middle gray on screen (0.5 display is 0.214 linear).
+        let gray = solid(&mut b, [0.214, 0.214, 0.214, 1.0], 32.0);
+        // amount, levels, pattern, size, palette (black and white), dark, light.
+        let mut uniforms = vec![1.0, 2.0, pattern, 1.0, 1.0];
+        uniforms.extend([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0]);
+        let e = effect(&mut b, &registry, gray, "oa.stylize.dither", uniforms, 0.0);
+        let out = composite(&mut b, 32, [0.0, 0.0, 0.0, 1.0], &[(e, BlendMode::Normal)]);
+        let px = render_one(&mut r, &b.finish(out));
+        assert!(px.iter().all(|p| p[0] < 0.01 || p[0] > 0.99), "only black and white");
+        px.iter().filter(|p| p[0] > 0.5).count() as f32 / px.len() as f32
+    };
+    assert!((white_share(0.0) - 0.5).abs() < 0.02, "ordered: half white");
+    assert!((white_share(1.0) - 0.5).abs() < 0.1, "noise: about half");
+}
+
+/// Distress eats a shape most at its edges: near the outline much is gone, deep inside
+/// little; scratches alone take thin streaks.
+#[test]
+fn distress_eats_most_at_the_edges() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let mut run = |amount: f32, scratches: f32| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let square = solid(&mut b, [1.0, 1.0, 1.0, 1.0], 64.0);
+        // amount, grain, reach, scratches, angle, speed, seed, holes, hole color.
+        let mut uniforms = vec![amount, 3.0, 6.0, scratches, 90.0, 0.0, 1.0, 0.0];
+        uniforms.extend([1.0, 1.0, 1.0, 1.0]);
+        let e = effect(&mut b, &registry, square, "oa.stylize.distress", uniforms, 0.0);
+        let m = Affine2::translate(16.0, 16.0);
+        let placed = b.add(NodeOp::Transform { matrix: m }, vec![e], m.map_rect(b.node(e).bounds), false);
+        let out = composite(&mut b, 96, [0.0; 4], &[(placed, BlendMode::Normal)]);
+        render_one(&mut r, &b.finish(out))
+    };
+    // The square covers 16–80; its outline band (3 px in) and its middle (24 px in).
+    let eaten = |px: &[[f32; 4]], keep: &dyn Fn(usize, usize) -> bool| {
+        let cells: Vec<f32> = (16..80).flat_map(|y| (16..80).map(move |x| (x, y))).filter(|(x, y)| keep(*x, *y)).map(|(x, y)| px[y * 96 + x][3]).collect();
+        cells.iter().filter(|a| **a < 0.5).count() as f32 / cells.len() as f32
+    };
+    let inset = |x: usize, y: usize| (x - 16).min(79 - x).min(y - 16).min(79 - y);
+    let px = run(0.6, 0.0);
+    let (rim, middle) = (eaten(&px, &|x, y| inset(x, y) < 3), eaten(&px, &|x, y| inset(x, y) >= 24));
+    assert!(rim > 0.3 && rim > middle * 3.0, "the outline crumbles more than the middle: {rim} vs {middle}");
+    assert!(middle < 0.25, "the middle mostly stays: {middle}");
+    let scratched = run(0.0, 1.0);
+    let s = eaten(&scratched, &|_, _| true);
+    assert!(s > 0.005 && s < 0.4, "scratches take thin streaks: {s}");
+}
+
+/// Disintegrate: half-way, some of the picture has broken off and slid the way it
+/// drifts (right) while some is still whole; at its end, nothing is left.
+#[test]
+fn disintegrate_breaks_the_picture_up_and_away() {
+    let Some(ctx) = gpu() else { return };
+    let registry = Registry::with_builtins();
+    let mut r = renderer(&ctx, FusionMode::Blocking);
+    let mut run = |amount: f32| {
+        let mut b = GraphBuilder::new(KeyContext::default());
+        let square = solid(&mut b, [1.0, 1.0, 1.0, 1.0], 48.0);
+        // amount, block, spread, direction (right), grain, fringe, speed, seed.
+        let uniforms = vec![amount, 8.0, 30.0, 0.0, 2.0, 0.0, 0.0, 1.0];
+        let e = effect(&mut b, &registry, square, "oa.stylize.disintegrate", uniforms, 30.0);
+        let m = Affine2::translate(8.0, 24.0);
+        let placed = b.add(NodeOp::Transform { matrix: m }, vec![e], m.map_rect(b.node(e).bounds), false);
+        let out = composite(&mut b, 96, [0.0; 4], &[(placed, BlendMode::Normal)]);
+        render_one(&mut r, &b.finish(out))
+    };
+    let share = |px: &[[f32; 4]], xs: std::ops::Range<usize>| {
+        let cells: Vec<f32> = (24..72).flat_map(|y| xs.clone().map(move |x| (x, y))).map(|(x, y)| px[y * 96 + x][3]).collect();
+        cells.iter().filter(|a| **a > 0.5).count() as f32 / cells.len() as f32
+    };
+    // The square covers x 8–56; past it (56–86) is where pieces drift to.
+    let half = run(0.5);
+    let (inside, beyond) = (share(&half, 8..56), share(&half, 58..86));
+    assert!(inside > 0.2 && inside < 0.9, "half-way, partly whole: {inside}");
+    assert!(beyond > 0.02, "and pieces have drifted right: {beyond}");
+    let end = run(1.0);
+    assert!(share(&end, 0..96) < 0.001, "at the end nothing is left");
 }
 
 /// A wide glow finds its edges on a coarse grid (4 × 4 pixels a cell at 64 px) and still

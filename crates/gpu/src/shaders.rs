@@ -1,6 +1,6 @@
 //! WGSL prelude and code generation.
 //!
-//! Every pass uses the same bind group: a 64-float uniform block, one input texture
+//! Every pass uses the same bind group: a 512-float uniform block, one input texture
 //! and a linear clamp sampler. Uniform slots:
 //!
 //! | slots  | meaning                                                   |
@@ -12,17 +12,17 @@
 //! | 8–13   | affine a b c d e f (layer draws)                          |
 //! | 14     | opacity (layer draws)                                     |
 //! | 15     | pass index                                                |
-//! | 16–63  | effect parameters                                         |
+//! | 16–511 | effect parameters                                         |
 
 use oa_graph::{EffectShader, WorkingSpace};
 use std::fmt::Write as _;
 
 pub const PARAM_BASE: usize = 16;
-pub const UNIFORM_SLOTS: usize = 64;
+pub const UNIFORM_SLOTS: usize = 512;
 pub use oa_graph::registry::CLOCK_SLOTS;
 
 pub const PRELUDE: &str = r#"
-struct Pass { h: array<vec4f, 16> }
+struct Pass { h: array<vec4f, 128> }
 @group(0) @binding(0) var<uniform> P: Pass;
 @group(0) @binding(1) var input_tex: texture_2d<f32>;
 @group(0) @binding(2) var input_samp: sampler;

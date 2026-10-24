@@ -139,6 +139,82 @@ pub fn break_apart(p: &Project, seq: SeqId, item: ItemId, mut alloc: impl FnMut(
     Ok(Broken { ops, clips, dropped_own_changes })
 }
 
+/// Ops taking one cam of multicam clip `item` out for the stretch `window` (timeline
+/// time, inside the clip; between two of its cuts): that cam's clips, where they play
+/// then and trimmed to it, as ordinary clips on the first picture track above the
+/// multicam clip that's free there — else a new temp layer just above it. The multicam
+/// clip stays as it is (this is a second view over it: a picture-in-picture, a split
+/// screen). Returns the ops and the clips made. Refused for a clip played at another
+/// speed (its insides would need retiming too).
+pub fn extract_cam(p: &Project, seq: SeqId, item: ItemId, cam: usize, window: TimeRange, mut alloc: impl FnMut() -> u64) -> R<(Vec<Op>, Vec<ItemId>)> {
+    let s = p.sequence(seq).ok_or(EditError::NotFound("sequence", seq.0))?;
+    let (ti, ii) = s.find_item(item).ok_or(EditError::NotFound("item", item.0))?;
+    let outer = &s.tracks[ti].items[ii];
+    let ItemKind::Nested { sequence } = outer.kind else { return Err(EditError::WrongTrackKind) };
+    if outer.time_map.speed.num() != outer.time_map.speed.den() || outer.speed_ramp().is_some() {
+        return Err(EditError::InvalidRange);
+    }
+    let inner = p.sequence(sequence).ok_or(EditError::NotFound("sequence", sequence.0))?;
+    let cams = inner.cams();
+    let track = cams.get(cam).ok_or(EditError::NotFound("cam", cam as u64))?;
+    let shown = TimeRange::new(window.start.max(outer.range.start), (window.end().min(outer.range.end()) - window.start.max(outer.range.start)).max(Time::ZERO));
+    if shown.duration <= Time::ZERO {
+        return Err(EditError::InvalidRange);
+    }
+    let shift = outer.range.start - outer.time_map.source_in;
+    let active = inner.active();
+    let format = s.active().id;
+    let mut pieces = Vec::new();
+    let mut ops = Vec::new();
+    for it in track.items.iter().filter(|i| i.enabled) {
+        let (start, end) = (it.range.start + shift, it.range.end() + shift);
+        if end <= shown.start || start >= shown.end() {
+            continue;
+        }
+        let mut piece = it.clone();
+        piece.range = TimeRange::new(start, end - start);
+        if start < shown.start {
+            let Some((range, map)) = piece.trimmed_head(shown.start) else { continue };
+            piece.range = range;
+            piece.time_map = map;
+        }
+        if piece.range.end() > shown.end() {
+            piece.range.duration = shown.end() - piece.range.start;
+        }
+        if piece.range.duration <= Time::ZERO {
+            continue;
+        }
+        piece.id = ItemId(alloc());
+        piece.group = None;
+        // Its settings for the format it was made in, on the timeline's own format.
+        if let Some(o) = active.overrides.get(&it.id) {
+            for (param, source) in &o.0 {
+                ops.push(Op::SetParam { seq, item: piece.id, target: ParamTarget::VariantOverride(format), param: param.clone(), source: Some(source.clone()) });
+            }
+        }
+        pieces.push(piece);
+    }
+    if pieces.is_empty() {
+        return Err(EditError::NotFound("clips", cam as u64));
+    }
+    // Above the multicam clip: the first picture track up that's free over the stretch.
+    let free = |t: &Track| t.kind == TrackKind::Video && !t.effects && !t.items.iter().any(|i| i.range.overlaps(shown));
+    let mut place = Vec::new();
+    let target = match s.tracks.iter().skip(ti + 1).find(|t| free(t)) {
+        Some(t) => t.id,
+        None => {
+            let id = TrackId(alloc());
+            let count = s.tracks.iter().filter(|t| t.kind == TrackKind::Video && !t.effects).count();
+            place.push(Op::InsertTrack { seq, index: ti + 1, track: Arc::new(Track { temp: true, ..Track::new(id, &format!("V{}", count + 1), TrackKind::Video) }) });
+            id
+        }
+    };
+    let clips = pieces.iter().map(|i| i.id).collect();
+    place.extend(pieces.into_iter().map(|item| Op::InsertItem { seq, track: target, item }));
+    place.extend(ops);
+    Ok((place, clips))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +285,41 @@ mod tests {
         assert_eq!(broken.clips.len(), 3);
         // The compound is still in the bin.
         assert_eq!(doc.project().sequences.len(), 2);
+    }
+
+    /// Extracting a cam for a stretch puts that cam's clips, trimmed to it, on a layer
+    /// above the multicam clip, which stays.
+    #[test]
+    fn a_cam_comes_out_for_its_stretch() {
+        let (mut doc, seq, item, v1) = project();
+        let mut next = 20_000;
+        // 12–14 s shows inside 4–6 s: cam 2's clip b (inside 4–10) plays its first 2 s.
+        let (ops, clips) = extract_cam(doc.project(), seq, item, 1, TimeRange::new(secs(12), secs(2)), || {
+            next += 1;
+            next
+        })
+        .unwrap();
+        doc.edit("extract", ops).unwrap();
+        let s = doc.project().sequence(seq).unwrap();
+        assert!(s.item(item).is_some(), "the multicam clip stays");
+        assert_eq!(clips.len(), 1);
+        let (ti, ii) = s.find_item(clips[0]).unwrap();
+        let piece = &s.tracks[ti].items[ii];
+        assert_eq!((piece.name.as_str(), piece.range), ("b", TimeRange::new(secs(12), secs(2))));
+        assert_eq!(piece.time_map.source_in, Time::ZERO, "from b's start");
+        let own = s.tracks.iter().position(|t| t.id == v1).unwrap();
+        assert!(ti > own && s.tracks[ti].temp, "on a layer above it");
+        // Cam 1's clip a (inside 0–5) for 12–14 s: its 4–5 s, cut at its end.
+        let (ops, clips) = extract_cam(doc.project(), seq, item, 0, TimeRange::new(secs(12), secs(2)), || {
+            next += 1;
+            next
+        })
+        .unwrap();
+        doc.edit("extract", ops).unwrap();
+        let s = doc.project().sequence(seq).unwrap();
+        let (ti, ii) = s.find_item(clips[0]).unwrap();
+        assert_eq!(s.tracks[ti].items[ii].range, TimeRange::new(secs(12), secs(1)));
+        assert!(extract_cam(doc.project(), seq, item, 5, TimeRange::new(secs(12), secs(2)), || 1).is_err(), "no such cam");
     }
 
     #[test]

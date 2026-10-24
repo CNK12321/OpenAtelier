@@ -294,6 +294,11 @@ impl App {
         let x0 = (area.center().x - width / 2.0).max(area.left() + margin + SIDEBAR_W + gap);
         let side = egui::Rect::from_min_max(egui::pos2(x0 - gap - SIDEBAR_W, area.top()), egui::pos2(x0 - gap, area.bottom()));
         let main = egui::Rect::from_min_max(egui::pos2(x0, area.top()), egui::pos2(x0 + width, area.bottom()));
+        // Over the backdrop: a soft backing under the folders and the projects.
+        if self.settings.ui_effects {
+            crate::backdrop::backing(ui, side.expand2(egui::vec2(10.0, 0.0)));
+            crate::backdrop::backing(ui, main.expand2(egui::vec2(14.0, 0.0)));
+        }
         let column = |rect: egui::Rect| egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min));
         let mut side_ui = ui.new_child(column(side));
         egui::ScrollArea::vertical().id_salt("projects-folders").auto_shrink([false, false]).show(&mut side_ui, |ui| {

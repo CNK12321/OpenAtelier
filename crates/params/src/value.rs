@@ -15,6 +15,8 @@ pub enum ParamType {
     Media,
     /// Color stops along a direction ([`Gradient`]).
     Gradient,
+    /// A bezier path ([`BezierPath`](crate::BezierPath)).
+    Path,
 }
 
 /// One color of a [`Gradient`]: straight RGBA at `pos` (0 → 1 along the direction).
@@ -122,6 +124,7 @@ pub enum Value {
     /// media's picture to the effect as a second input.
     Media(Option<u64>),
     Gradient(Gradient),
+    Path(crate::BezierPath),
 }
 
 impl Value {
@@ -137,6 +140,14 @@ impl Value {
             Value::Text(_) => ParamType::Text,
             Value::Media(_) => ParamType::Media,
             Value::Gradient(_) => ParamType::Gradient,
+            Value::Path(_) => ParamType::Path,
+        }
+    }
+
+    pub fn as_path(&self) -> Option<&crate::BezierPath> {
+        match self {
+            Value::Path(p) => Some(p),
+            _ => None,
         }
     }
 
@@ -204,6 +215,7 @@ impl Value {
             Value::Vec3(v) => v.iter().all(|x| x.is_finite()),
             Value::Color(v) => v.iter().all(|x| x.is_finite()),
             Value::Gradient(g) => g.angle.is_finite() && g.stops.iter().all(|s| s.pos.is_finite() && s.color.iter().all(|x| x.is_finite())),
+            Value::Path(p) => p.is_finite(),
             _ => true,
         }
     }
@@ -236,6 +248,8 @@ impl Value {
             (Value::Gradient(a), Value::Gradient(b)) if a.stops.len() == b.stops.len() => {
                 Value::Gradient(a.lerp(b, t).expect("same stop count"))
             }
+            // Matched point by point (see `BezierPath::blend`); open or closed holds.
+            (Value::Path(a), Value::Path(b)) => Value::Path(a.blend(b, t)),
             _ if t >= 1.0 => other.clone(),
             _ => self.clone(),
         }
@@ -275,6 +289,7 @@ impl Value {
                     s.color.iter().for_each(|x| f(*x, out));
                 }
             }
+            Value::Path(p) => p.write_canonical(out),
         }
     }
 }

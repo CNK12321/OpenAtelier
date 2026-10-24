@@ -384,11 +384,12 @@ impl Editor {
     }
 
     /// Copies `items` (clips of the open sequence) into a new sequence, a compound clip,
-    /// keeping their tracks and spacing, moved to start at 0, at the open format. It's
+    /// keeping their tracks and spacing, moved to start at 0, at `format` (the format
+    /// being edited: its size, and the clips' settings for it, become the compound's). It's
     /// then media: it shows in the bin, can be added to the timeline and feeds effects
     /// that take a picture (a mask…). `nest`: the clips are also replaced by one clip
     /// playing it. One undo step. Returns the sequence and, when nesting, the new clip.
-    pub fn compound(&mut self, items: &[ItemId], nest: bool) -> Result<(SeqId, Option<ItemId>), EditError> {
+    pub fn compound(&mut self, items: &[ItemId], nest: bool, format: VariantId) -> Result<(SeqId, Option<ItemId>), EditError> {
         let s = self.sequence().clone();
         let chosen: Vec<(usize, &Item)> =
             s.tracks.iter().enumerate().flat_map(|(t, tr)| tr.items.iter().filter(|i| items.contains(&i.id)).map(move |i| (t, i))).collect();
@@ -397,7 +398,7 @@ impl Editor {
         let number = self.doc.project().sequences.len();
         let name = format!("Compound {number}");
         let id = SeqId(self.doc.alloc_id());
-        let active = s.active();
+        let active = s.variant(format).unwrap_or_else(|| s.active());
         let mut variant = FormatVariant { id: VariantId(self.doc.alloc_id()), name: active.name.clone(), size: active.size, overrides: BTreeMap::new() };
         let mut inner = Sequence::new(id, &name, s.rate, variant.clone());
         for (t, track) in s.tracks.iter().enumerate() {
@@ -582,9 +583,6 @@ impl Editor {
         keys
     }
 
-    /// Where Ctrl+←/→ stops on a clip, as frames of the timeline at `rate`, in order: its
-    /// first frame (the first that shows it), each keyframe's frame (`keys`: timeline
-    /// times) and its last frame (the one its end falls in, or just before).
     /// Which clip of a track Alt+← / Alt+→ goes to (`starts`: each clip's first frame, in
     /// order; `at`: the clip it goes from, if any; `now`: the playhead's frame): the next
     /// one, or the one before — back from inside a clip, that clip's own start first. On
@@ -599,6 +597,9 @@ impl Editor {
         }
     }
 
+    /// Where Ctrl+←/→ stops on a clip, as frames of the timeline at `rate`, in order: its
+    /// first frame (the first that shows it), each keyframe's frame (`keys`: timeline
+    /// times) and its last frame (the one its end falls in, or just before).
     pub fn clip_stops(it: &Item, keys: &[Time], rate: oa_time::FrameRate) -> Vec<i64> {
         let first = {
             let f = rate.frame_at(it.range.start);
@@ -1424,6 +1425,24 @@ mod tests {
         let secs = |v: Vec<Time>| v.into_iter().map(|t| t.as_seconds_f64()).collect::<Vec<_>>();
         assert_eq!(secs(Editor::clip_key_times(e.sequence(), &it, wide)), [11.0], "the one key inside the clip");
         assert_eq!(secs(Editor::clip_key_times(e.sequence(), &it, tall)), [10.0, 12.0], "the format's own keys");
+    }
+
+    /// A compound clip is made at the format being edited — its size, and the clips'
+    /// settings for it — not whichever format the timeline was last saved on.
+    #[test]
+    fn compound_clips_take_the_format_being_edited() {
+        let mut e = Editor::new();
+        let clip = e.add_text(Time::ZERO, "A", Time::from_seconds(2)).unwrap();
+        e.add_variant("vertical-9x16").unwrap();
+        let tall = e.sequence().variants[1].clone();
+        assert_ne!(e.sequence().active_variant, tall.id, "the timeline's own format is still the wide one");
+        let moved = Op::SetParam { seq: e.seq, item: clip, target: ParamTarget::VariantOverride(tall.id), param: ParamId::new(schema::POSITION), source: Some(ParamSource::Static(Value::Vec2([0.1, 0.2]))) };
+        e.doc.edit("move", vec![moved]).unwrap();
+        let (seq, _) = e.compound(&[clip], true, tall.id).unwrap();
+        let inner = e.doc.project().sequence(seq).unwrap();
+        assert_eq!(inner.active().size, tall.size, "tall, as edited");
+        let inside = &inner.tracks[0].items[0];
+        assert_eq!(inner.active().overrides.get(&inside.id).and_then(|o| o.get(schema::POSITION)), Some(&ParamSource::Static(Value::Vec2([0.1, 0.2]))), "with the clip's place in that format");
     }
 
     #[test]

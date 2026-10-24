@@ -53,6 +53,7 @@ impl App {
             wanted: None,
             png: Some(out.clone()),
             see_through: false,
+            cam: None,
         });
         Some(out)
     }

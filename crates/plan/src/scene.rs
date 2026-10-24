@@ -36,6 +36,16 @@ pub fn text_spec(values: &Evaluated) -> oa_text::TextSpec {
     }
 }
 
+/// What title `item` says and how it's set at `ctx` (`values`: its text values there):
+/// its words, or the number its Counter shows instead (see [`crate::characters`]).
+pub fn title_spec(item: &Item, values: &Evaluated, ctx: &oa_params::EvalContext) -> oa_text::TextSpec {
+    let mut spec = text_spec(values);
+    if let Some(text) = crate::characters::counter_text(item, ctx) {
+        spec.content = text;
+    }
+    spec
+}
+
 /// Native size of a layer's content (at clip-local context `ctx`) and the most it may be
 /// rasterized above 1:1.
 pub(crate) fn layer_native(
@@ -49,7 +59,7 @@ pub(crate) fn layer_native(
         ItemKind::Text => {
             let values = item.params.eval(schema::text(), variant.overrides.get(&item.id), ctx);
             // Text is vector: sharp at any scale.
-            Ok((oa_text::layout(&text_spec(&values)).size, 8.0))
+            Ok((oa_text::layout(&title_spec(item, &values, ctx)).size, 8.0))
         }
         ItemKind::Media { media } => {
             let info = project.media(*media).and_then(|m| m.info.as_ref());
@@ -234,8 +244,9 @@ fn on_letters(item: &Item, l: &Placement, variant: &FormatVariant, t: Time, p: [
     if item.kind != ItemKind::Text {
         return true;
     }
-    let values = item.params.eval(schema::text(), variant.overrides.get(&item.id), &item.eval_context(t));
-    let layout = oa_text::layout(&text_spec(&values));
+    let ctx = item.eval_context(t);
+    let values = item.params.eval(schema::text(), variant.overrides.get(&item.id), &ctx);
+    let layout = oa_text::layout(&title_spec(item, &values, &ctx));
     let Some([x, y]) = l.to_layer(p) else { return false };
     let room = layout.em * 0.2;
     // (A glyph's ink box can come with its y edges either way round.)

@@ -9,11 +9,13 @@
 //!   footage — required for masks and tracking data).
 
 mod curve;
+pub mod path;
 pub mod signal;
 mod value;
 
 pub use curve::{Curve, Ease, EaseDir, Interp, Keyframe, KeyframeAnchor};
 pub use signal::{SoundBand, SoundSource};
+pub use path::{BezierPath, PathPoint};
 pub use value::{Gradient, GradientStop, ParamType, Value};
 
 use oa_time::Time;
@@ -73,6 +75,16 @@ pub enum Unit {
     Decibels,
 }
 
+/// One number every point of a path parameter has (see [`ParamSchema::point_attrs`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PointAttr {
+    pub id: String,
+    pub default: f64,
+    /// The slider's range in the properties panel.
+    #[serde(default)]
+    pub range: Option<(f64, f64)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParamSchema {
     pub id: ParamId,
@@ -82,6 +94,10 @@ pub struct ParamSchema {
     pub animatable: bool,
     /// Soft UI range (values outside are allowed).
     pub range: Option<(f64, f64)>,
+    /// A path's numbers per point (a width, an offset), in order: each point of the
+    /// value carries its own, these defaults where it has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub point_attrs: Vec<PointAttr>,
     /// A number that only goes in steps of this much (counted from the range's low end):
     /// the slider snaps to them and marks each.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +124,7 @@ impl ParamSchema {
             animatable: true,
             range: None,
             step: None,
+            point_attrs: Vec::new(),
             options: Vec::new(),
             multiple: false,
             default_anchor: KeyframeAnchor::ClipStart,
@@ -117,6 +134,11 @@ impl ParamSchema {
     /// `v` on this parameter's steps, if it goes in steps (the nearest, counted from the
     /// range's low end); anything else as it is. A keyframed number with steps moves
     /// from one to the next rather than gliding.
+    /// A path parameter's per-point defaults, in order.
+    pub fn point_defaults(&self) -> Vec<f64> {
+        self.point_attrs.iter().map(|a| a.default).collect()
+    }
+
     pub fn stepped(&self, v: Value) -> Value {
         match (v, self.step) {
             (Value::Float(x), Some(step)) if step > 0.0 => {

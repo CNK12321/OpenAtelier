@@ -706,6 +706,47 @@ fn compound_clips_tile_the_background() {
     }
 }
 
+/// A multicam clip draws only the cam it shows — red until the cut at 4 s, blue after —
+/// and, switched back to a compound clip, all of its tracks again.
+#[test]
+fn multicam_clips_show_one_cam() {
+    let inner = SeqId(40);
+    let cut = |multicam: bool| {
+        let mut p = project(|clip| {
+            clip.kind = ItemKind::Nested { sequence: SeqId(40) };
+            clip.multicam = multicam;
+            let keys = vec![Keyframe::hold(secs(0), Value::Float(0.0)), Keyframe::hold(secs(4), Value::Float(1.0))];
+            clip.params.set(schema::CAM, ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, keys)));
+        });
+        let mut s = Sequence::new(inner, "Shoot", FrameRate::FPS_30, variant(VariantId(42), "landscape-16x9"));
+        for (n, color) in [(43u64, [1.0, 0.0, 0.0, 1.0]), (45, [0.0, 0.0, 1.0, 1.0])] {
+            let mut t = Track::new(TrackId(n), "cam", TrackKind::Video);
+            let mut solid = Item::new(ItemId(n + 1), "solid", ItemKind::Solid, TimeRange::new(secs(0), secs(10)));
+            solid.params.set(schema::SOLID_COLOR, ParamSource::Static(Value::Color(color)));
+            t.items.push(solid);
+            s.tracks.push(Arc::new(t));
+        }
+        p.sequences.insert(inner, Arc::new(s));
+        p
+    };
+    let solids = |p: &Project, at: i64| -> Vec<[f32; 4]> {
+        let g = plan(p, secs(at), PlanOptions::default()).graph;
+        find(&g, |op| matches!(op, NodeOp::Solid { .. })).iter().filter_map(|n| if let NodeOp::Solid { color, .. } = n.op { Some(color) } else { None }).filter(|c| c[3] > 0.0 && *c != [0.0, 0.0, 0.0, 1.0]).collect()
+    };
+    let multicam = cut(true);
+    assert_eq!(solids(&multicam, 1), [[1.0, 0.0, 0.0, 1.0]], "cam 1 before the cut");
+    assert_eq!(solids(&multicam, 6), [[0.0, 0.0, 1.0, 1.0]], "cam 2 after it");
+    assert_eq!(solids(&cut(false), 6).len(), 2, "a compound clip draws all its tracks");
+    // One cam of the compound itself, asked for (its filmstrip, its switcher tile).
+    let g = plan_frame(&multicam, inner, secs(6), &PlanOptions { cam: Some(1), ..Default::default() }, &Registry::with_builtins()).unwrap().graph;
+    let colors: Vec<[f32; 4]> = find(&g, |op| matches!(op, NodeOp::Solid { .. })).iter().filter_map(|n| if let NodeOp::Solid { color, .. } = n.op { Some(color) } else { None }).filter(|c| *c != [0.0, 0.0, 0.0, 1.0]).collect();
+    assert_eq!(colors, [[0.0, 0.0, 1.0, 1.0]], "cam 2 alone");
+    // Its stretches, and where they change.
+    let clip = &multicam.sequence(SEQ).unwrap().tracks[0].items[0];
+    assert_eq!(schema::cam_cut_times(clip), [secs(4)]);
+    assert_eq!(schema::cam_stretches(clip).iter().map(|(_, c)| *c).collect::<Vec<_>>(), [0, 1]);
+}
+
 /// The background's effects run on the background only (a canvas of its color when
 /// it's a plain color), under the clips; turned off, they're gone.
 #[test]
@@ -1021,6 +1062,30 @@ fn duplicates_take_the_effects_they_are_given() {
     assert_eq!(count("no effects"), (1, 1, 1));
 }
 
+/// A keyframed path reaches Bend Along Path's shader as it is at that moment: halfway
+/// between two keys, its points halfway — sampled along it, with its width.
+#[test]
+fn a_keyframed_path_reaches_the_shader_blended() {
+    let p = project(|clip| {
+        let mut fx = EffectInstance::new(EffectId(70), oa_graph::registry::BEND);
+        let flat = oa_params::BezierPath::through(&[[0.0, 0.2], [1.0, 0.2]]);
+        let low = oa_params::BezierPath::through(&[[0.0, 0.6], [1.0, 0.6]]);
+        let keys = vec![Keyframe::linear(secs(0), Value::Path(flat)), Keyframe::linear(secs(2), Value::Path(low))];
+        fx.params.set("path", ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, keys)));
+        clip.effects.push(fx);
+    });
+    let g = plan(&p, secs(1), PlanOptions::default()).graph;
+    let bend = find(&g, |op| matches!(op, NodeOp::Effect { type_id, .. } if &**type_id == oa_graph::registry::BEND))[0];
+    let NodeOp::Effect { uniforms, .. } = &bend.op else { unreachable!() };
+    // Sample count, closed, numbers; then (x, y, width, offset) per sample.
+    assert_eq!(uniforms[0] as usize, oa_params::BezierPath::SAMPLES);
+    let first = &uniforms[3..7];
+    assert!((first[0] - 0.0).abs() < 1e-4 && (first[1] - 0.4).abs() < 1e-4, "halfway down: {first:?}");
+    assert!((first[2] - 0.3).abs() < 1e-4, "the default width: {first:?}");
+    // The layer's bounds reach out to take in the band (it can leave the clip).
+    assert!(bend.bounds.y1 >= g.node(bend.inputs[0]).bounds.y1);
+}
+
 /// A Duplicate's own effects run after the ones its copy takes from the clip, or before
 /// them; solo (the viewer, adjusting the copy) draws the copy without the clip.
 #[test]
@@ -1197,4 +1262,103 @@ fn effects_used_with_a_blend_mix_with_what_went_in() {
     assert_eq!(passes(Some(("screen", 100.0))), ["oa.color.invert", "blend 3"], "screen is the fourth mode");
     assert_eq!(passes(Some(("add", 40.0))), ["oa.color.invert", "blend 1", "mix 0.4"]);
     assert_eq!(passes(Some(("difference", 100.0))).last().map(String::as_str), Some("blend 6"), "a mode that reads what's under it");
+}
+
+/// The text node's letters showing other characters, and its words.
+fn slots_at(p: &Project, t: Time) -> (Vec<oa_graph::SlotSwap>, String, Vec<String>) {
+    let g = plan(p, t, PlanOptions::default()).graph;
+    let n = find(&g, |op| matches!(op, NodeOp::Text { .. }))[0].clone();
+    let NodeOp::Text { slots, spec, chain, .. } = n.op else { unreachable!() };
+    (slots, spec.content.clone(), chain.iter().map(|e| e.type_id.to_string()).collect())
+}
+
+#[test]
+fn a_counter_shows_its_number_formatted_and_rolls_its_digits() {
+    let counting = |style: &str, value: f64| {
+        with_title(|t| {
+            let mut fx = EffectInstance::new(EffectId(50), oa_graph::registry::COUNTER);
+            fx.params.set("value", ParamSource::Static(Value::Float(value)));
+            fx.params.set("decimals", ParamSource::Static(Value::Float(1.0)));
+            fx.params.set("prefix", ParamSource::Static(Value::Text("$".into())));
+            fx.params.set("style", ParamSource::Static(Value::Enum(style.into())));
+            t.effects.push(fx);
+        })
+    };
+    let p = counting("count", 1234.56);
+    let (slots, content, chain) = slots_at(&p, secs(1));
+    assert_eq!(content, "$1,234.6");
+    assert!(slots.is_empty() && chain.is_empty(), "{slots:?} {chain:?}");
+    // The viewer and hit testing lay out the same words.
+    let v = p.sequence(SEQ).unwrap().variant(WIDE).unwrap();
+    let wide = oa_plan::scene::layers_at(&p, SEQ, v, secs(1)).pop().unwrap().native[0];
+    let plain = with_title(|_| {});
+    let narrow = oa_plan::scene::layers_at(&plain, SEQ, plain.sequence(SEQ).unwrap().variant(WIDE).unwrap(), secs(1)).pop().unwrap().native[0];
+    assert!(wide > narrow, "{wide} vs {narrow}");
+
+    // Rolling, 19.95 shows 19.9 with the last digit half-way to 0 — and so, as each
+    // place below is at 9, the 9 and the 1 above it.
+    let (slots, content, _) = slots_at(&counting("roll", 19.95), secs(1));
+    assert_eq!(content, "$19.9");
+    let turning: Vec<(u32, Option<char>)> = slots.iter().map(|s| (s.index, s.draws.get(1).and_then(|d| d.ch))).collect();
+    assert_eq!(turning, vec![(4, Some('0')), (2, Some('0')), (1, Some('2'))], "{slots:?}");
+    assert!(slots.iter().all(|s| s.clip && s.draws.len() == 2));
+}
+
+#[test]
+fn characters_settle_into_the_text_as_an_intro() {
+    let p = with_title(|t| {
+        let mut fx = EffectInstance::new(EffectId(50), oa_graph::registry::CHARACTERS);
+        fx.params.set("style", ParamSource::Static(Value::Enum("roll".into())));
+        fx.role = EffectRole::In { duration: secs(2) };
+        t.effects.push(fx);
+    });
+    let (start, content, chain) = slots_at(&p, Time::from_seconds_f64(0.05));
+    assert_eq!(content, "Hello");
+    assert!(chain.is_empty(), "drawn by the text pass itself: {chain:?}");
+    assert_eq!(start.len(), 5, "every letter starts as another: {start:?}");
+    // Left to right: half-way, the first letters are done and the last still going.
+    let (mid, _, _) = slots_at(&p, secs(1));
+    assert!(!mid.is_empty() && mid.len() < 5 && mid.iter().all(|s| s.index > 0), "{mid:?}");
+    let (done, _, _) = slots_at(&p, secs(3));
+    assert!(done.is_empty());
+}
+
+#[test]
+fn characters_change_the_text_away_as_an_outro() {
+    let p = with_title(|t| {
+        let mut fx = EffectInstance::new(EffectId(50), oa_graph::registry::CHARACTERS);
+        fx.params.set("from", ParamSource::Static(Value::Enum("blank".into())));
+        fx.params.set("style", ParamSource::Static(Value::Enum("flip".into())));
+        fx.params.set("stagger", ParamSource::Static(Value::Float(0.0)));
+        fx.params.set("scramble", ParamSource::Static(Value::Float(0.0)));
+        fx.role = EffectRole::Out { duration: secs(2) };
+        t.effects.push(fx);
+    });
+    assert!(slots_at(&p, secs(1)).0.is_empty(), "the plain title before the outro");
+    // A quarter in, every flap is half closed on its own letter.
+    let (slots, _, _) = slots_at(&p, Time::from_seconds_f64(3.5));
+    assert_eq!(slots.len(), 5, "{slots:?}");
+    assert!(slots.iter().all(|s| s.draws.len() == 1 && s.draws[0].ch.is_none() && (s.draws[0].scale_y - 0.5).abs() < 1e-4), "{slots:?}");
+    // At the very end, nothing is left.
+    let (slots, _, _) = slots_at(&p, Time::from_seconds_f64(4.99));
+    assert!(slots.len() == 5 && slots.iter().all(|s| s.draws.is_empty()), "{slots:?}");
+}
+
+/// Characters is an intro or an outro only.
+#[test]
+fn characters_is_a_transition() {
+    let registry = Registry::with_builtins();
+    let d = registry.effect(oa_graph::registry::CHARACTERS).unwrap();
+    assert_eq!(d.usage, oa_graph::registry::EffectUsage::InOut);
+    assert!(d.off.is_empty());
+}
+
+#[test]
+fn the_counters_parameters_match_its_manifest() {
+    let registry = Registry::with_builtins();
+    let d = registry.effect(oa_graph::registry::COUNTER).unwrap();
+    let ours: Vec<(String, Value, Vec<String>)> = oa_plan::characters::counter_schema().iter().map(|s| (s.id.as_str().to_string(), s.default.clone(), s.options.clone())).collect();
+    let manifest: Vec<(String, Value, Vec<String>)> = d.params.iter().map(|s| (s.id.as_str().to_string(), s.default.clone(), s.options.clone())).collect();
+    assert_eq!(ours, manifest);
+    assert!(registry.effect(oa_graph::registry::CHARACTERS).is_some());
 }

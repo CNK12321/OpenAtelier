@@ -80,8 +80,8 @@ impl Default for TimelineView {
 
 #[derive(Clone, Copy)]
 pub(crate) enum Menu {
-    /// The selected clips.
-    Clips,
+    /// The selected clips, right-clicked at this time.
+    Clips(Time),
     Track(TrackId),
     /// Empty space at this time, on this track (if over one).
     Empty(Time, Option<TrackId>),
@@ -784,7 +784,7 @@ impl App {
                 if !self.selected.contains(&b.id) {
                     self.select_clip(b.id, false);
                 }
-                Some(Menu::Clips)
+                Some(Menu::Clips(time_at(pos.x)))
             } else {
                 Some(Menu::Empty(time_at(pos.x), row_at(pos.y).filter(|_| !in_ruler(pos)).map(|r| rows[r].0)))
             };
@@ -792,7 +792,7 @@ impl App {
         // Clicks inside don't close it (every entry closes it itself), so the name fields
         // for tracks can be clicked into and typed in.
         egui::Popup::context_menu(&response).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| match self.timeline_view.menu {
-            Some(Menu::Clips) => self.clip_menu(ui),
+            Some(Menu::Clips(at)) => self.clip_menu(ui, at),
             Some(Menu::Track(track)) => self.track_menu(ui, track),
             Some(Menu::Empty(at, track)) => self.empty_menu(ui, at, track),
             Some(Menu::Key(item, key)) => self.key_menu(ui, item, key),
@@ -916,20 +916,55 @@ impl App {
                     (false, _) => r.height(),
                     (true, false) => 0.0,
                 };
-                if picture && let Some(strip) = self.compound_strip(ui.ctx(), seq) {
+                if picture {
                     let pic = egui::Rect::from_min_max(r.min, egui::pos2(r.right(), r.bottom() - wave_h));
-                    let tile = (pic.height() * strip.aspect).max(8.0);
-                    let visible = painter.clip_rect();
-                    for x in shown_tiles([r.left(), r.right()], tile, [visible.left(), visible.right()]) {
-                        let at = source_in + (time_at(x).as_seconds_f64() - b.start) * speed;
-                        let dest = egui::Rect::from_min_size(egui::pos2(x, pic.top()), egui::vec2(tile, pic.height()));
-                        painter.image(strip.texture.id(), dest, strip.uv(at), egui::Color32::from_gray(190));
+                    // A multicam clip: each stretch from the filmstrip of the cam it shows.
+                    let stretches: Vec<(f32, f32, Option<usize>)> = match self.editor.item(b.id).filter(|i| i.multicam) {
+                        Some(it) => {
+                            let x_at = |t: Time| r.left() + ((t - it.range.start).as_seconds_f64() / span) as f32 * lane.width();
+                            oa_doc::schema::cam_stretches(it).into_iter().map(|(s, cam)| (x_at(s.start), x_at(s.end()), Some(cam))).collect()
+                        }
+                        None => vec![(r.left(), r.right(), None)],
+                    };
+                    let mut drew = false;
+                    for (x0, x1, cam) in stretches {
+                        let Some(strip) = self.cam_strip(ui.ctx(), seq, cam) else { continue };
+                        let painter = painter.with_clip_rect(painter.clip_rect().intersect(egui::Rect::from_x_y_ranges(x0..=x1, pic.y_range())));
+                        let tile = (pic.height() * strip.aspect).max(8.0);
+                        let visible = painter.clip_rect();
+                        for x in shown_tiles([x0, x1], tile, [visible.left(), visible.right()]) {
+                            let at = source_in + (time_at(x).as_seconds_f64() - b.start) * speed;
+                            let dest = egui::Rect::from_min_size(egui::pos2(x, pic.top()), egui::vec2(tile, pic.height()));
+                            painter.image(strip.texture.id(), dest, strip.uv(at), egui::Color32::from_gray(190));
+                        }
+                        drew = true;
                     }
-                    painter.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 14.0)), 0.0, egui::Color32::from_black_alpha(90));
+                    if drew {
+                        painter.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 14.0)), 0.0, egui::Color32::from_black_alpha(90));
+                    }
                 }
                 if audible {
                     let band = egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - wave_h), r.max);
                     self.paint_compound_sound(ui.ctx(), &painter, &sound, band, |x| source_in + (time_at(x).as_seconds_f64() - b.start) * speed);
+                }
+            }
+            // A multicam clip: a white line at each cut, and the cam each stretch shows.
+            if let Some(it) = self.editor.item(b.id).filter(|i| i.multicam) {
+                let painter = clip_painter.with_clip_rect(b.rect.shrink(1.0).intersect(lane));
+                let r = b.rect;
+                // Along the clip as drawn (it may be being dragged).
+                let x_at = |t: Time| r.left() + ((t - it.range.start).as_seconds_f64() / span) as f32 * lane.width();
+                for (stretch, cam) in oa_doc::schema::cam_stretches(it) {
+                    let (x0, x1) = (x_at(stretch.start), x_at(stretch.end()));
+                    if stretch.start > it.range.start {
+                        painter.line_segment([egui::pos2(x0, r.top()), egui::pos2(x0, r.bottom())], egui::Stroke::new(1.5, egui::Color32::WHITE));
+                    }
+                    if x1 - x0 > 30.0 {
+                        let label = painter.layout_no_wrap(trf("Cam {n}", &[("n", &(cam + 1).to_string())]), egui::FontId::proportional(10.0), egui::Color32::WHITE);
+                        let at = egui::pos2(x0 + 4.0, r.bottom() - label.size().y - 3.0);
+                        painter.rect_filled(egui::Rect::from_min_size(at, label.size()).expand2(egui::vec2(3.0, 1.0)), 3.0, egui::Color32::from_black_alpha(140));
+                        painter.galley(at, label, egui::Color32::WHITE);
+                    }
                 }
             }
             // Intro and outro ramps: the clip rising from / falling to its edges.
@@ -1230,6 +1265,12 @@ impl App {
     /// A compound clip's filmstrip — rendered from what's in it, on the preview thread,
     /// and made again after it's edited (the last one stays up meanwhile).
     pub(crate) fn compound_strip(&mut self, ctx: &egui::Context, seq: oa_doc::SeqId) -> Option<crate::previews::Strip> {
+        self.cam_strip(ctx, seq, None)
+    }
+
+    /// The filmstrip of one cam of compound `seq` (`None`: all of it), as a multicam clip
+    /// showing that cam draws it.
+    pub(crate) fn cam_strip(&mut self, ctx: &egui::Context, seq: oa_doc::SeqId, cam: Option<usize>) -> Option<crate::previews::Strip> {
         let project = self.editor.doc.snapshot();
         let sequence = project.sequences.get(&seq)?;
         // What it is now: a new sequence value (an edit inside it) is a new version.
@@ -1237,7 +1278,7 @@ impl App {
         let frames = (sequence.duration().as_seconds_f64().ceil() as usize).clamp(1, crate::previews::COMPOUND_FRAMES);
         let (worker, registry) = (&self.preview_worker, self.registry.clone());
         self.clip_previews
-            .compound_strip(ctx, seq, version, |reply| {
+            .compound_strip(ctx, seq, cam, version, |reply| {
                 worker.strip(crate::preview_worker::StripRequest {
                     seq,
                     version,
@@ -1246,6 +1287,7 @@ impl App {
                     frames,
                     frame_w: crate::previews::FRAME_W,
                     cols: crate::previews::COLS,
+                    cam,
                     reply,
                 })
             })
@@ -1253,7 +1295,7 @@ impl App {
     }
 
     /// Right-click on clips: edits for the whole selection.
-    fn clip_menu(&mut self, ui: &mut egui::Ui) {
+    fn clip_menu(&mut self, ui: &mut egui::Ui, at: Time) {
         let n = self.selected.len();
         let has = n > 0;
         ui.label(egui::RichText::new(if n == 1 { "1 clip".to_string() } else { format!("{n} clips") }).small().weak());
@@ -1336,6 +1378,10 @@ impl App {
         {
             self.break_compounds();
             ui.close();
+        }
+        // Multi-cam (Settings → Features): make it multicam, switch or extract a cam.
+        if let Some(id) = compound {
+            self.multicam_menu(ui, id, at);
         }
         ui.separator();
         if item(ui, "Copy effects", "", self.selection.is_some_and(|id| self.editor.item(id).is_some_and(|i| !i.effects.is_empty()))) {

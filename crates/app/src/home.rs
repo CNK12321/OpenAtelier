@@ -97,6 +97,22 @@ struct Card {
 
 impl App {
     pub(crate) fn home(&mut self, ui: &mut egui::Ui) {
+        // Behind it all: a ghost of a timeline playing (an interface effect).
+        if self.settings.ui_effects {
+            crate::backdrop::ghost_timeline(ui, ui.max_rect());
+            // And a soft backing under the name and the tabs.
+            let top = ui.max_rect();
+            crate::backdrop::backing(ui, egui::Rect::from_center_size(egui::pos2(top.center().x, top.top() + 78.0), egui::vec2(480.0, 120.0)));
+        }
+        // Settings, in the top right corner (as in the editor: Ctrl+, too).
+        {
+            let page = ui.max_rect();
+            let corner = egui::Rect::from_min_max(egui::pos2(page.right() - 180.0, page.top() + 12.0), egui::pos2(page.right() - 12.0, page.top() + 12.0 + crate::style::ICON));
+            let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(corner).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            if crate::icons::flat_button(&mut ui, crate::icons::SETTINGS, tr("Settings")).on_hover_text(tr("Settings (Ctrl+,)")).clicked() {
+                self.settings_open = true;
+            }
+        }
         ui.add_space(22.0);
         // The mark and the name, side by side, centered.
         let title = egui::RichText::new(tr("OpenAtelier")).size(crate::style::TITLE * 1.5).strong();
@@ -139,6 +155,11 @@ impl App {
         }
         // One centered column, at most 760 px wide. The inner ui keeps a top-down layout
         // of its own — inheriting the centering row's would lay everything out sideways.
+        if self.settings.ui_effects {
+            let area = ui.available_rect_before_wrap();
+            let width = area.width().min(760.0);
+            crate::backdrop::backing(ui, egui::Rect::from_center_size(egui::pos2(area.center().x, area.center().y), egui::vec2(width + 28.0, area.height())));
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let width = ui.available_width().min(760.0);
             let left = ((ui.available_width() - width) / 2.0).max(0.0);

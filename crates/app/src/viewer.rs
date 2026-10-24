@@ -469,6 +469,8 @@ impl App {
         let masking = self.mask_viewer(ui, &response, rect, zoom, available);
         // Its tools, down the left of the viewer (over the mask, taking clicks first).
         self.mask_tool_strip(ui, available);
+        // A multicam clip selected: its cams down the right, to switch between.
+        self.cam_switcher(ui, available);
         self.roto_banner(ui, available);
         if masking {
             self.viewer_canvas = Some((available, rect));
@@ -494,6 +496,11 @@ impl App {
         // Its effects' points (a Swirl's center…), grabbed before anything else.
         let effect_points = selected.as_ref().map(|p| self.effect_points(p.item, t)).unwrap_or_default();
         let effect_point = |pointer: egui::Pos2| -> Option<usize> { crate::points::point_near(&effect_points, selected.as_ref()?, &to_screen, pointer) };
+        // Its paths (Bend Along Path…): their points, handles, width ticks and curve,
+        // grabbed before anything else.
+        let path_targets = selected.as_ref().map(|p| self.path_targets(p.item, t)).unwrap_or_default();
+        let path_pick = self.path_pick.clone();
+        let path_at = |pointer: egui::Pos2| -> Option<(usize, crate::paths::PathGrab)> { App::path_hit(path_pick.as_ref(), &path_targets, selected.as_ref()?, &to_screen, pointer) };
         // A layer with a Surface is only hit inside its warped mesh (worked out up front:
         // the closure can't hold on to `self`).
         let meshes: Vec<(oa_doc::ItemId, scene::Placement, crate::surface::Surface)> = variant
@@ -514,11 +521,24 @@ impl App {
         let mut hovered_layer = None;
         let mut hovered_point = None;
         let mut hovered_effect_point = None;
-        if let Some(pos) = response.hover_pos().filter(|_| self.viewer_drag.is_none() && self.surface_drag.is_none() && self.point_drag.is_none()) {
+        let mut hovered_path = None;
+        if let Some(pos) = response.hover_pos().filter(|_| self.viewer_drag.is_none() && self.surface_drag.is_none() && self.point_drag.is_none() && self.path_drag.is_none()) {
             let c = to_canvas(pos);
+            hovered_path = path_at(pos);
             hovered_effect_point = effect_point(pos);
             hovered_point = surface_point(pos);
             match pick(c) {
+                _ if hovered_path.is_some() => {
+                    use crate::paths::PathGrab;
+                    let (icon, tip) = match hovered_path.map(|h| h.1) {
+                        Some(PathGrab::Curve(..)) => (egui::CursorIcon::Crosshair, tr("Drag to bend the curve · click to add a point here")),
+                        Some(PathGrab::Width(_)) => (egui::CursorIcon::Grab, tr("Drag to widen or narrow the band here")),
+                        Some(PathGrab::Handle(..)) => (egui::CursorIcon::Grab, tr("Drag to shape the curve through this point")),
+                        _ => (egui::CursorIcon::Grab, tr("Drag to move · double-click for a sharp or smooth corner · Delete to take it away")),
+                    };
+                    ui.ctx().set_cursor_icon(icon);
+                    response.clone().on_hover_text(tip);
+                }
                 _ if hovered_effect_point.is_some() => {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                     if let Some(e) = hovered_effect_point.and_then(|i| effect_points.get(i)) {
@@ -670,6 +690,10 @@ impl App {
         if response.drag_started_by(egui::PointerButton::Primary) && self.crop_mode.is_none() && !text_pointer {
             let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
             if let (Some(origin), Some(p)) = (origin, selected.as_ref())
+                && let Some((k, grab)) = path_at(origin)
+            {
+                self.begin_path_drag(p, &path_targets[k], grab, to_canvas(origin));
+            } else if let (Some(origin), Some(p)) = (origin, selected.as_ref())
                 && let Some(i) = effect_point(origin)
             {
                 self.begin_point_drag(p, &effect_points[i], to_canvas(origin));
@@ -795,8 +819,36 @@ impl App {
         if !ui.input(|i| i.pointer.primary_down()) && self.point_drag.take().is_some() {
             self.editor.doc.seal();
         }
+        if let (Some(drag), Some(p), Some(pos)) = (self.path_drag.clone(), selected.as_ref(), response.interact_pointer_pos())
+            && response.dragged_by(egui::PointerButton::Primary)
+            && drag.item == p.item
+        {
+            self.drag_path(&drag, p, to_canvas(pos));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        if !ui.input(|i| i.pointer.primary_down()) && self.path_drag.take().is_some() {
+            self.editor.doc.seal();
+        }
+        // A click on a path: a point picks it, the curve gets a point; a double-click
+        // on a point turns it sharp or smooth.
+        let mut path_clicked = false;
+        if (response.clicked() || response.double_clicked())
+            && !text_pointer
+            && let (Some(pos), Some(p)) = (response.interact_pointer_pos(), selected.as_ref())
+            && let Some((k, grab)) = path_at(pos)
+        {
+            path_clicked = true;
+            match grab {
+                crate::paths::PathGrab::Point(i) if response.double_clicked() => self.toggle_corner(p, &path_targets[k], i),
+                _ if response.double_clicked() => {}
+                _ => {
+                    self.click_path(p, &path_targets[k], grab);
+                }
+            }
+        }
         if response.clicked()
             && !text_pointer
+            && !path_clicked
             && let Some(pos) = response.interact_pointer_pos()
         {
             let c = to_canvas(pos);
@@ -817,6 +869,7 @@ impl App {
         // crop it.
         if response.double_clicked()
             && !text_pointer
+            && !path_clicked
             && let Some(pos) = response.interact_pointer_pos()
             && let Some(id) = hit(to_canvas(pos))
         {
@@ -880,6 +933,18 @@ impl App {
         if let Some(p) = current.as_ref().filter(|p| self.crop_mode != Some(p.item)) {
             let points = self.effect_points(p.item, t);
             self.paint_points(&painter, p, &points, &to_screen, hovered_effect_point);
+            let paths = self.path_targets(p.item, t);
+            if !paths.is_empty() {
+                self.paint_paths(&painter, p, &paths, &to_screen, hovered_path);
+                // What to do, along the top while there's a path to edit.
+                if self.path_drag.is_none() {
+                    let text = tr("Drag the curve to bend it · click it to add a point · double-click a point for a sharp or smooth corner");
+                    let galley = painter.layout_no_wrap(text.to_string(), egui::FontId::proportional(12.0), egui::Color32::WHITE);
+                    let at = egui::pos2(available.center().x - galley.size().x / 2.0, available.top() + 8.0);
+                    painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(10.0, 5.0)), 6.0, egui::Color32::from_black_alpha(170));
+                    painter.galley(at, galley, egui::Color32::WHITE);
+                }
+            }
         }
         if let Some(id) = self.canvas_text.as_ref().map(|c| c.item) {
             match visible(id) {
@@ -912,7 +977,7 @@ impl App {
         let variant = self.editor.sequence().variant(self.variant_id())?;
         let ctx = it.eval_context(t);
         let values = it.params.eval(oa_doc::schema::text(), variant.overrides.get(&item), &ctx);
-        Some(oa_text::layout(&scene::text_spec(&values)))
+        Some(oa_text::layout(&scene::title_spec(it, &values, &ctx)))
     }
 
     /// Stops typing into the title (one undo step for the whole session).

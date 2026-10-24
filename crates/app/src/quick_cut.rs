@@ -142,6 +142,7 @@ impl App {
             wanted: None,
             png: None,
             see_through: false,
+            cam: None,
         });
         if let Some(q) = self.bin.quick_cut.as_mut() {
             q.asked = Some(key);

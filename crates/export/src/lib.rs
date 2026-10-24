@@ -81,7 +81,7 @@ pub fn audio_mix(
     audio_path: impl Fn(oa_doc::MediaId) -> Option<std::path::PathBuf>,
 ) -> (Vec<oa_audio::AudioClip>, Vec<oa_audio::AudioBus>, Vec<oa_doc::ItemId>) {
     let (mut clips, mut buses, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
-    collect_audio(project, seq, &audio_path, 0, &mut clips, &mut buses, &mut skipped);
+    collect_audio(project, seq, &audio_path, 0, &|_| true, &mut clips, &mut buses, &mut skipped);
     clips.sort_by_key(|c| c.range.start);
     (clips, buses, skipped)
 }
@@ -105,18 +105,22 @@ fn sound_effects(item: &oa_doc::Item) -> Vec<oa_audio::AudioEffect> {
         .collect()
 }
 
+/// The sound of `seq`'s tracks that `keep` takes (all of them, but inside a multicam
+/// clip, one cam's or its other tracks).
+#[allow(clippy::too_many_arguments)]
 fn collect_audio(
     project: &Project,
     seq: SeqId,
     audio_path: &dyn Fn(oa_doc::MediaId) -> Option<std::path::PathBuf>,
     depth: usize,
+    keep: &dyn Fn(&oa_doc::Track) -> bool,
     clips: &mut Vec<oa_audio::AudioClip>,
     buses: &mut Vec<oa_audio::AudioBus>,
     skipped: &mut Vec<oa_doc::ItemId>,
 ) {
     let Some(s) = project.sequence(seq) else { return };
     use oa_doc::ClipEnd;
-    for track in s.tracks.iter().filter(|t| t.enabled) {
+    for track in s.tracks.iter().filter(|t| t.enabled && keep(t)) {
         let layer = sound_layer(s, track);
         if track.effects {
             // An audio effect track's containers (inside a compound clip, they'd have to
@@ -256,12 +260,11 @@ fn nested_audio(
     );
     let outer = |tau: Time| item.range.start + Time::from_seconds_f64((tau - item.time_map.source_in).as_seconds_f64() / k);
     let squeeze = |d: Time| Time::from_seconds_f64(d.as_seconds_f64() / k);
-    let mut inner = Vec::new();
-    let mut inner_buses = Vec::new();
-    collect_audio(project, sequence, audio_path, depth + 1, &mut inner, &mut inner_buses, skipped);
     let (lo, hi) = (item.range.start, item.range.end());
     // The same sequence can be used more than once: keep the mixer's ids apart.
     let rekey = |id: u64| id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ item.id.0;
+    // A clip heard in several stretches (a multicam clip's cam): each its own id.
+    let vary = |id: u64, w: usize| if w == 0 { id } else { id ^ (w as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93) };
     // The compound clip's own volume and fades, over everything inside it.
     let own = oa_audio::OuterGain {
         gain_db: item.params.get(oa_doc::schema::AUDIO_GAIN).cloned().unwrap_or(oa_params::ParamSource::Static(oa_params::Value::Float(0.0))),
@@ -272,74 +275,107 @@ fn nested_audio(
         fade_out: fades[1],
     };
     let has_own = item.params.get(oa_doc::schema::AUDIO_GAIN).is_some() || fades != [Time::ZERO; 2];
-    for mut b in inner_buses {
-        let (start, end) = (outer(b.range.start).max(lo), outer(b.range.end()).min(hi));
-        if end <= start {
-            continue;
+    // What's heard when: everything throughout — or, in a multicam clip, its tracks
+    // that aren't cams (its audio tracks) throughout, and each cam's own sound only
+    // while it shows.
+    let cams: Vec<oa_doc::TrackId> = if item.multicam { project.sequence(sequence).map(|s| s.cams().iter().map(|t| t.id).collect()).unwrap_or_default() } else { Vec::new() };
+    let mut groups: Vec<Heard> = vec![(None, vec![(lo, hi)])];
+    if item.multicam {
+        let stretches = oa_doc::schema::cam_stretches(item);
+        for (c, id) in cams.iter().enumerate() {
+            let windows: Vec<(Time, Time)> = stretches.iter().filter(|(_, cam)| *cam == c).map(|(r, _)| (r.start.max(lo), r.end().min(hi))).filter(|(a, b)| b > a).collect();
+            if !windows.is_empty() {
+                groups.push((Some(*id), windows));
+            }
         }
-        b.range = oa_time::TimeRange::new(start, end - start);
-        b.id = rekey(b.id);
-        if let Some(m) = &mut b.members {
-            m.iter_mut().for_each(|id| *id = rekey(*id));
-        }
-        buses.push(b);
     }
-    for mut c in inner {
-        let mut start = outer(c.range.start);
-        let mut end = outer(c.range.end());
-        if k != 1.0 {
-            c.speed *= k;
-            // A ramp inside runs k times as fast too.
-            if let Some(r) = c.ramp.take() {
-                let dur = c.range.duration.as_seconds_f64() / k;
-                c.ramp = Some(std::sync::Arc::new(oa_audio::SpeedRamp::sample(dur, |x| r.offset_at(x * k))));
-            }
-            c.keep_pitch = keep_pitch;
-            c.fade_in = squeeze(c.fade_in);
-            c.fade_out = squeeze(c.fade_out);
-            c.length = squeeze(c.length);
-            c.clock_rate *= k;
-        }
-        c.clock_start = outer(c.clock_start);
-        // The compound clips it was already inside move along with it.
-        for o in &mut c.outer {
-            let (s, e) = (outer(o.range.start), outer(o.range.end()));
-            o.range = oa_time::TimeRange::new(s, e - s);
-            o.clock_start = outer(o.clock_start);
-            o.clock_rate *= k;
-            o.fade_in = squeeze(o.fade_in);
-            o.fade_out = squeeze(o.fade_out);
-        }
-        if has_own {
-            c.outer.push(own.clone());
-        }
-        if start < lo {
-            let cut = (lo - start).as_seconds_f64();
-            match c.ramp.take() {
-                // A ramp: in from where it had got to, and on from there.
-                Some(r) => {
-                    let at = r.offset_at(cut);
-                    c.source_in += Time::from_seconds_f64(at);
-                    let rest = (end - lo).as_seconds_f64();
-                    c.ramp = Some(std::sync::Arc::new(oa_audio::SpeedRamp::sample(rest, |x| r.offset_at(cut + x) - at)));
+    for (group, windows) in groups {
+        let keep = |t: &oa_doc::Track| match group {
+            Some(cam) => t.id == cam,
+            None => !cams.contains(&t.id),
+        };
+        let mut inner = Vec::new();
+        let mut inner_buses = Vec::new();
+        collect_audio(project, sequence, audio_path, depth + 1, &keep, &mut inner, &mut inner_buses, skipped);
+        for (w, &(wlo, whi)) in windows.iter().enumerate() {
+            for mut b in inner_buses.iter().cloned() {
+                let (start, end) = (outer(b.range.start).max(wlo), outer(b.range.end()).min(whi));
+                if end <= start {
+                    continue;
                 }
-                None => c.source_in += Time::from_seconds_f64(cut * c.speed),
+                b.range = oa_time::TimeRange::new(start, end - start);
+                b.id = vary(rekey(b.id), w);
+                if let Some(m) = &mut b.members {
+                    m.iter_mut().for_each(|id| *id = vary(rekey(*id), w));
+                }
+                buses.push(b);
             }
-            c.fade_in = Time::ZERO;
-            start = lo;
+            for mut c in inner.iter().cloned() {
+                let mut start = outer(c.range.start);
+                let mut end = outer(c.range.end());
+                if k != 1.0 {
+                    c.speed *= k;
+                    // A ramp inside runs k times as fast too.
+                    if let Some(r) = c.ramp.take() {
+                        let dur = c.range.duration.as_seconds_f64() / k;
+                        c.ramp = Some(std::sync::Arc::new(oa_audio::SpeedRamp::sample(dur, |x| r.offset_at(x * k))));
+                    }
+                    c.keep_pitch = keep_pitch;
+                    c.fade_in = squeeze(c.fade_in);
+                    c.fade_out = squeeze(c.fade_out);
+                    c.length = squeeze(c.length);
+                    c.clock_rate *= k;
+                }
+                c.clock_start = outer(c.clock_start);
+                // The compound clips it was already inside move along with it.
+                for o in &mut c.outer {
+                    let (s, e) = (outer(o.range.start), outer(o.range.end()));
+                    o.range = oa_time::TimeRange::new(s, e - s);
+                    o.clock_start = outer(o.clock_start);
+                    o.clock_rate *= k;
+                    o.fade_in = squeeze(o.fade_in);
+                    o.fade_out = squeeze(o.fade_out);
+                }
+                if has_own {
+                    c.outer.push(own.clone());
+                }
+                if start < wlo {
+                    let cut = (wlo - start).as_seconds_f64();
+                    match c.ramp.take() {
+                        // A ramp: in from where it had got to, and on from there.
+                        Some(r) => {
+                            let at = r.offset_at(cut);
+                            c.source_in += Time::from_seconds_f64(at);
+                            let rest = (end - wlo).as_seconds_f64();
+                            c.ramp = Some(std::sync::Arc::new(oa_audio::SpeedRamp::sample(rest, |x| r.offset_at(cut + x) - at)));
+                        }
+                        None => c.source_in += Time::from_seconds_f64(cut * c.speed),
+                    }
+                    // Cut in at a cam cut: a moment's fade, so it doesn't click.
+                    c.fade_in = if wlo > lo { CAM_CUT_FADE } else { Time::ZERO };
+                    start = wlo;
+                }
+                if end > whi {
+                    end = whi;
+                    c.fade_out = if whi < hi { CAM_CUT_FADE } else { Time::ZERO };
+                }
+                if end <= start {
+                    continue;
+                }
+                c.range = oa_time::TimeRange::new(start, end - start);
+                c.id = vary(rekey(c.id), w);
+                clips.push(c);
+            }
         }
-        if end > hi {
-            end = hi;
-            c.fade_out = Time::ZERO;
-        }
-        if end <= start {
-            continue;
-        }
-        c.range = oa_time::TimeRange::new(start, end - start);
-        c.id = rekey(c.id);
-        clips.push(c);
     }
 }
+
+/// What of a compound clip is heard when: which of its tracks (`None`: all, or in a
+/// multicam clip those that aren't cams; else that cam's) and over which stretches.
+type Heard = (Option<oa_doc::TrackId>, Vec<(Time, Time)>);
+
+/// How long a multicam clip's sound fades across a cam cut (just enough not to click).
+const CAM_CUT_FADE: Time = Time::from_flicks(oa_time::FLICKS_PER_SECOND / 200);
 
 /// Where encoded frames go. One call per frame, in order.
 pub trait VideoSink {
@@ -600,6 +636,7 @@ impl Exporter {
                 text_supersample: if options.text_antialias { 2 } else { 1 },
                 see_through: false,
                 solo: None,
+                cam: None,
             },
             level: if options.reference { OptLevel::Reference } else { OptLevel::Full },
             rate,
@@ -966,6 +1003,50 @@ mod tests {
         assert_eq!(buses.len(), 1);
         assert_eq!(buses[0].members.as_deref(), Some(&[clips[0].id][..]), "over its own clip");
         assert_eq!(buses[0].range, TimeRange::new(secs(10.0), secs(1.0)));
+    }
+
+    /// A multicam clip: each cam's own sound plays only while that cam shows (a moment's
+    /// fade at each cut), and its audio tracks play throughout.
+    #[test]
+    fn multicam_sound_follows_the_cam() {
+        use oa_params::{Curve, Keyframe, KeyframeAnchor, ParamSource, Value};
+        let p = AspectPreset::by_id("landscape-16x9").unwrap();
+        let variant = |id| FormatVariant { id: VariantId(id), name: "wide".into(), size: p.size(1080), overrides: Default::default() };
+        let mut project = Project::new("t");
+        let media = MediaId(1);
+        let info = MediaInfo { width: 640, height: 360, duration: secs(60.0), rate: None, has_video: true, has_audio: true, still: false, ..Default::default() };
+        project.media.insert(media, Arc::new(MediaRef { id: media, path: "cam.mp4".into(), fingerprint: None, info: Some(info), scaling: Default::default(), folder: String::new(), color: Default::default() }));
+        // Inside: two cams (10 s each, with their own sound) and a microphone track.
+        let mut inner = Sequence::new(SeqId(2), "Shoot", FrameRate::FPS_30, variant(3));
+        for (n, id) in [(20u64, 4u64), (21, 5)] {
+            let mut t = Track::new(TrackId(id), "cam", TrackKind::Video);
+            t.items.push(Item::new(ItemId(n), "cam", ItemKind::Media { media }, TimeRange::new(secs(0.0), secs(10.0))));
+            inner.tracks.push(Arc::new(t));
+        }
+        let mut mic = Track::new(TrackId(6), "mic", TrackKind::Audio);
+        mic.items.push(Item::new(ItemId(22), "mic", ItemKind::Media { media }, TimeRange::new(secs(0.0), secs(10.0))));
+        inner.tracks.push(Arc::new(mic));
+        project.sequences.insert(SeqId(2), Arc::new(inner));
+        // Outside: cam 1 until 4 s, cam 2 from then.
+        let mut main = Sequence::new(SeqId(7), "Main", FrameRate::FPS_30, variant(8));
+        let mut v = Track::new(TrackId(9), "V1", TrackKind::Video);
+        let mut clip = Item::new(ItemId(10), "multicam", ItemKind::Nested { sequence: SeqId(2) }, TimeRange::new(secs(0.0), secs(10.0)));
+        clip.multicam = true;
+        let keys = vec![Keyframe::hold(secs(0.0), Value::Float(0.0)), Keyframe::hold(secs(4.0), Value::Float(1.0))];
+        clip.params.set(oa_doc::schema::CAM, ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, keys)));
+        v.items.push(clip);
+        main.tracks.push(Arc::new(v));
+        project.sequences.insert(SeqId(7), Arc::new(main));
+
+        let (clips, _) = audio_clips(&project, SeqId(7), |_| Some("cam.mp4".into()));
+        let spans: Vec<(f64, f64)> = clips.iter().map(|c| (c.range.start.as_seconds_f64(), c.range.end().as_seconds_f64())).collect();
+        assert_eq!(clips.len(), 3, "{spans:?}");
+        assert!(spans.contains(&(0.0, 10.0)), "the microphone throughout: {spans:?}");
+        assert!(spans.contains(&(0.0, 4.0)) && spans.contains(&(4.0, 10.0)), "each cam while it shows: {spans:?}");
+        let second = clips.iter().find(|c| c.range.start == secs(4.0)).unwrap();
+        assert_eq!(second.source_in, secs(4.0), "cam 2 heard from where it is at the cut");
+        assert!(second.fade_in > Time::ZERO, "a moment's fade at the cut");
+        assert_eq!(clips.iter().map(|c| c.id).collect::<std::collections::HashSet<_>>().len(), 3, "ids apart");
     }
 
     /// A compound clip's volume (keyframes too) and fades reach the sound inside it, and

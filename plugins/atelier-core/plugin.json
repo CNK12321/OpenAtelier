@@ -187,7 +187,7 @@
         {"id": "amount", "type": "float", "default": 0.35, "min": 0, "max": 2},
         {"id": "spacing", "type": "float", "default": 4, "min": 2, "max": 200, "unit": "layer_pixels"},
         {"id": "sharpness", "type": "float", "default": 1, "min": 0.2, "max": 8},
-        {"id": "roll", "type": "float", "default": 0, "min": -20, "max": 20}
+        {"id": "speed", "type": "float", "default": 0, "min": -20, "max": 20}
       ],
       "shader": {"entry": "oa_stylize_scanlines", "file": "stylize/scanlines.wgsl"}
     },
@@ -221,6 +221,53 @@
         {"id": "ink", "type": "color", "default": [0, 0, 0, 1]}
       ],
       "shader": {"entry": "oa_stylize_halftone", "file": "stylize/halftone.wgsl"}
+    },
+    {
+      "id": "oa.stylize.dither", "name": "Dither", "off": {"amount": 0}, "kind": "point", "category": "Stylize", "space": "display", "time_varying": true,
+      "description": "The picture in a few levels, its in-between shades made of a pattern of dots — ordered (a grid, like old computers and games), noise, or lines. In color, black and white, or between two colors of your own. Bigger cells make chunkier dots.",
+      "params": [
+        {"id": "amount", "type": "float", "default": 1, "min": 0, "max": 1},
+        {"id": "levels", "type": "float", "default": 4, "min": 2, "max": 16, "step": 1},
+        {"id": "pattern", "type": "enum", "options": ["ordered", "noise", "lines"], "default": "ordered"},
+        {"id": "size", "type": "float", "default": 1, "min": 1, "max": 16, "unit": "layer_pixels"},
+        {"id": "palette", "type": "enum", "options": ["color", "black and white", "two colors"], "default": "color"},
+        {"id": "dark", "type": "color", "default": [0.06, 0.22, 0.06, 1]},
+        {"id": "light", "type": "color", "default": [0.6, 0.74, 0.06, 1]},
+        {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "speed", "type": "float", "default": 0, "min": 0, "max": 400, "unit": "layer_pixels"}
+      ],
+      "shader": {"entry": "oa_stylize_dither", "file": "stylize/dither.wgsl"}
+    },
+    {
+      "id": "oa.stylize.disintegrate", "name": "Disintegrate", "off": {"amount": 0}, "kind": "spatial", "category": "Stylize", "time_varying": true, "preserves_opacity": false, "expand": "spread",
+      "description": "The picture breaking up and blowing away: it's cut into blocks that, one after another as the amount rises, slide off, fringe into red and blue and crumble into specks until nothing is left. Use it as an outro to make a clip fall apart, or an intro to make it come together.",
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.4, "min": 0, "max": 1},
+        {"id": "block", "type": "float", "default": 24, "min": 2, "max": 200, "unit": "layer_pixels"},
+        {"id": "spread", "type": "float", "default": 60, "min": 0, "max": 600, "unit": "layer_pixels"},
+        {"id": "direction", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "grain", "type": "float", "default": 2, "min": 0.5, "max": 32, "unit": "layer_pixels"},
+        {"id": "fringe", "type": "float", "default": 3, "min": 0, "max": 40, "unit": "layer_pixels"},
+        {"id": "speed", "type": "float", "default": 8, "min": 0, "max": 30},
+        {"id": "seed", "type": "float", "default": 1, "min": 0, "max": 100, "step": 1}
+      ],
+      "shader": {"entry": "oa_stylize_disintegrate", "file": "stylize/disintegrate.wgsl"}
+    },
+    {
+      "id": "oa.stylize.distress", "name": "Distress", "off": {"amount": 0, "scratches": 0}, "kind": "spatial", "category": "Stylize", "time_varying": true, "preserves_opacity": false,
+      "description": "Noise eating into the picture, like worn print, chipped paint or old film: most at its edges (text and cut-outs crumble at their outlines), in clumps the grain's size, with thin broken scratches. What's eaten goes see-through or turns a color. Speed makes it flicker; seed picks another pattern.",
+      "params": [
+        {"id": "amount", "type": "float", "default": 0.5, "min": 0, "max": 1},
+        {"id": "grain", "type": "float", "default": 3, "min": 0.5, "max": 64, "unit": "layer_pixels"},
+        {"id": "reach", "type": "float", "default": 6, "min": 0, "max": 64, "unit": "layer_pixels"},
+        {"id": "scratches", "type": "float", "default": 0.3, "min": 0, "max": 1},
+        {"id": "angle", "type": "float", "default": 90, "min": -180, "max": 180, "unit": "degrees"},
+        {"id": "speed", "type": "float", "default": 0, "min": 0, "max": 30},
+        {"id": "seed", "type": "float", "default": 1, "min": 0, "max": 100, "step": 1},
+        {"id": "holes", "type": "enum", "options": ["see-through", "color"], "default": "see-through"},
+        {"id": "hole_color", "type": "color", "default": [1, 1, 1, 1]}
+      ],
+      "shader": {"entry": "oa_stylize_distress", "file": "stylize/distress.wgsl"}
     },
     {
       "id": "oa.stylize.sharpen", "name": "Sharpen", "off": {"amount": 0}, "kind": "spatial", "category": "Stylize",
@@ -518,6 +565,22 @@
       "shader": {"entry": "oa_composite_duplicate", "file": "composite/duplicate.wgsl"}
     },
     {
+      "id": "oa.composite.bend", "name": "Bend Along Path", "kind": "spatial", "category": "Compositing", "preserves_opacity": false,
+      "description": "Lays the picture along a curve you draw in the viewer, as a band: drag the curve to bend it, click it to add a point. Stretch it along the path once, or repeat it (mirrored, for no seams); turn which way of the picture runs along; set the band's width and push it sideways at each point. Animate where the path ends to draw it in.",
+      "params": [
+        {"id": "path", "type": "path", "unit": "source_fraction",
+         "default": [{"id": 1, "at": [0.1, 0.65], "out": [0.25, -0.35]}, {"id": 2, "at": [0.9, 0.65], "in": [-0.25, -0.35]}],
+         "attributes": [{"id": "width", "default": 0.3, "min": 0, "max": 1}, {"id": "offset", "default": 0, "min": -0.5, "max": 0.5}]},
+        {"id": "fit", "type": "enum", "options": ["stretch", "repeat", "mirror"], "default": "stretch"},
+        {"id": "alignment", "type": "float", "default": 0, "min": 0, "max": 360, "unit": "direction"},
+        {"id": "slide", "type": "float", "default": 0, "min": -1, "max": 1},
+        {"id": "start", "type": "float", "default": 0, "min": 0, "max": 1},
+        {"id": "end", "type": "float", "default": 1, "min": 0, "max": 1},
+        {"id": "tile", "type": "float", "default": 1, "min": 0.1, "max": 4}
+      ],
+      "shader": {"entry": "oa_composite_bend", "file": "composite/bend.wgsl"}
+    },
+    {
       "id": "oa.stylize.slice", "name": "Slice", "off": {"separation": 0, "slide": 0}, "kind": "spatial", "category": "Stylize", "editor": "line", "preserves_opacity": false,
       "description": "Cuts the picture along a line — drag its point in the viewer, turn it by its handle — and pushes the two sides apart (separation) or slides them along the cut.",
       "bounds": "let reach = (abs(separation) + abs(slide)) * raster_scale;\nleft = x0 - reach;\ntop = y0 - reach;\nright = x1 + reach;\nbottom = y1 + reach;",
@@ -677,6 +740,34 @@
         {"id": "stagger", "type": "float", "default": 0.7, "min": 0, "max": 0.95}
       ],
       "shader": {"entry": "oa_text_fade", "file": "text/fade.wgsl"}
+    },
+    {
+      "id": "oa.text.characters", "name": "Characters", "kind": "glyph", "category": "Text", "usage": "in_out", "time_varying": true,
+      "description": "Letters that change into the text: each starts as another character — random ones (a decode) or none — and settles into its own, one after another; as an outro, the text changes away. Cut swaps characters in place, Roll turns them like a slot machine's reels, Flip folds them like a departure board, Fade crossfades. Scramble: how many random characters pass on the way. Rate: how often random ones change, a second. The letters keep their places throughout.",
+      "params": [
+        {"id": "from", "type": "enum", "options": ["random", "blank"], "default": "random"},
+        {"id": "style", "type": "enum", "options": ["cut", "roll", "flip", "fade"], "default": "cut"},
+        {"id": "order", "type": "enum", "options": ["left to right", "right to left", "random", "center out", "by word"], "default": "left to right"},
+        {"id": "stagger", "type": "float", "default": 0.6, "min": 0, "max": 0.95},
+        {"id": "scramble", "type": "float", "default": 0.5, "min": 0, "max": 1},
+        {"id": "characters", "type": "enum", "options": ["letters and digits", "letters", "digits", "symbols", "binary"], "default": "letters and digits"},
+        {"id": "rate", "type": "float", "default": 18, "min": 1, "max": 60},
+        {"id": "seed", "type": "float", "default": 1, "min": 0, "max": 100, "step": 1}
+      ],
+      "shader": {"entry": "oa_text_characters", "file": "text/characters.wgsl"}
+    },
+    {
+      "id": "oa.text.counter", "name": "Counter", "kind": "glyph", "category": "Text",
+      "description": "The title shows a number instead of its words: keyframe Value to count up or down. Decimals: places after the point. Separator: how thousands are marked (Period writes 1.234,5). Prefix and Suffix go around it ($, %, pts). Roll turns the digits like an odometer's instead of jumping.",
+      "params": [
+        {"id": "value", "type": "float", "default": 0},
+        {"id": "decimals", "type": "float", "default": 0, "min": 0, "max": 4, "step": 1},
+        {"id": "separator", "type": "enum", "options": ["comma", "period", "space", "none"], "default": "comma"},
+        {"id": "prefix", "type": "text", "default": ""},
+        {"id": "suffix", "type": "text", "default": ""},
+        {"id": "style", "type": "enum", "options": ["count", "roll"], "default": "count"}
+      ],
+      "shader": {"entry": "oa_text_counter", "file": "text/counter.wgsl"}
     },
     {
       "id": "oa.text.glow", "name": "Glow", "kind": "glyph_pixel", "category": "Text",

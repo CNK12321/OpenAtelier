@@ -221,3 +221,25 @@ fn old_mirrors_become_lines() {
     let at = |t: i64| fx[1].params.get("point").unwrap().eval(&oa_params::EvalContext::at(secs(t), secs(t)));
     assert_eq!(at(2), Value::Vec2([0.5, 0.8]), "the keys come along");
 }
+
+/// Scanlines' `roll` is its `speed` now: an old project's opens with it there, keys and
+/// all, on a clip and on the background.
+#[test]
+fn renamed_settings_carry_over() {
+    let mut p = healthy();
+    let s = Arc::make_mut(p.sequences.get_mut(&SeqId(1)).unwrap());
+    let keys = ParamSource::Animated(Curve::new(KeyframeAnchor::ClipStart, vec![oa_params::Keyframe::linear(secs(0), Value::Float(0.0)), oa_params::Keyframe::linear(secs(2), Value::Float(4.0))]));
+    let mut lines = EffectInstance::new(EffectId(30), "oa.stylize.scanlines");
+    lines.params.set("roll", keys.clone());
+    let mut behind = EffectInstance::new(EffectId(31), "oa.stylize.scanlines");
+    behind.params.set("roll", ParamSource::Static(Value::Float(-2.0)));
+    Arc::make_mut(&mut s.tracks[0]).items[0].effects = vec![lines];
+    s.background.effects = vec![behind];
+    let r = repair(&mut p);
+    assert!(r.is_clean(), "an upgrade, not damage: {r:?}");
+    let s = p.sequence(SeqId(1)).unwrap();
+    let fx = &s.tracks[0].items[0].effects[0];
+    assert_eq!(fx.params.get("speed"), Some(&keys));
+    assert!(fx.params.get("roll").is_none());
+    assert_eq!(s.background.effects[0].params.get("speed"), Some(&ParamSource::Static(Value::Float(-2.0))));
+}

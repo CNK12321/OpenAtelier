@@ -330,6 +330,9 @@ struct ParamDef {
     /// Only in steps of this much from `min` (the slider snaps, and marks each step).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     step: Option<f64>,
+    /// A path's numbers per point: `[{"id": "width", "default": 0.2, "min": 0, "max": 1}]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attributes: Vec<AttrDef>,
     /// none (default) · layer_pixels · canvas_fraction · source_fraction · degrees ·
     /// direction · seconds · decibels
     #[serde(default)]
@@ -343,6 +346,36 @@ struct ParamDef {
     /// the shader gets a bitmask, bit i for option i.
     #[serde(default)]
     multiple: bool,
+}
+
+/// One number of a path parameter's points, as manifests write it.
+#[derive(Debug, Deserialize, Serialize)]
+struct AttrDef {
+    id: String,
+    #[serde(default)]
+    default: f64,
+    #[serde(default)]
+    min: Option<f64>,
+    #[serde(default)]
+    max: Option<f64>,
+}
+
+/// A path's default in a manifest: points as `[x, y]` (corners), or whole points as
+/// a path saves them (`{"id", "at", "in", "out", "attrs"}`); or the path itself.
+fn path_default(v: Option<&serde_json::Value>) -> oa_params::BezierPath {
+    let Some(v) = v else { return oa_params::BezierPath::through(&[[0.1, 0.5], [0.9, 0.5]]) };
+    if let Ok(p) = serde_json::from_value::<oa_params::BezierPath>(v.clone()) {
+        return p.repaired();
+    }
+    let list = v.as_array().cloned().unwrap_or_default();
+    let corners: Vec<[f64; 2]> = list.iter().filter_map(|p| p.as_array().filter(|a| a.len() == 2).map(|a| [a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0)])).collect();
+    if corners.len() == list.len() && !corners.is_empty() {
+        return oa_params::BezierPath::through(&corners);
+    }
+    match serde_json::from_value::<Vec<oa_params::PathPoint>>(v.clone()) {
+        Ok(points) => oa_params::BezierPath { closed: false, points }.repaired(),
+        Err(_) => oa_params::BezierPath::through(&[[0.1, 0.5], [0.9, 0.5]]),
+    }
 }
 
 fn unit_of(name: Option<&str>) -> Result<Unit, String> {
@@ -389,6 +422,7 @@ impl ParamDef {
                 _ => Value::Gradient(Gradient::solid(numbers(d, [1.0, 1.0, 1.0, 1.0]))),
             },
             "media" => Value::Media(None),
+            "path" => Value::Path(path_default(d)),
             "text" => Value::Text(d.and_then(|v| v.as_str()).unwrap_or_default().into()),
             "enum" if self.multiple => {
                 if self.options.is_empty() || self.options.len() > 24 {
@@ -420,6 +454,7 @@ impl ParamDef {
         }
         schema.options = self.options;
         schema.multiple = self.multiple;
+        schema.point_attrs = self.attributes.into_iter().map(|a| oa_params::PointAttr { id: a.id, default: a.default, range: a.min.zip(a.max) }).collect();
         schema.animatable = !self.static_only;
         Ok(schema)
     }
@@ -504,13 +539,13 @@ impl EffectDef {
         let mut preview = Vec::new();
         for (id, v) in self.preview {
             let Some(p) = params.iter().find(|p| p.id.as_str() == id) else { return Err(format!("{where_}: \"preview\" sets \"{id}\", which isn't one of its parameters")) };
-            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, step: None, unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
+            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, step: None, attributes: Vec::new(), unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
             preview.push((ParamId::new(&id), def.into_schema().map_err(|e| format!("{where_}: preview: {e}"))?.default));
         }
         let mut off = Vec::new();
         for (id, v) in self.off {
             let Some(p) = params.iter().find(|p| p.id.as_str() == id) else { return Err(format!("{where_}: \"off\" sets \"{id}\", which isn't one of its parameters")) };
-            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, step: None, unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
+            let def = ParamDef { id: id.clone(), ty: type_name(p.ty).into(), default: Some(v), min: None, max: None, step: None, attributes: Vec::new(), unit: None, options: p.options.clone(), static_only: false, multiple: p.multiple };
             off.push((ParamId::new(&id), def.into_schema().map_err(|e| format!("{where_}: off: {e}"))?.default));
         }
         if let Some(e) = &self.editor
@@ -596,6 +631,7 @@ fn type_name(ty: oa_params::ParamType) -> &'static str {
         T::Text => "text",
         T::Media => "media",
         T::Gradient => "gradient",
+        T::Path => "path",
     }
 }
 

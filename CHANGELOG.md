@@ -4,6 +4,95 @@ Each release's section becomes its description on GitHub, and the app's update d
 lists its points. Name a section after the version as it's tagged (`0.1-beta.6`, the
 tag without its `v`) before tagging; until then it's **Unreleased**.
 
+## Unreleased
+
+### New
+- **Characters** (text intro and outro): letters that change into the text, or out of
+  it. Each starts as another character — random ones (a decode) or none — and settles
+  into its own, one after another (**order**: left to right, right to left,
+  random, center out, by word; **stagger**). **Cut** swaps characters in place, **roll**
+  turns them like a slot machine's reels, **flip** folds them like a departure board,
+  **fade** crossfades; **scramble** sets how many random characters pass on the way,
+  from letters, digits, symbols or binary, matching each letter's case. The letters keep
+  their places throughout, and other letter effects still move them.
+- **Counter** (text effect): the title shows a number — keyframe **value** to count up
+  or down — with **decimals**, a thousands **separator** (comma, period, space, none),
+  a **prefix** and a **suffix** ($, %, pts). **Roll** turns the digits like an
+  odometer's instead of jumping.
+- **Bend Along Path** (Effects → Compositing): lays the picture along a curve you draw
+  in the viewer, as a band. Drag the curve itself to bend it, click it to add a point
+  (the curve keeps its shape), drag a point or, once it's picked, its two handles;
+  drag the ticks either side of a point to widen or narrow the band there; double-click
+  a point for a sharp or smooth corner, Delete to take it away. Start from a shape
+  (straight, arc, S-curve, wave, circle). **Stretch** lays the picture along the path
+  once; **repeat** lays it end to end at its own shape (**mirror** flips every other
+  copy, for no seams); **alignment** turns which way of the picture runs along; each
+  point's **offset** pushes the band sideways there; **slide** moves the picture along
+  the path; **start** and **end** show part of it (keyframe **end** to draw it in).
+- **Disintegrate** (Stylize): the picture breaking up and blowing away. It's cut into
+  **blocks** that, one after another as the **amount** rises, slide off (up to
+  **spread**, towards **direction**), split into red and blue (**fringe**) and crumble
+  into specks (**grain**) until nothing is left. As an outro the clip falls apart; as
+  an intro it comes together. **Speed** makes the pieces jitter; **seed** picks another
+  break-up.
+- **Distress** (Stylize): noise eating into the picture, like worn print, chipped paint
+  or old film. It eats most near the picture's edges (**reach**), so titles and
+  cut-outs crumble at their outlines, in clumps of **grain** size, with thin broken
+  **scratches** at an **angle**. Holes go see-through or turn a color; **speed** makes
+  it flicker and **seed** picks another pattern.
+- **Dither** (Stylize): the picture in a few **levels**, its in-between shades made of
+  a pattern: **ordered** (the grid of old computers and games), **noise** or **lines**,
+  in chunkier cells with **size**. In color, black and white, or between two colors
+  of your own (a handheld-console green to start). The pattern can drift: **direction**
+  (a dial) and **speed** in pixels a second.
+- **Path properties:** a curve is now a property like any other, keyframed as a whole —
+  keys blend point by point, matched so that adding a point mid-animation never
+  scrambles the in-between frames, and handles turn smoothly instead of collapsing.
+  Plugins can use them too (`"type": "path"`).
+- **Multi-cam** (turn on in Settings → Features): edit footage from several cameras as
+  one clip. Right-click a compound clip → **Make multicam clip** (or select the clips
+  from each camera, lined up, and press the new button beside Captions): each of its
+  picture tracks becomes a cam, shown one at a time. Press **1–9** at the playhead —
+  while playing, too — or right-click → **Show cam** to cut to another; a white line
+  marks each cut on the clip, with the cam each stretch shows, and its thumbnails show
+  that cam. While it's selected, all its cams line the right of the viewer as they are
+  at the playhead (smaller when there are many) — click one to cut to it; a small
+  number in each corner is its key, the one showing outlined. Under them, **previous
+  cut**, **delete cut** (the cam before it carries on) and **next cut**; the panel
+  folds away to a tab. Its audio tracks play
+  throughout, and each camera's own sound plays while that camera shows (with a short
+  fade at each cut so it doesn't click). **Extract cam** takes any cam out for the
+  stretch between two cuts, as ordinary clips on a layer above — for a
+  picture-in-picture or a split screen. **Make compound clip** turns it back.
+
+### Changed
+- **Settings from the start page:** a Settings button in its top right corner (Ctrl+,
+  works there too), so themes, features and the rest can be set before opening a
+  project.
+- **The start page has a living backdrop:** a ghost of a timeline plays behind Home and
+  Projects — faint picture and sound tracks full of clips (keyframe lines on some,
+  waveforms on the sound), scrolling slowly by under a ruler of running timecodes, with
+  a slow drifting light bringing some stretches up and letting others fade. The pointer
+  is the playhead: it glides after the pointer and fades in, showing the moment it's
+  at, and what's near it brightens gently. It's kept very faint, with a soft backing
+  under the page's panels so they read clearly; it follows the theme, and switches off
+  with **UI effects** (Settings → Interface).
+- **A Features page in Settings:** the tools most people never need — advanced
+  transformations, advanced color, masks and now multi-cam — are switched on there,
+  each off until you want it. Turning one off only hides it; what you made with it
+  stays as it is.
+- **Scanlines' "roll" is now "speed"** (lines a second; below 0 they run down), named
+  like the other effects' speeds. Projects that used it open with it carried over,
+  keyframes and all.
+
+### Fixed
+- **Compound clips are made at the format you're editing:** nesting while looking at
+  the vertical format makes a vertical compound (with the clips placed as they are in
+  that format), not one at whichever format the timeline was saved on.
+- **Inside a compound clip, the format you pick is the compound's:** switching or
+  adding a format there changes the shape the compound clip is drawn at outside, and
+  opening it again shows that format.
+
 ## 0.1-beta.9 — Beta 9
 
 ### New

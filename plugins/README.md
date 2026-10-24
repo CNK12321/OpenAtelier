@@ -82,6 +82,17 @@ manifest (`"bounds": {"file": "shape.bounds"}`).
   `gradient` (a color, or a
   whole gradient as the editor saves one), `media` (a picture from the project — the
   effect's second input), `text`.
+* `path`: a bezier curve, drawn and bent in the viewer (drag the curve, click it to add
+  a point, double-click a point for a sharp or smooth corner). Its points are fractions
+  of the clip (`"unit": "source_fraction"`); `"attributes"` gives every point numbers
+  of its own (`[{"id": "width", "default": 0.3, "min": 0, "max": 1}]`), and
+  `"default"` its points (`[[0.1, 0.5], [0.9, 0.5]]`, or whole points with handles,
+  `{"id": 1, "at": […], "in": […], "out": […]}`). Keyframed as a whole: keys blend
+  point by point (matched by id, so adding a point never scrambles a move). The shader
+  gets it sampled evenly along its length (`BezierPath::PACKED_LEN` floats: the sample
+  count, 1 if closed, the number count, then x, y and the first two numbers per
+  sample), and the effect may draw anywhere along it (see Atelier Core's Bend Along
+  Path, `composite/bend.wgsl`).
 * Every one is keyframable (and can wiggle) unless `"static_only": true`.
 * `"step": 1` makes a `float` go only in steps of that much, counted from `min` (a
   count of copies, octaves, segments): the slider snaps and puts a dot at each step

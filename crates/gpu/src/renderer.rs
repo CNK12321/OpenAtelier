@@ -65,7 +65,8 @@ pub struct RenderStats {
     pub memory: crate::health::Memory,
 }
 
-/// The 64-float uniform block shared by every pass (layout in `shaders.rs`).
+/// The 512-float uniform block shared by every pass (layout in `shaders.rs`): room for
+/// an effect whose parameters include a sampled path.
 #[derive(Clone)]
 pub struct Uniforms(pub [f32; UNIFORM_SLOTS]);
 
@@ -322,7 +323,10 @@ impl GpuServices<'_> {
         let alpha = alpha.as_ref().unwrap_or(self.opaque);
         let pipeline = self.yuv_pipelines.get_blocking("yuv-nv12", yuv::spec)?;
         let target = self.target(out_size)?;
-        let buf = self.uniform_buffer(&Uniforms(yuv::uniforms(frame, out_size)));
+        // Its 64 floats at the start of the shared block.
+        let mut u = Uniforms::default();
+        u.0[..64].copy_from_slice(&yuv::uniforms(frame, out_size));
+        let buf = self.uniform_buffer(&u);
         let bg = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("oa-yuv"),
             layout: &self.yuv_pipelines.bind_group_layout,
@@ -1058,7 +1062,7 @@ impl Exec<'_> {
                 self.gpu.stats.passes += 1;
                 Ok(GpuImage { tex: target, origin, size })
             }
-            NodeOp::Text { spec, scale, style, spoken_style, spoken_word, chain } => {
+            NodeOp::Text { spec, scale, style, spoken_style, spoken_word, chain, slots } => {
                 let b = node.bounds;
                 let draw = crate::text::TextDraw {
                     spec,
@@ -1067,6 +1071,7 @@ impl Exec<'_> {
                     spoken_style,
                     spoken_word: *spoken_word,
                     chain,
+                    slots,
                     origin: [b.x0, b.y0],
                     size: [(b.x1 - b.x0).round().max(1.0) as u32, (b.y1 - b.y0).round().max(1.0) as u32],
                 };

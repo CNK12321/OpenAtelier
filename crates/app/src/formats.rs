@@ -198,6 +198,18 @@ impl App {
         };
         if let Err(e) = result {
             self.report_error(e.to_string());
+            return;
+        }
+        // Inside a compound clip, the format picked is the compound's own: the clip
+        // playing it outside draws it at this shape from now on.
+        if !self.compound_trail.is_empty() {
+            let s = self.editor.sequence();
+            let picked = s.variants[self.variant.min(s.variants.len() - 1)].id;
+            if picked != s.active_variant
+                && let Err(e) = self.editor.apply(tr("Compound clip format"), vec![Op::SetActiveVariant { seq, variant: picked }])
+            {
+                self.report_error(e.to_string());
+            }
         }
     }
 }

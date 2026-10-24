@@ -47,7 +47,9 @@ impl App {
         self.editor.seq = sequence;
         self.editor.video_track = video;
         self.editor.audio_track = audio;
-        self.variant = 0;
+        // Shown in its own format (the one the clip outside draws it at).
+        let s = self.editor.sequence();
+        self.variant = s.variants.iter().position(|v| v.id == s.active_variant).unwrap_or(0);
         self.entered_timeline(inside, None);
     }
 

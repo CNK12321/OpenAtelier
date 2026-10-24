@@ -48,8 +48,8 @@ pub fn repair(p: &mut Project) -> Report {
             std::sync::Arc::make_mut(s).sync_background();
         }
         // The background's effects are upgraded as a clip's are.
-        if s.background.effects.iter().any(|e| e.type_id == "oa.warp.mirror" && e.params.get("axis").or(e.params.get("position")).is_some()) {
-            std::sync::Arc::make_mut(s).background.effects.iter_mut().for_each(upgrade_mirror);
+        if s.background.effects.iter().any(needs_upgrade) {
+            std::sync::Arc::make_mut(s).background.effects.iter_mut().for_each(upgrade_effect);
         }
     }
 
@@ -231,7 +231,29 @@ fn repair_item(item: &mut Item, fresh: &mut impl FnMut() -> u64, r: &mut Report)
             effect_ids.insert(new);
         }
         sanitize_params(&mut fx.params, &format!("{what} effect {}", fx.type_id), r);
-        upgrade_mirror(fx);
+        upgrade_effect(fx);
+    }
+}
+
+/// Settings of built-in effects that have since been renamed: (effect, old id, new id).
+const RENAMED: [(&str, &str, &str); 1] = [("oa.stylize.scanlines", "roll", "speed")];
+
+/// Whether an effect was saved by an older version in a shape since changed.
+fn needs_upgrade(fx: &EffectInstance) -> bool {
+    (fx.type_id == "oa.warp.mirror" && fx.params.get("axis").or(fx.params.get("position")).is_some())
+        || RENAMED.iter().any(|(t, old, _)| fx.type_id == *t && fx.params.get(old).is_some())
+}
+
+/// Brings an effect saved by an older version up to date: Mirror's line, and renamed
+/// settings (their values and keys kept). An upgrade, not damage: not reported.
+fn upgrade_effect(fx: &mut EffectInstance) {
+    upgrade_mirror(fx);
+    for (t, old, new) in RENAMED {
+        if fx.type_id == t
+            && let Some(src) = fx.params.0.remove(&oa_params::ParamId::new(old))
+        {
+            fx.params.0.entry(oa_params::ParamId::new(new)).or_insert(src);
+        }
     }
 }
 

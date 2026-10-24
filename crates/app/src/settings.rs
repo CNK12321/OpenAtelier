@@ -77,6 +77,10 @@ pub struct Settings {
     /// effects to them.
     #[serde(default)]
     pub masking: bool,
+    /// Multicam editing: compound clips shown one cam at a time (convert, switch cams,
+    /// extract a cam), and its button beside Captions.
+    #[serde(default)]
+    pub multicam: bool,
     /// Squash and the crop sliders in Transform (crop by double-clicking a clip in the
     /// viewer works either way).
     pub advanced_transform: bool,
@@ -403,6 +407,7 @@ impl Default for Settings {
             save_as_you_go: true,
             advanced_color: false,
             masking: false,
+            multicam: false,
             advanced_transform: false,
             default_curve: DefaultCurve::default(),
             show_performance: false,

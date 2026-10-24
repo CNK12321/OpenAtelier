@@ -593,7 +593,7 @@ sees pixels at explicit edges (`readback`: tests, stills, thumbnails; later the 
 * **`FrameSource`** trait returns GPU images. Hardware decoders will wrap decoder
   surfaces behind it; today `TestPatternSource` renders media stand-ins in a shader.
 * **Shader contract** (plugin-facing, versioned with `PLUGIN_API_VERSION`): one bind group
-  (64-float uniform block, input texture, linear clamp sampler). Point ops are
+  (512-float uniform block, input texture, linear clamp sampler). Point ops are
   `fn(c: vec4f, base: u32) -> vec4f` on straight color in their declared working space;
   spatial effects are `fn(pos: vec2f, base: u32) -> vec4f` using `sample_input(pos)` and
   `pass_index()`. Built-in effects ship their WGSL in the registry exactly like plugins.

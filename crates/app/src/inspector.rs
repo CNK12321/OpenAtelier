@@ -678,6 +678,8 @@ impl App {
             _ => pretty(id),
         };
         match &schema.default {
+            // A path: drawn and bent in the viewer; here its shape, points and numbers.
+            Value::Path(_) => self.path_widget(ui, item, target, schema, &current, t, &label),
             Value::Float(_) if schema.unit == oa_params::Unit::Direction => {
                 // A direction: a pinwheel to spin plus a 0–360° field.
                 let mut degrees = current.as_float().unwrap_or(0.0);
@@ -2211,7 +2213,7 @@ impl App {
         transform::param_target(self.editor.doc.project(), self.editor.seq, item, self.variant_id(), self.transform_scope(), param)
     }
 
-    fn key_toggle_for(&mut self, ui: &mut egui::Ui, item: ItemId, target: ParamTarget, param: &str, default: Value, t: Time) {
+    pub(crate) fn key_toggle_for(&mut self, ui: &mut egui::Ui, item: ItemId, target: ParamTarget, param: &str, default: Value, t: Time) {
         let Some(it) = self.editor.item(item) else { return };
         let keys = self.editor.keyframe_times(item, &target, param);
         let local = t - it.range.start;

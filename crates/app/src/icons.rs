@@ -127,6 +127,7 @@ icons! {
     MIC = "mic", '\u{e029}', Mic;
     RECORD = "fiber_manual_record", '\u{e061}', Record;
     CAPTIONS = "subtitles", '\u{e048}', Subtitles;
+    MULTICAM = "switch_video", '\u{e41f}', Movie;
     FOLDER_OPEN = "folder_open", '\u{e2c8}', FolderOpen;
     PLUGINS = "extension", '\u{e87b}', Puzzle;
     REFRESH = "refresh", '\u{e5d5}', Refresh;

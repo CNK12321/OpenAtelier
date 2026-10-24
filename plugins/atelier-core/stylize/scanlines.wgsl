@@ -1,5 +1,6 @@
 fn oa_stylize_scanlines(c: vec4f, base: u32) -> vec4f {
-    // Dark lines every `spacing` layer pixels, travelling with `roll`.
+    // Dark lines every `spacing` layer pixels, travelling `speed` lines a second (up
+    // the picture; less than 0, down).
     let spacing = max(u(base + 1u), 1.0);
     let y = (layer_pos().y - in_origin().y) / spacing + u(base + 3u) * clip_seconds();
     let wave = 0.5 + 0.5 * cos(6.2831853 * y);

@@ -67,6 +67,8 @@ pub struct Request {
     /// Leave the sequence's background out: transparent where nothing is drawn (a
     /// picture read back for its transparency).
     pub see_through: bool,
+    /// Only this cam of the sequence (a multicam clip's; see `PlanOptions::cam`).
+    pub cam: Option<usize>,
 }
 
 /// A finished preview: display-ready (sRGB RGBA8), already submitted on the GPU.
@@ -105,6 +107,8 @@ pub struct StripRequest {
     pub frames: usize,
     pub frame_w: u32,
     pub cols: usize,
+    /// One cam of it (a multicam clip's own filmstrip per cam).
+    pub cam: Option<usize>,
     pub reply: Sender<Option<StripFrames>>,
 }
 
@@ -212,7 +216,8 @@ fn run(gpu: Arc<GpuContext>, decoders: oa_media::DecoderChoice, vram_budget: u64
                     media.get_or_insert_with(|| project_media.clone());
                 }
                 Msg::Pixels(r, reply) => readback = Some((r, reply)),
-                Msg::Strip(s) => match strips.iter_mut().find(|q| q.seq == s.seq) {
+                // The newest per compound and cam (each cam of a multicam clip its own).
+                Msg::Strip(s) => match strips.iter_mut().find(|q| q.seq == s.seq && q.cam == s.cam) {
                     Some(q) => *q = s,
                     None => strips.push(s),
                 },
@@ -306,7 +311,7 @@ fn render_strip(renderer: &mut Renderer, sources: &mut Sources, s: &StripRequest
     let rows = frames.div_ceil(s.cols);
     for i in 0..frames {
         let at = Time::from_seconds_f64(if frames == 1 { 0.0 } else { (i as f64 + 0.5) * duration / frames as f64 });
-        let r = Request { slot: 0, tag: 0, project: s.project.clone(), registry: s.registry.clone(), seq: s.seq, variant: variant.id, at, scale, wanted: None, png: None, see_through: false };
+        let r = Request { slot: 0, tag: 0, project: s.project.clone(), registry: s.registry.clone(), seq: s.seq, variant: variant.id, at, scale, wanted: None, png: None, see_through: false, cam: s.cam };
         let pixels = render(renderer, sources, &r).ok().and_then(|image| {
             let px = oa_gpu::readback::read_srgb8(renderer.context(), renderer.pipelines(), &image).ok()?;
             Some((px, [image.size[0] as usize, image.size[1] as usize]))
@@ -342,7 +347,7 @@ fn render_strip(renderer: &mut Renderer, sources: &mut Sources, s: &StripRequest
 }
 
 fn render(renderer: &mut Renderer, sources: &mut Sources, r: &Request) -> Result<oa_gpu::GpuImage, String> {
-    let opts = PlanOptions { variant: Some(r.variant), render_scale: r.scale.clamp(0.02, 1.0), see_through: r.see_through, ..Default::default() };
+    let opts = PlanOptions { variant: Some(r.variant), render_scale: r.scale.clamp(0.02, 1.0), see_through: r.see_through, cam: r.cam, ..Default::default() };
     let plan = plan_frame(&r.project, r.seq, r.at, &opts, &r.registry).map_err(|e| e.to_string())?;
     let graph = optimize(&plan.graph, OptLevel::Full, KeyContext::default());
     renderer.render(&graph, &r.registry, sources).map_err(|e| e.to_string())
@@ -418,6 +423,7 @@ mod tests {
             wanted,
             png,
             see_through: false,
+            cam: None,
         }
     }
 
@@ -471,7 +477,7 @@ mod tests {
 
         // A compound's filmstrip: its frames, rendered and laid out ten to a row.
         let (reply, strip) = channel();
-        worker.strip(StripRequest { seq: SeqId(1), version: 9, project: project(), registry: Arc::new(Registry::with_builtins()), frames: 3, frame_w: 32, cols: 10, reply });
+        worker.strip(StripRequest { seq: SeqId(1), version: 9, project: project(), registry: Arc::new(Registry::with_builtins()), frames: 3, frame_w: 32, cols: 10, cam: None, reply });
         let made = strip.recv_timeout(Duration::from_secs(20)).expect("answered").expect("rendered");
         assert_eq!((made.version, made.frames), (9, 3));
         assert_eq!(made.size, [32 * 10, 18], "cells of 32×18, ten to a row");

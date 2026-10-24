@@ -29,7 +29,7 @@ use crate::pool::WORKING_FORMAT;
 use crate::shaders::{PRELUDE, CLOCK_SLOTS};
 use crate::{GpuImage, RenderError};
 use oa_graph::registry::Registry;
-use oa_graph::{EffectKind, EffectShader};
+use oa_graph::{EffectKind, EffectShader, SlotDraw};
 use oa_text::{sdf, FontId, TextSpec};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -47,7 +47,7 @@ const CHAIN_BASE: usize = 164;
 const BOX: usize = 8;
 const ATLAS: u32 = 4096;
 /// Floats per glyph instance.
-const INSTANCE: usize = 16;
+const INSTANCE: usize = 20;
 
 #[derive(Copy, Clone)]
 struct AtlasEntry {
@@ -144,6 +144,7 @@ pub struct TextState {
     pipelines: Pipelines,
     sampler: wgpu::Sampler,
     atlas: Option<Atlas>,
+    chars: CharGlyphs,
 }
 
 impl TextState {
@@ -161,11 +162,38 @@ impl TextState {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        TextState { pipelines: Pipelines::with_layout(device, "oa-text", &entries), sampler, atlas: None }
+        TextState { pipelines: Pipelines::with_layout(device, "oa-text", &entries), sampler, atlas: None, chars: CharGlyphs::default() }
     }
 }
 
-/// Which stage a text effect runs in.
+/// A single character's glyph in a text's font, for letter slots showing other
+/// characters: its font and glyph, and its ink's middle from the pen, layout px.
+#[derive(Copy, Clone)]
+struct CharGlyph {
+    font: FontId,
+    glyph: u16,
+    center: f64,
+}
+
+/// Characters laid out on their own, by font settings and character (`None`: nothing
+/// to draw, as a space).
+#[derive(Default)]
+struct CharGlyphs(HashMap<(String, bool, bool, u64, char), Option<CharGlyph>>);
+
+impl CharGlyphs {
+    fn glyph(&mut self, spec: &TextSpec, ch: char) -> Option<CharGlyph> {
+        if self.0.len() > 4096 {
+            self.0.clear();
+        }
+        let key = (spec.family.clone(), spec.bold, spec.italic, spec.size.to_bits(), ch);
+        *self.0.entry(key).or_insert_with(|| {
+            let one = TextSpec { content: ch.to_string(), wrap: None, tracking: 0.0, ..spec.clone() };
+            let l = oa_text::layout(&one);
+            l.glyphs.first().map(|g| CharGlyph { font: g.font, glyph: g.glyph, center: (g.ink[0] + g.ink[2]) / 2.0 - g.origin[0] })
+        })
+    }
+}
+
 /// Where in the text pass an effect runs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -256,7 +284,7 @@ fn letter_progress(g: Glyph, stagger: f32) -> f32 {
 "#;
 
 const GLYPH_LIB: &str = r#"
-struct GlyphIn { quad: vec4f, uv: vec4f, center: vec2f, size: vec2f, index: f32, line: f32, word: f32, pad: f32 }
+struct GlyphIn { quad: vec4f, uv: vec4f, center: vec2f, size: vec2f, index: f32, line: f32, word: f32, alpha: f32, clip: vec4f }
 @group(0) @binding(3) var<storage, read> glyphs: array<GlyphIn>;
 
 struct VOut {
@@ -265,6 +293,7 @@ struct VOut {
     @location(1) color: vec4f,
     @location(2) local: vec2f,
     @location(3) @interpolate(flat) info: vec4f,
+    @location(4) @interpolate(flat) clip: vec4f,
 }
 "#;
 
@@ -281,7 +310,7 @@ struct BoxOut {
 "#;
 
 fn prelude() -> String {
-    let mut s = PRELUDE.replace("array<vec4f, 16>", &format!("array<vec4f, {}>", SLOTS / 4));
+    let mut s = PRELUDE.replace("array<vec4f, 128>", &format!("array<vec4f, {}>", SLOTS / 4));
     s.push_str(TEXT_COMMON);
     s
 }
@@ -369,9 +398,10 @@ fn vs_text(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     var out: VOut;
     out.pos = vec4f(o.x * 2.0 - 1.0, 1.0 - o.y * 2.0, 0.0, 1.0);
     out.uv = mix(gi.uv.xy, gi.uv.zw, c);
-    out.color = g.color;
+    out.color = vec4f(g.color.rgb, g.color.a * gi.alpha);
     out.local = p;
     out.info = vec4f(gi.index, max(max(abs(g.scale.x), abs(g.scale.y)), 1e-4), gi.word, 0.0);
+    out.clip = gi.clip;
     return out;
 }}
 
@@ -399,7 +429,9 @@ fn fs_text(v: VOut) -> @location(0) vec4f {{
     var c = vec4f((fill.rgb * fa + line.rgb * la * (1.0 - fa)) / max(a, 1e-5), a);
     let px = TextPixel(v.local, text_box(), dist, text_spread() * v.info.y, text_em(), v.info.x, text_count());
 {pixel}
-    let alpha = clamp(c.a * v.color.a, 0.0, 1.0);
+    // A letter slot showing a rolling character keeps it inside the slot.
+    let inside = all(v.local >= v.clip.xy) && all(v.local <= v.clip.zw);
+    let alpha = clamp(c.a * v.color.a, 0.0, 1.0) * select(0.0, 1.0, inside);
     return vec4f(c.rgb * alpha, alpha);
 }}
 "#
@@ -498,6 +530,8 @@ pub(crate) struct TextDraw<'a> {
     pub spoken_style: &'a [f32],
     pub spoken_word: f32,
     pub chain: &'a [oa_graph::TextEffect],
+    /// Letters showing other characters for now (see `oa_graph::SlotSwap`).
+    pub slots: &'a [oa_graph::SlotSwap],
     pub origin: [f64; 2],
     pub size: [u32; 2],
 }
@@ -550,37 +584,69 @@ impl crate::renderer::GpuServices<'_> {
         let mut instances: Vec<f32> = Vec::with_capacity(layout.glyphs.len() * INSTANCE);
         let s = t.scale;
         let mut pending = false;
+        const OPEN: [f32; 4] = [-1e9, -1e9, 1e9, 1e9];
+        let own = [SlotDraw { ch: None, dy: 0.0, scale_y: 1.0, alpha: 1.0 }];
         for g in &layout.glyphs {
-            let e = match atlas.glyph(&self.ctx.queue, g.font, g.glyph, bucket, self.wait) {
-                Ok(Some(e)) => e,
-                Ok(None) => continue,
-                Err(_) => {
-                    // Keep asking for the rest, so they're all made at once.
-                    pending = true;
-                    continue;
-                }
+            let swap = t.slots.iter().find(|w| w.index == g.index);
+            let draws = swap.map_or(&own[..], |w| &w.draws[..]);
+            let size = t.spec.size;
+            // The slot: the letter's ink across (with room for wider characters), from
+            // above the capitals to below the descenders.
+            let cx = (g.ink[0] + g.ink[2]) / 2.0;
+            let clip = match swap {
+                Some(w) if w.clip => [
+                    ((g.ink[0].min(cx - 0.3 * size) - 0.3 * size) * s) as f32,
+                    ((g.origin[1] - 0.95 * size) * s) as f32,
+                    ((g.ink[2].max(cx + 0.3 * size) + 0.3 * size) * s) as f32,
+                    ((g.origin[1] + 0.3 * size) * s) as f32,
+                ],
+                _ => OPEN,
             };
-            let pen = [(g.origin[0] * s) as f32, (g.origin[1] * s) as f32];
-            let [ax, ay, aw, ah] = e.rect.map(|x| x as f32);
-            let n = ATLAS as f32;
-            instances.extend([
-                pen[0] + e.offset[0] * k,
-                pen[1] + e.offset[1] * k,
-                aw * k,
-                ah * k,
-                ax / n,
-                ay / n,
-                (ax + aw) / n,
-                (ay + ah) / n,
-                ((g.ink[0] + g.ink[2]) / 2.0 * s) as f32,
-                ((g.ink[1] + g.ink[3]) / 2.0 * s) as f32,
-                ((g.ink[2] - g.ink[0]) * s) as f32,
-                ((g.ink[3] - g.ink[1]) * s) as f32,
-                g.index as f32,
-                g.line as f32,
-                g.word as f32,
-                0.0,
-            ]);
+            for d in draws {
+                // The character drawn: the letter's own, or another centered on it, on
+                // the same baseline.
+                let (font, glyph, pen_x) = match d.ch {
+                    None => (g.font, g.glyph, g.origin[0]),
+                    Some(ch) => match state.chars.glyph(t.spec, ch) {
+                        Some(c) => (c.font, c.glyph, cx - c.center),
+                        None => continue,
+                    },
+                };
+                let e = match atlas.glyph(&self.ctx.queue, font, glyph, bucket, self.wait) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        // Keep asking for the rest, so they're all made at once.
+                        pending = true;
+                        continue;
+                    }
+                };
+                let pen = [(pen_x * s) as f32, ((g.origin[1] + d.dy as f64 * size) * s) as f32];
+                // Folded about the middle of the line (a flap of a departure board).
+                let mid = ((g.origin[1] - 0.35 * size) * s) as f32;
+                let top = mid + (pen[1] + e.offset[1] * k - mid) * d.scale_y;
+                let [ax, ay, aw, ah] = e.rect.map(|x| x as f32);
+                let n = ATLAS as f32;
+                instances.extend([
+                    pen[0] + e.offset[0] * k,
+                    top,
+                    aw * k,
+                    ah * k * d.scale_y,
+                    ax / n,
+                    ay / n,
+                    (ax + aw) / n,
+                    (ay + ah) / n,
+                    (cx * s) as f32,
+                    ((g.ink[1] + g.ink[3]) / 2.0 * s) as f32,
+                    ((g.ink[2] - g.ink[0]) * s) as f32,
+                    ((g.ink[3] - g.ink[1]) * s) as f32,
+                    g.index as f32,
+                    g.line as f32,
+                    g.word as f32,
+                    d.alpha,
+                ]);
+                instances.extend(clip);
+            }
         }
         if pending {
             return Err(RenderError::NotReady);

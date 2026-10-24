@@ -475,6 +475,7 @@ impl App {
                     wanted: None,
                     png: None,
                     see_through: false,
+                    cam: None,
                 },
                 tx,
             );

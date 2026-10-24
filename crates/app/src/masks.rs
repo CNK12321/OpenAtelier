@@ -628,6 +628,7 @@ impl App {
                 wanted: None,
                 png: None,
                 see_through: true,
+                cam: None,
             },
             tx,
         );
@@ -662,6 +663,7 @@ impl App {
                 wanted: None,
                 png: None,
                 see_through: true,
+                cam: None,
             },
             tx,
         );

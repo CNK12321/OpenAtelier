@@ -123,6 +123,12 @@ fn background_item() -> Item {
 }
 
 impl Sequence {
+    /// Its cams, when it's a multicam clip's: its picture tracks (not effect tracks),
+    /// first to last — Cam 1, Cam 2…
+    pub fn cams(&self) -> Vec<&Track> {
+        self.tracks.iter().filter(|t| t.kind == TrackKind::Video && !t.effects).map(|t| t.as_ref()).collect()
+    }
+
     pub fn new(id: SeqId, name: &str, rate: FrameRate, first_variant: FormatVariant) -> Self {
         Sequence {
             id,
@@ -421,6 +427,11 @@ pub struct Item {
     /// Its effect groups (see [`EffectGroup`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effect_groups: Vec<EffectGroup>,
+    /// A compound clip shown one cam at a time: each of its picture tracks is a cam,
+    /// and [`crate::schema::CAM`] (keyed with hold keys, a cut at each) says which shows.
+    /// Its audio tracks always play; a cam's own sound plays while it shows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multicam: bool,
 }
 
 impl Item {
@@ -493,6 +504,7 @@ impl Item {
             masks: Vec::new(),
             keep_key_times: false,
             effect_groups: Vec::new(),
+            multicam: false,
         }
     }
 

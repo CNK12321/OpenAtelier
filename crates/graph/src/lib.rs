@@ -143,7 +143,8 @@ pub enum NodeOp {
     /// A text layer drawn in one pass (see `oa_gpu::text`). The word being spoken
     /// (`spoken_word`, −1 for none) is drawn with `spoken_style` and each effect's
     /// `spoken` uniforms — "highlight when spoken".
-    Text { spec: Arc<oa_text::TextSpec>, scale: f64, style: Vec<f32>, spoken_style: Vec<f32>, spoken_word: f32, chain: Vec<TextEffect> },
+    /// `slots`: letters showing other characters for now (see [`SlotSwap`]).
+    Text { spec: Arc<oa_text::TextSpec>, scale: f64, style: Vec<f32>, spoken_style: Vec<f32>, spoken_word: f32, chain: Vec<TextEffect>, slots: Vec<SlotSwap> },
     /// Where a bounded effect applies on a text layer: each letter's share of the layer
     /// (a cell from halfway to its neighbors, on its line) filled with how much of the
     /// effect it gets — `bounds` as in [`TextEffect::bounds`] — in every channel,
@@ -186,6 +187,31 @@ pub struct TextEffect {
     /// Only some of the letters (a "bounded" effect): whether the rest are percent of the
     /// letter count, then where it starts and ends and its blend, in letters (or percent).
     pub bounds: Option<[f32; 4]>,
+}
+
+/// What a letter's slot shows instead of its own letter, while a text effect that changes
+/// characters (Characters, Counter) is at work: any number of characters, each moved,
+/// squashed and faded — none at all hides the letter. The slot keeps its place in the
+/// laid-out text, so the line never shifts as its characters change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotSwap {
+    /// The letter (its order among the drawn letters, as `PlacedGlyph::index`).
+    pub index: u32,
+    /// Drawn only inside the letter's own slot (a roll, sliding in from below).
+    pub clip: bool,
+    pub draws: Vec<SlotDraw>,
+}
+
+/// One character drawn in a slot (see [`SlotSwap`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SlotDraw {
+    /// The character; `None` is the letter's own.
+    pub ch: Option<char>,
+    /// Moved down by this many ems (up when negative).
+    pub dy: f32,
+    /// Squashed to this share of its height, about the middle of the line (a flip).
+    pub scale_y: f32,
+    pub alpha: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -437,8 +463,18 @@ impl GraphBuilder {
                 f32s(&mut h, uniforms);
                 f32s(&mut h, &[*progress]);
             }
-            NodeOp::Text { spec, scale, style, spoken_style, spoken_word, chain } => {
+            NodeOp::Text { spec, scale, style, spoken_style, spoken_word, chain, slots } => {
                 h.update(&[7]);
+                h.update(&(slots.len() as u64).to_le_bytes());
+                for s in slots {
+                    h.update(&s.index.to_le_bytes());
+                    h.update(&[s.clip as u8]);
+                    h.update(&(s.draws.len() as u64).to_le_bytes());
+                    for d in &s.draws {
+                        h.update(&d.ch.map_or(u32::MAX, u32::from).to_le_bytes());
+                        f32s(&mut h, &[d.dy, d.scale_y, d.alpha]);
+                    }
+                }
                 f32s(&mut h, &[*spoken_word]);
                 h.update(&(spoken_style.len() as u64).to_le_bytes());
                 f32s(&mut h, spoken_style);

@@ -273,6 +273,7 @@ pub fn packed_len(ty: oa_params::ParamType) -> usize {
         T::Color => 4,
         T::Text => 0,
         T::Gradient => oa_params::Gradient::PACKED_LEN,
+        T::Path => oa_params::BezierPath::PACKED_LEN,
     }
 }
 
@@ -319,6 +320,8 @@ impl EffectDescriptor {
                 // effect's second input (`sample_media`).
                 Some(Value::Media(m)) => out.push(m.is_some() as u8 as f32),
                 Some(Value::Gradient(g)) => out.extend(g.pack()),
+                // Sampled along its length; positions stay fractions of the layer.
+                Some(Value::Path(p)) => out.extend(p.pack(&schema.point_defaults())),
                 Some(Value::Text(_)) | None => {}
             }
         }
@@ -360,8 +363,13 @@ impl EffectDescriptor {
     /// pulled outside, a sheet turned towards the camera) — around the shape it makes, so
     /// nothing is cut off.
     pub fn grown_bounds(&self, values: &Evaluated, raster_scale: f64, input: Rect) -> Rect {
-        let Some(script) = &self.bounds else { return input.expand(self.expand_px(values, raster_scale)) };
-        let grown = script.eval(values, raster_scale, input);
+        let grown = match (&self.bounds, self.path_reach(values, input)) {
+            (Some(script), _) => script.eval(values, raster_scale, input),
+            // An effect drawn along a path (with no bounds script): wherever the path
+            // goes, as far out as its points' numbers reach.
+            (None, Some(path)) => path,
+            (None, None) => return input.expand(self.expand_px(values, raster_scale)),
+        };
         // Never more than a few times the layer's own size (a point dragged far away).
         let (w, h) = ((input.x1 - input.x0).max(1.0), (input.y1 - input.y0).max(1.0));
         let reach = 2.0 * w.max(h);
@@ -371,6 +379,24 @@ impl EffectDescriptor {
             (grown.x1.min(input.x1 + reach) - 1e-3).ceil(),
             (grown.y1.min(input.y1 + reach) - 1e-3).ceil(),
         )
+    }
+}
+
+impl EffectDescriptor {
+    /// Where an effect drawn along its path parameter can reach: the layer and the
+    /// path's box (its points are fractions of the layer), grown by its points' first
+    /// two numbers (a width, half each side, and a sideways offset) as fractions of the
+    /// layer's shorter side. `None` without a path parameter.
+    fn path_reach(&self, values: &Evaluated, input: Rect) -> Option<Rect> {
+        let schema = self.params.iter().find(|p| p.ty == oa_params::ParamType::Path)?;
+        let path = values.get(schema.id.as_str()).and_then(Value::as_path)?;
+        let [lo, hi] = path.bounds()?;
+        let (w, h) = (input.x1 - input.x0, input.y1 - input.y0);
+        let defaults = schema.point_defaults();
+        let most = |k: usize| (0..path.points.len()).map(|i| path.attr(i, k, &defaults).abs()).fold(0.0, f64::max);
+        let reach = (most(0) / 2.0 + most(1)) * w.min(h) + 2.0;
+        let along = Rect::new(input.x0 + lo[0] * w - reach, input.y0 + lo[1] * h - reach, input.x0 + hi[0] * w + reach, input.y0 + hi[1] * h + reach);
+        Some(along.union(&input))
     }
 }
 
@@ -398,6 +424,16 @@ pub const BLEND: &str = "oa.composite.blend";
 /// **Duplicate**: not a shader pass — the planner draws the clip a second time, with its
 /// own transform and effects (`oa_doc::schema::DUPLICATE_EFFECT`).
 pub const DUPLICATE: &str = "oa.composite.duplicate";
+/// **Bend Along Path**: the picture laid along a curve (a `path` parameter), stretched
+/// or repeated, as wide as each point says.
+pub const BEND: &str = "oa.composite.bend";
+/// **Characters**: not a shader pass — the planner has the text pass draw other
+/// characters in the letters' places (`oa_graph::SlotSwap`): random ones, the text it
+/// was before, or none, settling into the text one letter after another.
+pub const CHARACTERS: &str = "oa.text.characters";
+/// **Counter**: not a shader pass — the title shows a keyframed number, formatted,
+/// its digits rolling like an odometer if asked.
+pub const COUNTER: &str = "oa.text.counter";
 /// **Drop Shadow**: the silhouette offset and softened behind the picture.
 pub const SHADOW: &str = "oa.light.shadow";
 /// **Depth**: the picture as a sheet with thickness, turned in 3D.

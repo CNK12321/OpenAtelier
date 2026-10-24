@@ -65,6 +65,7 @@ fn sections() -> Vec<(&'static str, Vec<Bind>)> {
                 b(&["Ctrl+G"], tr("Group")),
                 b(&["Ctrl+Shift+G"], tr("Ungroup")),
                 b(&["Alt+↑", "Alt+↓"], tr("Move the picked tracks up or down")),
+                b(&["1–9"], tr("A multicam clip selected: show that cam from the playhead on")),
                 b(&["Ctrl+Click"], tr("Pick more clips or tracks")),
                 b(&["Wheel"], tr("Scroll through time")),
                 b(&["Shift+Wheel"], tr("Scroll up and down")),

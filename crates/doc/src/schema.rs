@@ -228,6 +228,61 @@ pub fn bounds() -> &'static [ParamSchema] {
 pub const GROUP_MIX: &str = "mix";
 
 /// An effect group's own parameters: its mix, keyframable like any other.
+/// A multicam clip's shown cam (see `Item::multicam`): which of its picture tracks
+/// shows, counted from the first (0 is Cam 1). Keyed with hold keys, each one a cut.
+pub const CAM: &str = "multicam.cam";
+
+/// The cam a multicam clip shows at timeline time `t`: its key at or before `t` (a cut
+/// holds until the next, whatever the keys' easing says), else its first key's, else
+/// its one value.
+pub fn cam_at(item: &crate::Item, t: oa_time::Time) -> usize {
+    let as_cam = |v: &Value| v.as_float().unwrap_or(0.0).round().max(0.0) as usize;
+    match item.params.get(CAM) {
+        Some(oa_params::ParamSource::Animated(c)) if !c.keys.is_empty() => {
+            let ctx = item.eval_context(t);
+            let local = if c.anchor == oa_params::KeyframeAnchor::ClipStart { ctx.clip_time } else { ctx.source_time };
+            let at = c.keys.partition_point(|k| k.t <= local);
+            as_cam(&c.keys[at.saturating_sub(1)].value)
+        }
+        Some(src) => as_cam(&src.eval(&item.eval_context(t))),
+        None => 0,
+    }
+}
+
+/// Where a multicam clip's cuts fall (timeline times inside it, in order).
+pub fn cam_cut_times(item: &crate::Item) -> Vec<oa_time::Time> {
+    let Some(oa_params::ParamSource::Animated(c)) = item.params.get(CAM) else { return Vec::new() };
+    let (start, end) = (item.range.start, item.range.end());
+    let mut times: Vec<oa_time::Time> = c
+        .keys
+        .iter()
+        .filter_map(|k| match c.anchor {
+            oa_params::KeyframeAnchor::ClipStart => Some(start + k.t),
+            // (Cuts are keyed on the clip's own clock.)
+            _ => None,
+        })
+        .filter(|t| *t > start && *t < end)
+        .collect();
+    times.sort();
+    times.dedup();
+    // Only where the cam changes.
+    let mut last = cam_at(item, start);
+    times.retain(|t| {
+        let now = cam_at(item, *t);
+        let changed = now != last;
+        last = now;
+        changed
+    });
+    times
+}
+
+/// A multicam clip's stretches between cuts (timeline times) and the cam each shows.
+pub fn cam_stretches(item: &crate::Item) -> Vec<(oa_time::TimeRange, usize)> {
+    let cuts = cam_cut_times(item);
+    let edges: Vec<oa_time::Time> = std::iter::once(item.range.start).chain(cuts).chain(std::iter::once(item.range.end())).collect();
+    edges.windows(2).map(|w| (oa_time::TimeRange::new(w[0], w[1] - w[0]), cam_at(item, w[0]))).collect()
+}
+
 pub fn group() -> &'static [ParamSchema] {
     static S: OnceLock<Vec<ParamSchema>> = OnceLock::new();
     S.get_or_init(|| vec![ParamSchema::new(GROUP_MIX, Value::Float(100.0), Unit::None).range(0.0, 100.0)])

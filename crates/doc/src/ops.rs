@@ -61,6 +61,8 @@ pub enum Op {
     SetItemGroup { seq: SeqId, item: ItemId, group: Option<u64> },
     /// Whether a clip's keys keep their times when its length changes (`Item::keep_key_times`).
     SetKeepKeyTimes { seq: SeqId, item: ItemId, keep: bool },
+    /// Whether a compound clip shows one cam at a time (`Item::multicam`).
+    SetMulticam { seq: SeqId, item: ItemId, on: bool },
     InsertItem { seq: SeqId, track: TrackId, item: Item },
     RemoveItem { seq: SeqId, item: ItemId },
     SetItemTiming { seq: SeqId, item: ItemId, range: TimeRange, time_map: TimeMap },
@@ -285,6 +287,11 @@ impl Op {
                 let it = item_mut(p, seq, item)?;
                 let old = std::mem::replace(&mut it.keep_key_times, keep);
                 vec![Op::SetKeepKeyTimes { seq, item, keep: old }]
+            }
+            Op::SetMulticam { seq, item, on } => {
+                let it = item_mut(p, seq, item)?;
+                let old = std::mem::replace(&mut it.multicam, on);
+                vec![Op::SetMulticam { seq, item, on: old }]
             }
             Op::InsertItem { seq, track, item } => {
                 if item.range.duration <= oa_time::Time::ZERO {

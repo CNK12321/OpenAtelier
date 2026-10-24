@@ -13,6 +13,7 @@ mod assets;
 mod audition;
 mod autosave;
 mod band;
+mod backdrop;
 mod bin;
 mod clips;
 mod color;
@@ -24,6 +25,8 @@ mod logo;
 mod mask_draw;
 mod masks;
 mod media_pick;
+mod multicam;
+mod paths;
 mod points;
 mod surface;
 mod sound_cards;
@@ -553,6 +556,11 @@ struct App {
     surface_drag: Option<surface::SurfaceDrag>,
     /// An effect's point being dragged in the viewer.
     point_drag: Option<points::PointDrag>,
+    /// A path being dragged in the viewer, and the picked point of a path.
+    path_drag: Option<paths::PathDrag>,
+    path_pick: Option<paths::PathPick>,
+    /// The cam switcher beside the viewer folded away to a tab.
+    cam_switcher_folded: bool,
     /// The Export window is open; files waiting to be exported after the running one;
     /// where the running one goes.
     export_dialog: bool,
@@ -771,6 +779,9 @@ impl App {
             crop_drag: None,
             surface_drag: None,
             point_drag: None,
+            path_drag: None,
+            path_pick: None,
+            cam_switcher_folded: false,
             export_dialog: false,
             export_queue: Default::default(),
             export_path: None,
@@ -906,6 +917,8 @@ impl App {
         self.crop_drag = None;
         self.surface_drag = None;
         self.point_drag = None;
+        self.path_drag = None;
+        self.path_pick = None;
         self.curve_editor = None;
         self.wave_editor = None;
         self.connection_editor = None;
@@ -2253,6 +2266,10 @@ impl App {
                 return;
             }
         }
+        // A multicam clip selected: 1–9 switch its cam at the playhead (while playing too).
+        if self.multicam_keys(ctx) {
+            return;
+        }
         let pressed = |m: M, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         // F: fullscreen playback, in and out. While it's on, only playing and stepping —
         // no edits made by a key pressed while watching.
@@ -2371,6 +2388,17 @@ impl App {
         }
         if pressed(M::NONE, Key::T) {
             self.add_transition_at_playhead();
+        }
+        // Over the viewer with a path's point picked, Delete takes the point away (and
+        // Esc lets go of it), not the clip.
+        if over_viewer && self.path_pick.is_some() {
+            if (pressed(M::NONE, Key::Delete) || pressed(M::NONE, Key::Backspace)) && self.remove_picked_point() {
+                return;
+            }
+            if pressed(M::NONE, Key::Escape) {
+                self.path_pick = None;
+                return;
+            }
         }
         // Over the curve editor, Delete removes its key, not the clip.
         if !self.pointer_on_curve_editor(ctx) && !self.pointer_on_keyframes(ctx) {
@@ -3010,6 +3038,8 @@ impl App {
                 {
                     self.open_captions();
                 }
+                // Multi-cam (Settings → Features), beside it.
+                self.multicam_button(ui);
                 // Several clips picked on one track: ways to arrange them.
                 if self.arrangeable() {
                     ui.separator();

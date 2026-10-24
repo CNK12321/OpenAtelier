@@ -65,9 +65,10 @@ pub struct ClipPreviews {
     waves: HashMap<MediaId, Slot<Peaks>>,
     envelopes: HashMap<MediaId, Slot<Arc<oa_audio::envelope::Envelope>>>,
     /// Compound clips' filmstrips, rendered (on the preview thread) from what the
-    /// compound is — (the version shown, the strip), and a render in flight.
-    compounds: HashMap<oa_doc::SeqId, (u64, Strip)>,
-    compound_jobs: HashMap<oa_doc::SeqId, Receiver<Option<crate::preview_worker::StripFrames>>>,
+    /// compound is — (the version shown, the strip), and a render in flight — by
+    /// compound and cam (a multicam clip's cams have a filmstrip each).
+    compounds: HashMap<(oa_doc::SeqId, Option<usize>), (u64, Strip)>,
+    compound_jobs: HashMap<(oa_doc::SeqId, Option<usize>), Receiver<Option<crate::preview_worker::StripFrames>>>,
 }
 
 /// Frames in a compound clip's filmstrip: one a second, 1 to this many.
@@ -78,35 +79,37 @@ impl ClipPreviews {
     /// made stays up while a newer one renders; `start` asks for a render (it's handed
     /// where the result goes) — only when none is running, so a compound being edited
     /// re-renders once per finished strip, never piling up. `None` until the first is in.
-    pub fn compound_strip(&mut self, ctx: &egui::Context, seq: oa_doc::SeqId, version: u64, start: impl FnOnce(std::sync::mpsc::Sender<Option<crate::preview_worker::StripFrames>>)) -> Option<&Strip> {
-        if let Some(rx) = self.compound_jobs.get(&seq) {
+    /// `cam`: one cam of it only (a multicam clip's).
+    pub fn compound_strip(&mut self, ctx: &egui::Context, seq: oa_doc::SeqId, cam: Option<usize>, version: u64, start: impl FnOnce(std::sync::mpsc::Sender<Option<crate::preview_worker::StripFrames>>)) -> Option<&Strip> {
+        let key = (seq, cam);
+        if let Some(rx) = self.compound_jobs.get(&key) {
             match rx.try_recv() {
                 Ok(made) => {
-                    self.compound_jobs.remove(&seq);
+                    self.compound_jobs.remove(&key);
                     if let Some(f) = made {
                         let image = egui::ColorImage::from_rgba_unmultiplied(f.size, &f.pixels);
-                        let texture = ctx.load_texture(format!("compound-strip-{}", seq.0), image, egui::TextureOptions::LINEAR);
-                        self.compounds.insert(seq, (f.version, Strip { texture, frames: f.frames, duration: f.duration, aspect: f.aspect, scaling: oa_doc::MediaScaling::Smooth }));
+                        let texture = ctx.load_texture(format!("compound-strip-{}-{}", seq.0, cam.map_or(0, |c| c + 1)), image, egui::TextureOptions::LINEAR);
+                        self.compounds.insert(key, (f.version, Strip { texture, frames: f.frames, duration: f.duration, aspect: f.aspect, scaling: oa_doc::MediaScaling::Smooth }));
                     }
                 }
                 Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
                 Err(TryRecvError::Disconnected) => {
-                    self.compound_jobs.remove(&seq);
+                    self.compound_jobs.remove(&key);
                 }
             }
         }
-        let current = self.compounds.get(&seq).is_some_and(|(v, _)| *v == version);
-        if !current && !self.compound_jobs.contains_key(&seq) {
+        let current = self.compounds.get(&key).is_some_and(|(v, _)| *v == version);
+        if !current && !self.compound_jobs.contains_key(&key) {
             let (tx, rx) = channel();
             start(tx);
-            self.compound_jobs.insert(seq, rx);
+            self.compound_jobs.insert(key, rx);
         }
-        self.compounds.get(&seq).map(|(_, s)| s)
+        self.compounds.get(&key).map(|(_, s)| s)
     }
 
     /// Whether a compound's first filmstrip is still being made.
     pub fn compound_pending(&self, seq: oa_doc::SeqId) -> bool {
-        self.compound_jobs.contains_key(&seq) && !self.compounds.contains_key(&seq)
+        self.compound_jobs.contains_key(&(seq, None)) && !self.compounds.contains_key(&(seq, None))
     }
 
     /// The filmstrip for `media`, starting it if needed. `size` is the picture's size

@@ -76,6 +76,7 @@ impl App {
                         ui.add_space(4.0);
                         egui::ScrollArea::vertical().id_salt(("settings-scroll", page as u8)).auto_shrink([false, false]).show(ui, |ui| match page {
                             Page::Editing => self.settings_editing(ui),
+                            Page::Features => self.settings_features(ui),
                             Page::Interface => self.settings_interface(ui),
                             Page::Shortcuts => self.keybind_list(ui),
                             Page::Performance => self.settings_performance(ui),
@@ -101,16 +102,29 @@ impl App {
         }
     }
 
+    /// Tools most people never need, each off until switched on — so the editor stays
+    /// simple for those who don't use them. Turning one off hides its controls; nothing
+    /// made with it changes.
+    fn settings_features(&mut self, ui: &mut egui::Ui) {
+        let s = &mut self.settings;
+        ui.label(egui::RichText::new(tr("Turn on the tools you use; the rest stay out of the way. Turning one off only hides it: what you made with it stays as it is.")).small().weak());
+        ui.add_space(6.0);
+        let feature = |ui: &mut egui::Ui, on: &mut bool, name: &str, about: &str| {
+            ui.checkbox(on, egui::RichText::new(name).strong());
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(24.0);
+                ui.label(egui::RichText::new(about).small().weak());
+            });
+            ui.add_space(4.0);
+        };
+        feature(ui, &mut s.advanced_transform, tr("Advanced transformations"), tr("Squash and the crop sliders in Transform. Cropping by double-clicking a clip in the viewer works either way."));
+        feature(ui, &mut s.advanced_color, tr("Advanced color"), tr("Source color (log and HDR curves, gamut, levels) and the Output tone map. Off: files are read by their own tags."));
+        feature(ui, &mut s.masking, tr("Masks"), tr("A Masks tab in the inspector: draw masks on a clip (rectangle, ellipse, brush, magic select, fill, or a black-and-white picture), then give properties their own value inside them or run effects only there."));
+        feature(ui, &mut s.multicam, tr("Multi-cam"), tr("Edit footage from several cameras as one clip: a compound clip with a camera on each picture track shows one at a time — switch with 1–9 or right-click, a white line at each cut — and any stretch's camera can be taken out as its own clip. Its button sits beside Captions."));
+    }
+
     fn settings_editing(&mut self, ui: &mut egui::Ui) {
         let s = &mut self.settings;
-        ui.checkbox(&mut s.advanced_transform, tr("Advanced transformations"))
-            .on_hover_text(tr("Squash and the crop sliders in Transform. Cropping by double-clicking a clip in the viewer works either way."));
-        ui.checkbox(&mut s.advanced_color, tr("Advanced color"))
-            .on_hover_text(tr("Source color (log and HDR curves, gamut, levels) and the Output tone map. Off: files are read by their own tags."));
-        ui.add_space(6.0);
-        ui.strong("Masking");
-        ui.checkbox(&mut s.masking, tr("Masks tab")).on_hover_text(tr("A Masks tab in the inspector: draw masks on a clip (rectangle, ellipse, brush, magic select, fill, or a black-and-white picture), then give properties their own value inside them or run effects only there."));
-        ui.add_space(6.0);
         ui.label(tr("Default curve for new keyframes"));
         ui.horizontal(|ui| {
             let label = |c: CurveShape| match c {
@@ -182,7 +196,7 @@ impl App {
             }
         });
         ui.checkbox(&mut self.settings.ui_effects, tr("UI effects"))
-            .on_hover_text(tr("The glow around the viewer in the picture's colors, and project cards that lift and tilt toward the pointer. Off: plain frames and outlines."));
+            .on_hover_text(tr("The glow around the viewer in the picture's colors, project cards that lift and tilt toward the pointer, and the timeline playing behind the start page. Off: plain frames and outlines, and a plain start page."));
         // The language: built in (English, Spanish) or a file dropped into the locales
         // folder. Strings are picked at startup, so it applies on the next one.
         ui.horizontal(|ui| {
@@ -334,6 +348,7 @@ impl App {
 enum Page {
     #[default]
     Editing,
+    Features,
     Interface,
     Performance,
     Graphics,
@@ -344,11 +359,12 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 8] = [Page::Editing, Page::Interface, Page::Shortcuts, Page::Media, Page::Performance, Page::Graphics, Page::Updates, Page::Tracker];
+    const ALL: [Page; 9] = [Page::Editing, Page::Features, Page::Interface, Page::Shortcuts, Page::Media, Page::Performance, Page::Graphics, Page::Updates, Page::Tracker];
 
     fn name(self) -> &'static str {
         match self {
             Page::Editing => tr("Editing"),
+            Page::Features => tr("Features"),
             Page::Interface => tr("Interface"),
             Page::Performance => tr("Performance"),
             Page::Graphics => tr("Graphics"),

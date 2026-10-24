@@ -96,7 +96,7 @@ pub(crate) fn spec() -> PipelineSpec {
     }
 }
 
-/// Uniform block (64 floats, same buffer size as other passes).
+/// Uniform block (its first 64 floats; the buffer is the size other passes use).
 pub(crate) fn uniforms(frame: &Nv12Frame<'_>, out_size: [u32; 2]) -> [f32; 64] {
     let (kr, kb) = frame.color.matrix.kr_kb();
     let mut u = [0.0; 64];

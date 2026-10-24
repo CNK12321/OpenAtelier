@@ -284,7 +284,7 @@ impl App {
     /// by one clip playing it, which is then selected.
     pub(crate) fn compound_selection(&mut self, nest: bool) {
         let clips = self.selected_clips();
-        match self.editor.compound(&clips, nest) {
+        match self.editor.compound(&clips, nest, self.variant_id()) {
             Ok((_, Some(clip))) => {
                 self.selected.clear();
                 self.selection = Some(clip);

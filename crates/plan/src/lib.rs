@@ -11,6 +11,7 @@
 //! 3. `LayerPixels` effect params are multiplied by the raster scale, so a 10px blur
 //!    looks the same at any preview resolution.
 
+pub mod characters;
 pub mod scene;
 pub mod transitions;
 
@@ -42,11 +43,14 @@ pub struct PlanOptions {
     /// Show only this Duplicate's copy of its clip, not the clip (the viewer, while the
     /// copy's effects are adjusted).
     pub solo: Option<oa_doc::EffectId>,
+    /// Draw only this cam of the sequence (its picture tracks counted from the first),
+    /// as a multicam clip showing it would: a cam's own filmstrip, or its preview.
+    pub cam: Option<usize>,
 }
 
 impl Default for PlanOptions {
     fn default() -> Self {
-        PlanOptions { variant: None, render_scale: 1.0, use_proxies: false, key_context: KeyContext::default(), text_supersample: 1, see_through: false, solo: None }
+        PlanOptions { variant: None, render_scale: 1.0, use_proxies: false, key_context: KeyContext::default(), text_supersample: 1, see_through: false, solo: None, cam: None }
     }
 }
 
@@ -114,6 +118,7 @@ pub fn plan_frame(
         report: PlanReport::default(),
         frame: 1.0 / sequence.rate.as_f64().max(1.0),
         layer_crop: [0.0; 4],
+        only_cam: opts.cam,
     };
     let out = p.sequence(seq, Some(variant), t, opts.render_scale, 0);
     let out = p.output_transform(sequence, seq, t, out);
@@ -283,12 +288,18 @@ struct Planner<'a> {
     /// The crop of the clip whose effects are being planned (left, right, top, bottom;
     /// fractions of the layer): Surface rests its grid on what's left.
     layer_crop: [f64; 4],
+    /// The next sequence planned is a multicam clip's: only this cam of it (its picture
+    /// tracks counted from the first) — and its effect tracks — are drawn.
+    only_cam: Option<usize>,
 }
 
 impl Planner<'_> {
     /// Composite of `seq` at time `t`, `scale` × its canvas size.
     fn sequence(&mut self, seq: SeqId, variant: Option<VariantId>, t: Time, scale: f64, depth: usize) -> NodeId {
         let s = self.project.sequence(seq).expect("validated by caller or nesting checks");
+        // A multicam clip's sequence (or one cam of it asked for): that cam, and its
+        // effect tracks, are all that's drawn of it.
+        let only = self.only_cam.take();
         let v = variant.and_then(|v| s.variant(v)).unwrap_or_else(|| s.active());
         let size = [
             ((v.size.width as f64 * scale).round() as u32).max(1),
@@ -320,7 +331,9 @@ impl Planner<'_> {
             layers.push(LayerInfo { opacity: 1.0, blend: BlendMode::Normal, pixelated: false });
         }
         let canvas_rect = Rect::from_size(size[0] as f64, size[1] as f64);
-        for track in s.tracks.iter().filter(|t| t.enabled && t.kind == TrackKind::Video) {
+        let cams: Vec<oa_doc::TrackId> = s.cams().iter().map(|t| t.id).collect();
+        let shown = |track: &oa_doc::Track| only.is_none_or(|c| track.effects || cams.get(c) == Some(&track.id));
+        for track in s.tracks.iter().filter(|t| t.enabled && t.kind == TrackKind::Video && shown(t)) {
             // An effect track: its container's effects run over everything below it —
             // flattened into one picture (the background too), then carried on up as the
             // bottom layer of what's above.
@@ -1038,7 +1051,7 @@ impl Planner<'_> {
         visible: Option<Rect>,
     ) -> (NodeId, Rect, std::sync::Arc<oa_text::TextSpec>, f64) {
         let values = item.params.eval(schema::text(), variant.overrides.get(&item.id), ctx);
-        let spec = scene::text_spec(&values);
+        let spec = scene::title_spec(item, &values, ctx);
         // "Highlight when spoken": the values the spoken word takes instead.
         let spoken_values = spoken(&item.params, schema::text(), &values, ctx);
         let style_of = |values: &oa_params::Evaluated| {
@@ -1075,7 +1088,7 @@ impl Planner<'_> {
         let mut chain = Vec::new();
         for fx in item.active_effects().iter().filter(|e| item.effect_on(e) && item.group_of(e).is_none_or(|g| g.mix(ctx) > 0.0) && e.on_duplicate.is_none()) {
             let Some(d) = self.registry.effect(&fx.type_id).cloned() else { continue };
-            if !d.kind.text_only() {
+            if !d.kind.text_only() || [oa_graph::registry::CHARACTERS, oa_graph::registry::COUNTER].contains(&fx.type_id.as_str()) {
                 continue;
             }
             let Some(clock) = fx.role.clock(ctx.clip_time, item.range.duration) else { continue };
@@ -1109,6 +1122,12 @@ impl Planner<'_> {
             };
             chain.push(oa_graph::TextEffect { type_id: d.type_id.clone(), version: d.version, uniforms: pack(&values), spoken: alt.as_ref().map(pack).unwrap_or_default(), bounds });
         }
+        // Letters showing other characters (Characters, a rolling Counter) — a wider one
+        // may stand in for a narrow letter.
+        let slots = characters::slots(item, self.registry, ctx, &spec.content);
+        if !slots.is_empty() {
+            reach_em += 0.5;
+        }
         // Which word is being spoken — only worked out when something changes for it,
         // so other titles' frames (and cache keys) don't depend on it.
         let spoken_word = if any_spoken {
@@ -1133,7 +1152,7 @@ impl Planner<'_> {
             return self.text(item, variant, ctx, raster * f, s.map_rect(laid_out), visible.map(|v| s.map_rect(v)));
         }
         let spec = std::sync::Arc::new(spec);
-        let op = NodeOp::Text { spec: spec.clone(), scale: raster, style, spoken_style, spoken_word, chain };
+        let op = NodeOp::Text { spec: spec.clone(), scale: raster, style, spoken_style, spoken_word, chain, slots };
         (self.b.add(op, vec![], bounds, false), bounds, spec, raster)
     }
 
@@ -1497,7 +1516,11 @@ impl Planner<'_> {
                 };
                 self.b.add(NodeOp::Solid { color, size: raster_size }, vec![], bounds, color[3] >= 1.0)
             }
-            ItemKind::Nested { sequence } => self.sequence(*sequence, None, ctx.source_time, raster, depth + 1),
+            ItemKind::Nested { sequence } => {
+                // A multicam clip: only the cam it shows now (`sequence` takes it).
+                self.only_cam = item.multicam.then(|| schema::cam_at(item, item.range.start + ctx.clip_time));
+                self.sequence(*sequence, None, ctx.source_time, raster, depth + 1)
+            }
             ItemKind::Text => {
                 // Anti-aliased: drawn k× larger, then shrunk back to the layer's raster —
                 // its own pass, before the crop and the clip's effects. Too big to draw
