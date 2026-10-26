@@ -4,7 +4,7 @@ Each release's section becomes its description on GitHub, and the app's update d
 lists its points. Name a section after the version as it's tagged (`0.1-beta.6`, the
 tag without its `v`) before tagging; until then it's **Unreleased**.
 
-## Unreleased
+## 0.1-beta.10 — Beta 10
 
 ### New
 - **Characters** (text intro and outro): letters that change into the text, or out of
